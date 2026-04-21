@@ -10,31 +10,105 @@
  * For information on how to write a bdev module, see @ref bdev_module.
  */
 
-#ifndef SPDK_BDEV_MODULE_H
+/*
+ * [한국어 설명] bdev 모듈 작성자용 인터페이스 (bdev_module.h) — 1972 라인
+ *
+ * === 파일의 역할 ===
+ * bdev(SPDK Block Device 추상화) 서브시스템의 **"모듈 측"** 인터페이스를
+ * 정의한다. 공개 헤더 `spdk/bdev.h`가 "사용자(애플리케이션) 측" API라면,
+ * 이 헤더는 "NVMe/AIO/malloc/raid/lvol 등 실제 백엔드를 구현하는 bdev 모듈"이
+ * 필요로 하는 타입·콜백·등록 API·I/O 요청 객체 구조를 제공한다.
+ *
+ * 주요 내용:
+ *   (1) struct spdk_bdev_module — 모듈 생애주기 훅 (module_init/fini,
+ *       examine, config dump, 등록)
+ *   (2) struct spdk_bdev_fn_table — bdev 인스턴스별 모듈 콜백
+ *       (★ submit_request 가 I/O 제출 진입점)
+ *   (3) enum spdk_bdev_io_status / io_type — I/O 결과·종류 분류
+ *   (4) struct spdk_bdev — bdev 인스턴스 메타데이터 (블록 크기, 지원 기능,
+ *       UUID, 채널 생성 훅 등)
+ *   (5) struct spdk_bdev_io_*_params — I/O 요청 종류별 페이로드 구조
+ *       · block_params (read/write/unmap 등)
+ *       · reset_params, abort_params
+ *       · nvme_passthru_params
+ *       · zone_mgmt_params
+ *   (6) ★ struct spdk_bdev_io ★ — 단일 bdev I/O 요청 객체 (bdev 레이어의
+ *       핵심 데이터)
+ *   (7) I/O 상태 설정 헬퍼 (spdk_bdev_io_set_nvme_status, set_scsi_status,
+ *       set_aio_status 등)
+ *   (8) 모듈 등록 매크로, 파티션 bdev 도움 API
+ *   (9) 채널/통계/RAID/ZBD 관련 부수 API
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * 애플리케이션 I/O 경로:
+ *   app → spdk_bdev_read() [bdev.h]
+ *     → bdev 레이어: bdev_channel_get_io → bdev_io_init → bdev_io_submit [bdev_internal.h]
+ *       → 모듈의 spdk_bdev_fn_table.submit_request(ch, bdev_io) [이 헤더 fn_table]
+ *         예) module/bdev/nvme/bdev_nvme.c의 콜백이 bdev_io를 분석해
+ *             spdk_nvme_ns_cmd_read/write로 변환해 NVMe 드라이버로 dispatch
+ *
+ * 완료 경로:
+ *   모듈 콜백이 처리 후 spdk_bdev_io_complete(bdev_io, status) [bdev.h]
+ *     → bdev 레이어가 상위 사용자 콜백 호출
+ *
+ * 실행 컨텍스트: 모든 bdev I/O는 I/O channel(=spdk_thread)에 고정. 한
+ * bdev_io는 생성한 채널(즉 스레드)에서만 완료될 수 있다.
+ *
+ * === 타 모듈과의 연결 ===
+ * 의존:
+ *   - spdk/bdev.h (공개 I/O API, 타입 정의)
+ *   - spdk/bdev_zone.h (ZNS 스펙 상수)
+ *   - spdk/log.h, queue.h, thread.h, tree.h, util.h, uuid.h
+ *   - spdk/scsi_spec.h (SCSI 에러 변환 경로)
+ * 의존하는 모듈:
+ *   - lib/bdev/bdev.c (bdev 코어) — 이 헤더의 타입을 구현
+ *   - module/bdev/* (nvme, aio, malloc, raid, lvol, ...) — 모듈 작성자 사용
+ *   - lib/nvmf/ctrlr_bdev.c (NVMe-oF target이 bdev로 I/O dispatch)
+ * 공유 자료구조: spdk_bdev, spdk_bdev_io, spdk_bdev_module — bdev 코어와
+ *   모듈이 공동 소유.
+ *
+ * === 주요 함수/구조체 요약 ===
+ *   - spdk_bdev_module:          모듈 등록 루트
+ *   - spdk_bdev_fn_table:        I/O 제출·채널·상태 조회 콜백 vtable
+ *   - spdk_bdev:                 bdev 인스턴스 메타데이터
+ *   - spdk_bdev_io:              단일 I/O 요청 (★ I/O 경로 중앙 객체 ★)
+ *   - spdk_bdev_io_type:         READ/WRITE/UNMAP/FLUSH/RESET/PASSTHRU/COPY/...
+ *   - spdk_bdev_io_status:       SUCCESS/FAILED/NVME_ERROR/SCSI_ERROR/ABORTED/...
+ *   - SPDK_BDEV_MODULE_REGISTER: 모듈 정적 등록 매크로
+ *
+ * 본 주석은 파일 상단 블록을 제공한다. 개별 구조체(특히 `struct spdk_bdev_io`
+ * 1125줄)는 후속 세션에서 섹션 분할로 점진 주석을 확장한다.
+ */
+
+#ifndef SPDK_BDEV_MODULE_H       /* [한국어] include 가드 */
 #define SPDK_BDEV_MODULE_H
 
-#include "spdk/stdinc.h"
+#include "spdk/stdinc.h"         /* [한국어] 표준 타입 */
 
-#include "spdk/bdev.h"
-#include "spdk/bdev_zone.h"
-#include "spdk/log.h"
-#include "spdk/queue.h"
-#include "spdk/scsi_spec.h"
-#include "spdk/thread.h"
-#include "spdk/tree.h"
-#include "spdk/util.h"
-#include "spdk/uuid.h"
+#include "spdk/bdev.h"           /* [한국어] 공개 bdev 타입 (spdk_bdev_io_completion_cb 등) */
+#include "spdk/bdev_zone.h"      /* [한국어] Zoned bdev 스펙 */
+#include "spdk/log.h"            /* [한국어] SPDK_*LOG 매크로 */
+#include "spdk/queue.h"          /* [한국어] TAILQ/STAILQ — 모듈·bdev 리스트 */
+#include "spdk/scsi_spec.h"      /* [한국어] SCSI 센스 키 등 — 상태 변환 API 사용 */
+#include "spdk/thread.h"         /* [한국어] spdk_io_channel — bdev channel 기반 */
+#include "spdk/tree.h"           /* [한국어] RB 매크로 — 일부 bdev 내부 인덱스 */
+#include "spdk/util.h"           /* [한국어] container_of 등 */
+#include "spdk/uuid.h"           /* [한국어] bdev UUID 식별 */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #define SPDK_BDEV_CLAIM_NAME_LEN	32
+                                  /* [한국어] bdev claim 이름 문자열 최대 길이 (NUL 포함). 모듈이 "이 bdev는 내가 점유"를 등록할 때 사용 */
 
 /* This parameter is best defined for bdevs that share an underlying bdev,
  * such as multiple lvol bdevs sharing an nvme device, to avoid unnecessarily
  * resetting the underlying bdev and affecting other bdevs that are sharing it. */
 #define SPDK_BDEV_RESET_IO_DRAIN_RECOMMENDED_VALUE 5
+                                  /* [한국어] reset 시 in-flight I/O drain 대기 시간 권장값 (초)
+                                   *  - 공유 bdev(예: lvol 여러 개가 같은 NVMe 디바이스 사용)에서 불필요한 하위 reset 전파 방지
+                                   *  - 모듈 작성자가 fn_table 내 해당 필드에 이 값을 사용할 수 있음 */
 
 /** Block device module */
 struct spdk_bdev_module {
@@ -296,6 +370,16 @@ typedef void (*spdk_bdev_unregister_cb)(void *cb_arg, int rc);
  * communication with a backend. The main commands are read/write API
  * calls for I/O via submit_request.
  */
+/*
+ * [한국어] ★ struct spdk_bdev_fn_table - bdev 모듈 vtable ★
+ *
+ * 각 bdev 인스턴스가 모듈 측에 연결하는 "콜백 테이블". bdev 레이어가
+ * I/O를 제출하거나 정보를 조회할 때 여기에 등록된 함수 포인터를 호출한다.
+ *
+ * 가장 중요한 필드: **submit_request** — 이 함수가 bdev → 모듈 디스패치의
+ * 진입점이며 호출 빈도가 가장 높다. 예) bdev_nvme 모듈의 경우 bdev_io를
+ * 분해해 spdk_nvme_ns_cmd_read/write로 NVMe 드라이버에 forward.
+ */
 struct spdk_bdev_fn_table {
 	/** Destroy the backend block device object. If the destruct process
 	 *  for the bdev is asynchronous, return 1 from this function, and
@@ -304,15 +388,30 @@ struct spdk_bdev_fn_table {
 	 *  successful, or <0 if unsuccessful.
 	 */
 	int (*destruct)(void *ctx);
+                                  /* [한국어] bdev 인스턴스 해제 콜백
+                                   *  - 동기: 0 성공 / 음수 실패 반환
+                                   *  - 비동기: 1 반환 후 작업 완료 시 spdk_bdev_destruct_done() 호출
+                                   *  - @ctx: bdev 생성 시 등록한 module context 포인터 */
 
 	/** Process the IO. */
 	void (*submit_request)(struct spdk_io_channel *ch, struct spdk_bdev_io *);
+                                  /* [한국어] ★★★ I/O 제출 진입점 ★★★
+                                   *  - @ch: I/O가 제출되는 채널 (bdev_io가 속한 스레드와 동일)
+                                   *  - @bdev_io: 요청 객체 — opcode/LBA/payload 등 포함
+                                   *  - 모듈이 bdev_io를 처리(백엔드 큐로 포워드)하고, 완료 시 spdk_bdev_io_complete() 호출
+                                   *  - NOMEM 상황: spdk_bdev_io_complete(..., SPDK_BDEV_IO_STATUS_NOMEM)로 즉시 반환
+                                   *    → bdev 코어가 다음 완료 이벤트에서 재시도 */
 
 	/** Check if the block device supports a specific I/O type. */
 	bool (*io_type_supported)(void *ctx, enum spdk_bdev_io_type);
+                                  /* [한국어] 특정 I/O 타입(UNMAP/FLUSH/COPY/ZONE_* 등) 지원 여부 질의
+                                   *  - bdev 코어가 read/write 이외 명령 제출 전 체크 */
 
 	/** Get an I/O channel for the specific bdev for the calling thread. */
 	struct spdk_io_channel *(*get_io_channel)(void *ctx);
+                                  /* [한국어] 호출 스레드용 I/O 채널 반환
+                                   *  - 모듈이 내부적으로 spdk_io_device_register한 디바이스에 대해 spdk_get_io_channel 호출
+                                   *  - NVMe 모듈이면 반환된 채널의 trailing ctx에 nvme_qpair 연결 */
 
 	/**
 	 * Output driver-specific information to a JSON stream. Optional - may be NULL.
@@ -322,6 +421,8 @@ struct spdk_bdev_fn_table {
 	 * (most likely another nested object).
 	 */
 	int (*dump_info_json)(void *ctx, struct spdk_json_write_ctx *w);
+                                  /* [한국어] bdev 드라이버별 정보 JSON 출력 — bdev_get_bdevs RPC 응답에 삽입
+                                   *  - 선택적 (NULL 허용) */
 
 	/**
 	 * Output bdev-specific RPC configuration to a JSON stream. Optional - may be NULL.
@@ -338,41 +439,63 @@ struct spdk_bdev_fn_table {
 	 * constructor method. No other data should be written.
 	 */
 	void (*write_config_json)(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w);
+                                  /* [한국어] 이 bdev를 재생성하는 RPC 구성을 JSON으로 출력 — 구성 save 용
+                                   *  - 독립 구성 가능한 bdev(malloc, aio 등)에만 의미. NVMe ns처럼 상위 컨트롤러 의존적 bdev는 module config_json으로 처리 */
 
 	/** Get spin-time per I/O channel in microseconds.
 	 *  Optional - may be NULL.
 	 */
 	uint64_t (*get_spin_time)(struct spdk_io_channel *ch);
+                                  /* [한국어] 채널별 busy spin 시간(µs) — 스케줄러가 CPU 사용량 추정에 활용 */
 
 	/** Get bdev module context. */
 	void *(*get_module_ctx)(void *ctx);
+                                  /* [한국어] bdev 모듈별 내부 컨텍스트 반환 */
 
 	/** Get memory domains used by bdev. Optional - may be NULL.
 	 * Vbdev module implementation should call \ref spdk_bdev_get_memory_domains for underlying bdev.
 	 * Vbdev module must inspect types of memory domains returned by base bdev and report only those
 	 * memory domains that it can work with. */
 	int (*get_memory_domains)(void *ctx, struct spdk_memory_domain **domains, int array_size);
+                                  /* [한국어] 이 bdev가 사용하는 메모리 도메인 enumerate — RDMA 등 특수 도메인 지원 확인 */
 
 	/**
 	 * Reset I/O statistics specific for this bdev context.
 	 */
 	void (*reset_device_stat)(void *ctx);
+                                  /* [한국어] bdev 모듈 내부 통계 초기화 (bdev 코어 통계와 별개) */
 
 	/**
 	 * Dump I/O statistics specific for this bdev context.
 	 */
 	void (*dump_device_stat_json)(void *ctx, struct spdk_json_write_ctx *w);
+                                  /* [한국어] 모듈별 통계를 JSON으로 덤프 */
 
 	/** Check if bdev can handle spdk_accel_sequence to handle I/O of specific type. */
 	bool (*accel_sequence_supported)(void *ctx, enum spdk_bdev_io_type type);
+                                  /* [한국어] 이 bdev가 accel 시퀀스(DMA 엔진/가속기 체인)로 해당 I/O 타입을 처리할 수 있는지 — bdev 코어가 offload 경로 선택에 사용 */
 };
 
 /** bdev I/O completion status */
+/*
+ * [한국어] bdev I/O 완료 상태 코드
+ *
+ * 음수 = 오류 종류, 0 = 대기, 1 = 성공. 모듈은 spdk_bdev_io_complete()
+ * 호출 시 이 enum 값 중 하나를 전달한다.
+ *
+ * NOMEM 관례: 모듈이 내부 자원 부족으로 지금 제출 불가면 NOMEM을 주어
+ * bdev 코어가 완료 이벤트에 편승해 재시도하도록 한다(자동 retry). 다른
+ * 에러 상태는 즉시 상위 콜백으로 전달됨.
+ */
 enum spdk_bdev_io_status {
 	SPDK_BDEV_IO_STATUS_AIO_ERROR = -8,
+                                  /* [한국어] bdev_aio 모듈 경로에서 libaio 에러 — 별도 aio_result 필드 해석 필요 */
 	SPDK_BDEV_IO_STATUS_ABORTED = -7,
+                                  /* [한국어] abort 요청에 의해 중단된 I/O */
 	SPDK_BDEV_IO_STATUS_FIRST_FUSED_FAILED = -6,
+                                  /* [한국어] fused 명령(COMPARE+WRITE 등)의 첫 조각 실패 — 두 번째 조각은 자동 폐기 */
 	SPDK_BDEV_IO_STATUS_MISCOMPARE = -5,
+                                  /* [한국어] COMPARE 명령의 데이터 불일치 */
 	/*
 	 * NOMEM should be returned when a bdev module cannot start an I/O because of
 	 *  some lack of resources.  It may not be returned for RESET I/O.  I/O completed
@@ -380,16 +503,24 @@ enum spdk_bdev_io_status {
 	 *  completed.
 	 */
 	SPDK_BDEV_IO_STATUS_NOMEM = -4,
+                                  /* [한국어] 모듈 자원 부족 — bdev 코어가 채널 내 다른 I/O 완료 후 자동 재시도
+                                   *  - RESET I/O에는 사용 불가 (retry 안전하지 않음) */
 	SPDK_BDEV_IO_STATUS_SCSI_ERROR = -3,
+                                  /* [한국어] SCSI 에러 — 센스 키 등은 bdev_io 내 별도 필드 참조 */
 	SPDK_BDEV_IO_STATUS_NVME_ERROR = -2,
+                                  /* [한국어] NVMe 에러 — SCT/SC 필드는 bdev_io 내부 nvme 섹션 참조 */
 	SPDK_BDEV_IO_STATUS_FAILED = -1,
+                                  /* [한국어] 일반 실패 (세부 원인 미분류) */
 	SPDK_BDEV_IO_STATUS_PENDING = 0,
+                                  /* [한국어] 아직 완료되지 않음 (초기 상태) */
 	SPDK_BDEV_IO_STATUS_SUCCESS = 1,
+                                  /* [한국어] 정상 완료 */
 
 	/* This may be used as the size of an error status array by negation.
 	 * Hence, this should be updated when adding new error statuses.
 	 */
 	SPDK_MIN_BDEV_IO_STATUS = SPDK_BDEV_IO_STATUS_AIO_ERROR,
+                                  /* [한국어] 최소(가장 음수) 에러 코드 — 에러 통계 배열 크기 계산에 사용 */
 };
 
 /* We have to use the typedef in the function declaration to appease astyle. */
@@ -1122,55 +1253,120 @@ struct spdk_bdev_io_internal_fields {
 	void (*data_transfer_cpl)(void *ctx, int rc);
 };
 
+/*
+ * [한국어] ★★★ struct spdk_bdev_io - bdev 레이어 I/O 요청 객체 ★★★
+ *
+ * bdev 서브시스템에서 "하나의 I/O 요청"을 표현하는 최상위 객체.
+ * 애플리케이션이 `spdk_bdev_read/write/unmap/flush/...`를 호출하면 내부에서
+ * 채널별 풀(bdev_channel_get_io)에서 이 구조체 하나를 획득하여 초기화한 뒤,
+ * `submit_request(ch, bdev_io)` 콜백으로 모듈에 전달한다.
+ *
+ * 구성 원칙:
+ *   - 공개 필드(bdev, type, u) : 모듈이 읽어서 I/O를 수행
+ *   - internal 필드            : bdev 코어 전용, 모듈은 **접근 금지**
+ *   - driver_ctx[]             : 모듈 전용 per-I/O 컨텍스트. flexible array
+ *   - reserved 필드들          : ABI 안정성 — 향후 필드 추가 시 사용. 크기 불변
+ *   - driver_ctx 오프셋은 캐시 라인 정렬 (SPDK_STATIC_ASSERT로 강제)
+ *
+ * 수명 주기:
+ *   1) bdev 코어가 채널 mempool에서 획득(bdev_channel_get_io)
+ *   2) 사용자 요청 정보를 u.{bdev,reset,abort,...} 중 적합한 하나에 기록
+ *   3) internal.ch_link로 채널의 io_submitted 리스트에 등록
+ *   4) 모듈의 submit_request 콜백 호출 → 백엔드로 dispatch
+ *   5) 완료 시 spdk_bdev_io_complete(bdev_io, status) 호출
+ *   6) 코어가 사용자 콜백 invoke → 구조체 mempool 반납
+ *
+ * 메모리 레이아웃:
+ *   [ bdev / type / retries / iov / child_iov[] ]   ← 공개 읽기
+ *   [ u (opcode별 파라미터 union) ]                 ← 공개 쓰기
+ *   [ internal (status, split, bounce_buf, etc.) ] ← 모듈 접근 금지
+ *   [ driver_ctx[] ]                                ← 모듈 전용
+ */
 struct spdk_bdev_io {
 	/** The block device that this I/O belongs to. */
 	struct spdk_bdev *bdev;
+                                  /* [한국어] 이 I/O가 대상으로 하는 bdev 인스턴스
+                                   *  - 설정자: spdk_bdev_read/write 등 공개 API
+                                   *  - 읽는 자: 모듈 submit_request 콜백 — 블록 크기·UUID 조회 등 */
 
 	/** Enumerated value representing the I/O type. */
 	uint8_t type;
+                                  /* [한국어] enum spdk_bdev_io_type (READ/WRITE/UNMAP/FLUSH/RESET/COMPARE/COMPARE_AND_WRITE/ZONE_APPEND/NVME_ADMIN/NVME_IO/NVME_IO_MD/WRITE_ZEROES/COPY 등)
+                                   *  - 모듈이 이 값을 보고 u의 어느 필드를 해석할지 결정 */
 
-	uint8_t reserved0;
+	uint8_t reserved0;            /* [한국어] 예약 1바이트 (future flags) */
 
 	/** Number of IO submission retries */
 	uint16_t num_retries;
+                                  /* [한국어] NOMEM retry 누적 횟수 — bdev 코어가 재시도할 때마다 증가 */
 
-	uint32_t reserved1;
+	uint32_t reserved1;           /* [한국어] 정렬 예약 */
 
 	/** A single iovec element for use by this bdev_io. */
 	struct iovec iov;
+                                  /* [한국어] 단일 iovec 슬롯 — 페이로드가 연속 버퍼일 때 사용자가 직접 입력하지 않은 경우 코어가 bounce_buf 경로에서 구성 */
 
 	/** Array of iovecs used for I/O splitting. */
 	struct iovec child_iov[SPDK_BDEV_IO_NUM_CHILD_IOV];
+                                  /* [한국어] split 경로에서 child I/O가 사용하는 iovec 배열
+                                   *  - parent의 사용자 iovec을 MDTS 등 한계에 맞게 쪼개 이 배열에 재구성
+                                   *  - SPDK_BDEV_IO_NUM_CHILD_IOV: 기본 32 (일반 NVMe MDTS 하에서 충분) */
 
-	uint8_t reserved2[32];
+	uint8_t reserved2[32];        /* [한국어] ABI 예약 — 향후 필드 추가 공간 (크기 불변 보장) */
 
 	/** Parameters filled in by the user */
+	/*
+	 * [한국어] 사용자 입력 파라미터 union — type에 따라 어느 필드를 사용할지 결정
+	 *
+	 * type별 매핑:
+	 *   READ/WRITE/UNMAP/FLUSH/COMPARE/COPY/ZONE_APPEND/WRITE_ZEROES → u.bdev
+	 *   RESET                                                         → u.reset
+	 *   ABORT                                                         → u.abort
+	 *   NVME_ADMIN/NVME_IO/NVME_IO_MD                                 → u.nvme_passthru
+	 *   ZONE_MANAGEMENT                                               → u.zone_mgmt
+	 */
 	union {
 		struct spdk_bdev_io_block_params bdev;
+                                  /* [한국어] 블록 I/O 파라미터 — iovec, offset, num_blocks, unmap range 등
+                                   *  - 가장 자주 사용되는 필드 */
 		struct spdk_bdev_io_reset_params reset;
+                                  /* [한국어] Reset 파라미터 */
 		struct spdk_bdev_io_abort_params abort;
+                                  /* [한국어] Abort 대상 bdev_io 포인터 포함 */
 		struct spdk_bdev_io_nvme_passthru_params nvme_passthru;
+                                  /* [한국어] NVMe passthru — raw SQE를 그대로 전달하는 경로 */
 		struct spdk_bdev_io_zone_mgmt_params zone_mgmt;
+                                  /* [한국어] Zone management (OPEN/CLOSE/RESET/FINISH/OFFLINE 등) */
 	} u;
 
-	uint8_t reserved3[40];
+	uint8_t reserved3[40];        /* [한국어] ABI 예약 */
 
 	/**
 	 *  Fields that are used internally by the bdev subsystem.  Bdev modules
 	 *  must not read or write to these fields.
 	 */
 	struct spdk_bdev_io_internal_fields internal;
-	uint8_t reserved4[64];
+                                  /* [한국어] ★ bdev 코어 내부 전용 필드 ★
+                                   *  - status, NVMe/SCSI/AIO 에러 정보, split 상태, bounce buffer, 대기 큐 링크 등
+                                   *  - 모듈은 절대 접근 금지 — 읽기/쓰기 모두 disallowed
+                                   *  - 완료 상태는 spdk_bdev_io_complete() / set_nvme_status() 등 API로만 변경 */
+	uint8_t reserved4[64];        /* [한국어] ABI 예약 */
 
 	/**
 	 * Per I/O context for use by the bdev module.
 	 */
 	uint8_t driver_ctx[0];
+                                  /* [한국어] ★ 모듈 전용 per-I/O 컨텍스트 (flexible array) ★
+                                   *  - bdev 등록 시 모듈이 요청한 크기만큼 확장 — bdev_io 풀 할당 시 자동 확보
+                                   *  - 예: bdev_nvme 모듈은 여기에 nvme_request 연관 포인터를 저장
+                                   *  - 캐시 라인 정렬 (SPDK_STATIC_ASSERT로 강제) — 모듈이 hot data 배치에 유리 */
 
 	/* No members may be added after driver_ctx! */
+                                  /* [한국어] flexible array 이후 필드 추가 금지 — driver_ctx가 끝까지 확장 */
 };
 SPDK_STATIC_ASSERT(offsetof(struct spdk_bdev_io, driver_ctx) % SPDK_CACHE_LINE_SIZE == 0,
 		   "driver_ctx not cache line aligned");
+                                  /* [한국어] driver_ctx 시작이 64B 경계 — 모듈의 hot data가 false sharing 없이 배치되도록 */
 
 /**
  * Register a new bdev.

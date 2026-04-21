@@ -8,55 +8,163 @@
  * NVMe specification definitions
  */
 
-#ifndef SPDK_NVME_SPEC_H
+/*
+ * [한국어 설명] NVMe 스펙 구조체·상수 정의 (nvme_spec.h) — 4890 라인
+ *
+ * === 파일의 역할 ===
+ * NVMe Base Specification (1.x / 2.x)에서 정의한 **와이어 포맷 구조체와 상수**를
+ * 호스트 C 언어 타입으로 표현한다. SPDK의 유저스페이스 NVMe 드라이버가
+ * 장치와 실제로 주고받는 모든 바이트는 이 헤더의 타입으로 매핑된다.
+ *
+ * 포함 범위 (라인 번호는 대략적 위치):
+ *   - 제한 상수 (MAX_IO_QUEUES, QUEUE_MIN/MAX_ENTRIES 등)
+ *   - Controller Registers 레이아웃 (CAP/CC/CSTS/AQA/ASQ/ACQ, CMB, PMR 등)
+ *     · `struct spdk_nvme_registers` (line 534) — BAR0에 매핑됨
+ *     · 각 레지스터마다 bit-field union 정의
+ *   - SGL 디스크립터 (line 668 enum, 686 struct) — scatter-gather 기술
+ *   - PSDT(PRP or SGL for Data Transfer) 값
+ *   - Queue Priority, Arbitration, Fused 명령 타입 enum
+ *   - Feature ID 용 cdw10/11 비트 union들 (수많은 feature 세부)
+ *   - ★ 핵심 I/O 경로 구조체 ★
+ *     · `struct spdk_nvme_cmd` (line 1452) — 64B SQE (Submission Queue Entry)
+ *     · `struct spdk_nvme_status` (line 1506) — CQE 내 상태 필드
+ *     · `struct spdk_nvme_cpl` (line 1519) — 16B CQE (Completion Queue Entry)
+ *   - Dataset Management range, Compare/Write Zeroes 관련 구조
+ *   - Opcode enum (admin, I/O)
+ *   - Status Code Type / Status Code 값
+ *   - Identify data structures (ctrlr, namespace, namespace list, etc.)
+ *   - Get Log Page 구조체들 (error info, health info, firmware slot, changed ns 등)
+ *   - Sanitize, Directive, Format NVM, Security Send/Receive 구조체
+ *   - ZNS(Zoned Namespace), FDP(Flexible Data Placement) 관련 구조체
+ *   - Async Event Request 이벤트 정의
+ *
+ * 주요 약어:
+ *   - SQE: Submission Queue Entry (64B, host→device)
+ *   - CQE: Completion Queue Entry (16B, device→host)
+ *   - PRP: Physical Region Page — 4KB 경계 정렬 물리 주소 리스트
+ *   - SGL: Scatter/Gather List — 임의 오프셋/길이 지원 디스크립터
+ *   - MPTR: Metadata Pointer (PI 등 메타데이터 영역)
+ *   - DPTR: Data Pointer (PRP 또는 SGL)
+ *   - CID: Command Identifier — SQE와 CQE를 짝짓는 16비트 ID
+ *   - NSID: Namespace ID
+ *   - CDWn: Command Dword N (SQE의 32비트 워드 슬롯)
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * SPDK NVMe 드라이버의 "타입 정의 루트". lib/nvme/nvme_ns_cmd.c가 read/write
+ * 요청을 `struct spdk_nvme_cmd`로 채우고, lib/nvme/nvme_qpair.c의 submit/
+ * complete 경로와 lib/nvme/nvme_pcie*.c의 DMA 경로가 이 구조체들을 실제
+ * 호스트/장치 메모리 레이아웃으로 그대로 사용한다. 대부분의 구조체에는
+ * `SPDK_STATIC_ASSERT(sizeof(...))`로 스펙과의 바이트 크기 일치를 빌드 시에
+ * 검증한다.
+ *
+ * 실행 컨텍스트: 빌드 타임 타입 정의 + 런타임 DMA 대상 메모리 레이아웃.
+ * 런타임 코드는 포함되어 있지 않음 (전부 구조체/상수/enum).
+ *
+ * === 타 모듈과의 연결 ===
+ * 의존:
+ *   - spdk/stdinc.h - uintN_t/etc.
+ *   - spdk/assert.h - SPDK_STATIC_ASSERT
+ * 의존하는 모듈:
+ *   - lib/nvme/* : NVMe 드라이버 전체가 이 헤더에 의존
+ *   - lib/nvmf/* : NVMe-oF target (호스트↔타겟 프로토콜 동일)
+ *   - module/bdev/nvme/* : bdev NVMe 모듈
+ *   - app/spdk_nvme_identify, spdk_nvme_perf 등 진단/벤치 앱
+ *   - include/spdk/nvme.h의 많은 inline 함수가 이 구조체를 참조
+ * 공유 자료구조: 본 파일이 정의하는 모든 스펙 타입이 "공유". 다만 각
+ *   타입은 호출 스레드별 별도 인스턴스를 갖는 것이 기본 (SQE/CQE는 qpair
+ *   내부 링 버퍼에 위치).
+ *
+ * === 주요 함수/구조체 요약 ===
+ * 함수 없음 — 전부 타입 정의.
+ *
+ * 최우선 참조 구조체 (I/O 경로):
+ *   - struct spdk_nvme_cmd (64B) — SQE. 필드:
+ *       opc, fuse, psdt, cid, nsid, mptr, dptr(union prp or sgl1), cdw10~15
+ *   - struct spdk_nvme_status (2B) — 상태 비트필드: p, sc, sct, crd, m, dnr
+ *   - struct spdk_nvme_cpl (16B) — CQE. 필드:
+ *       cdw0, cdw1, sqhd, sqid, cid, status (phase bit 포함)
+ *   - struct spdk_nvme_sgl_descriptor (16B) — SGL 엔트리
+ *       union generic/unkeyed/keyed (transport별 의미 상이)
+ *
+ * 컨트롤러 초기화 시 주로 참조:
+ *   - struct spdk_nvme_registers — BAR0 매핑 레지스터 전체
+ *   - spdk_nvme_cap_register, cc_register, csts_register 등 bit-field unions
+ *
+ * 네임스페이스/컨트롤러 식별:
+ *   - struct spdk_nvme_ctrlr_data (Identify Controller)
+ *   - struct spdk_nvme_ns_data (Identify Namespace)
+ *
+ * 본 주석은 파일 상단 블록 + 핵심 I/O 경로 구조체(SGL/SQE/Status/CQE)에
+ * 대한 필드 수준 한국어 주석을 제공한다. 나머지 섹션(identify, log page,
+ * register bit-fields 등)은 후속 세션에서 점진적으로 확장한다.
+ */
+
+#ifndef SPDK_NVME_SPEC_H          /* [한국어] include 가드 */
 #define SPDK_NVME_SPEC_H
 
-#include "spdk/stdinc.h"
+#include "spdk/stdinc.h"          /* [한국어] 표준 정수 타입 */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include "spdk/assert.h"
+#include "spdk/assert.h"          /* [한국어] SPDK_STATIC_ASSERT — 구조체 크기 스펙 일치 검증용 */
 
 /**
  * Use to mark a command to apply to all namespaces, or to retrieve global
  *  log pages.
  */
 #define SPDK_NVME_GLOBAL_NS_TAG		((uint32_t)0xFFFFFFFF)
+                                  /* [한국어] NSID=0xFFFFFFFF 특수값 — "모든 네임스페이스 대상" 의미
+                                   *  - Identify/Get Log Page 등 명령에서 사용
+                                   *  - NVMe 스펙 §6.1 — 개별 네임스페이스가 아닌 global 정보 요청 시 전달 */
 
 #define SPDK_NVME_MAX_IO_QUEUES		(65535)
+                                  /* [한국어] NVMe 스펙상 허용되는 I/O 큐의 최대 수 (QID 0은 admin, 1~65535 범위) */
 
 #define SPDK_NVME_QUEUE_MIN_ENTRIES		(2)
+                                  /* [한국어] 큐 깊이 최소값 — 엔트리 2개 미만은 스펙 위반 */
 
 #define SPDK_NVME_ADMIN_QUEUE_MIN_ENTRIES	SPDK_NVME_QUEUE_MIN_ENTRIES
+                                  /* [한국어] admin 큐 최소 깊이 */
 #define SPDK_NVME_ADMIN_QUEUE_MAX_ENTRIES	4096
+                                  /* [한국어] admin 큐 최대 깊이 (스펙 상한) */
 
 /* Controllers with quirk NVME_QUIRK_MINIMUM_ADMIN_QUEUE_SIZE must have
  * admin queue size entries that are an even multiple of this number.
  */
 #define SPDK_NVME_ADMIN_QUEUE_QUIRK_ENTRIES_MULTIPLE	64
+                                  /* [한국어] 특정 벤더 컨트롤러가 요구하는 admin 큐 크기 단위
+                                   *  - SPDK는 quirk 플래그로 감지하여 해당 컨트롤러에 대해 큐 크기를 64의 배수로 강제 */
 
 #define SPDK_NVME_IO_QUEUE_MIN_ENTRIES		SPDK_NVME_QUEUE_MIN_ENTRIES
+                                  /* [한국어] I/O 큐 최소 깊이 */
 #define SPDK_NVME_IO_QUEUE_MAX_ENTRIES		65536
+                                  /* [한국어] I/O 큐 최대 깊이 (스펙상 16비트 인덱스 전 범위) */
 
 /**
  * Indicates the maximum number of range sets that may be specified
  *  in the dataset management command.
  */
 #define SPDK_NVME_DATASET_MANAGEMENT_MAX_RANGES	256
+                                  /* [한국어] Dataset Management(TRIM/Discard) 명령 하나가 다룰 수 있는 범위 세트 최대 개수
+                                   *  - SPDK bdev unmap 경로에서 큰 TRIM을 이 값으로 분할 */
 
 /**
  * Maximum number of blocks that may be specified in a single dataset management range.
  */
 #define SPDK_NVME_DATASET_MANAGEMENT_RANGE_MAX_BLOCKS	0xFFFFFFFFu
+                                  /* [한국어] DSM 단일 범위의 최대 블록 수 (32비트 전 범위) */
 
 /**
  * Maximum number of entries in the log page of Changed Namespace List.
  */
 #define SPDK_NVME_MAX_CHANGED_NAMESPACES 1024
+                                  /* [한국어] Changed Namespace List 로그 페이지의 최대 엔트리 수 (스펙) */
 
 #define SPDK_NVME_DOORBELL_REGISTER_SIZE 4
+                                  /* [한국어] 각 doorbell 레지스터 크기 = 4B (DSTRD=0 기준)
+                                   *  - 실제 stride는 CAP.DSTRD로 확장 가능 (8B/16B...) */
 
 union spdk_nvme_cap_register {
 	uint64_t	raw;
@@ -665,55 +773,91 @@ SPDK_STATIC_ASSERT(0xE14 == offsetof(struct spdk_nvme_registers, pmrmscl),
 SPDK_STATIC_ASSERT(0xE18 == offsetof(struct spdk_nvme_registers, pmrmscu),
 		   "Incorrect register offset");
 
+/* [한국어] ===== SGL (Scatter/Gather List) 디스크립터 =====
+ *  - NVMe 1.1+ 선택적 기능, NVMe-oF에서는 필수
+ *  - PRP와 달리 임의 오프셋·임의 길이의 메모리 조각을 자유롭게 연결 가능
+ *  - 각 디스크립터는 16B, hot-path에서 자주 등장 */
 enum spdk_nvme_sgl_descriptor_type {
 	SPDK_NVME_SGL_TYPE_DATA_BLOCK		= 0x0,
+                                  /* [한국어] 일반 데이터 블록 (호스트 메모리 내 버퍼) */
 	SPDK_NVME_SGL_TYPE_BIT_BUCKET		= 0x1,
+                                  /* [한국어] "비트 버킷" — read 시 특정 구간 폐기 (데이터 필터링) */
 	SPDK_NVME_SGL_TYPE_SEGMENT		= 0x2,
+                                  /* [한국어] 다음 SGL 세그먼트 포인터 (체이닝). 뒤에 계속 디스크립터가 따라옴 */
 	SPDK_NVME_SGL_TYPE_LAST_SEGMENT		= 0x3,
+                                  /* [한국어] 마지막 세그먼트 포인터 — 이후 추가 체이닝 없음 */
 	SPDK_NVME_SGL_TYPE_KEYED_DATA_BLOCK	= 0x4,
+                                  /* [한국어] 키(rkey) 포함 데이터 블록 — RDMA 트랜스포트에서 원격 메모리 접근용 */
 	SPDK_NVME_SGL_TYPE_TRANSPORT_DATA_BLOCK	= 0x5,
+                                  /* [한국어] 트랜스포트 특정 데이터 블록 (TCP SGL in-capsule 등) */
 	/* 0x6 - 0xE reserved */
 	SPDK_NVME_SGL_TYPE_VENDOR_SPECIFIC	= 0xF
+                                  /* [한국어] 벤더 확장용 */
 };
 
 enum spdk_nvme_sgl_descriptor_subtype {
 	SPDK_NVME_SGL_SUBTYPE_ADDRESS		= 0x0,
+                                  /* [한국어] 주소 기반 — address 필드가 버스 주소 */
 	SPDK_NVME_SGL_SUBTYPE_OFFSET		= 0x1,
+                                  /* [한국어] 오프셋 기반 — 기준 주소에 대한 상대 오프셋 */
 	SPDK_NVME_SGL_SUBTYPE_TRANSPORT		= 0xa,
+                                  /* [한국어] 트랜스포트 특정 의미 — 예: NVMe/TCP의 in-capsule data */
 };
 
 #pragma pack(push, 1)
+                                  /* [한국어] 1바이트 정렬 강제 — 스펙상 16B 정확히 맞추기 위해 패딩 금지 */
 struct spdk_nvme_sgl_descriptor {
 	uint64_t address;
+                                  /* [한국어] 버스/오프셋/키 중 하나로 해석되는 64비트 필드
+                                   *  - subtype에 따라 의미 변경
+                                   *  - SUBTYPE_ADDRESS: IOMMU 버스 주소
+                                   *  - SUBTYPE_OFFSET: 기준 주소로부터의 오프셋
+                                   *  - keyed 디스크립터에서는 하위 32비트가 rkey로 해석되는 변형도 있음 */
 	union {
 		struct {
 			uint8_t reserved[7];
 			uint8_t subtype	: 4;
+                                  /* [한국어] 하위 4비트: subtype (enum spdk_nvme_sgl_descriptor_subtype) */
 			uint8_t type	: 4;
+                                  /* [한국어] 상위 4비트: type (enum spdk_nvme_sgl_descriptor_type)
+                                   *  - generic 뷰: type/subtype만 빠르게 확인할 때 사용 */
 		} generic;
 
 		struct {
 			uint32_t length;
+                                  /* [한국어] 이 세그먼트의 데이터 길이 (바이트).
+                                   *  - DATA_BLOCK에서는 블록 크기
+                                   *  - SEGMENT/LAST_SEGMENT에서는 다음 세그먼트 내 디스크립터 배열 크기 */
 			uint8_t reserved[3];
 			uint8_t subtype	: 4;
 			uint8_t type	: 4;
 		} unkeyed;
+                                  /* [한국어] keyed가 아닌 일반 경우 — PCIe 트랜스포트에서 사용 */
 
 		struct {
 			uint64_t length		: 24;
+                                  /* [한국어] 24비트 길이 (최대 16MB 세그먼트) */
 			uint64_t key		: 32;
+                                  /* [한국어] 32비트 키 — RDMA rkey. 원격 메모리 영역 식별 */
 			uint64_t subtype	: 4;
 			uint64_t type		: 4;
 		} keyed;
+                                  /* [한국어] RDMA 트랜스포트용 — 원격 호스트가 보낸 rkey/주소로 DMA 가능한 영역 지정 */
 	};
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_sgl_descriptor) == 16, "Incorrect size");
+                                  /* [한국어] 정확히 16B — 스펙 SGL 디스크립터 크기 */
 #pragma pack(pop)
 
 enum spdk_nvme_psdt_value {
+                                  /* [한국어] PSDT (PRP or SGL for Data Transfer) — SQE의 psdt 필드에 저장
+                                   *  - 데이터/메타데이터 포인터를 PRP로 쓸지 SGL로 쓸지 지정 */
 	SPDK_NVME_PSDT_PRP		= 0x0,
+                                  /* [한국어] 데이터·메타 모두 PRP 사용 (PCIe 기본) */
 	SPDK_NVME_PSDT_SGL_MPTR_CONTIG	= 0x1,
+                                  /* [한국어] 데이터는 SGL, 메타는 연속 버퍼 포인터(mptr) */
 	SPDK_NVME_PSDT_SGL_MPTR_SGL	= 0x2,
+                                  /* [한국어] 데이터·메타 모두 SGL (메타는 data SGL 바로 앞 인접 SGL) */
 	SPDK_NVME_PSDT_RESERVED		= 0x3
 };
 
@@ -1449,92 +1593,189 @@ union spdk_nvme_cmd_cdw13 {
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_cmd_cdw13) == 4, "Incorrect size");
 
+/*
+ * [한국어] ★ I/O 경로 제출 측 핵심 구조체 ★
+ * struct spdk_nvme_cmd - Submission Queue Entry (SQE)
+ *
+ * NVMe 스펙 §4.2. 고정 64바이트. 16개의 32비트 dword(CDW0~CDW15)로 구성.
+ * 호스트는 이 구조체를 SQ 링 버퍼의 sq_tail 위치에 기록한 뒤 doorbell을
+ * ring하여 장치에 제출 통지. 장치는 DMA로 SQE를 읽고 해당 명령을 수행.
+ *
+ * Dword 배치:
+ *   CDW0    : opc(8) + fuse(2) + rsvd(4) + psdt(2) + cid(16)
+ *   CDW1    : nsid (네임스페이스 ID)
+ *   CDW2-3  : 예약
+ *   CDW4-5  : mptr (메타데이터 포인터, 64bit)
+ *   CDW6-9  : dptr — PRP(prp1 + prp2) 또는 SGL1 디스크립터
+ *   CDW10-15: 명령별 파라미터(opcode에 따라 해석)
+ *
+ * 호스트 드라이버는 opcode 설정 후 CDWn 필드를 opcode 규격에 맞게 채운다.
+ * 예) READ: nsid=X, dptr=PRP/SGL, cdw10/11=SLBA(64bit), cdw12=NLB(16bit)+제어 플래그
+ */
 struct spdk_nvme_cmd {
 	/* dword 0 */
 	uint16_t opc	:  8;	/* opcode */
+                                  /* [한국어] 8비트 opcode — admin(0x00~)이나 I/O(0x00~) 코드 지정. enum spdk_nvme_opc / spdk_nvme_nvm_opcode 참조
+                                   *  - 예: READ=0x02, WRITE=0x01, FLUSH=0x00, WRITE_ZEROES=0x08 */
 	uint16_t fuse	:  2;	/* fused operation */
-	uint16_t rsvd1	:  4;
-	uint16_t psdt	:  2;
+                                  /* [한국어] Fused 명령 지정 — 두 SQE를 원자적으로 실행하도록 큐잉
+                                   *  - 0=normal, 1=fused first, 2=fused second, 3=reserved
+                                   *  - COMPARE+WRITE atomic 구현에 사용 */
+	uint16_t rsvd1	:  4;     /* [한국어] 예약 4비트 */
+	uint16_t psdt	:  2;     /* [한국어] PSDT — PRP/SGL 중 어느 포맷으로 dptr·mptr을 해석할지 (enum spdk_nvme_psdt_value 참조) */
 	uint16_t cid;		/* command identifier */
+                                  /* [한국어] 16비트 command ID — 호스트가 SQE 제출 시 할당
+                                   *  - CQE의 cid와 매치해 어느 요청의 완료인지 복원
+                                   *  - 범위: 0 ~ (num_entries-1) 큐 내 unique 필요 */
 
 	/* dword 1 */
 	uint32_t nsid;		/* namespace identifier */
+                                  /* [한국어] 대상 네임스페이스 ID — 일반 I/O에서는 해당 NS 번호, 전역 명령은 0xFFFFFFFF(SPDK_NVME_GLOBAL_NS_TAG) */
 
 	/* dword 2-3 */
-	uint32_t rsvd2;
-	uint32_t rsvd3;
+	uint32_t rsvd2;           /* [한국어] 예약 */
+	uint32_t rsvd3;           /* [한국어] 예약 */
 
 	/* dword 4-5 */
 	uint64_t mptr;		/* metadata pointer */
+                                  /* [한국어] 메타데이터(PI Guard/AppTag/RefTag 포함 영역) 버스 주소
+                                   *  - PSDT=PRP이면 호스트 메모리 연속 버퍼 포인터
+                                   *  - PSDT=SGL_MPTR_SGL이면 이 필드가 SGL 디스크립터 시작 주소로 해석
+                                   *  - 메타데이터를 쓰지 않으면 0 */
 
 	/* dword 6-9: data pointer */
 	union {
 		struct {
 			uint64_t prp1;		/* prp entry 1 */
+                                  /* [한국어] 첫 PRP 엔트리 (임의 오프셋 허용)
+                                   *  - 단일 4KB 미만 전송은 prp1만으로 충분
+                                   *  - 그 이상은 prp1 + prp2로 2페이지, 혹은 prp2가 PRP 리스트 포인터 역할 */
 			uint64_t prp2;		/* prp entry 2 */
+                                  /* [한국어] 두 번째 PRP 엔트리 또는 PRP 리스트 포인터
+                                   *  - 전송이 2 페이지면: prp2 = 두 번째 페이지 주소
+                                   *  - 3페이지 이상: prp2 = 나머지 PRP를 담은 4KB 정렬된 리스트 배열 주소 (tracker의 u.prp[])
+                                   *  - 모든 후속 PRP는 4KB 경계 정렬 필수 */
 		} prp;
+                                  /* [한국어] PRP(Physical Region Page) 모드 — PSDT=0 */
 
 		struct spdk_nvme_sgl_descriptor sgl1;
+                                  /* [한국어] SGL 모드 — PSDT=1/2 시 이 필드로 해석
+                                   *  - 단일 디스크립터 또는 세그먼트 체이닝 가능
+                                   *  - NVMe-oF TCP/RDMA 경로가 주로 사용 */
 	} dptr;
+                                  /* [한국어] Data Pointer (dword 6-9, 16바이트). psdt 값에 따라 prp 또는 sgl1로 해석 */
 
 	/* command-specific */
 	union {
 		uint32_t cdw10;
 		union spdk_nvme_cmd_cdw10 cdw10_bits;
+                                  /* [한국어] cdw10 — opcode별 의미 상이. READ/WRITE에서는 SLBA의 하위 32비트 */
 	};
 	/* command-specific */
 	union {
 		uint32_t cdw11;
 		union spdk_nvme_cmd_cdw11 cdw11_bits;
+                                  /* [한국어] cdw11 — READ/WRITE에서는 SLBA 상위 32비트 (총 64bit LBA) */
 	};
 	/* command-specific */
 	union {
 		uint32_t cdw12;
 		union spdk_nvme_cmd_cdw12 cdw12_bits;
+                                  /* [한국어] cdw12 — READ/WRITE에서는 하위 16비트 NLB(Number of Logical Blocks, 0-based) + 상위 비트에 제어 플래그(FUA, LR, PI 등) */
 	};
 	/* command-specific */
 	union {
 		uint32_t cdw13;
 		union spdk_nvme_cmd_cdw13 cdw13_bits;
+                                  /* [한국어] cdw13 — DSM(Dataset Management) hint 비트, directive 등 */
 	};
 	/* dword 14-15 */
 	uint32_t cdw14;		/* command-specific */
+                                  /* [한국어] cdw14 — I/O PI 명령 시 EILBRT/RefTag, 기타 옵션 */
 	uint32_t cdw15;		/* command-specific */
+                                  /* [한국어] cdw15 — I/O PI 명령 시 ELBAT/ELBATM, 기타 옵션 */
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_cmd) == 64, "Incorrect size");
+                                  /* [한국어] 64B 고정 — 스펙 §4.2. 어긋나면 SQ 링 버퍼 인덱싱이 깨짐 */
 
+/*
+ * [한국어] ★ I/O 경로 완료 측 상태 필드 ★
+ * struct spdk_nvme_status - CQE 내부 상태 비트필드 (2바이트)
+ *
+ * NVMe 스펙 §4.6.1. CQE의 dword 3 상위 16비트에 배치된다.
+ * phase 비트(p)는 완료 폴링의 핵심 — 장치가 CQ에 새 엔트리를 쓸 때마다
+ * phase를 토글해서 호스트가 "새 CQE" 여부를 판별하게 함.
+ */
 struct spdk_nvme_status {
 	uint16_t p	:  1;	/* phase tag */
+                                  /* [한국어] Phase Tag — 장치가 CQ 한 바퀴 돌 때마다 뒤집힘
+                                   *  - 호스트는 자신이 기대하는 phase(qpair의 flags.phase)와 일치해야 "유효 CQE"로 판정
+                                   *  - 이 메커니즘이 CQ에 대한 lockless "새 엔트리 감지"의 근간 */
 	uint16_t sc	:  8;	/* status code */
+                                  /* [한국어] 상태 코드 (SC) — 성공/에러 세부 분류
+                                   *  - 0 = Successful Completion
+                                   *  - nonzero = sct(타입)과 조합해 enum spdk_nvme_status_code / spdk_nvme_generic_command_status_code 등 매핑 */
 	uint16_t sct	:  3;	/* status code type */
+                                  /* [한국어] SCT — 상태 코드 타입
+                                   *  - 0=Generic, 1=Command Specific, 2=Media/DI, 3=Path, 7=Vendor Specific
+                                   *  - (SCT, SC) 쌍으로 고유한 상태 해석 */
 	uint16_t crd	:  2;   /* command retry delay */
+                                  /* [한국어] Command Retry Delay — 실패 시 재시도까지 기다릴 시간(힌트)
+                                   *  - 컨트롤러가 CRT 레지스터로 주기 정의, 이 필드는 그 중 어느 슬롯을 쓸지 */
 	uint16_t m	:  1;	/* more */
+                                  /* [한국어] More — 같은 커맨드에 대해 추가 정보(예: 에러 로그)가 있음을 표시 */
 	uint16_t dnr	:  1;	/* do not retry */
+                                  /* [한국어] DNR — 1이면 호스트가 재시도해도 성공 가능성 없음 → 즉시 에러 반환 */
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_status) == 2, "Incorrect size");
+                                  /* [한국어] 2B 고정 — CQE의 dword 3 상위 절반 */
 
 /**
  * Completion queue entry
  */
+/*
+ * [한국어] ★ I/O 경로 완료 측 핵심 구조체 ★
+ * struct spdk_nvme_cpl - Completion Queue Entry (CQE)
+ *
+ * NVMe 스펙 §4.6. 고정 16바이트. 장치가 요청 처리 후 DMA로 호스트 CQ에 씀.
+ *
+ * 드라이버의 완료 폴링 흐름:
+ *   1) cq[cq_head] 위치의 CQE 읽기 (volatile read)
+ *   2) CQE의 status.p와 qpair의 기대 phase 비교 → 일치 시 유효
+ *   3) CQE의 cid로 tracker 배열 색인 → 원 nvme_request 복원
+ *   4) status 코드 평가 후 완료 콜백 호출
+ *   5) cq_head 증가, wrap 시 expected phase 토글
+ *   6) (일정 수 처리 후) CQ head doorbell ring
+ */
 struct spdk_nvme_cpl {
 	/* dword 0 */
 	uint32_t		cdw0;	/* command-specific */
+                                  /* [한국어] 명령별 반환 데이터 (예: GET_FEATURES 현재값, READ의 zero-copy 확장 정보 등)
+                                   *  - 일반 READ/WRITE는 0 */
 
 	/* dword 1 */
 	uint32_t		cdw1;	/* command-specific */
+                                  /* [한국어] 명령별 반환 확장 dword */
 
 	/* dword 2 */
 	uint16_t		sqhd;	/* submission queue head pointer */
+                                  /* [한국어] 장치가 현재까지 소비한 SQ head 포인터
+                                   *  - 호스트는 이 값으로 SQ 내 사용 가능 공간(= num_entries - (sq_tail - sqhd) mod num_entries)을 계산 */
 	uint16_t		sqid;	/* submission queue identifier */
+                                  /* [한국어] 이 CQE가 속한 SQ의 ID — 여러 SQ가 하나의 CQ를 공유할 때 식별 */
 
 	/* dword 3 */
 	uint16_t		cid;	/* command identifier */
+                                  /* [한국어] 원 SQE의 cid 복사 — 이 값으로 tracker 배열 색인 → 호스트 요청 복원 */
 	union {
 		uint16_t                status_raw;
+                                  /* [한국어] raw 16비트 뷰 — 전체 비트 마스크 비교 시 사용 */
 		struct spdk_nvme_status	status;
+                                  /* [한국어] 비트필드 뷰 — p/sc/sct/crd/m/dnr 개별 필드 접근 */
 	};
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_cpl) == 16, "Incorrect size");
+                                  /* [한국어] 16B 고정 — 스펙 §4.6. CQ 링 엔트리 크기 */
 
 /**
  * Dataset Management range
