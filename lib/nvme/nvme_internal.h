@@ -1050,291 +1050,321 @@ struct spdk_nvme_ns {
 /**
  * State of struct spdk_nvme_ctrlr (in particular, during initialization).
  */
+/*
+ * [한국어] ★ NVMe 컨트롤러 초기화/reset 상태머신 ★
+ *
+ * spdk_nvme_ctrlr.state 필드가 이 enum 값을 가지며, spdk_nvme_ctrlr_process_init()이
+ * 매 폴링마다 한 단계씩 진행한다. 초기화는 **동기 admin 커맨드 시퀀스**가 아니라
+ * 상태머신 방식(한 admin 커맨드 제출 → 완료 대기 → 다음 단계)으로 설계되어,
+ * 여러 컨트롤러를 병렬로 초기화할 수 있다.
+ *
+ * 일반 흐름 (성공 경로):
+ *   INIT_DELAY → CONNECT_ADMINQ → WAIT_FOR_CONNECT_ADMINQ →
+ *   READ_VS → WAIT → READ_CAP → WAIT → CHECK_EN → WAIT →
+ *   (이미 EN이면) DISABLE_WAIT_READY_1 → SET_EN_0 → DISABLE_WAIT_READY_0 → DISABLED
+ *   → ENABLE → ENABLE_WAIT_READY_1 → RESET_ADMIN_QUEUE →
+ *   IDENTIFY → CONFIGURE_AER → SET_KEEP_ALIVE_TIMEOUT →
+ *   IDENTIFY_IOCS_SPECIFIC → GET_ZNS_CMD_EFFECTS_LOG →
+ *   SET_NUM_QUEUES → ...(identify NS, discovery log 등)... →
+ *   READY
+ *
+ * 각 "XXX" 단계와 "XXX_WAIT_FOR_YYY" 단계가 쌍을 이룸:
+ *   - XXX: admin 커맨드 발행 (비동기)
+ *   - XXX_WAIT_FOR_YYY: 완료 폴링 (다음 process_init 호출에서 완료 확인 → 다음 상태 진입)
+ *
+ * 실패 시 NVME_CTRLR_STATE_ERROR로 전이 → is_failed=true → destroy만 가능.
+ */
 enum nvme_ctrlr_state {
 	/**
 	 * Wait before initializing the controller.
 	 */
-	NVME_CTRLR_STATE_INIT_DELAY,
+	NVME_CTRLR_STATE_INIT_DELAY,  /* [한국어] 초기화 시작 전 quirk delay (NVME_QUIRK_DELAY_BEFORE_CHK_RDY 등) */
 
 	/**
 	 * Connect the admin queue.
 	 */
 	NVME_CTRLR_STATE_CONNECT_ADMINQ,
+                                  /* [한국어] admin qpair 연결 단계
+                                   *  - PCIe: 즉시 성공
+                                   *  - NVMe-oF: Fabrics CONNECT 커맨드 발행 후 응답 대기 */
 
 	/**
 	 * Controller has not started initialized yet.
 	 */
 	NVME_CTRLR_STATE_INIT = NVME_CTRLR_STATE_CONNECT_ADMINQ,
+                                  /* [한국어] 초기화 시작 표시 — CONNECT_ADMINQ의 별칭 */
 
 	/**
 	 * Waiting for admin queue to connect.
 	 */
 	NVME_CTRLR_STATE_WAIT_FOR_CONNECT_ADMINQ,
+                                  /* [한국어] admin 연결 완료 폴링 */
 
 	/**
 	 * Read Version (VS) register.
 	 */
 	NVME_CTRLR_STATE_READ_VS,
+                                  /* [한국어] VS(Version) 레지스터 read 명령 발행 */
 
 	/**
 	 * Waiting for Version (VS) register to be read.
 	 */
 	NVME_CTRLR_STATE_READ_VS_WAIT_FOR_VS,
+                                  /* [한국어] VS 완료 대기. 완료 후 ctrlr->vs에 저장 */
 
 	/**
 	 * Read Capabilities (CAP) register.
 	 */
 	NVME_CTRLR_STATE_READ_CAP,
+                                  /* [한국어] CAP(Capabilities) read — MQES, DSTRD, CSS, MPSMIN/MAX 확보 */
 
 	/**
 	 * Waiting for Capabilities (CAP) register to be read.
 	 */
 	NVME_CTRLR_STATE_READ_CAP_WAIT_FOR_CAP,
+                                  /* [한국어] CAP 완료 대기 */
 
 	/**
 	 * Check EN to prepare for controller initialization.
 	 */
 	NVME_CTRLR_STATE_CHECK_EN,
+                                  /* [한국어] CC.EN 비트 확인 — 이미 1이면 disable 경로, 0이면 바로 enable 경로 */
 
 	/**
 	 * Waiting for CC to be read as part of EN check.
 	 */
 	NVME_CTRLR_STATE_CHECK_EN_WAIT_FOR_CC,
+                                  /* [한국어] CC read 완료 대기 */
 
 	/**
 	 * Waiting for CSTS.RDY to transition from 0 to 1 so that CC.EN may be set to 0.
 	 */
 	NVME_CTRLR_STATE_DISABLE_WAIT_FOR_READY_1,
+                                  /* [한국어] RDY=1 대기 — EN=1로 부팅된 장치에서 EN=0 쓰기 전에 먼저 RDY=1 확인 필요 (스펙) */
 
 	/**
 	 * Waiting for CSTS register to be read as part of waiting for CSTS.RDY = 1.
 	 */
 	NVME_CTRLR_STATE_DISABLE_WAIT_FOR_READY_1_WAIT_FOR_CSTS,
+                                  /* [한국어] CSTS 폴링 read 대기 */
 
 	/**
 	 * Disabling the controller by setting CC.EN to 0.
 	 */
 	NVME_CTRLR_STATE_SET_EN_0,
+                                  /* [한국어] CC.EN=0 쓰기 발행 */
 
 	/**
 	 * Waiting for the CC register to be read as part of disabling the controller.
 	 */
 	NVME_CTRLR_STATE_SET_EN_0_WAIT_FOR_CC,
+                                  /* [한국어] CC write 완료 대기 */
 
 	/**
 	 * Waiting for CSTS.RDY to transition from 1 to 0 so that CC.EN may be set to 1.
 	 */
 	NVME_CTRLR_STATE_DISABLE_WAIT_FOR_READY_0,
+                                  /* [한국어] RDY=0 전이 대기 (EN=0 이후 장치가 disable 완료 표시) */
 
 	/**
 	 * Waiting for CSTS register to be read as part of waiting for CSTS.RDY = 0.
 	 */
 	NVME_CTRLR_STATE_DISABLE_WAIT_FOR_READY_0_WAIT_FOR_CSTS,
+                                  /* [한국어] CSTS read 대기 */
 
 	/**
 	 * The controller is disabled. (CC.EN and CSTS.RDY are 0.)
 	 */
 	NVME_CTRLR_STATE_DISABLED,
+                                  /* [한국어] EN=0, RDY=0 확정 상태 — 이제 안전하게 admin queue 주소·크기 프로그래밍 가능 */
 
 	/**
 	 * Enable the controller by writing CC.EN to 1
 	 */
 	NVME_CTRLR_STATE_ENABLE,
+                                  /* [한국어] CC.EN=1 쓰기 (MPS/CSS/IOSQES/IOCQES 등 함께 설정) */
 
 	/**
 	 * Waiting for CC register to be written as part of enabling the controller.
 	 */
 	NVME_CTRLR_STATE_ENABLE_WAIT_FOR_CC,
+                                  /* [한국어] CC 쓰기 완료 대기 */
 
 	/**
 	 * Waiting for CSTS.RDY to transition from 0 to 1 after enabling the controller.
 	 */
 	NVME_CTRLR_STATE_ENABLE_WAIT_FOR_READY_1,
+                                  /* [한국어] RDY=1 전이 대기 → 이 시점부터 admin 커맨드 발행 가능 */
 
 	/**
 	 * Waiting for CSTS register to be read as part of waiting for CSTS.RDY = 1.
 	 */
 	NVME_CTRLR_STATE_ENABLE_WAIT_FOR_READY_1_WAIT_FOR_CSTS,
+                                  /* [한국어] CSTS read 대기 */
 
 	/**
 	 * Reset the Admin queue of the controller.
 	 */
 	NVME_CTRLR_STATE_RESET_ADMIN_QUEUE,
+                                  /* [한국어] admin 큐 재설정 — 이후 identify 등 admin 명령 발행 시작점 */
 
 	/**
 	 * Identify Controller command will be sent to then controller.
 	 */
-	NVME_CTRLR_STATE_IDENTIFY,
-
-	/**
-	 * Waiting for Identify Controller command be completed.
-	 */
+	NVME_CTRLR_STATE_IDENTIFY,    /* [한국어] Identify Controller (CNS=01) 발행 — 벤더/펌웨어/MDTS/지원 기능 조회 */
 	NVME_CTRLR_STATE_WAIT_FOR_IDENTIFY,
+                                  /* [한국어] Identify 응답 대기. 성공 시 ctrlr->cdata 채워짐 + quirks 매칭 */
 
 	/**
 	 * Configure AER of the controller.
 	 */
 	NVME_CTRLR_STATE_CONFIGURE_AER,
-
-	/**
-	 * Waiting for the Configure AER to be completed.
-	 */
+                                  /* [한국어] Async Event 구성 — 어떤 event type을 AER로 보고받을지 설정 */
 	NVME_CTRLR_STATE_WAIT_FOR_CONFIGURE_AER,
+                                  /* [한국어] Configure AER 완료 대기 */
 
 	/**
 	 * Set Keep Alive Timeout of the controller.
 	 */
 	NVME_CTRLR_STATE_SET_KEEP_ALIVE_TIMEOUT,
-
-	/**
-	 * Waiting for Set Keep Alive Timeout to be completed.
-	 */
+                                  /* [한국어] Keep Alive Timeout 설정 (NVMe-oF에서 connection liveness 유지) */
 	NVME_CTRLR_STATE_WAIT_FOR_KEEP_ALIVE_TIMEOUT,
+                                  /* [한국어] Keep Alive Timeout 완료 대기 */
 
 	/**
 	 * Get Identify I/O Command Set Specific Controller data structure.
 	 */
 	NVME_CTRLR_STATE_IDENTIFY_IOCS_SPECIFIC,
-
-	/**
-	 * Waiting for Identify I/O Command Set Specific Controller command to be completed.
-	 */
+                                  /* [한국어] I/O Command Set Specific Identify Controller (ZNS/KV 등) */
 	NVME_CTRLR_STATE_WAIT_FOR_IDENTIFY_IOCS_SPECIFIC,
+                                  /* [한국어] IOCS Specific 완료 대기 */
 
 	/**
 	 * Get Commands Supported and Effects log page for the Zoned Namespace Command Set.
 	 */
 	NVME_CTRLR_STATE_GET_ZNS_CMD_EFFECTS_LOG,
-
-	/**
-	 * Waiting for the Get Log Page command to be completed.
-	 */
+                                  /* [한국어] ZNS 지원 컨트롤러에서 command effects log page 조회 */
 	NVME_CTRLR_STATE_WAIT_FOR_GET_ZNS_CMD_EFFECTS_LOG,
+                                  /* [한국어] 완료 대기 */
 
 	/**
 	 * Set Number of Queues of the controller.
 	 */
 	NVME_CTRLR_STATE_SET_NUM_QUEUES,
-
-	/**
-	 * Waiting for Set Num of Queues command to be completed.
-	 */
+                                  /* [한국어] Set Features(NUMBER_OF_QUEUES) 발행 — 호스트가 원하는 I/O 큐 수 요청 */
 	NVME_CTRLR_STATE_WAIT_FOR_SET_NUM_QUEUES,
+                                  /* [한국어] 응답에서 장치가 실제 할당한 큐 수 확인 (요청보다 적을 수 있음) */
 
 	/**
 	 * Get active Namespace list of the controller.
 	 */
 	NVME_CTRLR_STATE_IDENTIFY_ACTIVE_NS,
-
-	/**
-	 * Waiting for the Identify Active Namespace commands to be completed.
-	 */
+                                  /* [한국어] Identify (CNS=02) — 활성 NSID 리스트 조회 */
 	NVME_CTRLR_STATE_WAIT_FOR_IDENTIFY_ACTIVE_NS,
+                                  /* [한국어] NS 리스트 대기. 여러 NS가 있으면 페이지별 반복 */
 
 	/**
 	 * Get Identify Namespace Data structure for each NS.
 	 */
 	NVME_CTRLR_STATE_IDENTIFY_NS,
-
-	/**
-	 * Waiting for the Identify Namespace commands to be completed.
-	 */
+                                  /* [한국어] 각 NS에 대해 Identify Namespace (CNS=00) 발행 — blocklen/PI/MDTS 등 채움 */
 	NVME_CTRLR_STATE_WAIT_FOR_IDENTIFY_NS,
+                                  /* [한국어] 각 NS 응답 대기 */
 
 	/**
 	 * Get Identify Namespace Identification Descriptors.
 	 */
 	NVME_CTRLR_STATE_IDENTIFY_ID_DESCS,
+                                  /* [한국어] Identify (CNS=03) — NSID별 UUID/NGUID/EUI64/CSI 디스크립터 리스트 */
 
 	/**
 	 * Get Identify I/O Command Set Specific Namespace data structure for each NS.
 	 */
 	NVME_CTRLR_STATE_IDENTIFY_NS_IOCS_SPECIFIC,
-
-	/**
-	 * Waiting for the Identify I/O Command Set Specific Namespace commands to be completed.
-	 */
+                                  /* [한국어] ZNS/KV 등 NS별 특화 identify 데이터 조회 */
 	NVME_CTRLR_STATE_WAIT_FOR_IDENTIFY_NS_IOCS_SPECIFIC,
+                                  /* [한국어] 완료 대기 */
 
 	/**
 	 * Waiting for the Identify Namespace Identification
 	 * Descriptors to be completed.
 	 */
 	NVME_CTRLR_STATE_WAIT_FOR_IDENTIFY_ID_DESCS,
+                                  /* [한국어] ID 디스크립터 완료 대기 */
 
 	/**
 	 * Set supported log pages of the controller.
 	 */
 	NVME_CTRLR_STATE_SET_SUPPORTED_LOG_PAGES,
+                                  /* [한국어] Identify에서 얻은 LPA 비트맵으로 log_page_supported[] 초기화 (admin 커맨드 없음) */
 
 	/**
 	 * Set supported log pages of INTEL controller.
 	 */
 	NVME_CTRLR_STATE_SET_SUPPORTED_INTEL_LOG_PAGES,
-
-	/**
-	 * Waiting for supported log pages of INTEL controller.
-	 */
+                                  /* [한국어] Intel 벤더 전용 log page 감지 */
 	NVME_CTRLR_STATE_WAIT_FOR_SUPPORTED_INTEL_LOG_PAGES,
+                                  /* [한국어] Intel log page probe 완료 대기 */
 
 	/**
 	 * Set supported features of the controller.
 	 */
 	NVME_CTRLR_STATE_SET_SUPPORTED_FEATURES,
+                                  /* [한국어] feature_supported[] 배열 초기화 (identify 기반) */
 
 	/**
 	 * Set the Host Behavior Support feature of the controller.
 	 */
 	NVME_CTRLR_STATE_SET_HOST_FEATURE,
-
-	/**
-	 * Waiting for the Host Behavior Support feature of the controller.
-	 */
+                                  /* [한국어] Set Features(HOST_BEHAVIOR_SUPPORT) — 호스트가 지원하는 확장 알림 */
 	NVME_CTRLR_STATE_WAIT_FOR_SET_HOST_FEATURE,
+                                  /* [한국어] 완료 대기 */
 
 	/**
 	 * Set Doorbell Buffer Config of the controller.
 	 */
 	NVME_CTRLR_STATE_SET_DB_BUF_CFG,
-
-	/**
-	 * Waiting for Doorbell Buffer Config to be completed.
-	 */
+                                  /* [한국어] Doorbell Buffer Config admin 커맨드 — shadow doorbell + eventidx 메모리 위치 등록 (NVMe 1.3+) */
 	NVME_CTRLR_STATE_WAIT_FOR_DB_BUF_CFG,
+                                  /* [한국어] 완료 대기. 성공 시 flags.has_shadow_doorbell=1 */
 
 	/**
 	 * Set Host ID of the controller.
 	 */
 	NVME_CTRLR_STATE_SET_HOST_ID,
-
-	/**
-	 * Waiting for Set Host ID to be completed.
-	 */
+                                  /* [한국어] Set Features(HOST_ID) — 멀티호스트 공유 컨트롤러 식별용 */
 	NVME_CTRLR_STATE_WAIT_FOR_HOST_ID,
+                                  /* [한국어] 완료 대기 */
 
 	/**
 	 * Let transport layer do its part of initialization.
 	 */
 	NVME_CTRLR_STATE_TRANSPORT_READY,
+                                  /* [한국어] 트랜스포트 계층의 추가 초기화 (NVMe-oF 인증, discovery 등) */
 
 	/**
 	 * Controller initialization has completed and the controller is ready.
 	 */
 	NVME_CTRLR_STATE_READY,
+                                  /* [한국어] ★ 초기화 완료 ★ — 사용자 API(I/O qpair 할당, read/write) 사용 가능 */
 
 	/**
 	 * Controller initialization has an error.
 	 */
 	NVME_CTRLR_STATE_ERROR,
+                                  /* [한국어] 초기화 실패. is_failed=true. destroy만 가능 */
 
 	/**
 	 * Admin qpair was disconnected, controller needs to be re-initialized
 	 */
 	NVME_CTRLR_STATE_DISCONNECTED,
+                                  /* [한국어] admin qpair 연결 끊김 — 재연결 후 재초기화 필요 */
 };
 
 #define NVME_TIMEOUT_INFINITE		0
+                                  /* [한국어] 무한 타임아웃 표시 — 요청에 타임아웃 적용 안 함 */
 #define NVME_TIMEOUT_KEEP_EXISTING	UINT64_MAX
+                                  /* [한국어] 기존 타임아웃 값 유지 표시 — opts 업데이트 시 timeout만 건들지 않도록 */
 
 /*
  * [한국어] struct spdk_nvme_ctrlr_aer_completion — AER 완료 캐시 엔트리
@@ -1715,54 +1745,109 @@ struct spdk_nvme_ctrlr {
                                   /* [한국어] 인증 시퀀스 번호 */
 };
 
+/*
+ * [한국어] struct spdk_nvme_detach_ctx - 비동기 detach 배치 컨텍스트
+ *
+ * 사용자가 여러 컨트롤러를 한 번에 detach 요청 시 각 컨트롤러의 detach 진행
+ * 상태를 리스트로 보관. 모든 컨트롤러가 detach 완료될 때까지 폴링.
+ */
 struct spdk_nvme_detach_ctx {
 	TAILQ_HEAD(, nvme_ctrlr_detach_ctx)	head;
+                                  /* [한국어] detach 중인 컨트롤러들의 상세 상태 리스트 */
 };
 
+/*
+ * [한국어] struct spdk_nvme_probe_ctx - probe 세션 컨텍스트
+ *
+ * spdk_nvme_probe/probe_async의 내부 상태. 트랜스포트가 장치를 발견할 때마다
+ * probe_cb 호출, 사용자가 attach 의사 표시하면 attach 절차(init_ctrlrs 리스트 진행)
+ * 후 완료 시 attach_cb 호출. 초기화 실패는 attach_fail_cb + failed_ctxs에 기록.
+ */
 struct spdk_nvme_probe_ctx {
 	struct spdk_nvme_transport_id		trid;
+                                  /* [한국어] probe 대상 트랜스포트 식별 (PCIe 전체 스캔은 빈 trid, NVMe-oF는 특정 target) */
 	const struct spdk_nvme_ctrlr_opts	*opts;
+                                  /* [한국어] 사용자 지정 기본 ctrlr opts (발견된 컨트롤러에 적용) */
 	void					*cb_ctx;
+                                  /* [한국어] 공통 사용자 컨텍스트 */
 	spdk_nvme_probe_cb			probe_cb;
+                                  /* [한국어] 장치 발견 시 "attach 할지?" 묻는 콜백 */
 	spdk_nvme_attach_cb			attach_cb;
+                                  /* [한국어] attach 성공 시 콜백 */
 	spdk_nvme_attach_fail_cb		attach_fail_cb;
+                                  /* [한국어] attach 실패 시 콜백 */
 	spdk_nvme_remove_cb			remove_cb;
+                                  /* [한국어] 이후 하드웨어 제거 시 호출될 콜백 */
 	TAILQ_HEAD(, spdk_nvme_ctrlr)		init_ctrlrs;
+                                  /* [한국어] 현재 초기화 진행 중인 컨트롤러들 — probe_poll에서 각자 상태머신 진행 */
 	/* detach contexts allocated for controllers that failed to initialize */
 	struct spdk_nvme_detach_ctx		failed_ctxs;
+                                  /* [한국어] 초기화 중 실패한 컨트롤러들의 안전한 해제 진행 */
 };
 
 typedef void (*nvme_ctrlr_detach_cb)(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] detach 완료 콜백 타입 */
 
+/*
+ * [한국어] detach 상태머신 — shutdown notification이 안전히 완료되도록 단계별 진행
+ *
+ * NVMe 스펙은 컨트롤러를 깔끔히 detach하려면 CC.SHN(Shutdown Notification)을
+ * 설정하고 CSTS.SHST가 "complete"로 전이할 때까지 대기하라고 요구.
+ */
 enum nvme_ctrlr_detach_state {
-	NVME_CTRLR_DETACH_SET_CC,
-	NVME_CTRLR_DETACH_CHECK_CSTS,
-	NVME_CTRLR_DETACH_GET_CSTS,
+	NVME_CTRLR_DETACH_SET_CC,     /* [한국어] CC.SHN=1 쓰기 (Normal/Abrupt shutdown) */
+	NVME_CTRLR_DETACH_CHECK_CSTS, /* [한국어] CSTS 폴링 시작 결정 */
+	NVME_CTRLR_DETACH_GET_CSTS,   /* [한국어] CSTS read 발행 */
 	NVME_CTRLR_DETACH_GET_CSTS_DONE,
+                                  /* [한국어] CSTS read 완료 후 SHST 판정 */
 };
 
+/*
+ * [한국어] struct nvme_ctrlr_detach_ctx - 개별 컨트롤러 detach 상태
+ */
 struct nvme_ctrlr_detach_ctx {
 	struct spdk_nvme_ctrlr			*ctrlr;
+                                  /* [한국어] detach 대상 컨트롤러 */
 	nvme_ctrlr_detach_cb			cb_fn;
+                                  /* [한국어] 완료 콜백 */
 	uint64_t				shutdown_start_tsc;
+                                  /* [한국어] shutdown 시작 타임스탬프 — timeout 계산 기준 */
 	uint32_t				shutdown_timeout_ms;
+                                  /* [한국어] 최대 대기 시간 (ms). 초과 시 강제 종료 */
 	bool					shutdown_complete;
+                                  /* [한국어] CSTS.SHST == complete 관찰됨 */
 	enum nvme_ctrlr_detach_state		state;
+                                  /* [한국어] 현재 detach 상태머신 단계 */
 	union spdk_nvme_csts_register		csts;
+                                  /* [한국어] 마지막으로 읽은 CSTS 값 캐시 */
 	TAILQ_ENTRY(nvme_ctrlr_detach_ctx)	link;
+                                  /* [한국어] spdk_nvme_detach_ctx->head 리스트 링크 */
 };
 
+/*
+ * [한국어] struct nvme_driver - NVMe 드라이버 전역 공유 상태
+ *
+ * 단일 프로세스에는 하나의 인스턴스(g_spdk_nvme_driver). 여러 프로세스가
+ * 동일 장치를 attach하면 primary가 이 구조체를 DPDK 공유 메모리에 놓고
+ * secondary가 참조 (multi-process 공유 컨트롤러 경로).
+ */
 struct nvme_driver {
 	pthread_mutex_t			lock;
+                                  /* [한국어] 전역 드라이버 상태 보호 (컨트롤러 리스트 수정 등)
+                                   *  - robust mutex 사용 — 프로세스 비정상 종료 시 복구 가능 */
 
 	/** Multi-process shared attached controller list */
 	TAILQ_HEAD(, spdk_nvme_ctrlr)	shared_attached_ctrlrs;
+                                  /* [한국어] 공유 컨트롤러 리스트 — 모든 프로세스가 보는 공통 뷰 */
 
 	bool				initialized;
+                                  /* [한국어] spdk_nvme_driver_init 완료 표시. secondary가 attach 전 대기 */
 	struct spdk_uuid		default_extended_host_id;
+                                  /* [한국어] 기본 128-bit Host ID (사용자가 opts로 재정의 가능) */
 
 	/** netlink socket fd for hotplug messages */
 	int				hotplug_fd;
+                                  /* [한국어] 리눅스 netlink uevent 소켓 — 장치 hot-add/remove 감지 */
 };
 
 #define nvme_ns_cmd_get_ext_io_opt(opts, field, defval) \
@@ -1777,96 +1862,178 @@ int nvme_driver_init(void);
 
 static inline bool
 nvme_qpair_is_admin_queue(struct spdk_nvme_qpair *qpair)
+/*
+ * [한국어]
+ * nvme_qpair_is_admin_queue - qpair가 admin 큐(QID=0)인지 판정
+ * admin 경로(identify, feature set 등)와 I/O 경로(read/write)를 분기할 때 사용.
+ */
 {
-	return qpair->id == 0;
+	return qpair->id == 0;        /* [한국어] NVMe 스펙상 QID 0만 admin 큐 */
 }
 
 static inline bool
 nvme_qpair_is_io_queue(struct spdk_nvme_qpair *qpair)
+/*
+ * [한국어]
+ * nvme_qpair_is_io_queue - I/O 큐(QID=1~) 여부 판정 (admin의 역)
+ */
 {
 	return qpair->id != 0;
 }
 
 static inline int
 nvme_robust_mutex_lock(pthread_mutex_t *mtx)
+/*
+ * [한국어]
+ * nvme_robust_mutex_lock - robust 뮤텍스 획득 + owner-dead 복구
+ *
+ * robust mutex: 뮤텍스 소유 프로세스가 release 전에 죽으면 pthread_mutex_lock이
+ *   EOWNERDEAD를 반환. 이때 pthread_mutex_consistent()로 뮤텍스 일관성 복구 후
+ *   다른 프로세스가 계속 진행할 수 있다. SPDK multi-process 공유 컨트롤러에서
+ *   primary 프로세스가 비정상 종료해도 secondary가 복구 가능.
+ * FreeBSD는 robust mutex 미지원 → 컴파일 분기로 제외.
+ */
 {
 	int rc = pthread_mutex_lock(mtx);
+                                  /* [한국어] 일반 lock 시도 */
 
 #ifndef __FreeBSD__
 	if (rc == EOWNERDEAD) {
+                                  /* [한국어] 이전 소유자가 죽은 상태로 뮤텍스 획득됨 — 일관성 복구 필요 */
 		rc = pthread_mutex_consistent(mtx);
+                                  /* [한국어] 뮤텍스를 사용 가능 상태로 재설정. 이후 정상 동작 */
 	}
 #endif
 
-	return rc;
+	return rc;                    /* [한국어] 0 성공, 그 외 errno */
 }
 
 static inline int
 nvme_ctrlr_lock(struct spdk_nvme_ctrlr *ctrlr)
+/*
+ * [한국어]
+ * nvme_ctrlr_lock - 컨트롤러 락 획득 + lock_depth 추적
+ * robust mutex 기반이므로 다른 프로세스 장애 시에도 안전.
+ * lock_depth는 진단·assert용 (재귀 획득 금지 정책 확인 등).
+ */
 {
 	int rc;
 
 	rc = nvme_robust_mutex_lock(&ctrlr->ctrlr_lock);
-	ctrlr->lock_depth++;
+                                  /* [한국어] 뮤텍스 획득 (owner-dead 자동 복구) */
+	ctrlr->lock_depth++;          /* [한국어] 진단용 depth 증가 */
 	return rc;
 }
 
 static inline int
 nvme_robust_mutex_unlock(pthread_mutex_t *mtx)
+/*
+ * [한국어]
+ * nvme_robust_mutex_unlock - 뮤텍스 해제 (단순 래퍼, 대칭성 유지용)
+ */
 {
 	return pthread_mutex_unlock(mtx);
 }
 
 static inline int
 nvme_ctrlr_unlock(struct spdk_nvme_ctrlr *ctrlr)
+/*
+ * [한국어]
+ * nvme_ctrlr_unlock - 컨트롤러 락 해제 + depth 감소
+ */
 {
-	ctrlr->lock_depth--;
+	ctrlr->lock_depth--;          /* [한국어] depth 감소 (해제 후 0이어야 정상) */
 	return nvme_robust_mutex_unlock(&ctrlr->ctrlr_lock);
 }
 
 /* Poll group management functions. */
+/*
+ * [한국어] 폴링 그룹 관리 — qpair를 전역 poll group에 연결·해제
+ */
 int nvme_poll_group_connect_qpair(struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] qpair를 해당 트랜스포트 sub-group에 추가 (connected_qpairs 리스트) */
 int nvme_poll_group_disconnect_qpair(struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] connected → disconnected 전이. 사용자 콜백으로 통지 후 재연결/삭제 대기 */
 void nvme_poll_group_write_disconnect_qpair_fd(struct spdk_nvme_poll_group *group);
+                                  /* [한국어] interrupt 모드에서 disconnect 이벤트를 fd로 통지 (epoll wake) */
 
 /* Admin functions */
+/*
+ * [한국어] ===== admin 커맨드 래퍼들 =====
+ *
+ * 공통 특징:
+ *   - 모두 비동기. cb_fn이 완료 시 호출됨
+ *   - admin qpair(qid=0)로 제출 — ctrlr->adminq 경유
+ *   - 반환: 0 제출 성공 / 음수 errno 실패
+ *   - 내부적으로 nvme_allocate_request + SQE 채우기 + nvme_qpair_submit_request
+ *
+ * 호출 체인 예:
+ *   nvme_ctrlr_cmd_identify → nvme_allocate_request(adminq) → SQE.opc=IDENTIFY,
+ *   cdw10=CNS, dptr=payload → nvme_qpair_submit_request → 트랜스포트 계층
+ */
 int	nvme_ctrlr_cmd_identify(struct spdk_nvme_ctrlr *ctrlr,
 				uint8_t cns, uint16_t cntid, uint32_t nsid,
 				uint8_t csi, void *payload, size_t payload_size,
 				spdk_nvme_cmd_cb cb_fn, void *cb_arg);
+                                  /* [한국어] Identify admin 커맨드 (opcode 0x06)
+                                   *  @cns:    Controller or Namespace Structure (00=Identify NS, 01=Identify Ctrlr, 02=Active NS List, 03=ID Descriptor List, 1A=allocated NS list 등)
+                                   *  @cntid:  Controller ID (secondary 컨트롤러 조회 시)
+                                   *  @nsid:   NS ID (NS 관련 CNS에서 유효)
+                                   *  @csi:    Command Set ID (NVM=0, KV=1, ZNS=2 — NVMe 2.0)
+                                   *  @payload:출력 버퍼 (일반적으로 4096B)
+                                   *  컨트롤러 초기화 상태머신의 핵심 admin 명령 */
 int	nvme_ctrlr_cmd_set_num_queues(struct spdk_nvme_ctrlr *ctrlr,
 				      uint32_t num_queues, spdk_nvme_cmd_cb cb_fn,
 				      void *cb_arg);
+                                  /* [한국어] Set Features (FID=7: NUMBER_OF_QUEUES) — 호스트 요청 I/O 큐 수 전달. 응답에 장치가 허용한 실제 수 */
 int	nvme_ctrlr_cmd_get_num_queues(struct spdk_nvme_ctrlr *ctrlr,
 				      spdk_nvme_cmd_cb cb_fn, void *cb_arg);
+                                  /* [한국어] Get Features 버전 — 이미 설정된 큐 수 조회 */
 int	nvme_ctrlr_cmd_set_async_event_config(struct spdk_nvme_ctrlr *ctrlr,
 		union spdk_nvme_feat_async_event_configuration config,
 		spdk_nvme_cmd_cb cb_fn, void *cb_arg);
+                                  /* [한국어] Set Features (FID=0x0B: ASYNC_EVENT_CONFIG) — AER로 받을 이벤트 종류 비트맵 설정 */
 int	nvme_ctrlr_cmd_set_host_id(struct spdk_nvme_ctrlr *ctrlr, void *host_id, uint32_t host_id_size,
 				   spdk_nvme_cmd_cb cb_fn, void *cb_arg);
+                                  /* [한국어] Set Features (FID=0x81: HOST_ID) — 64-bit 또는 128-bit Host 식별자 등록 */
 int	nvme_ctrlr_cmd_attach_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid,
 				 struct spdk_nvme_ctrlr_list *payload, spdk_nvme_cmd_cb cb_fn, void *cb_arg);
+                                  /* [한국어] NS Attach (opcode 0x15, SEL=0) — 특정 NS를 하나 이상의 컨트롤러에 연결 */
 int	nvme_ctrlr_cmd_detach_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid,
 				 struct spdk_nvme_ctrlr_list *payload, spdk_nvme_cmd_cb cb_fn, void *cb_arg);
+                                  /* [한국어] NS Attach (SEL=1) 분리 */
 int	nvme_ctrlr_cmd_create_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns_data *payload,
 				 spdk_nvme_cmd_cb cb_fn, void *cb_arg);
+                                  /* [한국어] NS Management (opcode 0x0D, SEL=0 Create) — 새 NS 생성 */
 int	nvme_ctrlr_cmd_doorbell_buffer_config(struct spdk_nvme_ctrlr *ctrlr,
 		uint64_t prp1, uint64_t prp2,
 		spdk_nvme_cmd_cb cb_fn, void *cb_arg);
+                                  /* [한국어] Doorbell Buffer Config (opcode 0x7C) — shadow doorbell + eventidx 물리 주소 등록
+                                   *  성공 시 컨트롤러가 MMIO 대신 이 메모리를 폴링해 doorbell 업데이트 관찰 */
 int	nvme_ctrlr_cmd_delete_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid, spdk_nvme_cmd_cb cb_fn,
 				 void *cb_arg);
+                                  /* [한국어] NS Management (SEL=1 Delete) */
 int	nvme_ctrlr_cmd_format(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid,
 			      struct spdk_nvme_format *format, spdk_nvme_cmd_cb cb_fn, void *cb_arg);
+                                  /* [한국어] Format NVM (opcode 0x80) — LBA 포맷(크기/메타/PI) 변경, 전체 데이터 삭제 */
 int	nvme_ctrlr_cmd_fw_commit(struct spdk_nvme_ctrlr *ctrlr,
 				 const struct spdk_nvme_fw_commit *fw_commit,
 				 spdk_nvme_cmd_cb cb_fn, void *cb_arg);
+                                  /* [한국어] FW Commit (opcode 0x10) — 다운로드한 펌웨어 이미지를 특정 slot에 커밋 */
 int	nvme_ctrlr_cmd_fw_image_download(struct spdk_nvme_ctrlr *ctrlr,
 		uint32_t size, uint32_t offset, void *payload,
 		spdk_nvme_cmd_cb cb_fn, void *cb_arg);
+                                  /* [한국어] FW Image Download (opcode 0x11) — 펌웨어 청크 전송. 여러 번 발행해 전체 이미지 구성 */
 int	nvme_ctrlr_cmd_sanitize(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid,
 				struct spdk_nvme_sanitize *sanitize, uint32_t cdw11,
 				spdk_nvme_cmd_cb cb_fn, void *cb_arg);
+                                  /* [한국어] Sanitize (opcode 0x84) — 전체 NVM을 스펙 정의대로 삭제 (Crypto/Block Erase/Overwrite) */
 void	nvme_completion_poll_cb(void *arg, const struct spdk_nvme_cpl *cpl);
+                                  /* [한국어] ★ 동기 대기 패턴용 범용 완료 콜백 ★
+                                   *  @arg: nvme_completion_poll_status 포인터
+                                   *  동작: status->cpl에 CQE 복사 + status->done=true 세팅.
+                                   *  사용자 코드가 status->done을 busy-polling으로 대기하면 동기 스타일 API 완성.
+                                   *  초기화 상태머신·Fabrics CONNECT 등에서 광범위하게 사용. */
 
 /**
  * Poll admin qpair for completions until a command completes.
@@ -1886,68 +2053,141 @@ void	nvme_completion_poll_cb(void *arg, const struct spdk_nvme_cpl *cpl);
  */
 int	nvme_wait_for_adminq_completion(struct spdk_nvme_ctrlr *ctrlr,
 					struct nvme_completion_poll_status *status, bool release);
+                                  /* [한국어] admin 커맨드를 동기 스타일로 대기 — 내부에서 spdk_nvme_ctrlr_process_admin_completions를 주기적으로 호출하며 status->done 폴링
+                                   *  @release: true면 status 메모리도 여기서 free
+                                   *  사용 전: 해당 커맨드를 nvme_completion_poll_cb + status로 제출해 두어야 함 */
 
 int	nvme_wait_for_completion_poll(struct spdk_nvme_qpair *qpair,
 				      struct nvme_completion_poll_status *status);
+                                  /* [한국어] 일반 I/O qpair 동기 대기 버전 — process_completions 폴링 */
 
+/*
+ * [한국어] ===== 컨트롤러 프로세스 관리 (multi-process) =====
+ */
 struct spdk_nvme_ctrlr_process *nvme_ctrlr_get_process(struct spdk_nvme_ctrlr *ctrlr,
 		pid_t pid);
+                                  /* [한국어] 주어진 PID에 해당하는 프로세스 엔트리 조회 (공유 컨트롤러에서) */
 struct spdk_nvme_ctrlr_process *nvme_ctrlr_get_current_process(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] 호출 프로세스(getpid())의 엔트리 조회 — AER cb, timeout cb 등록 대상 */
 int	nvme_ctrlr_add_process(struct spdk_nvme_ctrlr *ctrlr, void *devhandle);
+                                  /* [한국어] 프로세스가 이 컨트롤러에 attach — active_procs 리스트에 엔트리 추가 */
 void	nvme_ctrlr_free_processes(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] 모든 프로세스 엔트리 해제 (컨트롤러 destruct 시) */
 struct spdk_pci_device *nvme_ctrlr_proc_get_devhandle(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] 현재 프로세스의 PCI 디바이스 핸들 반환 (DPDK 모델) */
 
 int	nvme_ctrlr_probe(const struct spdk_nvme_transport_id *trid,
 			 struct spdk_nvme_probe_ctx *probe_ctx, void *devhandle);
+                                  /* [한국어] 단일 컨트롤러 probe — spdk_nvme_probe 내부 유틸. 사용자 probe_cb 호출 → attach 결정 */
 
+/*
+ * [한국어] ===== 컨트롤러 수명주기 =====
+ */
 int	nvme_ctrlr_construct(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] ctrlr 구조체 기본 필드 초기화 + admin qpair 할당 */
 void	nvme_ctrlr_destruct_finish(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] destruct 마지막 단계 — namespace/qpair 자원 해제 */
 void	nvme_ctrlr_destruct(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] 동기 destruct — shutdown 대기 포함 (블로킹) */
 void	nvme_ctrlr_destruct_async(struct spdk_nvme_ctrlr *ctrlr,
 				  struct nvme_ctrlr_detach_ctx *ctx);
+                                  /* [한국어] 비동기 destruct 시작. 이후 poll_async로 완료 폴링 */
 int	nvme_ctrlr_destruct_poll_async(struct spdk_nvme_ctrlr *ctrlr,
 				       struct nvme_ctrlr_detach_ctx *ctx);
+                                  /* [한국어] 비동기 destruct 진행 폴링. 0=진행 중, 1=완료, 음수=에러 */
 void	nvme_ctrlr_fail(struct spdk_nvme_ctrlr *ctrlr, bool hot_remove);
+                                  /* [한국어] 컨트롤러를 실패 상태로 전환 — 모든 outstanding I/O를 에러로 완료 처리
+                                   *  @hot_remove: true면 물리 제거 이벤트로 간주 */
 int	nvme_ctrlr_process_init(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] ★ 초기화 상태머신 한 단계 진행 ★ — spdk_nvme_probe_poll_async에서 주기 호출.
+                                   *  현재 state에 해당하는 admin 커맨드 발행 또는 완료 확인 수행 */
 void	nvme_ctrlr_disable(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] CC.EN=0 쓰기 시작 (disable 상태머신 진입) */
 int	nvme_ctrlr_disable_poll(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] disable 완료 폴링 — 1=완료, 0=진행 중 */
 void	nvme_ctrlr_connected(struct spdk_nvme_probe_ctx *probe_ctx,
 			     struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] probe 중 컨트롤러가 연결된 시점 콜백 — probe_ctx->init_ctrlrs 리스트에 추가 */
 
 int	nvme_ctrlr_submit_admin_request(struct spdk_nvme_ctrlr *ctrlr,
 					struct nvme_request *req);
+                                  /* [한국어] ★ admin qpair(0)에 nvme_request 제출 — 모든 admin 커맨드 래퍼의 최종 종착 경로 ★ */
+/*
+ * [한국어] ===== 컨트롤러 레지스터 accessor =====
+ *
+ * NVMe BAR0 레지스터들을 전송 추상화를 통해 read/write. PCIe에서는 MMIO로
+ * 직접 접근, NVMe-oF에서는 Property Get/Set Fabrics 커맨드 경유.
+ * set/get 함수들은 내부에서 트랜스포트별 register 접근 콜백으로 디스패치.
+ */
 int	nvme_ctrlr_get_cap(struct spdk_nvme_ctrlr *ctrlr, union spdk_nvme_cap_register *cap);
+                                  /* [한국어] CAP(Capabilities, 64bit) read — MQES·DSTRD·CSS·MPSMIN/MAX 추출 */
 int	nvme_ctrlr_get_vs(struct spdk_nvme_ctrlr *ctrlr, union spdk_nvme_vs_register *vs);
+                                  /* [한국어] VS(Version) read — NVMe 스펙 버전 */
 int	nvme_ctrlr_get_cmbsz(struct spdk_nvme_ctrlr *ctrlr, union spdk_nvme_cmbsz_register *cmbsz);
+                                  /* [한국어] CMBSZ read — Controller Memory Buffer 크기·용도 */
 int	nvme_ctrlr_get_pmrcap(struct spdk_nvme_ctrlr *ctrlr, union spdk_nvme_pmrcap_register *pmrcap);
+                                  /* [한국어] PMRCAP read — Persistent Memory Region 능력 */
 int	nvme_ctrlr_get_bpinfo(struct spdk_nvme_ctrlr *ctrlr, union spdk_nvme_bpinfo_register *bpinfo);
+                                  /* [한국어] BPINFO — Boot Partition 정보 */
 int	nvme_ctrlr_set_bprsel(struct spdk_nvme_ctrlr *ctrlr, union spdk_nvme_bprsel_register *bprsel);
+                                  /* [한국어] BPRSEL write — BP read 선택 (영역 크기/오프셋 등) */
 int	nvme_ctrlr_set_bpmbl(struct spdk_nvme_ctrlr *ctrlr, uint64_t bpmbl_value);
+                                  /* [한국어] BPMBL write — BP memory buffer 위치 */
 bool	nvme_ctrlr_multi_iocs_enabled(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] 다중 Command Set (NVM+ZNS+KV) 활성 여부 (CC.CSS가 IOCS이고 Identify IOCS 성공한 경우) */
 void nvme_ctrlr_disconnect_qpair(struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] qpair 연결 해제 (I/O 혹은 admin) — 하위 트랜스포트 disconnect 호출 */
 void nvme_ctrlr_abort_queued_aborts(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] 대기 중인 abort 요청 모두 취소 — reset/shutdown 경로 */
+
+/*
+ * [한국어] ===== qpair 수명주기 + hot path =====
+ */
 int nvme_qpair_init(struct spdk_nvme_qpair *qpair, uint16_t id,
 		    struct spdk_nvme_ctrlr *ctrlr,
 		    enum spdk_nvme_qprio qprio,
 		    uint32_t num_requests, bool async);
+                                  /* [한국어] qpair 기본 필드 초기화 + nvme_request 풀 할당 */
 void	nvme_qpair_deinit(struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] qpair 자원 해제 (req 풀 free 등) */
 void	nvme_qpair_complete_error_reqs(struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] 에러 주입 리스트의 요청들을 즉시 에러 완료 처리 */
 int	nvme_qpair_submit_request(struct spdk_nvme_qpair *qpair,
 				  struct nvme_request *req);
+                                  /* [한국어] ★ 제출 핵심 경로 ★ — req의 cmd를 SQE에 기록 → 트랜스포트 submit
+                                   *  qpair 상태가 ENABLED면 즉시 제출, 아니면 queued_req에 임시 저장
+                                   *  호출 체인: spdk_nvme_ns_cmd_read → nvme_ns_cmd_rw → [이 함수] → nvme_pcie_qpair_submit_request */
 void	nvme_qpair_abort_all_queued_reqs(struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] queued_req + aborting_queued_req 전부 에러 완료 */
 uint32_t nvme_qpair_abort_queued_reqs_with_cbarg(struct spdk_nvme_qpair *qpair, void *cmd_cb_arg);
+                                  /* [한국어] cb_arg 매칭된 queued_req만 abort — spdk_bdev_abort 경로 */
 void	nvme_qpair_abort_queued_reqs(struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] 모든 queued_req abort (위 variant 단순화 버전) */
 void	nvme_qpair_resubmit_requests(struct spdk_nvme_qpair *qpair, uint32_t num_requests);
+                                  /* [한국어] queued_req에서 최대 N개 꺼내 재제출 (트랜스포트 재연결 후) */
+
+/*
+ * [한국어] ===== namespace 관리 =====
+ */
 int	nvme_ctrlr_identify_active_ns(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] 활성 NSID 리스트 재조회 + RB 트리 갱신 (AER namespace change 수신 시) */
 void	nvme_ns_set_identify_data(struct spdk_nvme_ns *ns);
+                                  /* [한국어] Identify NS 응답을 ns 필드(sector_size/md_size/pi_type 등)로 파싱 */
 void	nvme_ns_set_id_desc_list_data(struct spdk_nvme_ns *ns);
+                                  /* [한국어] CNS=03 ID 디스크립터 응답을 파싱 (UUID/NGUID/EUI64/CSI) */
 void	nvme_ns_free_zns_specific_data(struct spdk_nvme_ns *ns);
+                                  /* [한국어] ZNS identify 추가 데이터 해제 */
 void	nvme_ns_free_nvm_specific_data(struct spdk_nvme_ns *ns);
+                                  /* [한국어] NVM command set 추가 데이터 해제 */
 void	nvme_ns_free_iocs_specific_data(struct spdk_nvme_ns *ns);
+                                  /* [한국어] ZNS+NVM 모두 해제 (편의 래퍼) */
 bool	nvme_ns_has_supported_iocs_specific_data(struct spdk_nvme_ns *ns);
+                                  /* [한국어] 이 NS가 특화 identify 데이터를 가지는지 (ZNS/NVM) */
 int	nvme_ns_construct(struct spdk_nvme_ns *ns, uint32_t id,
 			  struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] NS 객체 구성 — ctrlr 링크, NSID 저장, RB 트리 삽입 */
 void	nvme_ns_destruct(struct spdk_nvme_ns *ns);
+                                  /* [한국어] NS 객체 해제 — RB 트리 제거, identify 데이터 free */
 int	nvme_ns_cmd_zone_append_with_md(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 					void *buffer, void *metadata, uint64_t zslba,
 					uint32_t lba_count, spdk_nvme_cmd_cb cb_fn, void *cb_arg,

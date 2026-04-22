@@ -120,9 +120,9 @@ shared_lib/            # 빌드 산출 .so
 
 | 상태 | 파일 | 라인 | 비고 |
 |------|------|-----:|------|
-| ☐ | include/spdk/bdev.h | 2551 | bdev 공통 API |
+| ◐ | include/spdk/bdev.h | 2551 | **부분 확장 v4** 2026-04-22 (이전 모두 + **spdk_bdev_initialize/finish**(서브시스템 부팅/종료) + **io_type_supported** + **get_qos_rpc_type/get_qos_rate_limits/set_qos_rate_limits** + **get_qd** + **histogram_enable/get** + **for_each_channel + continue**. 수명 주기·DIF getter·seek_offset·histogram_enable_ext/channel_get_histogram 등 세부 API 일부 잔여) |
+| ☑ | include/spdk/bdev_zone.h | 296 | 2026-04-22 (상단 4섹션 블록 + zone_type/action/state enum 전체 값별 주석 + spdk_bdev_zone_info 전 필드 + 속성 getter 6종(zone_size/num_zones/zone_id 계산/max_zone_append_size/max_open/active_zones/optimal) + get_zone_info + zone_management + zone_append 4종(buf/iov × md 유무) + get_append_location 전부 주석 완료) |
 | ☐ | include/spdk/bdev_module.h | ? | bdev 모듈 작성자용 |
-| ☐ | include/spdk/bdev_zone.h | ? | Zoned bdev |
 | ☐ | include/spdk/module/bdev/*.h | ? | 모듈별 헤더 |
 
 ### Phase 4 — 기타 공개 헤더 (P1~P2)
@@ -237,6 +237,13 @@ examples/nvme/*, examples/bdev/*, examples/nvmf/*, examples/sock/*, examples/thr
 
 ## 최근 완료 파일 (역순 최대 30개)
 
+- 2026-04-22 · lib/nvme/nvme_internal.h [대부분 완료 ◐] — **enum nvme_ctrlr_state 40+ 초기화 상태머신 전 상태 주석** (CONNECT_ADMINQ → READ_VS/CAP → CHECK_EN → DISABLE/ENABLE → RESET → IDENTIFY → CONFIGURE_AER → SET_KEEP_ALIVE → IDENTIFY_IOCS_SPECIFIC → SET_NUM_QUEUES → IDENTIFY_ACTIVE_NS/IDENTIFY_NS → SET_SUPPORTED_FEATURES → SET_DB_BUF_CFG → TRANSPORT_READY → READY) + detach_ctx/probe_ctx/nvme_driver 구조체 + helper inlines(robust_mutex_lock의 owner-dead 복구 포함) + admin 커맨드 프로토타입 전체(identify/set_num_queues/attach_ns/doorbell_buffer_config/format/fw_commit/fw_image_download/sanitize) + ctrlr 수명주기(construct/destruct_async/poll_async/fail/process_init) + register accessor + qpair hot-path(submit_request) + ns 관리 전부 주석 완료.
+- 2026-04-22 · **include/spdk/bdev_zone.h** [☑ 완료] (296라인) — ZNS 공개 API 전체. 상단 4섹션 블록(zone 상태머신 다이어그램, 호출 흐름, 모듈 연결) + zone_type(CNV/SEQWR/SEQWP)/zone_action(CLOSE/FINISH/OPEN/RESET/OFFLINE)/zone_state(EMPTY/IMP_OPEN/FULL/CLOSED/READ_ONLY/OFFLINE/EXP_OPEN/NOT_WP) enum 전 값별 주석 + spdk_bdev_zone_info 전 필드(zone_id/wp/capacity/state/type) + 속성 getter 6종 + get_zone_info + zone_management + Zone Append 4종(buf/iov × md 유무, 장치 자동 wp 할당·LSM-tree 사용처) + get_append_location 전부 주석. 이제 ZNS 워크로드 개발자가 이 헤더 하나만 읽어도 zone 상태 전이, append 시 wp race 회피, log-structured 자료구조 활용 패턴까지 이해 가능.
+- 2026-04-22 · include/spdk/bdev.h [부분 확장 v4 ◐] — spdk_bdev_initialize/finish(서브시스템 부팅/종료 상세 흐름) + io_type_supported + QoS API 3종(get_rpc_type/get_rate_limits/set_rate_limits, 토큰 버킷 알고리즘 설명) + get_qd + histogram_enable/get(모든 채널 집계 비동기) + for_each_channel/continue(채널 순회 sync/async 패턴) 주석.
+- 2026-04-22 · include/spdk/bdev.h [부분 확장 v3 ◐] — struct spdk_bdev_ext_io_opts(★ _ext API 옵션 번들: memory_domain/accel_sequence/metadata/DIF 마스크/NVMe cdw12·13 전 필드) + compare/comparev 4종 + **comparev_and_writev**(fused atomic CAW) + zcopy_start/end(zero-copy populate/commit 사이클) + nvme_nssr + abort(cb_arg 매칭) + NVMe passthru 4종(admin/io/io_md/iov_md) + copy_blocks(offloaded 장치 내부 복사) + 기본 getter(get_name/product_name/block_size/num_blocks/buf_align/has_write_cache/is_zoned) + set_timeout 전부 상세 주석 완료.
+- 2026-04-22 · include/spdk/bdev.h [부분 확장 ◐] — iovec(readv/writev 3종씩) + write_zeroes + write_uncorrectable + unmap/flush/reset + **free_io**(완료 cb 내 필수 호출) + **io_wait_entry + queue_io_wait**(NOMEM 재시도 패턴) + **get_nvme_status/get_nvme_fused_status/get_scsi_status/get_aio_status**(실패 원인 조회) + get_iovec/get_md_buf 상세 주석. I/O 제출 → 완료 → 자원 반납 → 에러 조회의 전체 사이클이 주석만으로 완성.
+- 2026-04-22 · include/spdk/bdev.h [부분 ◐] — ★ I/O 경로 애플리케이션 진입 API ★. 파일 상단 4섹션 블록(사용자/관리/I/O 축 분리, 호출 흐름, bdev_module.h와의 관계) + SPDK_BDEV_SMALL/LARGE_BUF_MAX_SIZE + SPDK_BDEV_BUF_SIZE_WITH_MD + spdk_bdev_event_type/media_event + spdk_bdev_status + **enum spdk_bdev_io_type(23종)** 모든 값에 개별 주석 + spdk_bdev_qos_rate_limit_type(IOPS/BPS/R/W) + spdk_bdev_io_completion_cb + **struct spdk_bdev_io_stat** + 열거 API(get_by_name/first/next/first_leaf/next_leaf) + **struct spdk_bdev_open_opts** + **spdk_bdev_open_ext / _v2 / _async** + **spdk_bdev_close** + **spdk_bdev_get_io_channel** (thread affinity 규칙 설명) + **spdk_bdev_read / read_blocks / read_blocks_with_md** + **spdk_bdev_write / write_blocks** 전부 상세 주석. 각 API에 파라미터·반환·에러 코드·내부 호출 체인·전형 사용 패턴 포함.
+- 2026-04-22 · include/spdk/bdev_module.h [부분 확장] — **struct spdk_bdev_module** 전 필드(모듈 등록 루트, init/examine/fini 생애주기 콜백, async 플래그, __bdev_module_internal_fields) + **struct spdk_bdev** 전 필드(geometry/supported I/O/DIF/ZNS/NVMe/reset_io_drain_timeout/numa/fn_table 연결/internal=QoS·claim·open_descs·reset_in_progress·QD 텔레메트리·히스토그램·LBA 잠금 범위) + spdk_bdev_name/alias/module_claim 보조 구조체 주석 완비. 이로써 bdev 인스턴스와 모듈 등록 흐름 전체가 주석만으로 이해 가능.
 - 2026-04-21 · include/spdk/base64.h — 상단 4섹션 블록 + RFC4648 노트 + 2개 inline 헬퍼(get_encoded_strlen/get_decoded_len 산술 공식 분해) + 4개 함수(encode/urlsafe_encode/decode/urlsafe_decode) 모두 주석. 표준 vs URL-safe 알파벳 차이, 패딩 시맨틱, NVMe-oF 인증/JSON-RPC/iSCSI CHAP 사용처, dst=NULL dry-run 패턴 명시.
 - 2026-04-21 · include/spdk/pipe.h — 상단 4섹션 블록 + spdk_pipe/spdk_pipe_group 전방 선언 + 9개 함수(create/destroy/writer get_buffer·advance/reader bytes_available·get_buffer·advance/group create·destroy·add·remove) 모두 주석. zero-copy iovec 인터페이스 동작, advance 시맨틱(rewind 가능), group 풀의 LIFO 스택 재사용 패턴, non-thread-safe 명시.
 - 2026-04-21 · include/spdk/string.h — 상단 4섹션 블록 + SPDK_STRINGIFY 매크로 2단계 패턴 + 19개 함수 모두 주석. NVMe 우측 패딩 필드 처리(strcpy_pad/strlen_pad), in-place 파서(strsepq, str_trim, parse_ip_addr), thread-local strerror, parse_capacity 사이즈 표기, 엄격한 strtol/strtoll의 양수 강제, strarray 시리즈 등.
@@ -276,6 +283,36 @@ examples/nvme/*, examples/bdev/*, examples/nvmf/*, examples/sock/*, examples/thr
 - 2026-04-21 · include/spdk/likely.h
 
 ## 마지막 세션 요약
+
+**2026-04-22 (열여섯 번째 파트 — nvme_internal.h 상태머신 + 프로토타입 대량 완료)**:
+- **enum nvme_ctrlr_state 40+ 상태 전부 주석**. 각 상태의 admin 커맨드·완료 대기 의미, 상태 전이 조건 설명. 이제 NVMe 컨트롤러 부팅 시퀀스(CC.EN=0 disable → CC.EN=1 enable → identify → configure AER → set keep alive → set num queues → identify NS → set supported features → doorbell buffer config → ready)가 주석만으로 완전 추적 가능.
+- detach_ctx/probe_ctx/nvme_driver 구조체 전 필드 주석 (shutdown notification 상태머신, multi-process 공유 컨트롤러 리스트, netlink hotplug fd)
+- helper inline 함수 — **robust mutex의 EOWNERDEAD 복구** 설명 포함 (primary 프로세스 crash 후 secondary가 복구 가능한 구조)
+- admin 커맨드 프로토타입 일괄 주석 (identify/set_num_queues/attach_ns/create_ns/doorbell_buffer_config/format/fw_commit/fw_image_download/sanitize) — 각각 NVMe opcode/FID 매핑
+- 컨트롤러 수명주기 API (construct/destruct_async/poll_async/fail/process_init) + 동기 대기(wait_for_adminq_completion)
+- 레지스터 accessor (get_cap/vs/cmbsz/pmrcap/bpinfo/set_bprsel/set_bpmbl)
+- qpair hot-path (submit_request) + ns 관리 (identify_active_ns/construct/destruct)
+
+**이로써 `nvme_internal.h`는 거의 완성** — 잔여는 fabric/rdma/tcp 트랜스포트 특화 프로토타입과 namespace 세부 API 일부. I/O 경로 이해에 필요한 핵심은 전부 커버됨.
+
+**2026-04-22 (열다섯 번째 파트 — bdev_zone.h 완전 완료 + bdev.h QoS/histogram/for_each_channel)**:
+- `include/spdk/bdev_zone.h` (296줄) **전체 완료**. ZNS 공개 API의 모든 상수·구조체·함수에 한국어 주석. 특히 Zone Append의 "장치가 wp를 원자 할당" 개념과 LSM-tree/log-structured 자료구조 활용 패턴 명시. bdev_zone.h만 읽어도 ZNS 특유 상태머신/제약(max_open_zones/max_active_zones)/복구 시나리오까지 이해 가능.
+- `include/spdk/bdev.h` 추가: spdk_bdev_initialize/finish(애플리케이션 부팅/종료 흐름), io_type_supported, QoS 3종(get_rpc_type/get_rate_limits/set_rate_limits — 토큰 버킷 1ms poller), get_qd, histogram_enable/get(비동기 채널 집계), for_each_channel + continue(per-channel 순차 sync/async 작업 패턴).
+
+이로써 I/O 경로의 애플리케이션 측 표면이 거의 완성 — 기본 R/W, scatter-gather, PI, unmap/flush/reset, compare/CAW, zcopy, NVMe passthru, copy offload, ZNS 전체, 관리(open/close/init/fini), QoS, 완료 상태 조회, histogram, 채널 순회, 그리고 iteration/통계 모두 주석 커버.
+
+**2026-04-22 (열네 번째 파트 — bdev.h 고급 I/O + getter)**: compare 계열 4종 + **comparev_and_writev (fused atomic compare-and-write)** + **zcopy_start/end** (zero-copy populate/commit 사이클) + **NVMe passthru 4종** (admin/io/io_md/iov_md) + **copy_blocks** (장치 offload 복사) + abort + nvme_nssr + 주요 getter(get_name/block_size/num_blocks/buf_align/has_write_cache/is_zoned) + set_timeout 전부 주석. spdk_bdev_ext_io_opts(memory_domain/accel_sequence/NVMe cdw12·13) 필드 전체 상세 주석으로 _ext variant API의 모든 옵션 경로가 이해 가능해짐.
+
+**2026-04-22 (열세 번째 파트 — bdev.h 핵심 I/O API 완성)**: 이전 파트의 read/write 핵심에 이어 readv/writev 3종씩, write_zeroes/unmap/flush/reset, write_uncorrectable, free_io, io_wait 재시도 구조체(NOMEM 패턴), 완료 상태 조회(get_nvme_status/fused/scsi/aio/iovec/md_buf) 전부 주석. **이로써 애플리케이션이 read_blocks 호출 → bdev 코어 분기 → 모듈 submit → 장치 DMA → CQE → 완료 cb 내 get_nvme_status로 에러 분석 → free_io로 반납의 전체 흐름이 주석만으로 완전 추적 가능**.
+
+**2026-04-22 (열두 번째 파트 — bdev.h 공개 API 시작)**: I/O 경로의 애플리케이션 진입점인 `include/spdk/bdev.h` 핵심 섹션 주석 완료. 파일 상단 4섹션 블록 + 이벤트/상태/I/O 타입 enum 전체 + QoS 타입 + 통계 구조체 + 열거 API + open/close/get_io_channel + read·read_blocks·read_blocks_with_md·write·write_blocks 전부 상세 주석. 각 함수에 param/return/에러 코드/내부 호출 체인/전형 패턴 포함. 이로써 애플리케이션 → bdev.h API → bdev_module.h spdk_bdev_io → 모듈 submit_request → nvme_request → SQE → PCIe/CQE 흐름이 주석만으로 완전히 추적 가능.
+
+**2026-04-22 (열한 번째 파트 — bdev_module.h spdk_bdev/spdk_bdev_module 완료)**: I/O 경로 부분완료(◐) 파일의 핵심 누락분을 보완.
+- `include/spdk/bdev_module.h`의 `struct spdk_bdev_module` 전체(모듈 등록 루트, init/examine/fini 6개 콜백, async_init/fini/fini_start 플래그, __bdev_module_internal_fields의 spinlock·action_in_progress·quiesced_ranges)
+- `struct spdk_bdev` 전체(ctxt/name/aliases/product_name, blocklen·phys_blocklen·blockcnt, split_on_write_unit/split_on_optimal_io_boundary/md_interleave/dif_is_head_of_md/zoned/media_events/memory_domains_supported 비트필드, required_alignment·optimal_io_boundary·preferred_write_alignment/granularity·optimal_write_size·preferred_unmap_alignment/granularity, max_segment_size·max_num_segments·max_unmap·max_write_zeroes·max_copy·max_rw_size, uuid·md_len·DIF 3종·ZNS 6종·NVMe ctratt/nsid, reset_io_drain_timeout, numa, module/fn_table 연결, internal 전체(QoS·spinlock·status·examine_in_progress·claim v1/v2 union·open_descs·reset_in_progress·qd_poller·histogram·locked_ranges))
+- spdk_bdev_name/alias/module_claim 보조 구조체도 함께 주석
+
+**이제 I/O 경로의 bdev 측 객체(spdk_bdev_module, spdk_bdev, spdk_bdev_io)가 전부 주석 완비**. 나머지 bdev_module.h 부분은 param 구조체, io_internal_fields, 모듈 등록 매크로.
 
 **2026-04-21 (열 번째 파트 — string / pipe / base64 완료)**: Phase 0 잔여 중 세 파일 추가 완료.
 - `include/spdk/string.h` (원본 292 → 주석 후 712) — 문자열 유틸 19개 함수 + SPDK_STRINGIFY 매크로. NVMe 우측 패딩 필드 처리(strcpy_pad/strlen_pad), in-place 파서, thread-local strerror, parse_capacity의 사이즈 표기, 엄격한 strtol/strtoll 정책 등.
@@ -387,14 +424,14 @@ C. **`include/spdk/bdev_module.h`** (1972) — `struct spdk_bdev_io` 정의. bde
 include/spdk/bdev.h (2551)           ── ☐ IO-P0
 lib/bdev/bdev_internal.h (34)         ── ☑ 2026-04-21
 lib/bdev/bdev.c (11524)               ── ☐ IO-P0  (매우 큼, 섹션 분할)
-include/spdk/bdev_module.h (1972)     ── ◐ 부분 (상단 4섹션 블록 + struct spdk_bdev_fn_table + enum spdk_bdev_io_status + **struct spdk_bdev_io** 전 필드 완료. struct spdk_bdev / bdev_module / internal_fields / param 구조체 / 모듈 등록 매크로는 후속)
+include/spdk/bdev_module.h (1972)     ── ◐ 부분 (상단 4섹션 블록 + **struct spdk_bdev_module** + struct spdk_bdev_fn_table + enum spdk_bdev_io_status + spdk_bdev_name/alias/module_claim + **struct spdk_bdev 전체** + **struct spdk_bdev_io 전체** 완료. param 구조체(io_block/reset/abort/nvme_passthru/zone_mgmt) · spdk_bdev_io_internal_fields · 모듈 등록 매크로 · claim API 프로토타입은 후속)
   ↓
 module/bdev/nvme/bdev_nvme.c          ── ☐ IO-P0
   ↓ spdk_nvme_ns_cmd_read/write
 include/spdk/nvme.h (4802)            ── ☐ IO-P0
 include/spdk/nvme_spec.h (4890)       ── ◐ 부분 (상단 4섹션 블록 + SGL enum/struct + PSDT + SQE + Status + CQE 완료. 나머지 identify/log/register 구조체는 후속 세션)
   ↓
-lib/nvme/nvme_internal.h (1839)       ── ◐ 부분 (상단 블록 + nvme_payload + nvme_request + poll_status + AER + enum nvme_qpair_state/auth_state + nvme_auth + **spdk_nvme_qpair** + spdk_nvme_poll_group + transport_poll_group + **spdk_nvme_ns** + ctrlr_aer_completion + **spdk_nvme_ctrlr_process** + nvme_register_completion + **spdk_nvme_ctrlr** 전 필드 완료. 남은 건 enum nvme_ctrlr_state, detach/probe 구조체, helper inline(nvme_qpair_is_admin_queue 등), 트랜스포트/util 프로토타입)
+lib/nvme/nvme_internal.h (1839)       ── ◐ 대부분 완료 v2 — 상단 블록 + nvme_payload + nvme_request + poll_status + AER + qpair/auth state + nvme_auth + spdk_nvme_qpair + poll_group + transport_poll_group + spdk_nvme_ns + ctrlr_aer_completion + ctrlr_process + register_completion + spdk_nvme_ctrlr + **enum nvme_ctrlr_state 전체 40+ 상태 주석** + detach_ctx/probe_ctx/nvme_driver 구조체 + helper inlines(nvme_qpair_is_admin/io_queue·robust_mutex_lock·ctrlr_lock) + admin 커맨드 프로토타입(identify/set_num_queues/set_host_id/attach_ns/create_ns/doorbell_buffer_config/format/fw_commit/fw_image_download/sanitize) + wait_for_adminq_completion + ctrlr 수명주기(construct/destruct/fail/process_init) + register accessor(cap/vs/cmbsz/pmrcap/bpinfo) + qpair hot-path(submit_request/abort) + ns 관리(identify_active_ns/set_identify_data/construct/destruct) 전부 주석 완료. 극소수 잔여(fabric/rdma/tcp 특화 프로토타입, nvme_register_ns 등 namespace 세부 API)만 남음
 lib/nvme/nvme_ns_cmd.c (1516)         ── ☐ IO-P0
 lib/nvme/nvme_qpair.c (1314)          ── ☐ IO-P0  (SQ/CQ 관리, submit/complete)
 lib/nvme/nvme_transport.c (976)       ── ☐ IO-P0

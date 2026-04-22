@@ -111,6 +111,26 @@ extern "C" {
                                    *  - 모듈 작성자가 fn_table 내 해당 필드에 이 값을 사용할 수 있음 */
 
 /** Block device module */
+/*
+ * [한국어] ★ struct spdk_bdev_module — bdev 모듈 등록 루트 ★
+ *
+ * 각 bdev 백엔드(NVMe, AIO, malloc, uring, raid, lvol, crypto, delay, ...)는
+ * `SPDK_BDEV_MODULE_REGISTER` 매크로로 이 구조체 인스턴스 하나를 등록한다.
+ * 애플리케이션 초기화 시 bdev 코어가 모든 등록 모듈을 순회하며 module_init
+ * → examine_config → examine_disk 순으로 부트스트랩한다.
+ *
+ * 수명 주기:
+ *   1) SPDK_BDEV_MODULE_REGISTER로 모듈 전역 변수 정적 등록(컨스트럭터)
+ *   2) spdk_bdev_initialize 시 bdev 코어가 module_init() 호출 (순서: 등록 순)
+ *   3) 각 bdev 인스턴스 등록 시 examine_config → examine_disk 순회
+ *   4) init_complete() 호출 (optional)
+ *   5) 종료 시 fini_start → bdev unregister → module_fini
+ *
+ * 모듈 종류:
+ *   - 실제(physical) bdev 모듈: NVMe, AIO, uring, malloc, null — 직접 장치 노출
+ *   - virtual(vbdev) 모듈: raid, lvol, crypto, delay, error, passthru, split —
+ *     기존 bdev을 claim하여 상위에 새 bdev을 만든다 (examine_config/disk에서)
+ */
 struct spdk_bdev_module {
 	/**
 	 * Initialization function for the module. Called by the bdev library
@@ -119,6 +139,10 @@ struct spdk_bdev_module {
 	 * Modules are required to define this function.
 	 */
 	int (*module_init)(void);
+                                  /* [한국어] 모듈 초기화 콜백 — spdk_bdev_initialize 시 호출
+                                   *  - 동기: 0 성공 / 음수 errno 실패
+                                   *  - 비동기(async_init=true): 이 함수에서 spdk_bdev_module_init_done() 호출 전까지 반환해도 init 완료 대기
+                                   *  - 필수 구현 */
 
 	/**
 	 * Optional callback for modules that require notification of when
@@ -127,6 +151,7 @@ struct spdk_bdev_module {
 	 * Modules are not required to define this function.
 	 */
 	void (*init_complete)(void);
+                                  /* [한국어] 모든 모듈 init 완료 시 호출 — 모듈 간 의존성 해결 후 최종 설정 필요 시 사용 */
 
 	/**
 	 * Optional callback for modules that require notification of when
@@ -139,6 +164,9 @@ struct spdk_bdev_module {
 	 * Modules are not required to define this function.
 	 */
 	void (*fini_start)(void);
+                                  /* [한국어] 종료 프로세스 시작 통지
+                                   *  - 중요: vbdev을 노출하지 않고 claim만 건 모듈은 여기서 반드시 release
+                                   *  - async_fini_start=true이면 spdk_bdev_module_fini_start_done() 호출까지 대기 */
 
 	/**
 	 * Finish function for the module. Called by the bdev library
@@ -148,6 +176,8 @@ struct spdk_bdev_module {
 	 * Modules are not required to define this function.
 	 */
 	void (*module_fini)(void);
+                                  /* [한국어] 모든 bdev unregister 완료 후 최종 cleanup
+                                   *  - async_fini=true이면 spdk_bdev_module_fini_done() 호출까지 대기 */
 
 	/**
 	 * Function called to return a text string representing the module-level
@@ -164,15 +194,22 @@ struct spdk_bdev_module {
 	 * \return 0 on success or Bdev specific negative error code.
 	 */
 	int (*config_json)(struct spdk_json_write_ctx *w);
+                                  /* [한국어] 모듈 수준 JSON-RPC 구성 출력 — "save_config" 재현용
+                                   *  - 한 RPC가 여러 bdev을 만드는 경우(NVMe 컨트롤러 → 다중 NS)에 적합
+                                   *  - bdev 단위 1:1 대응은 spdk_bdev_fn_table.write_config_json 사용 — 두 중 하나만 선택 */
 
 	/** Name for the modules being defined. */
 	const char *name;
+                                  /* [한국어] 모듈 고유 이름 (예: "nvme", "aio", "malloc") — RPC/로그 식별자 */
 
 	/**
 	 * Returns the allocation size required for the backend for uses such as local
 	 * command structs, local SGL, iovecs, or other user context.
 	 */
 	int (*get_ctx_size)(void);
+                                  /* [한국어] 이 모듈이 bdev_io 당 필요한 trailing ctx(driver_ctx) 크기 반환
+                                   *  - bdev 코어가 mempool 엔트리 크기를 이 값만큼 확장해 할당
+                                   *  - NULL이면 모듈이 추가 컨텍스트 필요 없음 */
 
 	/**
 	 * First notification that a bdev should be examined by a virtual bdev module.
@@ -186,6 +223,11 @@ struct spdk_bdev_module {
 	 * be called immediately after the examine_config callback returns.
 	 */
 	void (*examine_config)(struct spdk_bdev *bdev);
+                                  /* [한국어] vbdev 모듈의 1차 검사 — 새 bdev 등장 알림
+                                   *  - I/O 발행 불가 (아직 open 전)
+                                   *  - config 기반 vbdev 생성(예: 구성 파일에 정의된 lvol store 복원)만 가능
+                                   *  - claim 결정을 **동기적으로** 확정해야 함
+                                   *  - 반환 전 반드시 spdk_bdev_module_examine_done() 호출 */
 
 	/**
 	 * Second notification that a bdev should be examined by a virtual bdev module.
@@ -194,6 +236,9 @@ struct spdk_bdev_module {
 	 * Once complete spdk_bdev_module_examine_done() must be called.
 	 */
 	void (*examine_disk)(struct spdk_bdev *bdev);
+                                  /* [한국어] vbdev 모듈의 2차 검사 — 디스크 I/O 수행 가능
+                                   *  - 예: blobstore super block 읽어서 lvol store 자동 발견
+                                   *  - 비동기 — 완료 시 spdk_bdev_module_examine_done() 호출 */
 
 	/**
 	 * Denotes if the module_init function may complete asynchronously. If set to true,
@@ -201,6 +246,7 @@ struct spdk_bdev_module {
 	 * spdk_bdev_module_init_done().
 	 */
 	bool async_init;
+                                  /* [한국어] module_init 비동기 완료 표시 */
 
 	/**
 	 * Denotes if the module_fini function may complete asynchronously.
@@ -208,6 +254,7 @@ struct spdk_bdev_module {
 	 * spdk_bdev_module_fini_done().
 	 */
 	bool async_fini;
+                                  /* [한국어] module_fini 비동기 완료 표시 */
 
 	/**
 	 * Denotes if the fini_start function may complete asynchronously.
@@ -215,17 +262,21 @@ struct spdk_bdev_module {
 	 * spdk_bdev_module_fini_start_done().
 	 */
 	bool async_fini_start;
+                                  /* [한국어] fini_start 비동기 완료 표시 */
 
 	/**
 	 * Fields that are used by the internal bdev subsystem. Bdev modules
 	 *  must not read or write to these fields.
 	 */
 	struct __bdev_module_internal_fields {
+                                  /* [한국어] bdev 코어 전용 내부 필드 — 모듈 코드가 접근 금지 */
 		/**
 		 * Protects action_in_progress and quiesced_ranges.
 		 * Take no locks while holding this one.
 		 */
 		struct spdk_spinlock spinlock;
+                                  /* [한국어] action_in_progress·quiesced_ranges 보호 spin lock
+                                   *  - 이 lock을 들고 다른 lock 획득 금지 (데드락 방지 규칙) */
 
 		/**
 		 * Count of bdev inits/examinations in progress. Used by generic bdev
@@ -234,13 +285,17 @@ struct spdk_bdev_module {
 		 * \note Used internally by bdev subsystem, don't change this value in bdev module.
 		 */
 		uint32_t action_in_progress;
+                                  /* [한국어] 진행 중인 init/examine 카운터 — bdev 코어가 완료 동기화에 사용 */
 
 		/**
 		 * List of quiesced lba ranges in all bdevs of this module.
 		 */
 		TAILQ_HEAD(, lba_range) quiesced_ranges;
+                                  /* [한국어] quiesce된 LBA 범위 리스트 — 모듈의 모든 bdev을 망라
+                                   *  - quiesce: 해당 구간 I/O 일시 정지 (snapshot/정합성 작업용) */
 
 		TAILQ_ENTRY(spdk_bdev_module) tailq;
+                                  /* [한국어] 전역 bdev_modules 리스트 링크 */
 	} internal;
 };
 
@@ -526,57 +581,124 @@ enum spdk_bdev_io_status {
 /* We have to use the typedef in the function declaration to appease astyle. */
 typedef enum spdk_bdev_io_status spdk_bdev_io_status_t;
 
+/*
+ * [한국어] struct spdk_bdev_name - bdev 이름 엔트리
+ *
+ * 이름과 bdev 포인터를 RB 트리 노드로 묶음. 전역 bdev 이름 트리(bdev_names)의
+ * 엔트리로 사용되어 이름→bdev 포인터를 O(log n)에 lookup한다.
+ */
 struct spdk_bdev_name {
-	char *name;
-	struct spdk_bdev *bdev;
-	RB_ENTRY(spdk_bdev_name) node;
+	char *name;                   /* [한국어] bdev의 이름 (예: "Nvme0n1", "Malloc0"). heap-allocated */
+	struct spdk_bdev *bdev;       /* [한국어] 이 이름이 가리키는 bdev 포인터 */
+	RB_ENTRY(spdk_bdev_name) node;/* [한국어] RB 트리 링크 */
 };
 
+/*
+ * [한국어] struct spdk_bdev_alias - bdev 별칭 엔트리
+ *
+ * 하나의 bdev이 본이름 외 여러 별칭을 가질 수 있음. 각 별칭은 동일 bdev을 가리키는
+ * 추가 이름으로 등록되어 이름 lookup에 동일하게 참여.
+ */
 struct spdk_bdev_alias {
-	struct spdk_bdev_name alias;
-	TAILQ_ENTRY(spdk_bdev_alias) tailq;
+	struct spdk_bdev_name alias;  /* [한국어] 별칭 이름 엔트리 (bdev 포인터 공유) */
+	TAILQ_ENTRY(spdk_bdev_alias) tailq; /* [한국어] bdev->aliases 리스트 링크 */
 };
 
+/*
+ * [한국어] struct spdk_bdev_module_claim - bdev claim 엔트리 (v2 API)
+ *
+ * claim은 "이 bdev의 I/O 제어를 이 모듈이 점유한다"는 선언. v1 API(spdk_bdev_module_claim_bdev)는
+ * 모듈 포인터 하나만 저장했지만, v2 API(spdk_bdev_module_claim_bdev_desc)는 여러 claim 타입과
+ * 다중 writer 공유를 지원하므로 각 claim을 이 엔트리로 개별 표현.
+ */
 struct spdk_bdev_module_claim {
 	struct spdk_bdev_module *module;
-	struct spdk_bdev_desc *desc;
+                                  /* [한국어] claim을 건 모듈 */
+	struct spdk_bdev_desc *desc;  /* [한국어] claim 시 사용된 descriptor (closed 시 claim 자동 해제) */
 	char name[SPDK_BDEV_CLAIM_NAME_LEN];
+                                  /* [한국어] claim 식별 이름 (로그/진단용, 임의 문자열) */
 	TAILQ_ENTRY(spdk_bdev_module_claim) link;
+                                  /* [한국어] bdev->internal.claim.v2.claims 리스트 링크 */
 };
 
 typedef TAILQ_HEAD(, spdk_bdev_io) bdev_io_tailq_t;
+                                  /* [한국어] bdev_io TAILQ 헤드 타입 별칭 — 여러 내부 리스트에서 반복 사용 */
 typedef STAILQ_HEAD(, spdk_bdev_io) bdev_io_stailq_t;
+                                  /* [한국어] bdev_io STAILQ 헤드 (단방향 연결 버전) */
 typedef TAILQ_HEAD(, lba_range) lba_range_tailq_t;
+                                  /* [한국어] LBA range TAILQ 헤드 — quiesce/lock 범위 관리 */
 
+/*
+ * [한국어] ★★★ struct spdk_bdev - bdev 인스턴스 메타데이터 ★★★
+ *
+ * SPDK가 노출하는 하나의 논리 블록 디바이스를 표현. 모듈이
+ * spdk_bdev_register()로 등록할 때 이 구조체를 채워 전달하며, bdev 코어가
+ * 이 메타데이터로 사용자 I/O를 라우팅·검증·split한다.
+ *
+ * 주요 정보 범주:
+ *   - 식별: ctxt, name, aliases, product_name, uuid, nsid
+ *   - 기하(geometry): blocklen, phys_blocklen, blockcnt, md_len
+ *   - 지원 기능 비트맵: io_type_supported, accel_sequence_supported
+ *   - I/O 제약/최적화 힌트: required_alignment, optimal_io_boundary,
+ *     write_unit_size, max_rw_size, max_segment_size, max_num_segments 등
+ *   - 제한(split 기준): max_unmap, max_write_zeroes, max_copy
+ *   - DIF/PI: dif_type, dif_pi_format, dif_check_flags, md_interleave, dif_is_head_of_md
+ *   - ZNS: zoned, zone_size, max_open/active_zones, optimal_open_zones, max_zone_append_size
+ *   - NVMe: ctratt, nsid
+ *   - reset 동작: reset_io_drain_timeout
+ *   - NUMA locality: numa
+ *   - 연결: module(등록자), fn_table(콜백 vtable)
+ *   - internal: bdev 코어 전용 (QoS, claim, open_descs, reset 진행, 통계 등)
+ *
+ * I/O 경로에서의 역할:
+ *   - 사용자 API가 blocklen/blockcnt로 LBA·길이 검증
+ *   - bdev 코어가 optimal_io_boundary·max_rw_size로 자동 split 결정
+ *   - 모듈 콜백이 bdev->ctxt로 backend context 복원 (NVMe ns 포인터 등)
+ */
 struct spdk_bdev {
 	/** User context passed in by the backend */
 	void *ctxt;
+                                  /* [한국어] 모듈이 bdev 등록 시 넣는 자유 컨텍스트
+                                   *  - 예: NVMe 모듈은 spdk_nvme_ns* 를 여기 저장
+                                   *  - fn_table의 모든 콜백이 첫 인자 ctx로 이 값을 받음 */
 
 	/** Unique name for this block device. */
 	char *name;
+                                  /* [한국어] 전역 고유 이름 (예: "Nvme0n1") — RPC/CLI 참조 키
+                                   *  - 전역 bdev_names RB 트리 키 */
 
 	/** Unique aliases for this block device. */
 	TAILQ_HEAD(spdk_bdev_aliases_list, spdk_bdev_alias) aliases;
+                                  /* [한국어] 별칭 리스트 — 하나의 bdev가 여러 이름으로 조회 가능 */
 
 	/** Unique product name for this kind of block device. */
 	char *product_name;
+                                  /* [한국어] 제품/드라이버 이름 (예: "NVMe disk", "Malloc disk") — 사용자 표시용 */
 
 	/** write cache enabled, not used at the moment */
 	int write_cache;
+                                  /* [한국어] 쓰기 캐시 활성 플래그 (현재 미사용, 향후 확장용) */
 
 	/** Size in bytes of a logical block for the backend */
 	uint32_t blocklen;
+                                  /* [한국어] 논리 블록 크기 (바이트, 일반적으로 512 또는 4096)
+                                   *  - 사용자 API의 LBA 단위와 I/O 크기 계산에 사용 */
 
 	/** Size in bytes of a physical block for the backend */
 	uint32_t phys_blocklen;
+                                  /* [한국어] 물리 블록 크기 — 4K 섹터 드라이브에서 논리=512, 물리=4096 가능 */
 
 	/** Bitmap of supported io types */
 	uint32_t io_type_supported;
+                                  /* [한국어] 지원하는 I/O 타입 비트마스크 (enum spdk_bdev_io_type의 각 비트)
+                                   *  - 사용자 API가 제출 전 SPDK_BDEV_IO_TYPE_*에 대한 이 비트를 확인 */
 
 	/** Number of blocks */
 	uint64_t blockcnt;
+                                  /* [한국어] 총 블록 수 — 총 용량 = blockcnt * blocklen */
 
 	struct {
+                                  /* [한국어] 비트필드 플래그 묶음 — 32비트 하나 내에 여러 bool 압축 */
 		/**
 		 * Specifies whether the write_unit_size is mandatory or
 		 * only advisory. If set to true, the bdev layer will split
@@ -590,6 +712,9 @@ struct spdk_bdev {
 		 * UNMAP, WRITE_ZEROES or FLUSH I/O.
 		 */
 		uint32_t split_on_write_unit : 1;
+                                  /* [한국어] WRITE I/O가 write_unit_size 경계를 넘으면 자동 split
+                                   *  - true면 강제 분할 (NVMe NPWG 같은 하드웨어 요구사항)
+                                   *  - UNMAP/WRITE_ZEROES/FLUSH에는 적용 안 됨 */
 
 		/**
 		 * Specifies whether the optimal_io_boundary is mandatory or
@@ -601,6 +726,8 @@ struct spdk_bdev {
 		 * UNMAP, WRITE_ZEROES or FLUSH I/O.
 		 */
 		uint32_t split_on_optimal_io_boundary : 1;
+                                  /* [한국어] optimal_io_boundary 경계에서 R/W 강제 split
+                                   *  - NVMe NOIOB (Namespace Optimal I/O Boundary)에 대응 */
 
 		/**
 		 * Specify metadata location and set to true if metadata is interleaved
@@ -609,6 +736,9 @@ struct spdk_bdev {
 		 * Note that this field is valid only if there is metadata.
 		 */
 		uint32_t md_interleave : 1;
+                                  /* [한국어] 메타데이터가 블록 데이터와 섞여있는지(extended LBA)
+                                   *  - true: 각 LBA 말미에 메타 (예: 512+8)
+                                   *  - false: 별도 메타 버퍼(mptr)에 분리 저장 */
 
 		/*
 		 * DIF location.
@@ -619,27 +749,38 @@ struct spdk_bdev {
 		 * Note that this field is valid only if DIF is enabled.
 		 */
 		uint32_t dif_is_head_of_md : 1;
+                                  /* [한국어] DIF가 메타데이터의 앞/뒤 어디에 위치하는지
+                                   *  - NVMe: DPS(Data Protection Settings) 비트 0이 head/tail 지정
+                                   *  - true = 앞, false = 뒤 */
 
 		/**
 		 * Specify whether bdev is zoned device.
 		 */
 		uint32_t zoned : 1;
+                                  /* [한국어] Zoned Namespace(ZNS) 여부 — true면 zone_size 등 zone 관련 필드 유효 */
 
 		/**
 		 * Specifies whether bdev supports media management events.
 		 */
 		uint32_t media_events : 1;
+                                  /* [한국어] 미디어 관리 이벤트(예: wear-out 경고) 지원 여부 */
 
 		uint32_t memory_domains_supported : 1;
+                                  /* [한국어] 메모리 도메인 지원(RDMA 등) — get_memory_domains 콜백 활성화 */
 
 		uint32_t reserved : 25;
+                                  /* [한국어] 예약 비트 — 25개 추가 플래그 공간 */
 	};
 
 	/** Number of blocks required for write */
 	uint32_t write_unit_size;
+                                  /* [한국어] 쓰기 단위 블록 수 (NVMe NPWG/NPWA 기반)
+                                   *  - 이 크기 경계로 정렬된 write이 최적 성능 */
 
 	/** Atomic compare & write unit */
 	uint16_t acwu;
+                                  /* [한국어] Atomic Compare & Write Unit — atomic 비교+쓰기가 보장되는 블록 수
+                                   *  - NVMe 컨트롤러의 ACWU identify 필드에 대응 */
 
 	/**
 	 * Specifies an alignment requirement for data buffers associated with an spdk_bdev_io.
@@ -649,28 +790,40 @@ struct spdk_bdev {
 	 * alignment, before the spdk_bdev_io is submitted to the bdev module.
 	 */
 	uint8_t required_alignment;
+                                  /* [한국어] 데이터 버퍼 정렬 요구사항 — 2^required_alignment 바이트 단위
+                                   *  - 0: 정렬 요구 없음
+                                   *  - 위반 시 bdev 코어가 bounce buffer로 double buffering 자동 수행 (성능 저하 발생)
+                                   *  - NVMe는 통상 블록 크기(9 또는 12) */
 
-	uint8_t reserved1;
+	uint8_t reserved1;            /* [한국어] 정렬 예약 */
 
 	/**
 	 * Optimal I/O boundary in blocks, or 0 for no value reported.
 	 */
 	uint32_t optimal_io_boundary;
+                                  /* [한국어] 최적 I/O 경계 (블록 단위) — 이 경계를 넘는 I/O는 성능 저하 가능
+                                   *  - split_on_optimal_io_boundary=true면 강제 분할
+                                   *  - 0이면 제약 없음 */
 
 	/** Size in blocks of the preferred write alignment for the backend */
 	uint32_t preferred_write_alignment;
+                                  /* [한국어] 권장 쓰기 정렬 (블록) — 이 정렬로 쓰면 최적 성능 (강제 아님) */
 
 	/** Size in blocks of the preferred write granularity for the backend */
 	uint32_t preferred_write_granularity;
+                                  /* [한국어] 권장 쓰기 단위 (블록) — 이 크기의 배수로 쓰는 것이 최적 */
 
 	/** Size in blocks of the optimal write size for the backend */
 	uint32_t optimal_write_size;
+                                  /* [한국어] 최적 쓰기 크기 (블록) — 한 번에 이 크기로 쓸 때 최대 throughput */
 
 	/** Size in blocks of the preferred unmap alignment for the backend */
 	uint32_t preferred_unmap_alignment;
+                                  /* [한국어] 권장 UNMAP 정렬 (블록) */
 
 	/** Size in blocks of the preferred unmap granularity for the backend */
 	uint32_t preferred_unmap_granularity;
+                                  /* [한국어] 권장 UNMAP 단위 (블록) */
 
 	/**
 	 * Max io size in bytes of a single segment
@@ -679,30 +832,39 @@ struct spdk_bdev {
 	 * should be zero or non-zero.
 	 */
 	uint32_t max_segment_size;
+                                  /* [한국어] 단일 iovec 세그먼트의 최대 크기 (바이트)
+                                   *  - max_num_segments와 쌍으로 0 또는 모두 비영 (어긋나면 검증 실패) */
 
 	/* Maximum number of segments in a I/O */
 	uint32_t max_num_segments;
+                                  /* [한국어] 한 I/O가 가질 수 있는 iovec 최대 개수 */
 
 	/* Maximum unmap in unit of logical block */
 	uint32_t max_unmap;
+                                  /* [한국어] UNMAP 명령의 최대 블록 수 — 초과 시 bdev 코어가 자동 분할 */
 
 	/* Maximum unmap block segments */
 	uint32_t max_unmap_segments;
+                                  /* [한국어] UNMAP의 최대 range 개수 (NVMe DSM 범위 세트 수) */
 
 	/* Maximum write zeroes in unit of logical block */
 	uint32_t max_write_zeroes;
+                                  /* [한국어] WRITE_ZEROES 최대 블록 수 — 초과 시 분할 */
 
 	/**
 	 * Maximum copy size in unit of logical block
 	 * Should be set explicitly when backing device support copy command
 	 */
 	uint32_t max_copy;
+                                  /* [한국어] COPY 명령(NVMe SIMPLE COPY) 최대 블록 수 */
 
 	/**
 	 * Maximum number of blocks in a single read/write I/O.  Requests exceeding this value will
 	 * be split by the bdev layer.
 	 */
 	uint32_t max_rw_size;
+                                  /* [한국어] 단일 R/W I/O 최대 블록 수 — 장치 MDTS 기반
+                                   *  - 초과 시 bdev 코어가 bdev_io를 split하여 여러 sub-IO로 제출 */
 
 	/**
 	 * UUID for this bdev.
@@ -710,11 +872,14 @@ struct spdk_bdev {
 	 * If not provided, it will be generated by bdev layer.
 	 */
 	struct spdk_uuid uuid;
+                                  /* [한국어] bdev 고유 UUID — 영속 식별자 (재시작해도 같은 bdev을 식별)
+                                   *  - 모듈이 설정 안 하면 bdev 코어가 자동 생성 */
 
 	/** Size in bytes of a metadata for the backend */
 	uint32_t md_len;
+                                  /* [한국어] 블록당 메타데이터 크기 (바이트, PI 포함) — 0이면 메타 없음 */
 
-	uint8_t reserved2[4];
+	uint8_t reserved2[4];         /* [한국어] ABI 예약 */
 
 	/**
 	 * DIF type for this bdev.
@@ -722,6 +887,7 @@ struct spdk_bdev {
 	 * Note that this field is valid only if there is metadata.
 	 */
 	enum spdk_dif_type dif_type;
+                                  /* [한국어] DIF 타입 (DISABLE/TYPE1/TYPE2/TYPE3) — md_len>0일 때만 유효 */
 
 	/**
 	 * DIF protection information format for this bdev.
@@ -730,52 +896,61 @@ struct spdk_bdev {
 	 * not SPDK_DIF_DISABLE.
 	 */
 	enum spdk_dif_pi_format dif_pi_format;
+                                  /* [한국어] PI 포맷 — 16/32/64-bit Guard 선택 (NVMe 2.0) */
 
-	uint8_t reserved3[4];
+	uint8_t reserved3[4];         /* [한국어] 예약 */
 
 	/**
 	 * Specify whether each DIF check type is enabled.
 	 */
 	uint32_t dif_check_flags;
+                                  /* [한국어] DIF 검사 플래그 비트마스크 (GUARD/APPTAG/REFTAG 개별 on/off) */
 
-	uint8_t reserved4[8];
+	uint8_t reserved4[8];         /* [한국어] 예약 */
 
 	/**
 	 * Default size of each zone (in blocks).
 	 */
 	uint64_t zone_size;
+                                  /* [한국어] ZNS: zone 하나의 크기 (블록). zoned=true일 때만 의미 */
 
 	/**
 	 * Maximum zone append data transfer size (in blocks).
 	 */
 	uint32_t max_zone_append_size;
+                                  /* [한국어] ZNS: Zone Append 최대 크기 (블록) */
 
 	/**
 	 * Maximum number of open zones.
 	 */
 	uint32_t max_open_zones;
+                                  /* [한국어] 동시에 open 상태일 수 있는 zone 최대 수 */
 
 	/**
 	 * Maximum number of active zones.
 	 */
 	uint32_t max_active_zones;
+                                  /* [한국어] active(open+closed) zone 최대 수 */
 
 	/**
 	 * Optimal number of open zones.
 	 */
 	uint32_t optimal_open_zones;
+                                  /* [한국어] 권장 open zone 수 (호스트 스케줄러 참고용) */
 
-	uint8_t reserved6[4];
+	uint8_t reserved6[4];         /* [한국어] 예약 */
 
 	/**
 	 * Specifies the bdev nvme controller attributes.
 	 */
 	union spdk_bdev_nvme_ctratt ctratt;
+                                  /* [한국어] NVMe 컨트롤러 속성 비트필드 — bdev_nvme 모듈이 CTRATT identify 값을 전달 */
 
 	/**
 	 * NVMe namespace ID.
 	 */
 	uint32_t nsid;
+                                  /* [한국어] NVMe NSID — bdev_nvme 모듈에서만 의미 (다른 모듈은 0) */
 
 	/* Upon receiving a reset request, this is the amount of time in seconds
 	 * to wait for all I/O to complete before moving forward with the reset.
@@ -795,8 +970,13 @@ struct spdk_bdev {
 	 * If this parameter remains equal to zero, the bdev reset will be forcefully
 	 * sent down to the device, without any delays and waiting for outstanding IO. */
 	uint16_t reset_io_drain_timeout;
+                                  /* [한국어] reset 수신 시 in-flight I/O drain 대기 시간 (초)
+                                   *  - 이 시간 안에 I/O 완료되면 reset 생략(skip)
+                                   *  - 0: 즉시 reset 강제 발행 (대기 없음, outstanding 관계없이)
+                                   *  - 공유 bdev(lvol이 하위 NVMe 공유) 등에서 불필요 reset 전파 방지
+                                   *  - 권장값: SPDK_BDEV_RESET_IO_DRAIN_RECOMMENDED_VALUE (5초) */
 
-	uint8_t reserved7[2];
+	uint8_t reserved7[2];         /* [한국어] 예약 */
 
 	struct {
 		/** Is numa.id valid? Needed to know whether numa.id == 0 was
@@ -804,33 +984,48 @@ struct spdk_bdev {
 		 *  calloc()'ing the structure.
 		 */
 		uint32_t id_valid : 1;
+                                  /* [한국어] numa.id가 명시적으로 설정되었는지 (0이 유효 노드일 수 있어 별도 플래그 필요) */
 		/** NUMA node ID for the bdev */
 		int32_t id : 31;
+                                  /* [한국어] bdev가 속한 NUMA 노드 — 채널/qpair 배치 최적화에 사용 */
 	} numa;
 
 	/** Bitmap of supported io types */
 	uint32_t accel_sequence_supported;
+                                  /* [한국어] accel 시퀀스로 처리 가능한 I/O 타입 비트맵 — bdev 코어가 DMA 엔진 offload 경로 선택 */
 
 	/**
 	 * Pointer to the bdev module that registered this bdev.
 	 */
 	struct spdk_bdev_module *module;
+                                  /* [한국어] 이 bdev를 등록한 모듈 포인터 (back-reference) */
 
 	/** function table for all LUN ops */
 	const struct spdk_bdev_fn_table *fn_table;
+                                  /* [한국어] 모듈이 제공하는 콜백 vtable — I/O 제출/채널/통계/JSON 등 */
 
 	/** Fields that are used internally by the bdev subsystem.  Bdev modules
 	 *  must not read or write to these fields.
 	 */
+	/*
+	 * [한국어] ★ bdev 코어 전용 내부 필드 — 모듈 접근 금지 ★
+	 *
+	 * spinlock 순서 규칙 (데드락 방지 — 반드시 이 순서로만 다중 획득):
+	 *   g_bdev_mgr.spinlock → bdev->internal.spinlock → bdev_desc->spinlock → bdev_module->internal.spinlock
+	 */
 	struct __bdev_internal_fields {
 		/** Quality of service parameters */
 		struct spdk_bdev_qos *qos;
+                                  /* [한국어] QoS(Quality of Service) 설정 포인터 — IOPS/대역폭 throttling
+                                   *  - NULL이면 QoS 미적용 */
 
 		/** True if the state of the QoS is being modified */
 		bool qos_mod_in_progress;
+                                  /* [한국어] QoS 변경 진행 중 플래그 — 중첩 수정 방지 */
 
 		/** Trace ID for this bdev. */
 		uint16_t trace_id;
+                                  /* [한국어] SPDK trace 프레임워크에 할당된 bdev ID — 트레이스 이벤트 태그 */
 
 		/**
 		 * SPDK spinlock protecting many of the internal fields of this structure. If
@@ -841,9 +1036,12 @@ struct spdk_bdev {
 		 *   bdev_module->internal.spinlock
 		 */
 		struct spdk_spinlock spinlock;
+                                  /* [한국어] internal 필드 보호 spinlock — claim/examine/open_descs/reset 상태 수정 시 필수
+                                   *  - 상단 순서 규칙 엄수 */
 
 		/** The bdev status */
 		enum spdk_bdev_status status;
+                                  /* [한국어] bdev 상태 (READY/REMOVING/UNREGISTERED 등) */
 
 		/**
 		 * How many bdev_examine() calls are iterating claim.v2.claims. When non-zero claims
@@ -851,12 +1049,15 @@ struct spdk_bdev {
 		 * bdev_examine() finishes. Must hold spinlock on all updates.
 		 */
 		uint32_t examine_in_progress;
+                                  /* [한국어] examine 진행 카운터 — 순회 중 claim 제거가 발생해도 리스트에서 즉시 빼지 않고 순회 완료까지 유지
+                                   *  - spinlock 필수 */
 
 		/**
 		 * The claim type: used in conjunction with claim. Must hold spinlock on all
 		 * updates.
 		 */
 		enum spdk_bdev_claim_type claim_type;
+                                  /* [한국어] 현재 bdev에 걸린 claim 타입 (NONE/EXCL_WRITE/READ_MANY_WRITE_ONE/…/SHARED) */
 
 		/** Which module has claimed this bdev. Must hold spinlock on all updates. */
 		union __bdev_internal_claim {
@@ -869,84 +1070,116 @@ struct spdk_bdev {
 				 * claimed.
 				 */
 				struct spdk_bdev_module		*module;
+                                  /* [한국어] v1 claim API 경로 — 단일 모듈 포인터만 저장 */
 			} v1;
 			/** Claims acquired with spdk_bdev_module_claim_bdev_desc() */
 			struct __bdev_internal_claim_v2 {
 				/** The claims on this bdev */
 				TAILQ_HEAD(v2_claims, spdk_bdev_module_claim) claims;
+                                  /* [한국어] v2 API의 다중 claim 리스트 (SHARED writer 등) */
 				/** See spdk_bdev_claim_opts.shared_claim_key */
 				uint64_t key;
+                                  /* [한국어] SHARED claim 키 — 동일 키를 가진 claimer만 추가 가능 */
 			} v2;
 		} claim;
+                                  /* [한국어] claim 정보 union (claim_type에 따라 v1/v2 선택) */
 
 		/** Callback function that will be called after bdev destruct is completed. */
 		spdk_bdev_unregister_cb	unregister_cb;
+                                  /* [한국어] unregister 완료 콜백 */
 
 		/** Unregister call context */
 		void *unregister_ctx;
+                                  /* [한국어] unregister_cb에 전달할 컨텍스트 */
 
 		/** Thread that issued the unregister.  The cb must be called on this thread. */
 		struct spdk_thread *unregister_td;
+                                  /* [한국어] unregister를 호출한 스레드 — cb를 이 스레드에서 반드시 호출 (메시지 전달) */
 
 		/** List of open descriptors for this block device. */
 		TAILQ_HEAD(, spdk_bdev_desc) open_descs;
+                                  /* [한국어] 이 bdev에 대해 현재 open된 모든 descriptor 리스트
+                                   *  - unregister 시 각 desc에 remove 이벤트 통지하여 close 유도 */
 
 		TAILQ_ENTRY(spdk_bdev) link;
+                                  /* [한국어] 전역 bdev 리스트 링크 */
 
 		/** points to a reset bdev_io if one is in progress. */
 		struct spdk_bdev_io *reset_in_progress;
+                                  /* [한국어] 진행 중인 reset bdev_io (중복 reset 방지 — 하나만 동시 진행) */
 
 		/** List of reset bdev_ios that are not submitted to the underlying device. */
 		bdev_io_tailq_t		queued_resets;
+                                  /* [한국어] 장치로 아직 보내지 않고 대기 중인 reset 요청 큐 */
 
 		/** poller for tracking the queue_depth of a device, NULL if not tracking */
 		struct spdk_poller *qd_poller;
+                                  /* [한국어] 큐 깊이 측정 poller — enable_histogram 경로에서 활성 */
 
 		/** open descriptor to use qd_poller safely */
 		struct spdk_bdev_desc *qd_desc;
+                                  /* [한국어] qd_poller가 bdev을 안전하게 참조하기 위한 전용 descriptor */
 
 		/** period at which we poll for queue depth information */
 		uint64_t period;
+                                  /* [한국어] QD 폴링 주기 (틱) */
 
 		/** new period to be used to poll for queue depth information */
 		uint64_t new_period;
+                                  /* [한국어] 다음 주기 (런타임 변경 반영용) */
 
 		/** used to aggregate queue depth while iterating across the bdev's open channels */
 		uint64_t temporary_queue_depth;
+                                  /* [한국어] 모든 채널의 QD를 집계할 때 쓰는 임시 누적값 */
 
 		/** queue depth as calculated the last time the telemetry poller checked. */
 		uint64_t measured_queue_depth;
+                                  /* [한국어] 가장 최근 측정된 QD — 사용자 쿼리 응답 */
 
 		/** most recent value of ticks spent performing I/O. Used to calculate the weighted time doing I/O */
 		uint64_t io_time;
+                                  /* [한국어] 최근 관찰된 I/O 실행 누적 틱 — weighted_io_time 계산 입력 */
 
 		/** weighted time performing I/O. Equal to measured_queue_depth * period */
 		uint64_t weighted_io_time;
+                                  /* [한국어] 가중 I/O 시간 = QD × period. 장치 활용도 지표 */
 
 		/** accumulated I/O statistics for previously deleted channels of this bdev */
 		struct spdk_bdev_io_stat *stat;
+                                  /* [한국어] 삭제된 채널들의 누적 I/O 통계 — bdev 단위 총합에 포함 */
 
 		/** true if tracking the queue_depth of a device is in progress */
 		bool	qd_poll_in_progress;
+                                  /* [한국어] QD 수집 이터레이션 진행 중 (재진입 방지) */
 
 		/** histogram enabled on this bdev */
 		bool	 histogram_enabled;
+                                  /* [한국어] 지연시간 히스토그램 활성 여부 */
 		bool	 histogram_in_progress;
+                                  /* [한국어] 히스토그램 수집 진행 중 */
 		uint8_t	 histogram_io_type;
+                                  /* [한국어] 히스토그램 대상 I/O 타입 (READ/WRITE/ALL 등) */
 		uint8_t	 histogram_granularity;
+                                  /* [한국어] 히스토그램 버킷 세분성 (지수 단위) */
 		uint64_t histogram_min_val;
+                                  /* [한국어] 히스토그램 최소 관찰값 (nsec) */
 		uint64_t histogram_max_val;
+                                  /* [한국어] 히스토그램 최대 관찰값 */
 
 		/** Currently locked ranges for this bdev.  Used to populate new channels. */
 		lba_range_tailq_t locked_ranges;
+                                  /* [한국어] 현재 잠겨 있는 LBA 범위 목록 (read/write serialization)
+                                   *  - 새 채널 생성 시 상태 전파 */
 
 		/** Pending locked ranges for this bdev.  These ranges are not currently
 		 *  locked due to overlapping with another locked range.
 		 */
 		lba_range_tailq_t pending_locked_ranges;
+                                  /* [한국어] 잠금 요청됐지만 기존 잠금과 겹쳐 대기 중인 범위 */
 
 		/** Bdev name used for quick lookup */
 		struct spdk_bdev_name bdev_name;
+                                  /* [한국어] 전역 이름 트리 엔트리 (RB) — bdev_names에 연결됨 */
 	} internal;
 };
 
