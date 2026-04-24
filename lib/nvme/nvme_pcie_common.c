@@ -2398,54 +2398,76 @@ nvme_pcie_qpair_build_contig_hw_sgl_request(struct spdk_nvme_qpair *qpair, struc
 		struct nvme_tracker *tr, bool dword_aligned)
 {
 	uint8_t *virt_addr;
+                                  /* [한국어] 현재 진행 중인 가상 주소 포인터 — mapping_length 만큼 전진 */
 	uint64_t phys_addr, mapping_length;
+                                  /* [한국어] vtophys 결과 + 연속 물리 영역 길이 (hugepage 경계 고려) */
 	uint32_t length;
+                                  /* [한국어] 남은 payload 바이트 */
 	struct spdk_nvme_sgl_descriptor *sgl;
+                                  /* [한국어] tracker의 SGL 배열 기록 위치 */
 	uint32_t nseg = 0;
+                                  /* [한국어] 생성된 SGL descriptor 개수 */
 
 	assert(req->payload_size != 0);
+                                  /* [한국어] payload 없는 요청은 이 경로 안 옴 */
 	assert(nvme_payload_type(&req->payload) == NVME_PAYLOAD_TYPE_CONTIG);
+                                  /* [한국어] CONTIG 페이로드 전용 (단일 연속 가상 버퍼) */
 
 	sgl = tr->u.sgl;
+                                  /* [한국어] tracker의 SGL 배열 선두 */
 	req->cmd.psdt = SPDK_NVME_PSDT_SGL_MPTR_CONTIG;
+                                  /* [한국어] PSDT=SGL 모드 (build_metadata가 필요 시 SGL_MPTR_SGL로 승격) */
 	req->cmd.dptr.sgl1.unkeyed.subtype = 0;
+                                  /* [한국어] subtype=ADDRESS */
 
 	length = req->payload_size;
+                                  /* [한국어] 남은 바이트 */
 	/* ubsan complains about applying zero offset to null pointer if contig_or_cb_arg is NULL,
 	 * so just double cast it to make it go away */
 	virt_addr = (uint8_t *)((uintptr_t)req->payload.contig_or_cb_arg + req->payload_offset);
+                                  /* [한국어] 이중 cast(uintptr_t→uint8_t*)로 undefined behavior sanitizer 경고 회피.
+                                   *         contig_or_cb_arg가 NULL + offset 0 조합에서 uintptr_t로 우회. */
 
 	while (length > 0) {
+                                  /* [한국어] payload 전체를 물리 연속 segment들로 분해 */
 		if (nseg >= NVME_MAX_SGL_DESCRIPTORS) {
+                                  /* [한국어] descriptor 배열 한계 — 상위 split이 안 되어 있음 (버그) */
 			nvme_pcie_fail_request_bad_vtophys(qpair, tr);
 			return -EFAULT;
 		}
 
 		if (dword_aligned && ((uintptr_t)virt_addr & 3)) {
+                                  /* [한국어] 정렬 요구 장치에서 위반 */
 			NVME_QPAIR_ERRLOG(qpair, "virt_addr %p not dword aligned\n", virt_addr);
 			nvme_pcie_fail_request_bad_vtophys(qpair, tr);
 			return -EFAULT;
 		}
 
 		mapping_length = length;
+                                  /* [한국어] 최대 length만큼 연속이면 좋겠다는 힌트 */
 		phys_addr = nvme_pcie_vtophys(qpair->ctrlr, virt_addr, &mapping_length);
+                                  /* [한국어] vtophys — mapping_length에 실제 연속 영역 길이 반환 (hugepage 경계 전까지) */
 		if (phys_addr == SPDK_VTOPHYS_ERROR) {
 			nvme_pcie_fail_request_bad_vtophys(qpair, tr);
 			return -EFAULT;
 		}
 
 		mapping_length = spdk_min(length, mapping_length);
+                                  /* [한국어] 남은 length 초과 안 하도록 clamp */
 
 		length -= mapping_length;
 		virt_addr += mapping_length;
+                                  /* [한국어] 다음 segment로 전진 */
 
 		sgl->unkeyed.type = SPDK_NVME_SGL_TYPE_DATA_BLOCK;
 		sgl->unkeyed.length = mapping_length;
 		sgl->address = phys_addr;
 		sgl->unkeyed.subtype = 0;
+                                  /* [한국어] SGL descriptor 기록 — 물리 연속 영역 하나당 하나의 descriptor */
 
 		sgl++;
 		nseg++;
+                                  /* [한국어] 다음 슬롯 + 카운터 */
 	}
 
 	if (nseg == 1) {
@@ -2455,6 +2477,8 @@ nvme_pcie_qpair_build_contig_hw_sgl_request(struct spdk_nvme_qpair *qpair, struc
 		 *  This means the SGL in the tracker is not used at all, so copy the first (and only)
 		 *  SGL element into SGL1.
 		 */
+                                  /* [한국어] ★ 단일 descriptor inline 최적화 (hw_sgl_request와 동일):
+                                   *         SQE의 sgl1에 직접 Data Block으로 기록 → 장치 PCIe read 1회 감소. */
 		req->cmd.dptr.sgl1.unkeyed.type = SPDK_NVME_SGL_TYPE_DATA_BLOCK;
 		req->cmd.dptr.sgl1.address = tr->u.sgl[0].address;
 		req->cmd.dptr.sgl1.unkeyed.length = tr->u.sgl[0].unkeyed.length;
@@ -2462,6 +2486,7 @@ nvme_pcie_qpair_build_contig_hw_sgl_request(struct spdk_nvme_qpair *qpair, struc
 		/* SPDK NVMe driver supports only 1 SGL segment for now, it is enough because
 		 *  NVME_MAX_SGL_DESCRIPTORS * 16 is less than one page.
 		 */
+                                  /* [한국어] 다중 descriptor — LAST_SEGMENT로 tracker 배열 전체를 장치에 전달 */
 		req->cmd.dptr.sgl1.unkeyed.type = SPDK_NVME_SGL_TYPE_LAST_SEGMENT;
 		req->cmd.dptr.sgl1.address = tr->prp_sgl_bus_addr;
 		req->cmd.dptr.sgl1.unkeyed.length = nseg * sizeof(struct spdk_nvme_sgl_descriptor);
@@ -2491,104 +2516,154 @@ nvme_pcie_qpair_build_hw_sgl_request(struct spdk_nvme_qpair *qpair, struct nvme_
 				     struct nvme_tracker *tr, bool dword_aligned)
 {
 	int rc;
+                                  /* [한국어] next_sge_fn 반환값 (0=성공, !=0=iter 종료/실패) */
 	void *virt_addr;
+                                  /* [한국어] next_sge_fn이 돌려준 사용자 SGE의 가상 주소 */
 	uint64_t phys_addr, mapping_length;
+                                  /* [한국어] vtophys 결과 + 연속 매핑 길이 (hugepage 경계 고려) */
 	uint32_t remaining_transfer_len, remaining_user_sge_len, length;
+                                  /* [한국어] transfer_len: 전체 payload 중 남은 바이트
+                                   *         user_sge_len: 현재 사용자 SGE 중 남은 바이트 (여러 물리 segment로 쪼갤 수 있음)
+                                   *         length: 이번 iteration에 소비할 바이트 */
 	struct spdk_nvme_sgl_descriptor *sgl;
+                                  /* [한국어] tracker의 SGL descriptor 배열 포인터 (현재 기록 위치) */
 	uint32_t nseg = 0;
+                                  /* [한국어] 지금까지 생성한 SGL descriptor 개수 */
 	struct nvme_pcie_qpair *pqpair = nvme_pcie_qpair(qpair);
 
 	/*
 	 * Build scattered payloads.
 	 */
 	assert(req->payload_size != 0);
+                                  /* [한국어] payload 없는 요청은 이 함수 호출 안 함 */
 	assert(nvme_payload_type(&req->payload) == NVME_PAYLOAD_TYPE_SGL);
+                                  /* [한국어] 이 함수는 SGL 모드 전용 (reset/next 콜백 필수) */
 	assert(req->payload.reset_sgl_fn != NULL);
 	assert(req->payload.next_sge_fn != NULL);
 	req->payload.reset_sgl_fn(req->payload.contig_or_cb_arg, req->payload_offset);
+                                  /* [한국어] ★ 사용자 SGL 반복자 초기화 — payload_offset부터 순회 시작
+                                   *         (split 요청의 child면 원본 iovec의 중간부터 시작) */
 
 	sgl = tr->u.sgl;
+                                  /* [한국어] tracker의 SGL 배열 선두부터 기록 */
 	req->cmd.psdt = SPDK_NVME_PSDT_SGL_MPTR_CONTIG;
+                                  /* [한국어] PSDT=SGL 모드로 전환 (build_metadata가 필요 시 SGL_MPTR_SGL로 승격) */
 	req->cmd.dptr.sgl1.unkeyed.subtype = 0;
+                                  /* [한국어] subtype=ADDRESS (직접 주소 지정) */
 
 	remaining_transfer_len = req->payload_size;
+                                  /* [한국어] 전체 소비할 바이트 */
 
 	while (remaining_transfer_len > 0) {
+                                  /* [한국어] payload 전체를 소비할 때까지 사용자 SGE를 순회 */
 		rc = req->payload.next_sge_fn(req->payload.contig_or_cb_arg,
 					      &virt_addr, &remaining_user_sge_len);
+                                  /* [한국어] ★ 사용자가 제공한 콜백으로 다음 SGE 받음
+                                   *         - virt_addr: 사용자 버퍼 주소 (또는 UINT64_MAX로 Bit Bucket 요청)
+                                   *         - remaining_user_sge_len: 이 SGE의 길이 */
 		if (rc) {
+                                  /* [한국어] 콜백 실패 — payload iter가 잘못됨 */
 			nvme_pcie_fail_request_bad_vtophys(qpair, tr);
 			return -EFAULT;
 		}
 
 		/* Bit Bucket SGL descriptor */
 		if ((uint64_t)virt_addr == UINT64_MAX) {
+                                  /* [한국어] ★ Bit Bucket 특수 sentinel — 사용자가 "이 범위는 READ하되 호스트로 안 가져와도 됨"이라고 표시
+                                   *         용도: metadata를 건너뛰거나, 일부 필드만 읽고 싶을 때 */
 			/* TODO: enable WRITE and COMPARE when necessary */
 			if (req->cmd.opc != SPDK_NVME_OPC_READ) {
+                                  /* [한국어] 스펙상 WRITE/COMPARE도 가능하지만 SPDK 현 구현은 READ만 */
 				NVME_QPAIR_ERRLOG(qpair, "Only READ command can be supported\n");
 				goto exit;
 			}
 			if (nseg >= NVME_MAX_SGL_DESCRIPTORS) {
+                                  /* [한국어] descriptor 배열 용량 초과 — 상위가 MDTS 판정에서 분할했어야 함 */
 				NVME_QPAIR_ERRLOG(qpair, "Too many SGL entries\n");
 				goto exit;
 			}
 
 			sgl->unkeyed.type = SPDK_NVME_SGL_TYPE_BIT_BUCKET;
+                                  /* [한국어] Bit Bucket type 기록 — 장치가 이 영역 데이터를 버림 */
 			/* If the SGL describes a destination data buffer, the length of data
 			 * buffer shall be discarded by controller, and the length is included
 			 * in Number of Logical Blocks (NLB) parameter. Otherwise, the length
 			 * is not included in the NLB parameter.
 			 */
+                                  /* [한국어] 스펙: data 버퍼인 경우 length는 NLB에 포함 — 장치가 그만큼 읽되 호스트엔 안 보냄 */
 			remaining_user_sge_len = spdk_min(remaining_user_sge_len, remaining_transfer_len);
+                                  /* [한국어] 남은 transfer_len을 초과할 수 없음 */
 			remaining_transfer_len -= remaining_user_sge_len;
+                                  /* [한국어] 전체 진행 카운터 감소 */
 
 			sgl->unkeyed.length = remaining_user_sge_len;
+                                  /* [한국어] Bit Bucket 길이 */
 			sgl->address = 0;
+                                  /* [한국어] Bit Bucket의 address는 의미 없음 — 0 */
 			sgl->unkeyed.subtype = 0;
 
 			sgl++;
+                                  /* [한국어] 다음 descriptor 슬롯 */
 			nseg++;
 
 			continue;
+                                  /* [한국어] next_sge_fn 다음 반복 */
 		}
 
 		remaining_user_sge_len = spdk_min(remaining_user_sge_len, remaining_transfer_len);
+                                  /* [한국어] 사용자 SGE 길이가 남은 transfer_len 초과하면 초과분 버림 */
 		remaining_transfer_len -= remaining_user_sge_len;
+                                  /* [한국어] 전체 카운터 먼저 차감 — 내부 루프가 user_sge만 소비 */
 		while (remaining_user_sge_len > 0) {
+                                  /* [한국어] 내부 루프: 이 사용자 SGE 하나를 물리 segment들로 쪼갠다 */
 			if (nseg >= NVME_MAX_SGL_DESCRIPTORS) {
+                                  /* [한국어] descriptor 배열 overflow */
 				NVME_QPAIR_ERRLOG(qpair, "Too many SGL entries\n");
 				goto exit;
 			}
 
 			if (dword_aligned && ((uintptr_t)virt_addr & 3)) {
+                                  /* [한국어] 4B 정렬 요구 장치인데 위반 — 스펙 위반 */
 				NVME_QPAIR_ERRLOG(qpair, "virt_addr %p not dword aligned\n", virt_addr);
 				goto exit;
 			}
 
 			mapping_length = remaining_user_sge_len;
+                                  /* [한국어] vtophys에게 "최대 이만큼 연속 영역 필요" 힌트 */
 			phys_addr = nvme_pcie_vtophys(qpair->ctrlr, virt_addr, &mapping_length);
+                                  /* [한국어] 가상→물리 변환 — hugepage 경계에서 mapping_length가 줄어들 수 있음 */
 			if (phys_addr == SPDK_VTOPHYS_ERROR) {
+                                  /* [한국어] DPDK 힙 미등록 영역 등 */
 				goto exit;
 			}
 
 			length = spdk_min(remaining_user_sge_len, mapping_length);
+                                  /* [한국어] 실제 쪼갤 길이 — user SGE 남은 양과 물리 연속 영역 중 작은 쪽 */
 			remaining_user_sge_len -= length;
 			virt_addr = (uint8_t *)virt_addr + length;
+                                  /* [한국어] 다음 물리 segment로 전진 */
 
 			if (!pqpair->flags.disable_pcie_sgl_merge && nseg > 0 &&
 			    phys_addr == (*(sgl - 1)).address + (*(sgl - 1)).unkeyed.length) {
+                                  /* [한국어] ★ SGL merge 최적화:
+                                   *         이전 descriptor의 end 주소가 현재 start 주소와 물리적으로 연속이면
+                                   *         → 새 descriptor 만들지 말고 이전 것의 length만 증가 → descriptor 개수 감소
+                                   *         장치가 처리할 SGL 수 줄여 throughput 개선 */
 				/* extend previous entry */
 				(*(sgl - 1)).unkeyed.length += length;
 				continue;
+                                  /* [한국어] 새 descriptor 추가 안 하고 내부 루프 계속 */
 			}
 
 			sgl->unkeyed.type = SPDK_NVME_SGL_TYPE_DATA_BLOCK;
+                                  /* [한국어] 일반 DATA_BLOCK descriptor 생성 */
 			sgl->unkeyed.length = length;
 			sgl->address = phys_addr;
 			sgl->unkeyed.subtype = 0;
 
 			sgl++;
 			nseg++;
+                                  /* [한국어] 다음 descriptor 슬롯 + 카운터 */
 		}
 	}
 
@@ -2599,6 +2674,9 @@ nvme_pcie_qpair_build_hw_sgl_request(struct spdk_nvme_qpair *qpair, struct nvme_
 		 *  This means the SGL in the tracker is not used at all, so copy the first (and only)
 		 *  SGL element into SGL1.
 		 */
+                                  /* [한국어] ★ 단일 descriptor 최적화:
+                                   *         SQE 내부의 sgl1 필드에 직접 Data Block으로 기록 (inline).
+                                   *         장치가 SGL list를 fetch하러 PCIe read 안 함 → 1 round-trip 감소. */
 		req->cmd.dptr.sgl1.unkeyed.type = SPDK_NVME_SGL_TYPE_DATA_BLOCK;
 		req->cmd.dptr.sgl1.address = tr->u.sgl[0].address;
 		req->cmd.dptr.sgl1.unkeyed.length = tr->u.sgl[0].unkeyed.length;
@@ -2606,6 +2684,11 @@ nvme_pcie_qpair_build_hw_sgl_request(struct spdk_nvme_qpair *qpair, struct nvme_
 		/* SPDK NVMe driver supports only 1 SGL segment for now, it is enough because
 		 *  NVME_MAX_SGL_DESCRIPTORS * 16 is less than one page.
 		 */
+                                  /* [한국어] 다중 descriptor — SGL list 방식:
+                                   *         sgl1.type = LAST_SEGMENT (이 주소가 마지막 segment임을 장치에 알림)
+                                   *         sgl1.address = tr->prp_sgl_bus_addr (tracker 내 SGL 배열의 물리 주소)
+                                   *         sgl1.length = nseg × 16B (전체 descriptor 배열 크기)
+                                   *         SPDK는 현재 single-segment만 지원 — 최대 NVME_MAX_SGL_DESCRIPTORS×16 < 4KB라 충분 */
 		req->cmd.dptr.sgl1.unkeyed.type = SPDK_NVME_SGL_TYPE_LAST_SEGMENT;
 		req->cmd.dptr.sgl1.address = tr->prp_sgl_bus_addr;
 		req->cmd.dptr.sgl1.unkeyed.length = nseg * sizeof(struct spdk_nvme_sgl_descriptor);
@@ -2615,6 +2698,7 @@ nvme_pcie_qpair_build_hw_sgl_request(struct spdk_nvme_qpair *qpair, struct nvme_
 	return 0;
 
 exit:
+                                  /* [한국어] 실패 경로 — 빌드 중단 + bad_vtophys 경로로 에러 완료 */
 	nvme_pcie_fail_request_bad_vtophys(qpair, tr);
 	return -EFAULT;
 }
@@ -2622,33 +2706,57 @@ exit:
 /**
  * Build PRP list describing scattered payload buffer.
  */
+/*
+ * [한국어] ★ nvme_pcie_qpair_build_prps_sgl_request - SGL 페이로드 → PRP 리스트 (장치 SGL 미지원 시).
+ *
+ * 사용자가 SGL 모드로 요청했으나 장치가 SGL 미지원 → PRP로 변환.
+ * 각 사용자 SGE를 prp_list_append에 연쇄 호출해 하나의 통합 PRP 리스트로 구성.
+ *
+ * 중요 제약: 중간 SGE는 반드시 **페이지 경계에서 끝나야 함** (PRP의 엄격한 정렬 요구).
+ * 그렇지 않은 SGE는 상위 `_nvme_ns_cmd_split_request_prp`(nvme_ns_cmd.c)가 이미 split 처리했어야 함.
+ * assert로 방어적 검증.
+ *
+ * prp_index가 호출 간 유지됨 — 여러 SGE의 결과가 하나의 PRP 리스트로 누적.
+ */
 static int
 nvme_pcie_qpair_build_prps_sgl_request(struct spdk_nvme_qpair *qpair, struct nvme_request *req,
 				       struct nvme_tracker *tr, bool dword_aligned)
 {
 	int rc;
+                                  /* [한국어] next_sge_fn / prp_list_append 결과 */
 	void *virt_addr;
+                                  /* [한국어] 현재 사용자 SGE의 가상 주소 */
 	uint32_t remaining_transfer_len, length;
+                                  /* [한국어] 전체 남은 transfer_len / 이번 SGE 길이 */
 	uint32_t prp_index = 0;
+                                  /* [한국어] 누적 PRP 엔트리 수 — 여러 SGE 걸쳐 유지 (prp_list_append가 in-out) */
 	uint32_t page_size = qpair->ctrlr->page_size;
+                                  /* [한국어] 컨트롤러가 지정한 페이지 크기 (CAP.MPSMIN 기반, 보통 4KB) */
 
 	/*
 	 * Build scattered payloads.
 	 */
 	assert(nvme_payload_type(&req->payload) == NVME_PAYLOAD_TYPE_SGL);
+                                  /* [한국어] 이 함수는 SGL payload 전용 */
 	assert(req->payload.reset_sgl_fn != NULL);
 	req->payload.reset_sgl_fn(req->payload.contig_or_cb_arg, req->payload_offset);
+                                  /* [한국어] ★ SGL 반복자 초기화 (split된 child면 offset부터) */
 
 	remaining_transfer_len = req->payload_size;
+                                  /* [한국어] 소비할 전체 바이트 */
 	while (remaining_transfer_len > 0) {
+                                  /* [한국어] payload 전체 소비까지 사용자 SGE 순회 */
 		assert(req->payload.next_sge_fn != NULL);
 		rc = req->payload.next_sge_fn(req->payload.contig_or_cb_arg, &virt_addr, &length);
+                                  /* [한국어] 다음 SGE 조회 — virt_addr과 length 획득 */
 		if (rc) {
+                                  /* [한국어] 콜백 실패 — 빌드 포기 */
 			nvme_pcie_fail_request_bad_vtophys(qpair, tr);
 			return -EFAULT;
 		}
 
 		length = spdk_min(remaining_transfer_len, length);
+                                  /* [한국어] 남은 transfer_len 초과하면 초과분 버림 */
 
 		/*
 		 * Any incompatible sges should have been handled up in the splitting routine,
@@ -2656,20 +2764,30 @@ nvme_pcie_qpair_build_prps_sgl_request(struct spdk_nvme_qpair *qpair, struct nvm
 		 *
 		 * All SGEs except last must end on a page boundary.
 		 */
+                                  /* [한국어] ★ PRP 모드의 핵심 제약 검증:
+                                   *         마지막 SGE는 임의 길이 OK (PRP는 마지막만 정렬 완화).
+                                   *         중간 SGE는 반드시 페이지 경계에서 끝나야 함
+                                   *         (안 그러면 PRP 엔트리가 페이지 중간을 가리키게 돼 장치가 거부).
+                                   *         상위(nvme_ns_cmd.c의 split_request_prp)가 이미 보장했어야. */
 		assert((length == remaining_transfer_len) ||
 		       _is_page_aligned((uintptr_t)virt_addr + length, page_size));
 
 		rc = nvme_pcie_prp_list_append(qpair->ctrlr, tr, &prp_index, virt_addr, length, page_size);
+                                  /* [한국어] ★ PRP 리스트에 추가 — 이 SGE를 페이지 단위 PRP 엔트리들로 분해.
+                                   *         prp_index 유지되어 연속 호출이 하나의 PRP 리스트로 누적. */
 		if (rc) {
+                                  /* [한국어] 실패 (vtophys/배열 overflow 등) */
 			nvme_pcie_fail_request_bad_vtophys(qpair, tr);
 			return rc;
 		}
 
 		remaining_transfer_len -= length;
+                                  /* [한국어] 전체 카운터 감소 */
 	}
 
 	NVME_QPAIR_DEBUGLOG(qpair, "Number of PRP entries: %" PRIu32 "\n", prp_index);
 	return 0;
+                                  /* [한국어] 성공 — prp_list_append가 PSDT=PRP, prp1/prp2 모두 세팅 완료 */
 }
 
 /*
