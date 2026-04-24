@@ -143,7 +143,7 @@ accel, accel_module, ae4dma, blob, blob_bdev, fsdev, fsdev_module, ftl, gpt_spec
 | ☐ | lib/nvme/nvme_pcie.c | PCIe 트랜스포트 |
 | ☐ | lib/nvme/nvme_pcie_common.c | PCIe 공통 |
 | ☐ | lib/nvme/nvme_pcie_internal.h | PCIe 내부 |
-| ☐ | lib/nvme/nvme_transport.c | 트랜스포트 추상화 |
+| ☑ | lib/nvme/nvme_transport.c | 2026-04-24 **완료** — 원본 976줄 → 주석 후 1820줄. 파일 상단 4섹션 블록(vtable 디스패치 패턴 원리, qpair->transport 캐시 vs nvme_get_transport 조회 경로 분기 근거=multi-process, hot path 호출 체인) + 레지스트리 5종(get_first/next/get + available/available_by_name + transport_register with assert-based dup/overflow 방어) + 컨트롤러 수명주기 7종(construct/scan/scan_attached/destruct/enable/enable_interrupts/ready) + 레지스터 동기 4종(set/get_reg_4/8) + **★ register_operation_completion 헬퍼**(sync op + 가짜 완료 큐잉 패턴, multi-process hugepage 할당) + 비동기 4종(set/get_reg_4/8_async, async 미구현 트랜스포트용 sync fallback 패턴) + 컨트롤러 속성 2종(get_max_xfer_size/get_max_sges) + **CMB 3종**(reserve/map/unmap, Controller Memory Buffer의 PCIe 전용 특성) + **PMR 4종**(enable/disable/map/unmap, Persistent Memory Region, -ENOSYS vs -ENOTSUP 반환 관례 차이) + I/O qpair 관리(create_io_qpair-qpair->transport 캐시 저장, delete_io_qpair-multi-process lookup 이유, connect_qpair_fail, **★ connect_qpair**-동기/비동기 busy-wait 상태머신, disconnect_qpair-idempotent, qpair_get_fd-interrupt mode, **disconnect_qpair_done**-active_proc 기반 abort, get_memory_domains, process_transport_events-ctrlr_lock) + **★★ qpair hot-path 5종 공통 패턴**(spdk_likely!is_admin → qpair->transport 직접 호출, else → nvme_get_transport 재조회) 모두 주석: abort_reqs/reset/**★★★ submit_request**/**★★★ process_completions**/iterate_requests + qpair_authenticate + admin_qpair_abort_aers + **Poll Group 10종**(tgroup 수명주기 + connected/disconnected STAILQ 이동 불변식 + num_connected_qpairs 카운터 유지 + process_completions/check_disconnected 폴링 디스패치 + poll_group_disconnect/connect_qpair의 리스트 이동 로직 + stats 2종) + get_trtype + **★ get/set_opts ABI 호환 SET_FIELD 매크로 패턴** + get_registers(volatile MMIO 포인터 노출 경고) 전부 상세 주석. 이 파일만 읽어도 NVMe 드라이버의 vtable 아키텍처, multi-process safety, hot/cold 경계, optional op 규약 전체 파악 가능. |
 | ☐ | lib/nvme/nvme_fabric.c | Fabrics 공통 |
 | ☐ | lib/nvme/nvme_rdma.c | RDMA 트랜스포트 |
 | ☐ | lib/nvme/nvme_tcp.c | TCP 트랜스포트 |
@@ -213,10 +213,10 @@ examples/nvme/*, examples/bdev/*, examples/nvmf/*, examples/sock/*, examples/thr
 ## 다음에 할 일 (Next Actions — 세션 재진입 시 여기부터)
 
 1. **I/O 경로 구현 이어가기** (가장 자연스러운 연속선):
-   - `lib/nvme/nvme_pcie_common.c` (1912) — ★ doorbell ring, PRP 빌드, completion poll. nvme_qpair.c가 `nvme_transport_qpair_submit_request`로 위임한 이후 실제 SQ 기록과 doorbell MMIO write가 일어나는 경계.
-   - `lib/nvme/nvme_transport.c` (976) — 트랜스포트 vtable 디스패치. nvme_qpair.c의 `nvme_transport_*` 호출이 실제 어디로 가는지 추적.
-   - `lib/nvme/nvme_pcie.c` (1173) — PCIe 트랜스포트 구체화 (attach, MMIO BAR 매핑 등)
-   - `lib/nvme/nvme_fabric.c` — Fabrics CONNECT/AUTH/disconnect 공통 로직
+   - `lib/nvme/nvme_pcie_common.c` (1912) — ★ PCIe 트랜스포트의 hot path 실제 구현: doorbell ring, PRP 빌드, completion poll. nvme_transport.c가 ops.qpair_submit_request/process_completions로 위임한 최종 수신지. 이 파일 완료 시 애플리케이션→장치 전 여정이 주석만으로 추적 가능.
+   - `lib/nvme/nvme_pcie.c` (1173) — PCIe 트랜스포트 attach 구현 (DPDK enumerate, MMIO BAR 매핑, MSI-X 설정)
+   - `lib/nvme/nvme_fabric.c` — Fabrics CONNECT/AUTH/disconnect 공통 로직 (NVMe-oF 진입점)
+   - `lib/nvme/nvme_poll_group.c` — transport poll group들을 묶는 상위 그룹 (nvme_transport.c의 tgroup과 쌍)
 
 2. **부분완료(◐) 파일 마무리**:
    - `include/spdk/bdev.h` (2551) — 아직 ◐. seek_offset, histogram_enable_ext 등 세부 API 잔여
@@ -240,9 +240,11 @@ examples/nvme/*, examples/bdev/*, examples/nvmf/*, examples/sock/*, examples/thr
 
 ## 현재 진행 중 파일
 
-(없음 — lib/nvme/nvme_qpair.c 전체 완료)
+(없음 — lib/nvme/nvme_transport.c 전체 완료)
 
 ## 최근 완료 파일 (역순 최대 30개)
+
+- 2026-04-24 · **lib/nvme/nvme_transport.c [☑ 완료]** — **★ 트랜스포트 vtable 디스패치 레이어 ★**. 원본 976줄 → 주석 후 1820줄. 상단 4섹션 블록에서 SPDK NVMe의 vtable 아키텍처 전체 구조를 문서화: 트랜스포트(PCIe/RDMA/TCP/VFIOUSER/CUSE)별 ops 구조체가 `SPDK_NVME_TRANSPORT_REGISTER` 매크로로 전역 TAILQ에 등록되며, 상위 레이어는 이 파일의 `nvme_transport_*` 래퍼만 호출. 핵심 설계 이슈: **multi-process 안전성**(primary/secondary 프로세스가 각자 g_transports[]에 다른 주소의 ops를 가지므로 admin 큐는 매번 `nvme_get_transport(trstring)` 조회 필요, I/O 큐만 `qpair->transport` 캐시 사용). **async fallback 패턴**: set/get_reg_4/8_async가 트랜스포트별 async 미구현 시 동기 호출 + `register_operations` STAILQ에 가짜 완료 큐잉 → 다음 admin `process_completions`가 `nvme_complete_register_operations`로 처리 (nvme_qpair.c 완성된 이전 세션 작업과 짝). **Hot-path 5종 공통 패턴**(abort_reqs/reset/submit_request/process_completions/iterate_requests): `spdk_likely(!is_admin) → qpair->transport->ops.xxx` vs `nvme_get_transport→ops.xxx`. 기타 완료: 레지스트리 5종, 컨트롤러 수명주기 7종, 동기 레지스터 4종, **CMB 3종** + **PMR 4종**(장치 내부 메모리 활용, optional 지원 차이 -ENOTSUP/-ENOSYS), qpair 관리 8종(connect_qpair의 동기/비동기 busy-wait, disconnect_qpair_done의 active_proc 기반 abort), 인증·AER abort, **Poll Group 10종**(transport tgroup + connected/disconnected STAILQ 이동 불변식 + num_connected_qpairs 카운터), ABI 호환 opts SET_FIELD 매크로, volatile register 포인터 공개. **이 파일만 읽어도 SPDK NVMe 드라이버의 vtable 디스패치 아키텍처·멀티프로세스 안전성·hot/cold 경계·optional op 규약 전체가 파악 가능**.
 
 - 2026-04-24 · **lib/nvme/nvme_qpair.c [☑ 완료]** — **★ Queue Pair 제출/완료/상태머신 코어 ★**. 원본 1314줄 → 주석 후 2371줄. 파일 상단 4섹션 블록(submit/complete 호출 그래프 + state machine 다이어그램 + 공유 자료구조 맵) + 전역 opcode/status 사전 11종(admin/fabric/feat/io/sgl_type/sgl_subtype/status_type/generic/cmd_specific/media_error/path 각 테이블과 sentinel 규약) + 디버그 프린터 11개(PRP/SGL/DPTR/Admin/IO cmd·completion 문자열화) + state_string(수명주기 아스키 다이어그램) + is_retry(DNR 기반 TP 4028 정책) + **★ manual_complete_request**(가짜 CQE 합성 후 cb_fn 호출) + abort_queued/SWAP-기반 재귀 회피 + abort_queued_with_cbarg/격리 리스트 + **★ check_enabled**(CONNECTED→ENABLING→ENABLED 전이, PCIe reset abort, queued_req flush, reset 감지→disconnect) + **★ resubmit_requests**(완료 개수만큼 flow control 재제출) + **★ complete_register_operations**(multi-process register 완료 큐) + **★★★ spdk_nvme_qpair_process_completions**(7단계 상세: admin 선행 → is_failed 체크 → check_enabled → error injection → transport delegate → delete_after_completion → resubmit) + getter 6종 + **★ init/deinit**(req_buf 풀 64B align, reserved_req 특수 슬롯) + **★★★ _nvme_qpair_submit_request**(9단계: state check → split children 재귀 → err injection → submit_tick → ENABLED/FABRIC-CONNECTING 허용 조건 → transport submit → EAGAIN/error 경로) + **nvme_qpair_submit_request / resubmit_request / abort_all_queued_reqs**(FIFO 순서 유지 + queued_req 큐잉 규약) + **add/remove_cmd_error_injection**(admin lock 규약) 전부 주석.
 
@@ -306,6 +308,35 @@ examples/nvme/*, examples/bdev/*, examples/nvmf/*, examples/sock/*, examples/thr
 - 2026-04-21 · include/spdk/likely.h
 
 ## 마지막 세션 요약
+
+**2026-04-24 (스무 번째 파트 — lib/nvme/nvme_transport.c 완전 완료)**: **I/O 경로 아키텍처의 세 번째 기둥 완성**. nvme_ns_cmd.c(사용자 API→nvme_request 번역) + nvme_qpair.c(제출/완료/상태머신) + **nvme_transport.c(vtable 디스패치)** 삼박자. 이제 상위 코드가 어떤 트랜스포트(PCIe/RDMA/TCP/VFIOUSER/CUSE)인지 모른 채 작동하는 메커니즘이 명확해짐.
+
+핵심 완료:
+- **파일 상단 4섹션 블록**: vtable 디스패치 패턴 원리, 두 조회 경로(qpair->transport 캐시 vs nvme_get_transport 조회) 공존 이유를 **multi-process 안전성**으로 상세 설명. PCIe 멀티프로세스에서 각 프로세스가 자기 g_transports[] 정적 배열에 서로 다른 함수 포인터를 갖기 때문에 admin 큐는 매 호출마다 trstring 기반 lookup 필요.
+
+- **★★ async fallback 패턴의 해부**: `register_operations` 큐잉 메커니즘 — 트랜스포트가 async 레지스터 op를 구현 안 했을 때 동기 호출 + 가짜 완료 큐잉 → 다음 admin `process_completions`가 `nvme_complete_register_operations`(nvme_qpair.c에서 이미 주석된 함수)로 실행. 이렇게 함으로써 상위 코드는 "async" 단일 API로만 작성되어도 PCIe 같은 본질적으로 동기인 트랜스포트에서 동작.
+
+- **★★★ Hot-path 5종의 공통 디스패치 패턴**: abort_reqs/reset/submit_request/process_completions/iterate_requests 모두 `spdk_likely(!is_admin)→qpair->transport 캐시` vs `else→nvme_get_transport 재조회` 분기. 특히 submit_request와 process_completions는 nvme_qpair.c의 `_nvme_qpair_submit_request`와 `spdk_nvme_qpair_process_completions`가 위임하는 최종 관문.
+
+- **컨트롤러 수명주기**: construct→scan→enable→enable_interrupts→ready→...→destruct 시퀀스. 각 함수에 트랜스포트별 구현 예시(PCIe MMIO vs Fabrics property capsule)와 `nvme_ctrlr_process_init` 상태머신 연결.
+
+- **CMB/PMR 고급 기능**: Controller Memory Buffer(장치 내부 메모리, 휘발성)와 Persistent Memory Region(비휘발성, NVMe 1.4) 각각의 호출 시퀀스(reserve/enable→map→unmap→disable), PCIe 전용성, BaM 같은 고성능 라이브러리 사용처까지 문서화.
+
+- **qpair connect/disconnect 상세**: `nvme_transport_ctrlr_connect_qpair`의 동기/비동기 busy-wait 로직(CONNECTING 상태 유지 → fabrics+poll_group은 group 단위 폴링, 그 외는 qpair 단일 폴링), `disconnect_qpair_done`의 active_proc 기반 조건부 abort + interrupt-mode poll_group fd event write + fabric poll/auth cleanup.
+
+- **Poll Group 관리**: `transport_poll_group` 내부 구조 — connected/disconnected 두 STAILQ로 qpair 분리 관리, `qpair->poll_group_tailq_head` 포인터로 소속 리스트 O(1) 판별. connect/disconnect_qpair의 리스트 이동 로직과 `num_connected_qpairs` 카운터 유지 불변식. 이것이 NVMe-oF 멀티 qpair 폴링 성능의 기반.
+
+- **ABI 호환 opts 패턴**: `spdk_nvme_transport_get_opts/set_opts`의 `SET_FIELD` 매크로 + `opts_size` 필드 — 새 필드 추가 시 이전 SPDK 빌드 애플리케이션과도 호환성 유지. `SPDK_STATIC_ASSERT(sizeof==32)`로 크기 드리프트 방지.
+
+**결과**: SPDK NVMe 드라이버 아키텍처 이해의 **네 기둥** 완성:
+  (1) nvme_ns_cmd.c — 사용자 API → nvme_request 번역
+  (2) nvme_qpair.c  — 제출/완료/상태머신 코어
+  (3) nvme_transport.c — vtable 디스패치
+  (4) [다음] nvme_pcie_common.c — 실제 doorbell/PRP 빌드 (트랜스포트 구현)
+
+다음 세션은 `lib/nvme/nvme_pcie_common.c` (1912줄) 진입 — doorbell ring, PRP 빌드, completion poll의 실제 구현. 이 파일을 마치면 애플리케이션 spdk_nvme_ns_cmd_read() 호출부터 장치 SQE fetch까지의 전 여정이 주석만으로 완결.
+
+---
 
 **2026-04-24 (열아홉 번째 파트 — lib/nvme/nvme_qpair.c 완전 완료)**: **I/O 경로 코어 구현 파일 두 번째 완료**. nvme_ns_cmd.c가 "사용자 API → nvme_request 변환"이었다면, nvme_qpair.c는 "nvme_request → 트랜스포트 submit & 완료 콜백" — 트랜스포트 독립적 제출/완료 코어. 이제 `spdk_nvme_ns_cmd_read` → `_nvme_ns_cmd_rw` → `nvme_qpair_submit_request` → `_nvme_qpair_submit_request` → `nvme_transport_qpair_submit_request` 전 경로가 주석만으로 연결 가능.
 
