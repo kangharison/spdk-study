@@ -138,7 +138,7 @@ accel, accel_module, ae4dma, blob, blob_bdev, fsdev, fsdev_module, ftl, gpt_spec
 | ☐ | lib/nvme/nvme_ctrlr.c | 컨트롤러 |
 | ☐ | lib/nvme/nvme_ctrlr_cmd.c | 컨트롤러 admin 커맨드 |
 | ☐ | lib/nvme/nvme_ns.c | 네임스페이스 |
-| ☐ | lib/nvme/nvme_ns_cmd.c | 네임스페이스 I/O |
+| ☑ | lib/nvme/nvme_ns_cmd.c | 2026-04-24 **완료** — 원본 1516줄 → 주석 후 2592줄. 모든 공개 API 주석 완료: compare 4종(+with_md, +v, +v_with_md), read/write 6종(+with_md, +v, +v_with_md, +_ext, +v_ext), 내부 _ext 빌더 2종(rw_ext, rwv_ext), zone append 3종(check_zone_append + append_with_md + appendv_with_md), 관리형 I/O 6종(write_zeroes, verify, write_uncorrectable, dataset_management/DSM, copy/SCC, flush), reservation 4종(register/release/acquire/report), io_mgmt 2종(recv/send). 핵심(setup_request, _nvme_ns_cmd_rw, spdk_nvme_ns_cmd_read/write)은 이전 세션에 이미 완료. |
 | ☐ | lib/nvme/nvme_qpair.c | Queue Pair |
 | ☐ | lib/nvme/nvme_pcie.c | PCIe 트랜스포트 |
 | ☐ | lib/nvme/nvme_pcie_common.c | PCIe 공통 |
@@ -212,20 +212,27 @@ examples/nvme/*, examples/bdev/*, examples/nvmf/*, examples/sock/*, examples/thr
 
 ## 다음에 할 일 (Next Actions — 세션 재진입 시 여기부터)
 
-1. **Phase 0 남은 작은 파일**부터 완결:
-   - `include/spdk/fd_group.h` (268) — epoll 그룹 래퍼
-   - `include/spdk/file.h`       — 파일 I/O 유틸 (소형)
-   - `include/spdk/string.h` (292) — 문자열 유틸
-   - `include/spdk/pipe.h` (169)  — 링 파이프
-   - `include/spdk/base64.h` (116)
+1. **I/O 경로 구현 이어가기** (가장 자연스러운 연속선):
+   - `lib/nvme/nvme_qpair.c` (1314) — ★ submit/complete 코어. nvme_qpair_submit_request가 어떻게 request를 qpair의 queued_req/free_req 리스트로 관리하고 트랜스포트에 dispatch하는지. 완료 경로(process_completions)도 포함.
+   - `lib/nvme/nvme_pcie_common.c` (1912) — ★ doorbell ring, PRP 빌드, completion poll. nvme_ns_cmd.c가 만든 request가 실제로 장치 SQE로 내려가는 경계.
+   - `lib/nvme/nvme_pcie.c` (1173) — PCIe 트랜스포트 구체화
+   - `lib/nvme/nvme_transport.c` (976) — 트랜스포트 추상화 디스패치
+
+2. **부분완료(◐) 파일 마무리**:
+   - `include/spdk/bdev.h` (2551) — 아직 ◐. seek_offset, histogram_enable_ext 등 세부 API 잔여
+   - `include/spdk/bdev_module.h` — claim API 프로토타입, param 구조체 잔여
+   - `lib/nvme/nvme_internal.h` — fabric/rdma/tcp 특화 프로토타입, namespace 세부 API
+
+3. **Phase 0 남은 파일**:
    - `include/spdk/dif.h`         — T10 DIF
    - `include/spdk/histogram_data.h` (286)
    - `include/spdk/log.h` (443)
-2. 그 다음 **부분완료(◐) 파일 중 비교적 끝이 가까운 것**을 마무리:
-   - `include/spdk/bdev_module.h` 의 `struct spdk_bdev`, bdev_module 등록 매크로
-   - `lib/nvme/nvme_internal.h` 의 enum nvme_ctrlr_state, detach/probe 구조체, helper inlines
-3. `include/spdk/tree.h` (842) — BSD tree 매크로 포팅 (큰 파일, 전용 세션)
-4. Phase 0 완료 후 Phase 1(env.h, thread.h, event.h, init.h, scheduler.h, conf.h, dma.h, env_dpdk.h)로 진행.
+   - `include/spdk/json.h` / `jsonrpc.h` / `rpc.h` — RPC 스택
+   - `include/spdk/trace.h` / `trace_parser.h`
+   - `include/spdk/tree.h` (842) — BSD tree 매크로 (전용 세션)
+
+4. **Phase 1 공개 헤더**: env.h, thread.h, event.h, init.h, scheduler.h, conf.h, dma.h, env_dpdk.h
+
 5. **세션 종료 전 반드시**: 본 `.md`에서 아래 항목 갱신
    - "마지막 세션 요약"
    - "현재 진행 중 파일" (중간에 멈췄다면 위치와 함께 기록)
@@ -233,10 +240,22 @@ examples/nvme/*, examples/bdev/*, examples/nvmf/*, examples/sock/*, examples/thr
 
 ## 현재 진행 중 파일
 
-(없음)
+(없음 — lib/nvme/nvme_ns_cmd.c 전체 완료)
 
 ## 최근 완료 파일 (역순 최대 30개)
 
+- 2026-04-24 · **lib/nvme/nvme_ns_cmd.c [☑ 완료]** — **★ I/O 경로 구현 파일 첫 완전 정복 ★**. 원본 1516줄 → 주석 후 2592줄. 이전 세션의 핵심(setup_request, _nvme_ns_cmd_rw, spdk_nvme_ns_cmd_read/write)에 이어 이번 세션에서 **29개 공개 API 나머지 전부 주석**:
+  - **Compare 4종**(compare/compare_with_md/comparev/comparev_with_md): fused CAS 용도 설명, PI apptag/mask 동작, SGL vs CONTIG 경로 분기
+  - **Read/Write 변형 6종**(read_with_md/readv/readv_with_md/readv_ext, write_with_md/writev/writev_with_md/writev_ext + write_ext/read_ext): separate metadata 경로, ZCL/ext_io_opts 사용, accel_sequence 오프로드 조건
+  - **_ext 내부 빌더 2종**(nvme_ns_cmd_rw_ext — CONTIG, nvme_ns_cmd_rwv_ext — SGL): opts NULL 처리, accel 검증, payload.opts 전파
+  - **Zone Append 3종**(check_zone_append + zone_append_with_md + zone_appendv_with_md): ZNS wp 자동 할당 개념, ZASL ≤ MDTS 조기 검사, split 금지 방어 로직, get_append_location 완료 CQE에서 최종 LBA 반환
+  - **관리형 I/O 6종**(write_zeroes/verify/write_uncorrectable/DSM/copy-SCC/flush): payload-없는 request 빌드(nvme_allocate_request_null), user_copy 버퍼 이동, 각 SQE CDW 필드 매핑, 사용처(discard/scrub/VWC 플러시)
+  - **Reservation 4종**(register/release/acquire/report): multi-host PR 메커니즘 설명, RREGA/RRELA/RACQA/RTYPE 값별 의미, 128-bit Host ID와 EDS 플래그 분기
+  - **IO Management 2종**(recv/send): NVMe 2.0 TP4100 관리 서브커맨드 프레임워크, MO/MOS 필드, FDP 사용처
+
+이로써 **lib/nvme/nvme_ns_cmd.c의 모든 함수·실행 라인·SQE 필드 매핑이 주석만으로 완전 추적 가능**. 이 파일 하나로 애플리케이션 → _nvme_ns_cmd_rw → SQE → submit 전 여정이 이해됨.
+
+- 2026-04-22 · **lib/nvme/nvme_ns_cmd.c [부분 ◐ 핵심 완료]** — **★ I/O 경로 구현 파일 첫 진입 ★**. 파일 상단 4섹션 블록(I/O 경로 번역 레이어 위치, 전체 호출 흐름 상세, 지원 명령 목록, 상위·하위 연결) + 보조 함수 10종(check_request_length / map_failure_rc / md_excluded_from_xfer / get_host_buffer_sector_size / get_sectors_per_max_io / add_child_request / split_request / is_io_flags_valid / is_accel_sequence_valid) + **_nvme_ns_cmd_setup_request**(★ SQE CDW10-15 필드 매핑: SLBA 64bit alias / PI Type1·2 RefTag / fused / NLB 0-based / AppTag+mask 비트 배치) + **_nvme_ns_cmd_rw**(★ R/W 공통 엔트리: nvme_allocate_request → stripe/MDTS/SGL/PRP split 판정 → setup_request) + **spdk_nvme_ns_cmd_read + spdk_nvme_ns_cmd_write**(★ 공개 API 진입점, 호스트→장치 전체 SQE 제출 순서 문서화) 전부 상세 주석.
 - 2026-04-22 · lib/nvme/nvme_internal.h [대부분 완료 ◐] — **enum nvme_ctrlr_state 40+ 초기화 상태머신 전 상태 주석** (CONNECT_ADMINQ → READ_VS/CAP → CHECK_EN → DISABLE/ENABLE → RESET → IDENTIFY → CONFIGURE_AER → SET_KEEP_ALIVE → IDENTIFY_IOCS_SPECIFIC → SET_NUM_QUEUES → IDENTIFY_ACTIVE_NS/IDENTIFY_NS → SET_SUPPORTED_FEATURES → SET_DB_BUF_CFG → TRANSPORT_READY → READY) + detach_ctx/probe_ctx/nvme_driver 구조체 + helper inlines(robust_mutex_lock의 owner-dead 복구 포함) + admin 커맨드 프로토타입 전체(identify/set_num_queues/attach_ns/doorbell_buffer_config/format/fw_commit/fw_image_download/sanitize) + ctrlr 수명주기(construct/destruct_async/poll_async/fail/process_init) + register accessor + qpair hot-path(submit_request) + ns 관리 전부 주석 완료.
 - 2026-04-22 · **include/spdk/bdev_zone.h** [☑ 완료] (296라인) — ZNS 공개 API 전체. 상단 4섹션 블록(zone 상태머신 다이어그램, 호출 흐름, 모듈 연결) + zone_type(CNV/SEQWR/SEQWP)/zone_action(CLOSE/FINISH/OPEN/RESET/OFFLINE)/zone_state(EMPTY/IMP_OPEN/FULL/CLOSED/READ_ONLY/OFFLINE/EXP_OPEN/NOT_WP) enum 전 값별 주석 + spdk_bdev_zone_info 전 필드(zone_id/wp/capacity/state/type) + 속성 getter 6종 + get_zone_info + zone_management + Zone Append 4종(buf/iov × md 유무, 장치 자동 wp 할당·LSM-tree 사용처) + get_append_location 전부 주석. 이제 ZNS 워크로드 개발자가 이 헤더 하나만 읽어도 zone 상태 전이, append 시 wp race 회피, log-structured 자료구조 활용 패턴까지 이해 가능.
 - 2026-04-22 · include/spdk/bdev.h [부분 확장 v4 ◐] — spdk_bdev_initialize/finish(서브시스템 부팅/종료 상세 흐름) + io_type_supported + QoS API 3종(get_rpc_type/get_rate_limits/set_rate_limits, 토큰 버킷 알고리즘 설명) + get_qd + histogram_enable/get(모든 채널 집계 비동기) + for_each_channel/continue(채널 순회 sync/async 패턴) 주석.
@@ -283,6 +302,45 @@ examples/nvme/*, examples/bdev/*, examples/nvmf/*, examples/sock/*, examples/thr
 - 2026-04-21 · include/spdk/likely.h
 
 ## 마지막 세션 요약
+
+**2026-04-24 (열여덟 번째 파트 — lib/nvme/nvme_ns_cmd.c 완전 완료)**: 이전 세션에서 핵심만 주석했던 `lib/nvme/nvme_ns_cmd.c`의 **29개 공개 API 래퍼 전부 주석 완료**. 이 파일은 이제 ☑ 완료 상태.
+
+이번 세션에서 완료한 주요 그룹:
+1. **Compare 4종** — NVMe fused CAS(Compare+Write atomic)의 전반부 진입점. CONTIG/CONTIG+MD/SGL/SGL+MD 4변형 모두 동일 파이프라인(opc=COMPARE만 다름)이지만 각각의 payload 구성 + PI apptag/mask 전파를 상세 문서화.
+
+2. **Read/Write 변형 일괄** — 기존 read/write 핵심에 대응하는 with_md (separate metadata), v (SGL), v_with_md (SGL+MD), _ext (extended options), v_ext (SGL+ext) 전 조합. ★ 특히 `nvme_ns_cmd_rw_ext`(CONTIG)와 `nvme_ns_cmd_rwv_ext`(SGL) 내부 빌더는 accel_sequence/memory_domain/cdw13/PI mask 등 bdev_nvme가 세밀 제어하는 모든 옵션의 통합 진입점임을 명시.
+
+3. **Zone Append 3종** — ★ ZNS의 핵심 기능. check_zone_append의 2단계 검증(ZONE_APPEND_SUPPORTED 비트 + ZASL 크기) + CONTIG/SGL 두 변형 각각에서 split 금지 방어(num_children 확인 후 free) + log-structured 자료구조와의 연결(장치가 wp 자동 할당 반환) 설명.
+
+4. **관리형 I/O 6종** — write_zeroes/verify/write_uncorrectable/DSM/copy/flush. 이들은 _nvme_ns_cmd_rw를 거치지 않고 SQE를 직접 조립하는 "capability 명령" 카테고리. 각각:
+   - write_zeroes (0x08): 장치 offload로 0-fill, PCIe 대역 절약
+   - verify (0x0C): 미디어 스크러빙
+   - write_uncorrectable (0x04): 보안/진단용 블록 마킹
+   - DSM (0x09): discard/TRIM + sequential/latency 힌트
+   - copy/SCC (0x19, NVMe 2.0): 장치 내부 복사 오프로드
+   - flush (0x00): VWC → 비휘발성 매체 플러시
+
+5. **Reservation 4종** — NVMe-oF / shared SSD / clustered FS에서 필수. 그룹 상단에 통합 설명(SCSI PR과의 유사성, 4개 커맨드 조합 워크플로우) + 각 함수에서 RREGA/RRELA/RACQA action 값별 의미, RTYPE 변형, CPTPL(power loss persist), IEKEY(key 검증 무시) 동작 모두 명시.
+
+6. **IO Management 2종** — NVMe 2.0 TP4100 관리 서브커맨드 프레임워크. MO/MOS 필드 구조와 FDP(Flexible Data Placement) 사용처 설명.
+
+**결과**: `lib/nvme/nvme_ns_cmd.c`를 읽으면 SPDK 유저스페이스 NVMe I/O 경로의 **호스트 측 모든 번역 로직**이 파일 하나로 완결 추적 가능. 다음 세션은 nvme_qpair.c(submit/complete)나 nvme_pcie_common.c(doorbell/PRP 빌드)로 이어갈 예정.
+
+---
+
+**2026-04-22 (열일곱 번째 파트 — lib/nvme/nvme_ns_cmd.c 구현 진입)**: **I/O 경로의 실제 코드로 첫 진입**. 이전까지 헤더·구조체 정의만 주석했다면 이제 사용자 API가 실제로 어떻게 `nvme_request`로 변환되는지 구현 레벨에서 추적 가능해졌다.
+
+핵심 완료:
+- 파일 상단 4섹션 블록 — 이 파일의 번역 레이어 역할, 호출 체인(user API → _nvme_ns_cmd_rw → split → setup_request → submit), 지원되는 모든 NVMe 명령 목록
+- **`_nvme_ns_cmd_setup_request`** — SQE 필드 매핑 상세 주석 (CDW10-11의 64비트 SLBA alias 트릭, CDW12의 NLB 0-based 표기, CDW14의 PI Type1/2 RefTag 세팅, CDW15의 AppTag+mask 비트 배치)
+- **`_nvme_ns_cmd_rw`** — 모든 R/W의 공통 엔트리. request 할당 → zone_append 예외 처리 → stripe split 조건(경계 가로지르는 I/O) → MDTS split → SGL/PRP split 분기 → setup_request
+- split 보조 함수들 — `_nvme_add_child_request`(parent 롤백 포함), `_nvme_ns_cmd_split_request`(stripe/MDTS sector_mask 기반 분할)
+- 파라미터 검증 — `_is_io_flags_valid`, `_is_accel_sequence_valid`(poll_group 연결 필수 이유 설명)
+- 메타데이터 처리 — `_nvme_md_excluded_from_xfer`(PRACT + extended LBA + PI + md_size==8 4조건), `_nvme_get_host_buffer_sector_size`(sector vs extended_lba_size 분기)
+- 에러 정제 — `nvme_ns_map_failure_rc`(-ENOMEM을 retry 가능 vs qdepth 초과로 영구 실패 분류)
+- **`spdk_nvme_ns_cmd_read/write`** — 공개 API 진입점. 호스트 → 장치 전체 제출 순서(SQE 빌드 → tracker → PRP → doorbell MMIO → 장치 fetch → CQE → 콜백)를 상세 문서화.
+
+이로써 **애플리케이션이 spdk_nvme_ns_cmd_read를 호출할 때 내부에서 일어나는 모든 번역 단계**가 주석만으로 추적 가능. 특히 "왜 64비트 SLBA를 *(uint64_t *)&cmd->cdw10에 직접 쓰는지"처럼 코드만 보면 의아한 부분들도 이유 명시.
 
 **2026-04-22 (열여섯 번째 파트 — nvme_internal.h 상태머신 + 프로토타입 대량 완료)**:
 - **enum nvme_ctrlr_state 40+ 상태 전부 주석**. 각 상태의 admin 커맨드·완료 대기 의미, 상태 전이 조건 설명. 이제 NVMe 컨트롤러 부팅 시퀀스(CC.EN=0 disable → CC.EN=1 enable → identify → configure AER → set keep alive → set num queues → identify NS → set supported features → doorbell buffer config → ready)가 주석만으로 완전 추적 가능.
