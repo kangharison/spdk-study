@@ -144,7 +144,7 @@ accel, accel_module, ae4dma, blob, blob_bdev, fsdev, fsdev_module, ftl, gpt_spec
 | ☑ | lib/nvme/nvme_pcie_common.c | 2026-04-24 **완료** — 원본 1912줄 → 주석 후 3313줄. 파일 상단 4섹션 블록(제출/완료 호출 체인 그래프, nvme_pcie_qpair/tracker 자료구조 맵, hot-path 전체 순서) + 헬퍼 5종(vtophys PCIe/VFIO-USER 분기, qpair_reset phase bit 초기화, qpair_get_fd interrupt-mode, construct_tracker, alloc_cmb bump allocator) + **★ qpair_construct**(SQ/CQ hugepage 할당, tracker 풀 64B align, shadow doorbell 설정, max_completions_cap 계산) + admin_qpair_construct(SHARE hugepage) + multi-process admin 3종(insert/complete_pending_admin + cmd_create/delete_io_cq/sq CDW10-11 설정) + connect 콜백 체인(create_sq_cb with shadow doorbell setup, create_cq_cb) + _create_io_qpair(poll_group shared stats vs 개별 calloc) + connect/disconnect_qpair + **★★ copy_command_mmio**(QEMU 8B-at-a-time) + **★★★ copy_command**(SSE2 non-temporal 128b×4 store) + **★★★★ submit_tracker**(SQ[sq_tail]=SQE + sq_tail wrap + doorbell MMIO write) + **★★★ complete_tracker**(retry 판정 + multi-process insert + nvme_complete_request + free_tr 반환) + manual_complete + abort_trackers(last 저장 무한루프 회피) + admin_abort_aers(AER 전용) + check_timeout(FIFO 순서 가정 조기 break) + **★★★★ process_completions** (7단계: state check → CONNECTING admin 대리 폴링 → ctrlr_lock → max_cap 적용 → phase bit 루프 + next prefetch + memory barrier(PPC/RISC-V/aarch64) + tracker 복원 + complete_tracker → CQ doorbell ring + delay_cmd_submit flush + timeout + admin pending 처리 + vtophys failure 지연 처리) + qpair_destroy/create_io_qpair/delete_io_qpair(2단계 Delete SQ→CQ + shadow doorbell 클리어) + fail_request_bad_vtophys(in_completion_context 분기) + **★★★ prp_list_append** (PRP1/PRP2/PRP list 3가지 모드, 4KB 페이지 경계 엄격 정렬) + build_req 분기 테이블(4 조합 dispatcher) + **★ build_contig_request**(CONTIG→PRP, payload_offset 반영) + **★★ build_contig_hw_sgl_request**(CONTIG→SGL, vtophys mapping_length 기반 물리 segment 분해, 단일/다중 descriptor 분기, ubsan NULL 회피 이중 cast) + **★★ build_hw_sgl_request**(SGL→SGL, next_sge_fn 반복, Bit Bucket SGL 처리, ★ SGL merge 최적화 - 인접 물리 주소면 previous length 확장, 단일 DATA_BLOCK inline vs LAST_SEGMENT 분기) + **★★ build_prps_sgl_request**(SGL→PRP, prp_list_append 누적 호출, 중간 SGE 페이지 경계 assert 방어 검증) + **★ build_metadata**(3 경로: SGL_MPTR_SGL vs CONTIG MPTR 물리주소) + **★★★★ submit_request** (5단계: admin lock → tracker pop → req 연결 + cid = tr->cid → PSDT=PRP 기본 → build_req_fn 분기 → build_metadata → submit_tracker) + poll_group 10종(PCIe는 comp_channel 없이 순차 순회 + g_dummy_stat 리다이렉트) + **SPDK_TRACE_REGISTER_FN**(SUBMIT/COMPLETE 추적점) 모든 함수 본문 inline까지 완료. **이로써 애플리케이션 spdk_nvme_ns_cmd_read() → SQ에 SQE 기록 → doorbell MMIO → 장치 fetch → CQE 기록 → phase bit polling → cb_fn 실행의 전 여정이 주석만으로 추적 가능**. |
 | ☐ | lib/nvme/nvme_pcie_internal.h | PCIe 내부 |
 | ☑ | lib/nvme/nvme_transport.c | 2026-04-24 **완료** — 원본 976줄 → 주석 후 1820줄. 파일 상단 4섹션 블록(vtable 디스패치 패턴 원리, qpair->transport 캐시 vs nvme_get_transport 조회 경로 분기 근거=multi-process, hot path 호출 체인) + 레지스트리 5종(get_first/next/get + available/available_by_name + transport_register with assert-based dup/overflow 방어) + 컨트롤러 수명주기 7종(construct/scan/scan_attached/destruct/enable/enable_interrupts/ready) + 레지스터 동기 4종(set/get_reg_4/8) + **★ register_operation_completion 헬퍼**(sync op + 가짜 완료 큐잉 패턴, multi-process hugepage 할당) + 비동기 4종(set/get_reg_4/8_async, async 미구현 트랜스포트용 sync fallback 패턴) + 컨트롤러 속성 2종(get_max_xfer_size/get_max_sges) + **CMB 3종**(reserve/map/unmap, Controller Memory Buffer의 PCIe 전용 특성) + **PMR 4종**(enable/disable/map/unmap, Persistent Memory Region, -ENOSYS vs -ENOTSUP 반환 관례 차이) + I/O qpair 관리(create_io_qpair-qpair->transport 캐시 저장, delete_io_qpair-multi-process lookup 이유, connect_qpair_fail, **★ connect_qpair**-동기/비동기 busy-wait 상태머신, disconnect_qpair-idempotent, qpair_get_fd-interrupt mode, **disconnect_qpair_done**-active_proc 기반 abort, get_memory_domains, process_transport_events-ctrlr_lock) + **★★ qpair hot-path 5종 공통 패턴**(spdk_likely!is_admin → qpair->transport 직접 호출, else → nvme_get_transport 재조회) 모두 주석: abort_reqs/reset/**★★★ submit_request**/**★★★ process_completions**/iterate_requests + qpair_authenticate + admin_qpair_abort_aers + **Poll Group 10종**(tgroup 수명주기 + connected/disconnected STAILQ 이동 불변식 + num_connected_qpairs 카운터 유지 + process_completions/check_disconnected 폴링 디스패치 + poll_group_disconnect/connect_qpair의 리스트 이동 로직 + stats 2종) + get_trtype + **★ get/set_opts ABI 호환 SET_FIELD 매크로 패턴** + get_registers(volatile MMIO 포인터 노출 경고) 전부 상세 주석. 이 파일만 읽어도 NVMe 드라이버의 vtable 아키텍처, multi-process safety, hot/cold 경계, optional op 규약 전체 파악 가능. |
-| ☐ | lib/nvme/nvme_fabric.c | Fabrics 공통 |
+| ☑ | lib/nvme/nvme_fabric.c | 2026-04-26 **완료** — 원본 671줄 → 주석 후 1578줄. 파일 상단 4섹션 블록(NVMe-oF의 5대 책임: Property R/W·Discovery·CONNECT·AUTH 진입 판단·수명주기 정리, 호출 체인 3종) + struct nvme_fabric_prop_ctx 전 필드(value/size/cb_fn/cb_arg, 수명주기) + Property Set/Get 헬퍼 6종(prop_set_cmd/prop_set_cmd_sync/prop_set_cmd_done/prop_set_cmd_async + prop_get_cmd/prop_get_cmd_sync/prop_get_cmd_done/prop_get_cmd_async — opcode=0x7F + fctype=0x00/0x04, value union, attrib.size, robust=true/false 차이, 트램펄린 콜백 패턴) + 공개 reg R/W 8종(set/get_reg_4/8 sync/async — 트랜스포트 ops 진입점) + Discovery 3종(discover_probe — subtype/trtype/NQN/traddr/trsvcid 정규화 + nvme_ctrlr_probe 재귀, get_discovery_log_page — GET LOG PAGE LID=0x70, ctrlr_discover — 4KB 페이징 with 헤더 처리·entries[0] 오프셋·numrec 추출·recfmt 검증) + ctrlr_scan(직접 NQN vs DISCOVERY_NQN 분기, discovery_ctrlr 임시 생성→process_init→Identify→destruct, direct_connect 모드는 discovery_ctrlr 자체를 attach) + **★★ qpair_connect_async**(NVMe-oF CONNECT 핸드셰이크 9단계 — 인자 검증·DMA 1024B nvmf_data 할당·status calloc·SQE 빌드(opcode/fctype/qid/sqsize/kato)·**reserved_req 사용 이유**·nvmf_data 페이로드 채우기(admin=cntlid 0xFFFF / IO=ctrlr->cntlid + hostid 16B + hostnqn + subnqn)·submit_request·timeout_tsc 계산·fabric_poll_status 보존) + **★ qpair_connect_poll**(완료 폴링 + cntlid 추출 + atr/ascr 플래그 추출, 응답 status_code_specific.success vs invalid union, sct/sc 에러 로깅) + qpair_poll_cleanup(timed_out 분기로 use-after-free 회피) + qpair_auth_cleanup(idempotent cb 호출) + **★ qpair_auth_required**(4-OR: atr/ascr/dhchap_ctrlr_key/auth.cb_fn) + qpair_connect 동기 래퍼(busy-wait 루프). **이 파일만 읽어도 NVMe-oF의 와이어 포맷(Property Set/Get·Discovery Log Page·CONNECT 페이로드 1024B), 호스트 ↔ 타깃 핸드셰이크 전 시퀀스, 인증 진입 결정 정책, multi-process 안전성 패턴이 주석만으로 완전 추적 가능**. |
 | ☐ | lib/nvme/nvme_rdma.c | RDMA 트랜스포트 |
 | ☐ | lib/nvme/nvme_tcp.c | TCP 트랜스포트 |
 | ☐ | lib/nvme/nvme_poll_group.c | 폴링 그룹 |
@@ -213,8 +213,9 @@ examples/nvme/*, examples/bdev/*, examples/nvmf/*, examples/sock/*, examples/thr
 ## 다음에 할 일 (Next Actions — 세션 재진입 시 여기부터)
 
 1. **NVMe 드라이버 다섯 기둥 완결 이후 확장 작업**:
-   - `lib/nvme/nvme_fabric.c` — Fabrics CONNECT/AUTH/disconnect 공통 로직 (NVMe-oF 진입점)
+   - ☑ `lib/nvme/nvme_fabric.c` (2026-04-26 완료) — Fabrics CONNECT/AUTH/Property R/W/Discovery 공통 로직
    - `lib/nvme/nvme_poll_group.c` — transport poll group들을 묶는 상위 그룹 (nvme_transport.c의 tgroup과 쌍)
+   - `lib/nvme/nvme_auth.c` — DH-CHAP 인증 상태머신 (nvme_fabric.c의 atr/ascr 후속)
    - `lib/nvme/nvme.c` — nvme_internal.h의 nvme_complete_request 등 공용 헬퍼 구현
    - `lib/nvme/nvme_ctrlr.c` — ctrlr 상태머신 구현 (process_init, enable/disable)
    - `lib/nvme/nvme_ns.c` — namespace identify 및 설정
@@ -246,9 +247,21 @@ examples/nvme/*, examples/bdev/*, examples/nvmf/*, examples/sock/*, examples/thr
 
 ## 현재 진행 중 파일
 
-(없음 — lib/nvme/nvme_pcie.c 전체 완료)
+(없음 — lib/nvme/nvme_fabric.c 전체 완료)
 
 ## 최근 완료 파일 (역순 최대 30개)
+
+- 2026-04-26 · **lib/nvme/nvme_fabric.c [☑ 완료]** — **★ NVMe-oF 트랜스포트 공통 레이어 완전 정복 ★**. 원본 671줄 → 주석 후 1578줄. PCIe NVMe와 NVMe-oF의 본질적 차이를 드러내는 파일. PCIe는 호스트가 BAR을 mmap하여 CC/CSTS/AQA/ASQ/ACQ 레지스터를 직접 MMIO로 R/W하지만 RDMA/TCP/FC/vfio-user에서는 같은 레지스터 R/W를 **Fabric Property Set/Get 커맨드(opcode 0x7F + fctype 0x00/0x04)**로 메시지 변환해야 함 — 이 파일이 그 변환 계층. 핵심 완료:
+  - **★ Property R/W 6종 헬퍼 + 8종 공개 API**: prop_set_cmd/sync/done/async + prop_get 동일 패턴. SQE 빌드(opcode=0x7F, fctype, ofst, attrib.size, value.u64), value union으로 4B/8B 양쪽 지원, sync는 nvme_completion_poll_cb + busy-wait, async는 nvme_fabric_prop_ctx 트램펄린(spdk_nvme_cmd_cb → spdk_nvme_reg_cb 시그니처 변환). robust=true/false의 status leak 정책 차이 명시.
+  - **★ Discovery 3종**: discover_probe(subtype 검사 — DISCOVERY/CURRENT는 referral skip + NVME만 처리, trtype available_by_name 검사, NQN/traddr/trsvcid 정규화 — strlen_pad/str_chomp/null-terminate, priority 상속, nvme_ctrlr_probe 재귀), get_discovery_log_page(LID=0x70 GET LOG PAGE 동기), ctrlr_discover(4KB 버퍼 페이징 알고리즘 — 첫 페이지 헤더 16B + 3 entries vs 이후 페이지 4 entries, recfmt=0 검증, numrec/log_page_offset 누적 갱신).
+  - **★ ctrlr_scan**: subnqn != DISCOVERY_NQN → 직접 nvme_ctrlr_probe / DISCOVERY_NQN → 임시 discovery_ctrlr 생성(default opts) → process_init 루프로 READY까지 → Identify Controller로 cdata → direct_connect 분기(true=discovery_ctrlr 자체를 attach + add_process / false=ctrlr_discover 실행 후 destruct).
+  - **★★ qpair_connect_async** — NVMe-oF CONNECT 핸드셰이크의 시작점. 9단계 시퀀스: 인자 검증(num_entries 0~MAX) → DMA 1024B nvmf_data spdk_zmalloc(SPDK_MALLOC_DMA) → status tracker calloc + dma_data 보존 → SQE 빌드(opcode=0x7F + fctype=0x01 + qid + sqsize=N-1(0-based) + kato) → **reserved_req 사용**(일반 free_req 풀이 비어 있어도 CONNECT/AUTH는 무조건 가능해야 하므로 큐페어 init 시 1슬롯 격리 보존) → NVME_INIT_REQUEST(콜백/페이로드/길이) + memcpy(cmd) → 페이로드 채우기(admin=cntlid 0xFFFF / I/O=ctrlr->cntlid + hostid 16B + hostnqn + subnqn) → nvme_qpair_submit_request → timeout_tsc 계산 + auth.flags 0 클리어 + fabric_poll_status 저장.
+  - **★ qpair_connect_poll** — 응답 폴링 + 결과 추출. nvme_wait_for_completion_poll → -EAGAIN이면 재호출, 도착하면 timed_out/cpl_is_error 분기(timed_out → -ECANCELED + 진단 로그(trtype/adrfam/traddr/trsvcid/subnqn) / sct,sc 에러 → -EIO + sct/sc 로깅). SUCCESS는 status_code_specific.success union 파싱: admin이면 cntlid 추출 → ctrlr->cntlid 영구 저장(이후 I/O CONNECT의 페이로드에 첨부되는 controller association 키), authreq.atr=1 → qpair->auth.flags.atr=1, ascr=1 → qpair->auth.flags.ascr=1.
+  - **수명주기 정리**: poll_cleanup(timed_out=true면 leak 허용 — late callback에서 use-after-free 회피), auth_cleanup(idempotent — cb_fn=NULL 후 두 번 호출 방어).
+  - **★ qpair_auth_required**: 4-조건 OR — atr || ascr || dhchap_ctrlr_key != NULL || auth.cb_fn != NULL. 컨트롤러 요구·호스트 정책·사용자 명시 4가지 경로 통합.
+  - **qpair_connect**: connect_async + busy-wait { connect_poll } 동기 래퍼.
+
+  **결과 — NVMe-oF 진입점 완비**: 이 파일을 통해 (1) PCIe vs NVMe-oF의 레지스터 R/W 추상화 차이, (2) Discovery 서비스가 어떻게 다단계 페이징으로 entry를 가져오는지, (3) NVMe-oF CONNECT 와이어 포맷 1024B(hostid·cntlid·subnqn·hostnqn) + admin=0xFFFF의 controller 할당 메커니즘, (4) 인증 진입 결정 정책 4가지가 모두 주석만으로 추적 가능. 다음 세션은 nvme_auth.c (DH-CHAP 인증 상태머신) 또는 nvme_poll_group.c (poll group 상위 추상) 중 선택.
 
 - 2026-04-25 · **lib/nvme/nvme_pcie.c [☑ 완료]** — **★ PCIe 트랜스포트 cold-path 완전 정복 ★**. 원본 1173줄 → 주석 후 1920줄. 파일 상단 4섹션 블록에서 PCIe 5대 책임(probe/BAR/MMIO/SIGBUS/CMB-PMR) + 호출 체인 + SPDK_NVME_TRANSPORT_REGISTER 등록 원리 문서화. 핵심 완료:
   - **★ SIGBUS 방어** (link loss 시 BAR을 anonymous MAP_FIXED remap + 0xFF 채움, atomic CAS 재진입 방지, g_thread_mmio_ctrlr TLS 마커로 어느 컨트롤러인지 식별)
@@ -330,6 +343,27 @@ examples/nvme/*, examples/bdev/*, examples/nvmf/*, examples/sock/*, examples/thr
 - 2026-04-21 · include/spdk/likely.h
 
 ## 마지막 세션 요약
+
+**2026-04-26 (스물네 번째 파트 — lib/nvme/nvme_fabric.c 완전 완료 ☑)**: NVMe-oF 트랜스포트 공통 레이어. PCIe NVMe와 NVMe-oF의 본질적 차이를 드러내는 파일 — PCIe는 BAR mmap으로 레지스터를 직접 MMIO로 R/W하지만, NVMe-oF는 **Fabric Property Set/Get 커맨드(opcode 0x7F + fctype 0x00/0x04)**로 메시지화. 이 파일이 그 변환 계층 + Discovery 서비스 + CONNECT 핸드셰이크를 모두 담당.
+
+원본 671줄 → 주석 후 1578줄. 핵심 완료:
+
+- **★ Property R/W**: prop_set_cmd/sync/done/async + prop_get 동일 패턴 + 공개 reg_4/8 set/get sync/async 8종. 트램펄린 콜백(spdk_nvme_cmd_cb → spdk_nvme_reg_cb 시그니처 변환), nvme_fabric_prop_ctx의 value/size 보존 차이, robust=true/false 시 status leak 정책.
+- **★ Discovery 흐름**: discover_probe(NQN/traddr/trsvcid 정규화 + nvme_ctrlr_probe 재귀), get_discovery_log_page(LID=0x70), ctrlr_discover(4KB 버퍼 페이징 — 첫 페이지 16B 헤더 + 3 entries vs 이후 4 entries, recfmt=0 검증, numrec/offset 누적), ctrlr_scan(직접 vs DISCOVERY_NQN 분기 + direct_connect 모드).
+- **★★ qpair_connect_async**: NVMe-oF CONNECT 9단계 — 인자 검증 → DMA 1024B nvmf_data → status calloc → SQE 빌드(opcode=0x7F, fctype=0x01, qid, sqsize=N-1, kato) → **reserved_req 사용**(free_req 풀 부족 대비 격리 슬롯) → 페이로드(admin=cntlid 0xFFFF / I/O=ctrlr->cntlid + hostid 16B + hostnqn + subnqn) → submit → timeout_tsc + fabric_poll_status 보존.
+- **★ qpair_connect_poll**: 응답 폴링 + cntlid 추출(controller association 핵심 키) + atr/ascr 인증 플래그 추출. status_code_specific union의 success/invalid 분기, sct/sc 진단 로깅.
+- **★ auth_required**: atr || ascr || dhchap_ctrlr_key || auth.cb_fn 4-OR 정책 (컨트롤러 요구·호스트 정책·사용자 명시 통합).
+- **수명주기**: poll_cleanup(timed_out=true 시 leak 허용 → late callback use-after-free 회피), auth_cleanup(idempotent).
+
+**결과 — NVMe-oF 진입점 완비**: PCIe vs NVMe-oF의 레지스터 R/W 추상화 차이, Discovery 서비스의 다단계 페이징, CONNECT 와이어 포맷 1024B와 admin=0xFFFF controller 할당, 인증 진입 결정 정책 4가지가 모두 주석만으로 추적 가능.
+
+다음 세션 후보:
+- `lib/nvme/nvme_auth.c` — DH-CHAP 인증 상태머신 (이번 atr/ascr 후속 흐름)
+- `lib/nvme/nvme_poll_group.c` — poll group 상위 추상 (transport tgroup과 쌍)
+- `lib/nvme/nvme_tcp.c` 또는 `nvme_rdma.c` — 실제 트랜스포트 구현 (이 파일의 사용자)
+- `lib/nvme/nvme_ctrlr.c` — 컨트롤러 상태머신 (process_init이 fabric의 set_reg_4_async 호출)
+
+---
 
 **2026-04-25 (스물세 번째 파트 — lib/nvme/nvme_pcie.c 완전 완료 ☑)**: PCIe 트랜스포트의 cold-path 구현 파일 완결. 이로써 **SPDK NVMe 드라이버의 다섯 기둥이 모두 ☑ 완결** — 애플리케이션 `spdk_nvme_probe()`부터 장치 DMA 완료 콜백까지의 전 여정이 주석만으로 추적 가능.
 
