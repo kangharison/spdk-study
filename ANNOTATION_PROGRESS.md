@@ -140,7 +140,7 @@ accel, accel_module, ae4dma, blob, blob_bdev, fsdev, fsdev_module, ftl, gpt_spec
 | ☐ | lib/nvme/nvme_ns.c | 네임스페이스 |
 | ☑ | lib/nvme/nvme_ns_cmd.c | 2026-04-24 **완료** — 원본 1516줄 → 주석 후 2592줄. 모든 공개 API 주석 완료: compare 4종(+with_md, +v, +v_with_md), read/write 6종(+with_md, +v, +v_with_md, +_ext, +v_ext), 내부 _ext 빌더 2종(rw_ext, rwv_ext), zone append 3종(check_zone_append + append_with_md + appendv_with_md), 관리형 I/O 6종(write_zeroes, verify, write_uncorrectable, dataset_management/DSM, copy/SCC, flush), reservation 4종(register/release/acquire/report), io_mgmt 2종(recv/send). 핵심(setup_request, _nvme_ns_cmd_rw, spdk_nvme_ns_cmd_read/write)은 이전 세션에 이미 완료. |
 | ☑ | lib/nvme/nvme_qpair.c | 2026-04-24 **완료** — 원본 1314줄 → 주석 후 2371줄. 파일 상단 4섹션 블록(제출/완료 호출 그래프, state machine 다이어그램) + 전역 opcode/status 사전 11종(admin/fabric/feat/io/sgl_type/sgl_subtype/status_type/generic/cmd_specific/media_error/path) + 디버그 프린터 11개(nvme_get_sgl_*, nvme_get_prp_string, nvme_get_dptr_string, nvme_get_admin/io_qpair_command_string, nvme_admin/io_qpair_print_command, spdk_nvme_print_command/completion, spdk_nvme_qpair_print_command/completion) + nvme_get_string 선형 검색 + spdk_nvme_cpl_get_status_string/_type_string + nvme_qpair_state_string(수명주기 다이어그램) + nvme_completion_is_retry(DNR 기반 재시도 판정) + **★ nvme_qpair_manual_complete_request**(트랜스포트 경유 없이 가짜 CQE 합성) + **★ abort_queued_reqs / _complete_abort_queued_reqs / abort_queued_reqs_with_cbarg**(SWAP-기반 재귀 회피 + cb_arg 격리) + **★ nvme_qpair_check_enabled**(상태머신 전이 + PCIe reset abort + queued_req flush) + **★ nvme_qpair_resubmit_requests**(완료 개수만큼 flow control 재제출) + **★ nvme_complete_register_operations**(multi-process register 완료 큐) + **★ spdk_nvme_qpair_process_completions**(완료 폴링 진입점, 7단계 상세) + getter 6종(get_fd/failure_reason/abort_dnr/is_connected/get_id/num_outstanding) + **★ nvme_qpair_init**(req_buf 풀 배치, 64B align, reserved_req 특수 슬롯) + **★ nvme_qpair_complete_error_reqs / nvme_qpair_deinit** + **★ _nvme_qpair_submit_request**(9단계 제출 코어: state check → split 재귀 → err injection → submit_tick → ENABLED/FABRIC-CONNECTING 허용 → 트랜스포트 delegate → EAGAIN/error 경로) + **nvme_qpair_submit_request / resubmit_request / abort_all_queued_reqs** + **spdk_nvme_qpair_add/remove_cmd_error_injection** 전부 상세 주석. 이 파일만 읽어도 SPDK NVMe의 submit→doorbell→CQE→callback 완전 경로와 reset/split/err-injection/multi-process 특수 케이스 모두 파악 가능. |
-| ☐ | lib/nvme/nvme_pcie.c | PCIe 트랜스포트 |
+| ☑ | lib/nvme/nvme_pcie.c | 2026-04-25 **완료** — 원본 1173줄 → 주석 후 1920줄. 파일 상단 4섹션 블록(PCIe cold-path 전체 개관, 5개 주요 책임: probe/BAR/MMIO/SIGBUS/CMB-PMR, probe→attach 호출 체인) + 전역 (g_signal_lock, g_sigset, g_hotplug_filter_cb, nvme_pcie_enum_ctx) + **★ nvme_sigbus_fault_sighandler**(PCIe link loss SIGBUS 방어 — atomic CAS로 재진입 방지, BAR을 anonymous 메모리로 MAP_FIXED remap, 0xFF로 채움 → all-ones 감지 경로) + _nvme_pcie_event_process(UEVENT ADD/REMOVE) + _nvme_pcie_hotplug_monitor + reg_addr + get_registers + **★ set/get_reg_4/8**(TLS 마커 g_thread_mmio_ctrlr + spdk_mmio_* + all-ones 감지) + ASQ/ACQ/AQA/CMBLOC/CMBSZ/PMRCAP/PMRCTL/PMRSTS/PMRMSCL/PMRMSCU register wrappers + get_max_xfer_size(NVME_MAX_PRP_LIST_ENTRIES × page_size) + get_max_sges + **★ map_cmb**(CAP.CMBS 확인 + CMBSZ SZU/SZ 해석 + CMBLOC BIR/OFST + BAR mmap + 경계 검증) + unmap_cmb + reserve_cmb + **map_io_cmb**(WDS/RDS 검사 + 4MiB 최소 + 2MB 정렬 + spdk_mem_register) + unmap_io_cmb + **★ map_pmr**(PMRCAP BIR 검사 + BAR mmap + CMSS 지원 시 PMRMSCU/PMRMSCL CBA 설정 + PMRSTS.CBAI 확인) + unmap_pmr + **★ config_pmr**(PMRCTL.EN 토글 + PMRSTS.NRDY 대기 + PMRCAP.PMRTO/PMRTU 기반 timeout) + enable/disable_pmr + map_io_pmr/unmap_io_pmr + **★★ allocate_bars**(spdk_pci_device_map_bar BAR0 + regs 설정 + doorbell_base 계산 + CMB/PMR 매핑) + free_bars + **★★ pcie_nvme_enum_cb**(primary/secondary 분기 + traddr 필터 + nvme_ctrlr_probe 진입) + scan_attached + **★ ctrlr_scan**(hotplug 이벤트 우선 처리 + spdk_pci_enumerate vs device_attach 분기) + **★★ ctrlr_construct**(pci_claim + pctrlr 할당 + opts/quirks/NUMA 복사 + allocate_bars + PCI CMD 0x404 busmaster+INTx disable + CAP read + doorbell_stride 계산 + admin qpair 생성 + process 등록 + SIGBUS 핸들러 최초 등록) + **★ ctrlr_enable**(ASQ/ACQ/AQA 레지스터 세팅 — CC.EN=1 이전 preparation) + ctrlr_destruct + enable_interrupts(VFIO MSI-X) + qpair_iterate_requests + spdk_nvme_pcie_set_hotplug_filter + **★ nvme_pci_driver_id**(SPDK_PCI_CLASS_NVME 매칭 테이블) + **SPDK_PCI_DRIVER_REGISTER**(NEED_MAPPING + WC_ACTIVATE — Write Combining으로 doorbell 성능 향상) + **★★★ pcie_ops**(vtable 전체 — 6 수명주기 + 5 register + 2 limits + 3 CMB + 4 PMR + 4 qpair 수명주기 + 7 qpair hot-path + 10 poll group 포함) + **★★★ SPDK_NVME_TRANSPORT_REGISTER**(constructor로 main() 전에 TAILQ에 등록) 전부 주석. **이 파일 완료로 SPDK NVMe 드라이버의 PCIe 경로 전체(probe → BAR mmap → admin 큐 → CC.EN=1 → I/O hot-path → hotplug/SIGBUS 방어 → 정리)가 주석만으로 완결**. |
 | ☑ | lib/nvme/nvme_pcie_common.c | 2026-04-24 **완료** — 원본 1912줄 → 주석 후 3313줄. 파일 상단 4섹션 블록(제출/완료 호출 체인 그래프, nvme_pcie_qpair/tracker 자료구조 맵, hot-path 전체 순서) + 헬퍼 5종(vtophys PCIe/VFIO-USER 분기, qpair_reset phase bit 초기화, qpair_get_fd interrupt-mode, construct_tracker, alloc_cmb bump allocator) + **★ qpair_construct**(SQ/CQ hugepage 할당, tracker 풀 64B align, shadow doorbell 설정, max_completions_cap 계산) + admin_qpair_construct(SHARE hugepage) + multi-process admin 3종(insert/complete_pending_admin + cmd_create/delete_io_cq/sq CDW10-11 설정) + connect 콜백 체인(create_sq_cb with shadow doorbell setup, create_cq_cb) + _create_io_qpair(poll_group shared stats vs 개별 calloc) + connect/disconnect_qpair + **★★ copy_command_mmio**(QEMU 8B-at-a-time) + **★★★ copy_command**(SSE2 non-temporal 128b×4 store) + **★★★★ submit_tracker**(SQ[sq_tail]=SQE + sq_tail wrap + doorbell MMIO write) + **★★★ complete_tracker**(retry 판정 + multi-process insert + nvme_complete_request + free_tr 반환) + manual_complete + abort_trackers(last 저장 무한루프 회피) + admin_abort_aers(AER 전용) + check_timeout(FIFO 순서 가정 조기 break) + **★★★★ process_completions** (7단계: state check → CONNECTING admin 대리 폴링 → ctrlr_lock → max_cap 적용 → phase bit 루프 + next prefetch + memory barrier(PPC/RISC-V/aarch64) + tracker 복원 + complete_tracker → CQ doorbell ring + delay_cmd_submit flush + timeout + admin pending 처리 + vtophys failure 지연 처리) + qpair_destroy/create_io_qpair/delete_io_qpair(2단계 Delete SQ→CQ + shadow doorbell 클리어) + fail_request_bad_vtophys(in_completion_context 분기) + **★★★ prp_list_append** (PRP1/PRP2/PRP list 3가지 모드, 4KB 페이지 경계 엄격 정렬) + build_req 분기 테이블(4 조합 dispatcher) + **★ build_contig_request**(CONTIG→PRP, payload_offset 반영) + **★★ build_contig_hw_sgl_request**(CONTIG→SGL, vtophys mapping_length 기반 물리 segment 분해, 단일/다중 descriptor 분기, ubsan NULL 회피 이중 cast) + **★★ build_hw_sgl_request**(SGL→SGL, next_sge_fn 반복, Bit Bucket SGL 처리, ★ SGL merge 최적화 - 인접 물리 주소면 previous length 확장, 단일 DATA_BLOCK inline vs LAST_SEGMENT 분기) + **★★ build_prps_sgl_request**(SGL→PRP, prp_list_append 누적 호출, 중간 SGE 페이지 경계 assert 방어 검증) + **★ build_metadata**(3 경로: SGL_MPTR_SGL vs CONTIG MPTR 물리주소) + **★★★★ submit_request** (5단계: admin lock → tracker pop → req 연결 + cid = tr->cid → PSDT=PRP 기본 → build_req_fn 분기 → build_metadata → submit_tracker) + poll_group 10종(PCIe는 comp_channel 없이 순차 순회 + g_dummy_stat 리다이렉트) + **SPDK_TRACE_REGISTER_FN**(SUBMIT/COMPLETE 추적점) 모든 함수 본문 inline까지 완료. **이로써 애플리케이션 spdk_nvme_ns_cmd_read() → SQ에 SQE 기록 → doorbell MMIO → 장치 fetch → CQE 기록 → phase bit polling → cb_fn 실행의 전 여정이 주석만으로 추적 가능**. |
 | ☐ | lib/nvme/nvme_pcie_internal.h | PCIe 내부 |
 | ☑ | lib/nvme/nvme_transport.c | 2026-04-24 **완료** — 원본 976줄 → 주석 후 1820줄. 파일 상단 4섹션 블록(vtable 디스패치 패턴 원리, qpair->transport 캐시 vs nvme_get_transport 조회 경로 분기 근거=multi-process, hot path 호출 체인) + 레지스트리 5종(get_first/next/get + available/available_by_name + transport_register with assert-based dup/overflow 방어) + 컨트롤러 수명주기 7종(construct/scan/scan_attached/destruct/enable/enable_interrupts/ready) + 레지스터 동기 4종(set/get_reg_4/8) + **★ register_operation_completion 헬퍼**(sync op + 가짜 완료 큐잉 패턴, multi-process hugepage 할당) + 비동기 4종(set/get_reg_4/8_async, async 미구현 트랜스포트용 sync fallback 패턴) + 컨트롤러 속성 2종(get_max_xfer_size/get_max_sges) + **CMB 3종**(reserve/map/unmap, Controller Memory Buffer의 PCIe 전용 특성) + **PMR 4종**(enable/disable/map/unmap, Persistent Memory Region, -ENOSYS vs -ENOTSUP 반환 관례 차이) + I/O qpair 관리(create_io_qpair-qpair->transport 캐시 저장, delete_io_qpair-multi-process lookup 이유, connect_qpair_fail, **★ connect_qpair**-동기/비동기 busy-wait 상태머신, disconnect_qpair-idempotent, qpair_get_fd-interrupt mode, **disconnect_qpair_done**-active_proc 기반 abort, get_memory_domains, process_transport_events-ctrlr_lock) + **★★ qpair hot-path 5종 공통 패턴**(spdk_likely!is_admin → qpair->transport 직접 호출, else → nvme_get_transport 재조회) 모두 주석: abort_reqs/reset/**★★★ submit_request**/**★★★ process_completions**/iterate_requests + qpair_authenticate + admin_qpair_abort_aers + **Poll Group 10종**(tgroup 수명주기 + connected/disconnected STAILQ 이동 불변식 + num_connected_qpairs 카운터 유지 + process_completions/check_disconnected 폴링 디스패치 + poll_group_disconnect/connect_qpair의 리스트 이동 로직 + stats 2종) + get_trtype + **★ get/set_opts ABI 호환 SET_FIELD 매크로 패턴** + get_registers(volatile MMIO 포인터 노출 경고) 전부 상세 주석. 이 파일만 읽어도 NVMe 드라이버의 vtable 아키텍처, multi-process safety, hot/cold 경계, optional op 규약 전체 파악 가능. |
@@ -212,11 +212,17 @@ examples/nvme/*, examples/bdev/*, examples/nvmf/*, examples/sock/*, examples/thr
 
 ## 다음에 할 일 (Next Actions — 세션 재진입 시 여기부터)
 
-1. **I/O 경로 구현 이어가기**:
-   - `lib/nvme/nvme_pcie.c` (1173) — ★ PCIe 트랜스포트 attach 구현 (DPDK enumerate, MMIO BAR 매핑, MSI-X 설정). 이 파일 완료 시 PCIe 경로 전체 완결.
+1. **NVMe 드라이버 다섯 기둥 완결 이후 확장 작업**:
    - `lib/nvme/nvme_fabric.c` — Fabrics CONNECT/AUTH/disconnect 공통 로직 (NVMe-oF 진입점)
    - `lib/nvme/nvme_poll_group.c` — transport poll group들을 묶는 상위 그룹 (nvme_transport.c의 tgroup과 쌍)
    - `lib/nvme/nvme.c` — nvme_internal.h의 nvme_complete_request 등 공용 헬퍼 구현
+   - `lib/nvme/nvme_ctrlr.c` — ctrlr 상태머신 구현 (process_init, enable/disable)
+   - `lib/nvme/nvme_ns.c` — namespace identify 및 설정
+
+2. **추가 I/O 경로 트랜스포트** (필요 시):
+   - `lib/nvme/nvme_rdma.c` — RDMA 트랜스포트 (NVMe-oF)
+   - `lib/nvme/nvme_tcp.c` — TCP 트랜스포트 (NVMe-oF)
+   - `lib/nvme/nvme_vfio_user.c` — vfio-user 트랜스포트
 
 2. **부분완료(◐) 파일 마무리**:
    - `include/spdk/bdev.h` (2551) — 아직 ◐. seek_offset, histogram_enable_ext 등 세부 API 잔여
@@ -240,9 +246,23 @@ examples/nvme/*, examples/bdev/*, examples/nvmf/*, examples/sock/*, examples/thr
 
 ## 현재 진행 중 파일
 
-(없음 — lib/nvme/nvme_pcie_common.c 전체 완료)
+(없음 — lib/nvme/nvme_pcie.c 전체 완료)
 
 ## 최근 완료 파일 (역순 최대 30개)
+
+- 2026-04-25 · **lib/nvme/nvme_pcie.c [☑ 완료]** — **★ PCIe 트랜스포트 cold-path 완전 정복 ★**. 원본 1173줄 → 주석 후 1920줄. 파일 상단 4섹션 블록에서 PCIe 5대 책임(probe/BAR/MMIO/SIGBUS/CMB-PMR) + 호출 체인 + SPDK_NVME_TRANSPORT_REGISTER 등록 원리 문서화. 핵심 완료:
+  - **★ SIGBUS 방어** (link loss 시 BAR을 anonymous MAP_FIXED remap + 0xFF 채움, atomic CAS 재진입 방지, g_thread_mmio_ctrlr TLS 마커로 어느 컨트롤러인지 식별)
+  - **★ MMIO 레지스터 R/W** (set/get_reg_4/8 + ASQ/ACQ/AQA/CMB*/PMR* wrappers, all-ones 감지로 link 무효 탐지)
+  - **★ CMB 5종** (CAP.CMBS + CMBSZ SZU/SZ/SQS + CMBLOC BIR/OFST 해석 + BAR mmap + 2MB 정렬 DPDK 등록)
+  - **★ PMR 6종** (CMSS 지원 시 PMRMSCU/L로 CBA 설정 + CBAI 검증 + config_pmr의 PMRTO/PMRTU timeout 대기)
+  - **★★ allocate_bars** (BAR0 mmap + doorbell_base 계산 — nvme_pcie_common.c의 sq_tdbl/cq_hdbl 기반)
+  - **★★ ctrlr_construct** (pci_claim → 구조체 할당 → quirks/NUMA → allocate_bars → PCI CMD 0x404 busmaster+INTx disable → doorbell_stride 계산 → admin qpair → 프로세스 등록 → 최초 시 SIGBUS 핸들러)
+  - **★ ctrlr_scan/pcie_nvme_enum_cb** (DPDK enumerate 경유 primary/secondary 분기 + traddr 필터)
+  - **★ ctrlr_enable** (ASQ/ACQ/AQA 레지스터 세팅)
+  - **★★★ pcie_ops vtable** (42개 함수 포인터 — 이 파일 cold-path + nvme_pcie_common.c hot-path 전체 바인딩)
+  - **★★★ SPDK_NVME_TRANSPORT_REGISTER(pcie, &pcie_ops)** (constructor로 main() 전 자동 등록)
+
+  **이로써 SPDK NVMe 드라이버의 다섯 기둥 완성**: (1)☑ nvme_ns_cmd.c (2)☑ nvme_qpair.c (3)☑ nvme_transport.c (4)☑ nvme_pcie_common.c (5)☑ nvme_pcie.c. 애플리케이션 spdk_nvme_probe()부터 실제 장치 DMA까지 전 여정이 주석만으로 완전 추적 가능.
 
 - 2026-04-24 · **lib/nvme/nvme_pcie_common.c [☑ 완료]** — **★ PCIe hot-path 구현 완전 정복 ★**. 원본 1912줄 → 주석 후 3313줄. 이번 세션에서 잔여 inline 주석 완료: `build_contig_hw_sgl_request`(CONTIG→SGL vtophys 물리 segment 분해 루프), `build_hw_sgl_request`(SGL→SGL 전체 본문 - next_sge_fn/Bit Bucket/merge 최적화/내부 루프), `build_prps_sgl_request`(SGL→PRP 누적 호출 + 페이지 경계 assert 설명). 이전 세션의 핵심부와 합쳐 파일 전체 완결. 파일 상단 4섹션 블록에서 SPDK NVMe의 "1 IOPS가 어떻게 처리되는지" 전 과정 문서화 — **submit: 사용자 API → _nvme_ns_cmd_rw → nvme_qpair_submit_request → nvme_transport_qpair_submit_request → ★ nvme_pcie_qpair_submit_request → tracker 할당 → PRP/SGL 빌드 → ★ submit_tracker → SQ[sq_tail]=SQE + doorbell MMIO write → 장치 fetch**. **complete: 장치가 CQE 기록 + phase 토글 → reactor poller → process_completions → phase bit 검사 → tracker 복원 → complete_tracker → nvme_complete_request → cb_fn**. 핵심 함수 10개 모두 ★★★ 상세 주석: submit_request(5단계 dispatch), process_completions(7단계 + next prefetch + memory barrier), submit_tracker(SSE2 non-temporal SQE copy + doorbell), complete_tracker(retry+multi-process), prp_list_append(PRP1/PRP2/list 3-mode + 4KB 경계), build_metadata(SGL_MPTR_SGL vs CONTIG MPTR), qpair_construct(tracker 풀 레이아웃), connect 체인(Create CQ→SQ 비동기 콜백 + shadow doorbell setup), delete_io_qpair(2단계 Delete SQ→CQ), copy_command(QEMU MMIO + SSE2 hot variants). 잔여: build_hw_sgl_request/build_prps_sgl_request 내부 루프 inline 세부.
 
@@ -310,6 +330,44 @@ examples/nvme/*, examples/bdev/*, examples/nvmf/*, examples/sock/*, examples/thr
 - 2026-04-21 · include/spdk/likely.h
 
 ## 마지막 세션 요약
+
+**2026-04-25 (스물세 번째 파트 — lib/nvme/nvme_pcie.c 완전 완료 ☑)**: PCIe 트랜스포트의 cold-path 구현 파일 완결. 이로써 **SPDK NVMe 드라이버의 다섯 기둥이 모두 ☑ 완결** — 애플리케이션 `spdk_nvme_probe()`부터 장치 DMA 완료 콜백까지의 전 여정이 주석만으로 추적 가능.
+
+핵심 완료:
+- **파일 상단 4섹션 블록**: PCIe cold-path 5대 책임(probe/BAR/MMIO/SIGBUS/CMB-PMR) + probe→attach 호출 체인 + `SPDK_NVME_TRANSPORT_REGISTER` 등록 원리. nvme_pcie_common.c(hot-path)와의 역할 분리 명시.
+
+- **★ SIGBUS 방어 메커니즘** (`nvme_sigbus_fault_sighandler`): PCIe link loss 중 MMIO 접근 → SIGBUS 발생 → 일반 핸들러면 crash. SPDK는 이 핸들러로 **BAR 영역을 anonymous 메모리로 MAP_FIXED remap + 0xFF로 채움** → 후속 MMIO read는 all-ones를 반환하지만 프로세스 생존. `g_thread_mmio_ctrlr` TLS 마커로 어느 컨트롤러가 SIGBUS 냈는지 식별. atomic CAS(`g_signal_lock`)로 재진입 방지.
+
+- **★ MMIO 레지스터 R/W** (set/get_reg_4/8): `spdk_mmio_*` 경유 volatile 접근. all-ones 감지로 link 무효 추정. ASQ/ACQ/AQA/CMBLOC/CMBSZ/PMRCAP/PMRCTL/PMRSTS/PMRMSCL/PMRMSCU 각 레지스터별 wrapper.
+
+- **★ CMB 5종** (map_cmb/unmap_cmb/reserve_cmb/map_io_cmb/unmap_io_cmb): CAP.CMBS 확인 → CMBSZ의 SZU(unit size = 2^(12+4×SZU))/SZ 해석 + CMBLOC의 BIR/OFST 계산 → BAR mmap → 경계 검증. 공개 map_io_cmb는 WDS/RDS 최소 하나 + 4MiB 이상 + 2MB 정렬 후 `spdk_mem_register`로 DPDK 힙에 등록.
+
+- **★ PMR 6종** (map/unmap/config/enable/disable/map_io/unmap_io): CMSS 지원 시 PMRMSCU(상위 32b) + PMRMSCL(하위 32b + CMSE=1) 순서로 CBA 설정 → PMRSTS.CBAI 확인. `config_pmr`의 PMRCTL.EN 토글 + PMRSTS.NRDY 대기 루프 + PMRCAP.PMRTO/PMRTU 기반 timeout (0=500ms 단위, 1=1분 단위).
+
+- **★★ allocate_bars**: BAR0 mmap → `pctrlr->regs` 설정 → `doorbell_base = &regs->doorbell[0].sq_tdbl` 계산(★ 이 포인터가 nvme_pcie_common.c의 qpair_construct가 각 SQ/CQ doorbell 위치 산출의 기반) → CMB/PMR 매핑 시도.
+
+- **★★ ctrlr_construct**: 10단계 시퀀스 — pci_claim → 구조체 할당(SHARE hugepage) → opts/quirks/NUMA → 공통 construct → allocate_bars → PCI CMD 0x404(Bus Master Enable + INTx Disable) → CAP read + doorbell_stride(2^DSTRD dword) → admin qpair 생성 → 프로세스 등록 → 최초 시 SIGBUS 핸들러 등록.
+
+- **★★ ctrlr_scan/pcie_nvme_enum_cb**: DPDK `spdk_pci_enumerate` 경유 — primary는 traddr 필터 + `nvme_ctrlr_probe`, secondary는 primary 구축 컨트롤러에 `nvme_ctrlr_add_process`로 자기 컨텍스트만 추가. interrupt 모드는 secondary 금지.
+
+- **★ ctrlr_enable**: ASQ/ACQ 물리 주소 + AQA(크기 0-based) 설정 — CC.EN=1 이전 preparation (CC.EN 자체는 공통 nvme_ctrlr.c가 처리).
+
+- **★★★ pcie_ops vtable**: 42개 함수 포인터로 `spdk_nvme_transport_ops` 전체 채움. 수명주기 6 + 레지스터 5 + limits 2 + CMB 3 + PMR 4 + qpair 수명주기 4 + qpair hot-path 7 + poll group 10 + name/type 2. 이 파일(cold-path)과 nvme_pcie_common.c(hot-path) 양쪽에 정의된 함수를 모두 연결.
+
+- **★★★ SPDK_NVME_TRANSPORT_REGISTER(pcie, &pcie_ops)**: 파일 맨 아래의 이 한 줄이 존재 이유. `__attribute__((constructor))`로 전개되어 main() 전에 자동 실행 → `spdk_nvme_transport_register(&pcie_ops)` → nvme_transport.c의 `g_spdk_nvme_transports` TAILQ에 PCIe ops 삽입 → 이후 상위 레이어가 `nvme_get_transport("PCIE")`로 조회 가능 → vtable dispatch가 이 파일로 연결.
+
+**결과 — SPDK NVMe 드라이버의 다섯 기둥 모두 완결**:
+  (1) ☑ `lib/nvme/nvme_ns_cmd.c`     — 사용자 API → nvme_request 번역
+  (2) ☑ `lib/nvme/nvme_qpair.c`      — 제출/완료/상태머신 코어
+  (3) ☑ `lib/nvme/nvme_transport.c`  — vtable 디스패치 (multi-process)
+  (4) ☑ `lib/nvme/nvme_pcie_common.c` — doorbell/PRP/MMIO hot-path
+  (5) ☑ `lib/nvme/nvme_pcie.c`       — PCIe attach/BAR/SIGBUS (이번 세션)
+
+이제 **애플리케이션이 `spdk_nvme_probe()` 호출하는 순간부터, DPDK enumerate → pcie_nvme_enum_cb → ctrlr_construct → BAR mmap → admin 큐 준비 → CC.EN=1 → identify → I/O qpair 생성 → `spdk_nvme_ns_cmd_read()` → nvme_request 빌드 → SQ write → doorbell MMIO → 장치 fetch → DMA → CQE 기록 → phase bit polling → cb_fn 실행 → free_tr 반환까지 전 여정**이 주석만으로 완결 추적 가능.
+
+다음 세션은 `lib/nvme/nvme_fabric.c` (NVMe-oF CONNECT/AUTH 공통 로직) 또는 `lib/nvme/nvme_poll_group.c` (transport poll group 상위 추상) 중 선택.
+
+---
 
 **2026-04-24 (스물두 번째 파트 — lib/nvme/nvme_pcie_common.c 잔여 inline 마무리 ☑)**: 이전 세션에서 부분완료(◐)로 남긴 파일을 완결(☑)로 전환. 3개 빌더 함수 본문의 라인별 inline 주석 완료로 파일 전체 주석 충족.
 
