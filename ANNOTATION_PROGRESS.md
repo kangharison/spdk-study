@@ -267,11 +267,36 @@ examples/nvme/*, examples/bdev/*, examples/nvmf/*, examples/sock/*, examples/thr
 
 ## 현재 진행 중 파일
 
-- ◐ **lib/nvme/nvme_ctrlr.c** — 5997 → 6510 → 6778줄. v1 핵심 8종 + v2 qpair 관리 10종 + v3 features/fail 9종 = 27종 보강. 잔여 ~80 함수. 다음 세션 Part 4에서 shutdown/reset/AER 우선 진행.
+- ◐ **lib/nvme/nvme_ctrlr.c** — 5997 → 6510 → 6778 → 7289줄. v1 8종 + v2 qpair 10종 + v3 features/fail 9종 + v4 shutdown chain/enable/state_string 9종 = **36종 보강**. 잔여 ~70 함수. 다음 세션 Part 5에서 reset/disconnect/reconnect/AER 우선 진행.
 
 ## 최근 완료 파일 (역순 최대 30개)
 
-- 2026-04-29 · **lib/nvme/nvme_ctrlr.c [◐ 부분 v3 — Part 3: features/fail 9종]** — 6510줄 → 6778줄 (+268줄). features 비트맵 + fail 진입점 보강:
+- 2026-04-29 · **5차 병렬 agent 4개 작업 동시 실행** — 7개 파일 일괄 완료:
+  - **include/spdk/event.h** (384→851, +467) — agent A. 14함수 + spdk_app_opts 40+ 필드 + spdk_app_parse_args_rvals enum 3값 + 매크로 SPDK_APP_GETOPT_STRING/SPDK_STATIC_ASSERT + typedef 3 + 전방선언 2. **인사이트**: spdk_app_opts 의 4중 ABI 안전장치 (`__attribute__((packed))` + reserved 홀 + caller opts_size + STATIC_ASSERT) 명시.
+  - **include/spdk/init.h** (154→366, +212) — agent A. 8함수 (rpc_initialize/finish/server_finish/pause/resume + subsystem_init/load_config/fini/exists) + typedef 2 + spdk_rpc_opts 3필드.
+  - **include/spdk/scheduler.h** (319→605, +286) — agent A. 9함수 + 4구조체(governor 11멤버, scheduler 7멤버, thread_info 4필드, core_info 9필드, governor_capabilities) + 매크로 3 (REGISTER × 2, MAX_LCORE_FREQS). **인사이트**: 모든 vtable 콜백이 단일 "scheduling reactor" 위에서만 실행되어 내부 동기화 불필요.
+  - **include/spdk/conf.h** (187→448, +261) — agent B. 14함수 + opaque 구조체 4개. **인사이트**: SPDK 18.04 이후 JSON-RPC 로 전환 → INI 파서가 사실상 deprecated 동결 API.
+  - **include/spdk/env_dpdk.h** (103→269, +166) — agent B. 5함수 + 1구조체(6필드). **인사이트**: 외부 앱이 이미 rte_eal_init 호출한 임베드 시나리오용 우회 진입점, post_fini 가 의도적으로 EAL 종료 안 함 (소유권 분리), legacy_mem 플래그가 vfio DMA 매핑 방식 결정.
+  - **lib/thread/thread_internal.h** (104) — agent B 검증. 이미 4섹션 + 모든 필드 멀티라인 + include 전부 주석 완비 상태로 보강 불필요.
+  - **lib/thread/iobuf.c** (916→1510, +594) — agent C. 22함수 + 6구조체 (iobuf_channel_node/channel/module/node/iobuf/get_stats_ctx) 모든 필드 멀티라인 + 매크로 IOBUF_FOREACH_NUMA_ID/SET_FIELD + STAILQ pop/push + spdk_ring + DPDK numa_id 분기 인라인. **★ 핵심 인사이트**: get() hot path = per-thread STAILQ 캐시 hit (락·atomic 없음) → miss 시 IOBUF_BATCH_SIZE 단위로 글로벌 lockless ring 에서 batch dequeue (DPDK Magazine 패턴). 글로벌 풀도 비면 reactor 공유 wait queue 등록 후 NULL. put() 은 wait queue 비면 cache push (cache_size+batch 초과 시만 batch flush, ring 슬롯·캐시라인 효율 목적), 비어있지 않으면 글로벌 ring 우회하고 동일 thread waiter 에 buf 직접 전달. lockless 근거는 모든 함수 진입의 `spdk_io_channel_get_thread(ch->parent) == spdk_get_thread()` assert 로 명시.
+
+- 2026-04-29 · **lib/nvme/nvme_ctrlr.c [◐ 부분 v4 — Part 4: shutdown chain + enable/state_string 9종]** — 6778 → 7289줄 (+511). agent D 병렬. shutdown 비동기 5-step chain 완결:
+  - **★ shutdown 5-step chain**: nvme_ctrlr_shutdown_async → set_cc_done → get_cc_done → poll_async → get_csts_done. 각 콜백 헤더에 직전/직후 함수 도식 명시.
+  - **nvme_ctrlr_shutdown_set_cc_done**: CC.SHN(Shutdown Notification) 비트 set 완료 콜백. 다음=GET_CSTS 단계.
+  - **nvme_ctrlr_shutdown_get_cc_done**: 현 CC 값 read 완료, SHN 비트 mask 후 NORMAL_SHUTDOWN(01b) 또는 ABRUPT_SHUTDOWN(10b) write 결정.
+  - **nvme_ctrlr_shutdown_async**: shutdown chain 시작점. is_disconnecting 검사 → state CHECK_SHUTDOWN.
+  - **nvme_ctrlr_shutdown_get_csts_done**: CSTS.SHST(Shutdown Status) 비트 검사 — 00=Normal, 01=Occurring, 10=Complete. complete 시 chain 종료, 그 외 poll 재진입.
+  - **nvme_ctrlr_shutdown_poll_async**: shutdown 진행 폴링. RTD3E (NVMe §5.15.2.2 Runtime D3 Entry latency) 기반 timeout 계산.
+  - **nvme_ctrlr_get_ready_timeout**: CAP.TO(Timeout) × 500ms 환산.
+  - **nvme_ctrlr_set_cc_en_done**: CC.EN=1 write 완료. 다음=CHECK_EN_DONE.
+  - **★ nvme_ctrlr_enable**: controller bring-up 의 enable 단계. CAP.MQES/CSS 검증 + CC.IOSQES/IOCQES/AMS/SHN/CSS 비트필드 빌드 + AB(Arbitration Burst)/MPS(Memory Page Size)/EN 통합 → 비동기 write.
+  - **nvme_ctrlr_state_string**: enum nvme_ctrlr_state → 사람용 문자열 매핑 테이블 (~80개 case).
+
+  **NVMe Spec 인용**: §7.6.2(Shutdown Processing), §3.1.5(CC), §3.1.6(CSTS), §3.1.1(CAP), §5.15.2.2(RTD3E), §7.3(Reset). CC.SHN/EN, CSTS.SHST 비트 의미를 spec 값과 함께 명시.
+
+  **누적 — nvme_ctrlr.c 36종 보강**: v1 핵심 8종 + v2 qpair 10종 + v3 features/fail 9종 + v4 shutdown/enable/state_string 9종. **잔여 ~70 함수** (다음 세션 Part 5): set_state/set_state_quiet, free_zns/iocs/doorbell_buffer, set_doorbell_buffer_config_done/cfg, abort_queued_aborts, ★ disconnect/disconnect_done, ★ reconnect_async/reinitialize_io_qpair/reconnect_poll_async, disable/disable_poll, fail_io_qpairs, **★ spdk_nvme_ctrlr_reset/reset_subsystem (사용자 reset API)**, set_trid/set_remove_cb, AER 처리 일습.
+
+- 2026-04-29 · **4차 병렬 agent 7개 파일 일괄 완료** — 6510줄 → 6778줄 (+268줄). features 비트맵 + fail 진입점 보강:
   - **nvme_ctrlr_set_supported_log_pages**: log_page_supported[] 비트맵 결정. mandatory 3종(Error/Health/Firmware Slot) + LPA.cses(Command Effects) + CMIC.anars(ANA, 옵션이면 즉시 read+parse) + ctratt.fdps(FDP 4종) + Intel/PCIe 분기로 SET_SUPPORTED_INTEL_LOG_PAGES 또는 직접 SET_SUPPORTED_FEATURES 로 전이.
   - **nvme_ctrlr_set_intel_supported_features**: Intel vendor FID 7종 (MAX_LBA C1h / NATIVE_MAX_LBA C2h / POWER_GOVERNOR C6h / SMBUS C8h / LED C7h / TIMED_WORKLOAD D5h / LATENCY_TRACKING E2h) 비트맵만 활성화 (실제 admin 명령 발행 안 함).
   - **★ nvme_ctrlr_set_arbitration_feature**: 실제 Set Features (FID=01h) admin 발행. AB(3-bit) + WRR HPW/MPW/LPW 가중치 cdw11 비트필드 빌드 + completion poll 동기 대기. AB=0 / >7 / WRR 미지원 분기 처리.

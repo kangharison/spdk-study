@@ -1927,20 +1927,69 @@ spdk_nvme_ctrlr_fail(struct spdk_nvme_ctrlr *ctrlr)
 	nvme_ctrlr_unlock(ctrlr);                                          /* [한국어] lock 해제 */
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_shutdown_set_cc_done - shutdown 시퀀스에서 CC 레지스터 쓰기 완료 콜백
+ *
+ * @_ctx:  nvme_ctrlr_detach_ctx (shutdown 진행 상태를 담은 컨텍스트)
+ * @value: 방금 쓴 CC 레지스터 값 (참고용 — shutdown 본 콜백은 사용 안 함)
+ * @cpl:   admin write 명령의 NVMe completion (성공/실패 sct/sc 포함)
+ *
+ * 동기/배경:
+ *   shutdown chain 의 4단계 비동기 콜백 체인 중 1번째 완료 시점에 호출된다.
+ *   체인 흐름:
+ *     nvme_ctrlr_shutdown_async() → CC read 발행
+ *       → nvme_ctrlr_shutdown_get_cc_done() (CC read 완료 → SHN/EN 비트 갱신 후 CC write 발행)
+ *         → nvme_ctrlr_shutdown_set_cc_done() (CC write 완료 → CSTS 폴링 준비) ← 본 함수
+ *           → nvme_ctrlr_shutdown_poll_async() (CSTS read 반복 → SHST=Complete 대기)
+ *             → nvme_ctrlr_shutdown_get_csts_done() (CSTS read 완료 → 다시 poll 평가)
+ *
+ *   NVMe Spec 1.x §7.6.2 Shutdown Processing:
+ *     CC.SHN(Shutdown Notification) = 01b (Normal) or 10b (Abrupt) 쓰기 후
+ *     컨트롤러가 메타데이터/캐시를 안전하게 NVM에 flush 하고 CSTS.SHST = 10b(Complete)로 표기.
+ *   즉 이 함수는 "SHN 비트가 디바이스에 기록되었다"는 사실만 보장하며, 실제 shutdown 완료는
+ *   다음 단계(CSTS 폴링)에서 확인한다.
+ *
+ * 동작 단계:
+ *   [1] CPL 에러 검사 — write 자체 실패 시 즉시 shutdown_complete=true 로 종료(정리는 caller 가 수행).
+ *   [2] no_shn_notification 옵션 분기 — 사용자가 SHN 통지를 끈 경우(테스트/특정 quirk),
+ *       SHN 대신 EN=0 만 쓰는 경로이므로 CSTS 폴링 불필요 → 즉시 완료 마킹.
+ *   [3] RTD3E(NVMe Spec §5.15.2.2 Identify Controller, RTD3 Entry Latency) 기반 shutdown timeout 계산.
+ *       RTD3E 단위는 µs 이므로 ms 로 변환 (CEIL_DIV 1000), 최소 10초(10000ms) 강제.
+ *   [4] shutdown_start_tsc 기록 + state = CHECK_CSTS — poll_async 가 다음 진입 시 CSTS read 시작.
+ *
+ * 실행 컨텍스트:
+ *   admin qpair completion 처리 스레드(보통 management thread). spdk_nvme_qpair_process_completions()
+ *   콜 스택에서 동기적으로 호출됨. ctrlr lock 은 caller(nvme_ctrlr_shutdown_poll_async 와 동일 컨텍스트)
+ *   가 보유하고 있다고 가정 — 본 콜백은 별도 lock 획득 안 함.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_set_cc_async (admin write 발행) → admin completion → 본 콜백
+ */
 static void
 nvme_ctrlr_shutdown_set_cc_done(void *_ctx, uint64_t value, const struct spdk_nvme_cpl *cpl)
 {
 	struct nvme_ctrlr_detach_ctx *ctx = _ctx;
+	/* [한국어] void* → 실제 detach 컨텍스트로 캐스팅 — async helper 의 cb_arg 타입 규약. */
 	struct spdk_nvme_ctrlr *ctrlr = ctx->ctrlr;
+	/* [한국어] 로깅·옵션 조회용으로 ctrlr 포인터 추출 (편의 변수). */
 
 	if (spdk_nvme_cpl_is_error(cpl)) {
+		/* [한국어] CPL 의 sct/sc 필드 검사 — admin write 가 실패했는지(SC ≠ Success). */
 		NVME_CTRLR_ERRLOG(ctrlr, "Failed to write CC.SHN\n");
+		/* [한국어] 사용자/운영자 진단용 — CC 레지스터 write 실패는 디바이스 상태 이상 신호. */
 		ctx->shutdown_complete = true;
+		/* [한국어] 더 진행해도 의미 없음 → 즉시 완료 마킹하여 상위 poll loop 종료 유도.
+		 *         caller 가 이후 detach 정리 경로로 진입한다. */
 		return;
 	}
 
 	if (ctrlr->opts.no_shn_notification) {
+		/* [한국어] 사용자 옵션: SHN 통지 없이 단순히 CC.EN=0 만으로 디바이스 비활성화.
+		 *         (일부 가상 디바이스/테스트 환경에서 SHN 처리가 부정확한 경우 우회.)
+		 *         이 경로에서는 get_cc_done 이 EN=0 을 직접 썼으므로 CSTS 폴링이 불필요. */
 		ctx->shutdown_complete = true;
+		/* [한국어] EN=0 write 가 성공했으므로 shutdown 절차는 끝. */
 		return;
 	}
 
@@ -1952,51 +2001,160 @@ nvme_ctrlr_shutdown_set_cc_done(void *_ctx, uint64_t value, const struct spdk_nv
 	 *  10 seconds as a reasonable amount of time to
 	 *  wait before proceeding.
 	 */
+	/* [한국어] NVMe Spec §5.15.2.2 Identify Controller — RTD3E(Runtime D3 Entry Latency, µs)는
+	 *         호스트가 SHN=1 을 쓴 시점부터 컨트롤러가 SHST=10b(Complete) 로 표기할 때까지의
+	 *         최대 예상 시간이다. 0 또는 너무 작은 값을 보고하는 디바이스는 보수적으로 10s 사용. */
 	NVME_CTRLR_DEBUGLOG(ctrlr, "RTD3E = %" PRIu32 " us\n", ctrlr->cdata.rtd3e);
+	/* [한국어] 디바이스가 광고한 RTD3E(µs) 디버그 출력 — 진단/튜닝 참고. */
 	ctx->shutdown_timeout_ms = SPDK_CEIL_DIV(ctrlr->cdata.rtd3e, 1000);
+	/* [한국어] µs → ms 올림 변환. CEIL_DIV 사용 이유: rtd3e 가 1000 미만이면 0 ms 가 되어 timeout 즉시 만료
+	 *         하는 버그를 방지하기 위함. */
 	ctx->shutdown_timeout_ms = spdk_max(ctx->shutdown_timeout_ms, 10000);
+	/* [한국어] 최소 10초(10000ms) 보장 — 디바이스 보고치가 비현실적으로 작은 경우 대비. */
 	NVME_CTRLR_DEBUGLOG(ctrlr, "shutdown timeout = %" PRIu32 " ms\n", ctx->shutdown_timeout_ms);
+	/* [한국어] 최종 적용된 timeout 값을 로깅 — 이후 poll_async 가 ms_waited 와 비교. */
 
 	ctx->shutdown_start_tsc = spdk_get_ticks();
+	/* [한국어] 폴링 시작 기준 시각(TSC tick) 저장. poll_async 에서
+	 *         ms_waited = (now - start) * 1000 / hz 로 경과 시간 계산. */
 	ctx->state = NVME_CTRLR_DETACH_CHECK_CSTS;
+	/* [한국어] 상태 머신 전이: SET_CC → CHECK_CSTS.
+	 *         다음 poll_async 호출 시 CSTS read 를 발행하는 분기로 진입. */
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_shutdown_get_cc_done - shutdown chain 의 CC 레지스터 read 완료 콜백 (RMW 의 R 단계)
+ *
+ * @_ctx:  nvme_ctrlr_detach_ctx
+ * @value: 방금 읽은 CC 레지스터 32-bit 값 (uint64_t 컨테이너에 담겨 전달됨)
+ * @cpl:   admin Get Property/MMIO read 결과 CPL
+ *
+ * 동기/배경:
+ *   shutdown chain 의 두 번째 단계. CC 레지스터를 RMW(Read-Modify-Write) 하기 위해
+ *   먼저 read 가 필요하다. 이유:
+ *     1) CC 의 다른 비트 (CSS, MPS, IOSQES, IOCQES, AMS 등)를 보존해야 한다.
+ *        SHN 만 1 로 세팅하고 나머지를 0 으로 덮어쓰면 컨트롤러 동작이 망가진다.
+ *     2) no_shn_notification 옵션 분기 시 EN 비트 현재 값(이미 0인지)도 확인해야 한다.
+ *
+ *   NVMe Spec 1.x §3.1.5 Controller Configuration (CC):
+ *     - bit 4 (EN):    Enable — 1 = 컨트롤러 활성, 0 = 비활성/리셋
+ *     - bits 14:13(SHN): Shutdown Notification — 00=No, 01=Normal, 10=Abrupt
+ *     - 기타: CSS, MPS, AMS, IOSQES, IOCQES (보존 대상)
+ *
+ * 동작 단계:
+ *   [1] CPL 에러면 shutdown_complete=true 로 즉시 종료.
+ *   [2] value(64-bit MMIO read 컨테이너) 의 하위 32-bit 를 cc 로 캐스팅 + assert 로 상위 0 확인.
+ *   [3] no_shn_notification 분기:
+ *         - EN==0 이면 이미 비활성화 상태 → 추가 작업 없이 완료.
+ *         - EN==1 이면 EN=0 으로 RMW (controller reset 효과).
+ *       기본 분기:
+ *         - SHN = SPDK_NVME_SHN_NORMAL (=01b) — 정상 shutdown 통지.
+ *   [4] nvme_ctrlr_set_cc_async 로 write 발행. 실패 시 즉시 종료 마킹.
+ *
+ * 실행 컨텍스트:
+ *   admin completion 처리 컨텍스트(get_cc_async 의 콜백). 본 함수는 set_cc_done 처럼
+ *   별도 lock 을 잡지 않고 ctx 만 갱신.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_get_cc_async (read 발행) → admin completion → 본 콜백
+ *     → nvme_ctrlr_set_cc_async (write 발행, cb=set_cc_done)
+ */
 static void
 nvme_ctrlr_shutdown_get_cc_done(void *_ctx, uint64_t value, const struct spdk_nvme_cpl *cpl)
 {
 	struct nvme_ctrlr_detach_ctx *ctx = _ctx;
+	/* [한국어] cb_arg 복원 — chain 전반에서 ctx 가 진행 상태 보관. */
 	struct spdk_nvme_ctrlr *ctrlr = ctx->ctrlr;
+	/* [한국어] 편의 변수 — async helper 호출과 로깅에 사용. */
 	union spdk_nvme_cc_register cc;
+	/* [한국어] CC 레지스터 비트필드 union — raw 32bit 와 .bits.{en, shn, css, ...} 양방향 접근. */
 	int rc;
 
 	if (spdk_nvme_cpl_is_error(cpl)) {
+		/* [한국어] read 자체가 실패했는지 확인 — 실패면 RMW 진행 불가. */
 		NVME_CTRLR_ERRLOG(ctrlr, "Failed to read the CC register\n");
 		ctx->shutdown_complete = true;
+		/* [한국어] 폴링 루프 빠져나가도록 마킹 — caller 가 후속 정리. */
 		return;
 	}
 
 	assert(value <= UINT32_MAX);
+	/* [한국어] CC 는 32-bit 레지스터인데 async helper 는 64-bit 컨테이너를 사용 →
+	 *         상위 32bit 가 0 임을 디버그 빌드에서 확인. */
 	cc.raw = (uint32_t)value;
+	/* [한국어] 32bit 값 그대로 union 에 적재 → bits 필드를 통해 EN/SHN/CSS 등 추출 가능. */
 
 	if (ctrlr->opts.no_shn_notification) {
+		/* [한국어] 옵션 분기: SHN 통지 생략 모드. */
 		NVME_CTRLR_INFOLOG(ctrlr, "Disable SSD without shutdown notification\n");
+		/* [한국어] 운영자에게 알리는 INFO 레벨 메시지 — 비표준 종료 경로 사용 중. */
 		if (cc.bits.en == 0) {
+			/* [한국어] EN 비트(NVMe §3.1.5)가 이미 0 — 컨트롤러가 이미 비활성 상태.
+			 *         추가 write 불필요 → 즉시 완료 마킹. */
 			ctx->shutdown_complete = true;
 			return;
 		}
 
 		cc.bits.en = 0;
+		/* [한국어] EN 비트만 1→0 으로 클리어. 다른 비트는 보존(RMW).
+		 *         이는 controller reset 의 시작 신호 — 디바이스가 in-flight I/O 정리. */
 	} else {
 		cc.bits.shn = SPDK_NVME_SHN_NORMAL;
+		/* [한국어] SHN(Shutdown Notification) = 01b (Normal Shutdown).
+		 *         NVMe Spec §3.1.5: Normal 은 컨트롤러가 모든 outstanding 명령을 완료하고
+		 *         캐시·메타데이터를 NVM 에 안전하게 flush 하도록 요청. (Abrupt=10b 와 대비.) */
 	}
 
 	rc = nvme_ctrlr_set_cc_async(ctrlr, cc.raw, nvme_ctrlr_shutdown_set_cc_done, ctx);
+	/* [한국어] RMW 의 W 단계: 수정된 cc.raw 를 admin Set Property/MMIO write 로 발행.
+	 *         완료 시 set_cc_done 콜백이 호출되어 chain 다음 단계(CSTS 폴링 준비)로 진입. */
 	if (rc != 0) {
+		/* [한국어] write 발행 자체가 실패 (admin queue full, allocation 실패 등). */
 		NVME_CTRLR_ERRLOG(ctrlr, "Failed to write CC.SHN\n");
 		ctx->shutdown_complete = true;
+		/* [한국어] 폴링 루프 종료 신호. */
 	}
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_shutdown_async - controller shutdown 비동기 시퀀스의 진입점
+ *
+ * @ctrlr: shutdown 시킬 컨트롤러
+ * @ctx:   shutdown 진행 상태를 담을 detach 컨텍스트 (caller 가 stack/heap 으로 할당)
+ *
+ * 동기/배경:
+ *   spdk_nvme_detach_async / spdk_nvme_ctrlr_disable / 정상 종료 경로에서 호출되어
+ *   NVMe Spec §7.6.2 의 "Shutdown Processing" 시퀀스를 시작한다. 본 함수는 첫 번째 admin
+ *   register read 를 발행하기만 하고 즉시 return — 실제 shutdown 진행은
+ *   poll_async / 콜백 chain 에서 비동기로 진행된다.
+ *
+ *   중요: 본 함수가 return 한 시점에 shutdown 은 *시작* 된 것이지 완료된 것이 아니다.
+ *         caller 는 ctx->shutdown_complete 가 true 가 될 때까지 nvme_ctrlr_shutdown_poll_async()
+ *         를 반복 호출해야 한다 (또는 동기 wrapper 인 nvme_ctrlr_shutdown_poll_blocking).
+ *
+ * 동작 단계:
+ *   [1] hot-removal 검사 — 디바이스가 PCIe 핫 언플러그된 경우, MMIO 가 모두 invalid 한 상태.
+ *       shutdown 명령 시도해도 의미 없으므로 즉시 완료 마킹.
+ *   [2] adminq 상태 검사 — adminq 가 NULL 이거나 transport 가 failure 상태면 admin 명령
+ *       발행 불가 → 즉시 완료 마킹 (graceful fail).
+ *   [3] state = SET_CC 로 초기화 (chain 의 첫 번째 단계 — get_cc_async 응답 대기).
+ *   [4] get_cc 발행 → 응답 시 shutdown_get_cc_done 호출되어 RMW 진행.
+ *
+ * 실행 컨텍스트:
+ *   detach API 호출자 스레드. ctrlr lock 은 caller(nvme_ctrlr_destruct/detach 경로) 에서
+ *   이미 획득했다고 가정 — 본 함수는 별도 lock 작업 없음.
+ *
+ * 호출 체인:
+ *   spdk_nvme_detach_async / nvme_ctrlr_destruct_async →
+ *     nvme_ctrlr_shutdown_async (본 함수) →
+ *       nvme_ctrlr_get_cc_async →
+ *         (admin completion) nvme_ctrlr_shutdown_get_cc_done →
+ *           nvme_ctrlr_set_cc_async →
+ *             (admin completion) nvme_ctrlr_shutdown_set_cc_done →
+ *               (poll loop) nvme_ctrlr_shutdown_poll_async ↔ nvme_ctrlr_shutdown_get_csts_done
+ */
 static void
 nvme_ctrlr_shutdown_async(struct spdk_nvme_ctrlr *ctrlr,
 			  struct nvme_ctrlr_detach_ctx *ctx)
@@ -2004,140 +2162,400 @@ nvme_ctrlr_shutdown_async(struct spdk_nvme_ctrlr *ctrlr,
 	int rc;
 
 	if (ctrlr->is_removed) {
+		/* [한국어] 디바이스가 PCIe 슬롯에서 물리적으로 제거됨(hotplug remove)
+		 *         또는 transport 가 영구 실패로 표기 — MMIO/admin 모두 무의미. */
 		ctx->shutdown_complete = true;
+		/* [한국어] shutdown 시도 skip 하고 즉시 완료 처리 — caller 는 cleanup 으로 진행. */
 		return;
 	}
 
 	if (ctrlr->adminq == NULL ||
 	    ctrlr->adminq->transport_failure_reason != SPDK_NVME_QPAIR_FAILURE_NONE) {
+		/* [한국어] adminq 가 아예 생성 안 됐거나(초기화 실패) transport 레벨 실패 마킹된 경우.
+		 *         (transport_failure_reason 값:
+		 *           SPDK_NVME_QPAIR_FAILURE_NONE = 정상,
+		 *           NVME_QPAIR_FAILURE_LOCAL/REMOTE/UNKNOWN = 각각 호스트/타깃/원인불명 실패) */
 		NVME_CTRLR_INFOLOG(ctrlr, "Adminq is not connected.\n");
+		/* [한국어] INFO 레벨 — 정상 종료 시퀀스 중에도 발생 가능 (이미 disconnect 된 reset 후 등). */
 		ctx->shutdown_complete = true;
+		/* [한국어] admin 명령 발행 불가 → graceful 한 폴링 종료. */
 		return;
 	}
 
 	ctx->state = NVME_CTRLR_DETACH_SET_CC;
+	/* [한국어] state machine 초기 상태 = SET_CC (이름은 "CC 쓰기 대기" 의미).
+	 *         poll_async 의 switch 에서 NVME_CTRLR_DETACH_SET_CC 분기는 "register op 진행 중"
+	 *         으로 해석되어 -EAGAIN 으로 polling 계속. */
 	rc = nvme_ctrlr_get_cc_async(ctrlr, nvme_ctrlr_shutdown_get_cc_done, ctx);
+	/* [한국어] CC read 비동기 발행 — completion 시 get_cc_done 콜백이 RMW 의 R→M→W 단계 진행. */
 	if (rc != 0) {
+		/* [한국어] admin 큐 자원 부족·할당 실패 — chain 시작 자체가 실패. */
 		NVME_CTRLR_ERRLOG(ctrlr, "Failed to read the CC register\n");
 		ctx->shutdown_complete = true;
+		/* [한국어] 폴링 루프 종료 신호 → caller 가 cleanup. */
 	}
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_shutdown_get_csts_done - shutdown chain 의 CSTS read 완료 콜백
+ *
+ * @_ctx:  nvme_ctrlr_detach_ctx
+ * @value: 방금 읽은 CSTS(Controller Status) 32-bit 값
+ * @cpl:   admin/MMIO read 결과 CPL
+ *
+ * 동기/배경:
+ *   shutdown chain 의 마지막 폴링 단계. SHN write 후 컨트롤러가 SHST(Shutdown Status)
+ *   필드를 SPDK_NVME_SHST_COMPLETE(=10b) 로 갱신할 때까지 CSTS 를 주기적으로 read 한다.
+ *   본 함수는 한 번의 CSTS read 가 끝났을 때 호출되며, 결과를 ctx->csts 에 저장하고
+ *   상태 머신을 GET_CSTS_DONE 으로 전이시킨다. 실제 SHST 비트 검사는
+ *   다음 poll_async 호출에서 수행된다 (read 콜백과 평가 로직 분리 패턴).
+ *
+ *   NVMe Spec 1.x §3.1.6 Controller Status (CSTS):
+ *     - bit 0    (RDY):      Ready
+ *     - bit 1    (CFS):      Controller Fatal Status
+ *     - bits 3:2 (SHST):     Shutdown Status — 00=Normal, 01=Occurring, 10=Complete
+ *     - bit 4    (NSSRO):    NVM Subsystem Reset Occurred
+ *     - bit 5    (PP):       Processing Paused
+ *
+ * 동작 단계:
+ *   [1] CPL 에러 검사 — read 실패면 즉시 완료 마킹 후 종료.
+ *   [2] 32-bit assert + raw 저장 (CC 와 동일한 패턴).
+ *   [3] state = GET_CSTS_DONE — poll_async 가 다음 진입 시 CSTS 평가 분기로 진입.
+ *
+ * 실행 컨텍스트:
+ *   admin completion 처리 컨텍스트. lock 추가 획득 없음.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_shutdown_poll_async (CHECK_CSTS 분기) →
+ *     nvme_ctrlr_get_csts_async →
+ *       (admin completion) 본 콜백 →
+ *         (다음 poll_async 호출) GET_CSTS_DONE 분기에서 SHST 평가
+ */
 static void
 nvme_ctrlr_shutdown_get_csts_done(void *_ctx, uint64_t value, const struct spdk_nvme_cpl *cpl)
 {
 	struct nvme_ctrlr_detach_ctx *ctx = _ctx;
+	/* [한국어] cb_arg 복원 — chain 내 다른 콜백과 동일 패턴. */
 
 	if (spdk_nvme_cpl_is_error(cpl)) {
+		/* [한국어] CSTS read 실패 — admin queue/transport 문제 가능성. */
 		NVME_CTRLR_ERRLOG(ctx->ctrlr, "Failed to read the CSTS register\n");
 		ctx->shutdown_complete = true;
+		/* [한국어] 더 이상 폴링 의미 없음 → 종료 마킹. */
 		return;
 	}
 
 	assert(value <= UINT32_MAX);
+	/* [한국어] CSTS 도 32-bit 레지스터 — 64-bit 컨테이너의 상위는 0 이어야 함. */
 	ctx->csts.raw = (uint32_t)value;
+	/* [한국어] raw 저장 → poll_async 가 다음 호출 시 csts.bits.shst 등을 평가. */
 	ctx->state = NVME_CTRLR_DETACH_GET_CSTS_DONE;
+	/* [한국어] 상태 전이: GET_CSTS(read 발행 후 대기) → GET_CSTS_DONE.
+	 *         poll_async switch 에서 GET_CSTS_DONE 분기는 SHST 평가 로직으로 fall-through. */
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_shutdown_poll_async - shutdown 진행 상태를 한 번 평가/진행 (반복 호출 대상)
+ *
+ * @ctrlr: shutdown 중인 컨트롤러
+ * @ctx:   shutdown_async 가 초기화한 detach 컨텍스트
+ * @return:
+ *   - 0       : shutdown 완료 (성공 또는 timeout 으로 강제 종료) — caller 가 cleanup 진행 가능
+ *   - -EAGAIN : 아직 진행 중 — caller 는 일정 간격 후 다시 호출해야 함
+ *   - -EIO    : CSTS read 발행 실패 (admin 자원 문제)
+ *   - -EINVAL : 알 수 없는 state (defensive)
+ *
+ * 동기/배경:
+ *   shutdown chain 의 CSTS 폴링 루프 본체. shutdown_async 가 SET_CC →(콜백)→ CHECK_CSTS 까지
+ *   상태를 진전시킨 후, caller 가 본 함수를 -EAGAIN 이 아닐 때까지 반복 호출한다.
+ *
+ *   본 함수의 역할은 두 가지로 명확히 분리된다:
+ *     (A) state machine 진행: 직전 CSTS 결과가 도착했는지 확인하고, 필요시 다음 read 발행.
+ *     (B) timeout 평가: ms_waited 와 shutdown_timeout_ms 비교.
+ *
+ * 동작 단계 (state 별):
+ *   - SET_CC / GET_CSTS:
+ *       이전 register operation 의 완료를 기다리는 중. process_completions 호출하여
+ *       admin CQ 폴링 → -EAGAIN 반환. 콜백이 호출되면 state 가 다른 값으로 전이됨.
+ *   - CHECK_CSTS:
+ *       state = GET_CSTS 로 변경 후 새로운 CSTS read 발행.
+ *       (shutdown_async 직후 set_cc_done 콜백이 CHECK_CSTS 로 세팅한 경우 진입.)
+ *   - GET_CSTS_DONE:
+ *       방금 도착한 csts 결과를 break 후 평가 단계로 fall-through.
+ *       state = CHECK_CSTS 로 되돌려서 timeout 미달 시 다음 read 발행 가능.
+ *   - default: assert (불가능한 상태).
+ *
+ *   평가 단계 (GET_CSTS_DONE 통과 후):
+ *     [1] ms_waited 계산 — TSC tick 차이를 ms 로 변환.
+ *     [2] csts.bits.shst == SHST_COMPLETE(=10b) 면 정상 종료 → return 0.
+ *     [3] timeout 미만이면 -EAGAIN 으로 폴링 계속 (다음 호출에서 CHECK_CSTS 분기 진입).
+ *     [4] timeout 초과면 ERRLOG + return 0 (강제 종료 — caller 가 후속 정리 진행).
+ *
+ * 실행 컨텍스트:
+ *   detach 폴링 컨텍스트(보통 management thread). admin queue process_completions 호출하므로
+ *   adminq 에 대한 single-thread 접근 불변량 유지가 필요 (호출자가 보장).
+ *
+ * 호출 체인:
+ *   spdk_nvme_detach_async / spdk_nvme_detach_poll →
+ *     nvme_ctrlr_shutdown_poll_async (본 함수) →
+ *       (CHECK_CSTS) nvme_ctrlr_get_csts_async →
+ *         (completion) nvme_ctrlr_shutdown_get_csts_done →
+ *           (다음 호출) state=GET_CSTS_DONE 진입 → SHST 평가
+ */
 static int
 nvme_ctrlr_shutdown_poll_async(struct spdk_nvme_ctrlr *ctrlr,
 			       struct nvme_ctrlr_detach_ctx *ctx)
 {
 	union spdk_nvme_csts_register	csts;
+	/* [한국어] CSTS 비트필드 union — .bits.shst, .bits.rdy 등으로 디코드. */
 	uint32_t			ms_waited;
+	/* [한국어] shutdown_start_tsc 부터 현재까지 경과 ms — timeout 비교용. */
 
 	switch (ctx->state) {
 	case NVME_CTRLR_DETACH_SET_CC:
 	case NVME_CTRLR_DETACH_GET_CSTS:
 		/* We're still waiting for the register operation to complete */
+		/* [한국어] 두 상태 모두 "register 비동기 op 발행 후 콜백 대기 중" 의미.
+		 *         - SET_CC:   shutdown_async 시작 직후 ~ get_cc_done 까지 / get_cc_done 후
+		 *                     set_cc_async 발행 후 set_cc_done 까지 (이 사이 구간 모두 SET_CC).
+		 *         - GET_CSTS: get_csts_async 발행 후 get_csts_done 까지. */
 		spdk_nvme_qpair_process_completions(ctrlr->adminq, 0);
+		/* [한국어] admin CQ 를 한 번 폴링 — pending CPL 이 있으면 해당 콜백 실행 →
+		 *         state 가 GET_CSTS_DONE / CHECK_CSTS 등으로 전이될 수 있음.
+		 *         max_completions=0 → 모든 가용 completion 처리. */
 		return -EAGAIN;
+		/* [한국어] 아직 진행 중 — caller 는 다시 호출해야 함. */
 
 	case NVME_CTRLR_DETACH_CHECK_CSTS:
+		/* [한국어] "이제 새 CSTS read 를 발행할 차례" 상태.
+		 *         set_cc_done 직후 또는 GET_CSTS_DONE 평가에서 timeout 미달 시 진입. */
 		ctx->state = NVME_CTRLR_DETACH_GET_CSTS;
+		/* [한국어] 즉시 GET_CSTS 로 전이 — 콜백 도착 전까지 SET_CC/GET_CSTS 분기에서 폴링. */
 		if (nvme_ctrlr_get_csts_async(ctrlr, nvme_ctrlr_shutdown_get_csts_done, ctx)) {
+			/* [한국어] CSTS read 비동기 발행 실패 — admin queue 자원 부족 등.
+			 *         이 경우 state 는 GET_CSTS 로 남지만 콜백 호출이 없으므로 리턴값으로 종료 신호. */
 			NVME_CTRLR_ERRLOG(ctrlr, "Failed to read the CSTS register\n");
 			return -EIO;
 		}
 		return -EAGAIN;
+		/* [한국어] read 발행 성공 — 콜백 도착까지 폴링 계속. */
 
 	case NVME_CTRLR_DETACH_GET_CSTS_DONE:
+		/* [한국어] CSTS read 콜백이 raw 값을 ctx->csts 에 저장한 직후 진입.
+		 *         이번 호출에서 SHST 평가 후, timeout 미달이면 다시 read 발행 가능하도록
+		 *         CHECK_CSTS 로 reset. */
 		ctx->state = NVME_CTRLR_DETACH_CHECK_CSTS;
 		break;
+		/* [한국어] switch 탈출 → 아래 평가 로직으로 fall-through. */
 
 	default:
 		assert(0 && "Should never happen");
+		/* [한국어] state 머신 외 값 — 메모리 손상 또는 enum 변경 미반영 의심. */
 		return -EINVAL;
 	}
 
 	ms_waited = (spdk_get_ticks() - ctx->shutdown_start_tsc) * 1000 / spdk_get_ticks_hz();
+	/* [한국어] 경과 시간 ms 계산: tick_diff × 1000 / ticks_per_sec.
+	 *         start_tsc 는 set_cc_done 에서 SHN write 성공 직후 기록됨. */
 	csts.raw = ctx->csts.raw;
+	/* [한국어] 콜백이 저장한 마지막 CSTS raw 값을 union 에 적재 — bits 필드 디코드용. */
 
 	if (csts.bits.shst == SPDK_NVME_SHST_COMPLETE) {
+		/* [한국어] SHST(Shutdown Status, NVMe §3.1.6 bits 3:2) = 10b (Complete).
+		 *         컨트롤러가 메타/캐시 flush 완료 → 안전하게 disconnect 가능. */
 		NVME_CTRLR_DEBUGLOG(ctrlr, "shutdown complete in %u milliseconds\n", ms_waited);
+		/* [한국어] 디버그 로깅 — 실제 소요 ms 기록 (RTD3E 와 비교 가능). */
 		return 0;
+		/* [한국어] 정상 종료 — caller 는 더 이상 폴링하지 않음. */
 	}
 
 	if (ms_waited < ctx->shutdown_timeout_ms) {
+		/* [한국어] 아직 RTD3E 기반 timeout 안 지남 — 폴링 계속.
+		 *         다음 호출에서 CHECK_CSTS 분기로 진입해 새 CSTS read 발행. */
 		return -EAGAIN;
 	}
 
 	NVME_CTRLR_ERRLOG(ctrlr, "did not shutdown within %u milliseconds\n",
 			  ctx->shutdown_timeout_ms);
+	/* [한국어] timeout 초과 — 디바이스가 SHST=Complete 보고 안 함.
+	 *         이 경우 강제로 진행 (return 0). caller 가 hot-remove 또는 fail 경로 처리. */
 	if (ctrlr->quirks & NVME_QUIRK_SHST_COMPLETE) {
+		/* [한국어] 알려진 quirk: VMware 가상 NVMe SSD 는 SHST=Complete 표기를 누락하는 경우가 있음.
+		 *         operator 가 진단 시 혼란 줄이기 위한 힌트 메시지. */
 		NVME_CTRLR_ERRLOG(ctrlr, "likely due to shutdown handling in the VMWare emulated NVMe SSD\n");
 	}
 
 	return 0;
+	/* [한국어] timeout 이지만 caller 가 cleanup 으로 진행하도록 0 반환 (성공으로 간주). */
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_get_ready_timeout - CAP.TO 필드로부터 enable/disable ready timeout(ms) 계산
+ *
+ * @ctrlr: 컨트롤러
+ * @return: ready timeout (ms) — CSTS.RDY 비트가 기대 값으로 바뀌기까지 호스트가 기다려야 할 최대 시간
+ *
+ * 동기/배경:
+ *   NVMe Spec 1.x §3.1.1 Controller Capabilities (CAP) — bits 31:24 (TO, Timeout):
+ *     "Worst case time that host shall wait for CSTS.RDY to transition from 0 to 1
+ *      after CC.EN transitions from 0 to 1, or from 1 to 0 after CC.EN 1→0."
+ *     단위는 500ms 이다 (즉 CAP.TO * 500ms).
+ *
+ *   이 timeout 은 enable_async / disable_async chain 에서 ENABLE_WAIT_FOR_READY_1 /
+ *   DISABLE_WAIT_FOR_READY_0 상태의 state_timeout_tsc 로 사용된다 — 초과 시 process_init 에서
+ *   에러 처리.
+ *
+ * 동작: ctrlr->cap (READ_CAP 단계에서 한 번 읽어 캐시) 의 TO 비트필드에 500 곱셈만 수행.
+ * 실행 컨텍스트: 모든 컨텍스트 (단순 산술, lock 불필요).
+ * 호출처: nvme_ctrlr_set_cc_en_done, disable 경로 등.
+ */
 static inline uint64_t
 nvme_ctrlr_get_ready_timeout(struct spdk_nvme_ctrlr *ctrlr)
 {
 	return ctrlr->cap.bits.to * 500;
+	/* [한국어] CAP.TO (단위 500ms) → ms 환산. 예: TO=20 → 10000ms = 10초. */
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_set_cc_en_done - CC.EN=1 write 완료 콜백 (enable 시퀀스 단계 전이)
+ *
+ * @ctx:   spdk_nvme_ctrlr* (cb_arg 로 ctrlr 자체를 전달)
+ * @value: 방금 쓴 CC 값 (참고용)
+ * @cpl:   write 결과
+ *
+ * 동기/배경:
+ *   nvme_ctrlr_enable() 가 발행한 "CC.EN=1, CC.CSS/MPS/IOSQES/... 설정" admin write 의 완료
+ *   시점에 호출된다. 이 시점에 디바이스는 SQ/CQ 메모리, 어드민 큐, 컨트롤러 내부 상태 등을
+ *   초기화 시작 — 호스트는 CSTS.RDY 가 0→1 로 바뀔 때까지 기다려야 한다 (NVMe Spec §3.1.5
+ *   "Initialization Sequence").
+ *
+ * 동작 단계:
+ *   [1] CPL 에러면 state = ERROR (회복 불가) 로 전이하고 종료. INFINITE timeout 으로 setting —
+ *       reset/cleanup 경로가 처리할 때까지 그대로 머무름.
+ *   [2] 정상이면 state = ENABLE_WAIT_FOR_READY_1 로 전이. timeout 은 CAP.TO * 500ms (NVMe 스펙치).
+ *       이후 process_init 의 다음 iteration 에서 CSTS read 를 발행해 RDY=1 확인.
+ *
+ * 실행 컨텍스트: admin completion 콜백.
+ * 호출 체인:
+ *   nvme_ctrlr_enable → nvme_ctrlr_set_cc_async (CC write 발행) →
+ *     (admin completion) 본 콜백 → nvme_ctrlr_set_state(ENABLE_WAIT_FOR_READY_1) →
+ *       (process_init 다음 iter) nvme_ctrlr_process_init_wait_for_ready_1
+ */
 static void
 nvme_ctrlr_set_cc_en_done(void *ctx, uint64_t value, const struct spdk_nvme_cpl *cpl)
 {
 	struct spdk_nvme_ctrlr *ctrlr = ctx;
+	/* [한국어] cb_arg 는 enable() 에서 ctrlr 자체로 설정 — 따라서 단순 캐스팅. */
 
 	if (spdk_nvme_cpl_is_error(cpl)) {
+		/* [한국어] CC write 실패 — 디바이스 자체에 문제가 있어 enable 진행 불가. */
 		NVME_CTRLR_ERRLOG(ctrlr, "Failed to set the CC register\n");
 		nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_ERROR, NVME_TIMEOUT_INFINITE);
+		/* [한국어] 상태머신을 ERROR 로 고정 — INFINITE 는 timeout 검사 비활성화 sentinel.
+		 *         외부 reset 경로가 명시적으로 회복할 때까지 그대로. */
 		return;
 	}
 
 	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_ENABLE_WAIT_FOR_READY_1,
 			     nvme_ctrlr_get_ready_timeout(ctrlr));
+	/* [한국어] 정상 경로: 다음 상태 = WAIT_FOR_READY_1 (CSTS.RDY=1 대기).
+	 *         timeout 은 CAP.TO * 500ms — NVMe 가 보장하는 최대 ready 전이 시간. */
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_enable - 컨트롤러 enable: CC 레지스터를 spec 에 맞게 구성하고 EN=1 write 발행
+ *
+ * @ctrlr: enable 할 컨트롤러 (이미 disabled / RDY=0 상태여야 함)
+ * @return:
+ *   - 0       : CC write 발행 성공 (실제 enable 완료는 set_cc_en_done 콜백 + RDY=1 대기)
+ *   - -EINVAL : CC.EN 이 이미 1 이거나 arb_mechanism 이 디바이스 capability 와 불일치
+ *   - -EIO    : nvme_ctrlr_set_cc_async 발행 실패
+ *   - 기타    : nvme_transport_ctrlr_enable 의 transport-level 실패 코드
+ *
+ * 동기/배경:
+ *   process_init 상태머신에서 NVME_CTRLR_STATE_ENABLE 진입 시 한 번 호출되는 함수.
+ *   NVMe Spec §7.6.1 Initialization 의 "host shall configure CC and write CC.EN to 1" 절차를
+ *   구현한다. 본 함수가 return 한 시점에는 CC write 가 발행만 된 상태 — 실제 활성화 완료는
+ *   set_cc_en_done 콜백이 RDY=1 대기로 전이시킨 뒤 process_init 의 다음 iteration 에서 검증.
+ *
+ *   설정하는 CC 비트(NVMe Spec §3.1.5):
+ *     EN=1            : 컨트롤러 활성화
+ *     CSS             : Command Set Select (NVM / I/O Command Sets / Admin-only)
+ *     SHN=0           : Shutdown Notification 클리어 (이전 shutdown 흔적 제거)
+ *     IOSQES=6        : SQ entry size = 64 byte (2^6)
+ *     IOCQES=4        : CQ entry size = 16 byte (2^4)
+ *     MPS             : Memory Page Size (host page size) — 2^(12+mps)
+ *     AMS             : Arbitration Mechanism Select (RR/WRR/Vendor-specific)
+ *
+ * 동작 단계:
+ *   [1] transport-specific enable hook 호출 (PCIe: BAR 검증, Fabrics: 추가 properties 등).
+ *   [2] process_init_cc 캐시(직전 read_cc 단계에서 저장)를 base 로 RMW 시작.
+ *       만약 EN 이 이미 1 이면 호출 컨텍스트 버그 → -EINVAL.
+ *   [3] EN=1, SHN=0, IOSQES/IOCQES/MPS 표준값 세팅.
+ *   [4] CSS 결정:
+ *         - 디바이스가 CAP.CSS=0 이면(spec 위반) NVM 으로 가정.
+ *         - opts.command_set 이 sentinel(>=CHAR_BIT) 이면 IOCS > NVM > NOIO 우선순위로 자동 선택.
+ *         - opts.command_set 이 CAP.CSS 에 포함 안 되면 NVM 으로 fallback.
+ *   [5] AMS 검증: WRR/VS 옵션은 CAP.AMS 에 해당 비트가 있어야 사용 가능. 없으면 -EINVAL.
+ *   [6] 최종 cc.raw 를 process_init_cc 에 백업 후 set_cc_async 발행 (cb=set_cc_en_done).
+ *
+ * 실행 컨텍스트:
+ *   process_init 폴링 컨텍스트(보통 management thread). ctrlr lock 보유 가정.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_process_init →
+ *     nvme_ctrlr_enable (본 함수) →
+ *       nvme_transport_ctrlr_enable (transport hook) +
+ *       nvme_ctrlr_set_cc_async (CC write 발행) →
+ *         (admin completion) nvme_ctrlr_set_cc_en_done →
+ *           state = ENABLE_WAIT_FOR_READY_1
+ */
 static int
 nvme_ctrlr_enable(struct spdk_nvme_ctrlr *ctrlr)
 {
 	union spdk_nvme_cc_register	cc;
+	/* [한국어] CC 의 비트필드 union — 단계적으로 비트 세팅 후 raw 를 admin write 에 사용. */
 	int				rc;
 
 	rc = nvme_transport_ctrlr_enable(ctrlr);
+	/* [한국어] transport 별 enable 훅 — PCIe 는 BAR/MMIO 검증, Fabrics 는 추가 property write 등.
+	 *         실패 시 enable 자체 중단. */
 	if (rc != 0) {
 		NVME_CTRLR_ERRLOG(ctrlr, "transport ctrlr_enable failed\n");
 		return rc;
 	}
 
 	cc.raw = ctrlr->process_init_cc.raw;
+	/* [한국어] 직전 READ_CC 단계에서 디바이스로부터 읽어 캐시한 CC 값을 RMW base 로 사용.
+	 *         이는 디바이스가 강제하는 reserved 비트들을 보존하기 위함. */
 	if (cc.bits.en != 0) {
+		/* [한국어] 호출 전제 조건 위반 — 호출자는 EN=0 인 disabled 상태에서 진입해야 함.
+		 *         (CHECK_EN → SET_EN_0 → DISABLE_WAIT_FOR_READY_0 → DISABLED → ENABLE 순서) */
 		NVME_CTRLR_ERRLOG(ctrlr, "called with CC.EN = 1\n");
 		return -EINVAL;
 	}
 
 	cc.bits.en = 1;
+	/* [한국어] EN(Enable, NVMe §3.1.5 bit 0)=1 — 본 write 가 디바이스 활성화 트리거. */
 	cc.bits.css = 0;
+	/* [한국어] CSS 임시 0 — 아래 [4] 단계에서 적절한 command set 결정 후 재설정. */
 	cc.bits.shn = 0;
+	/* [한국어] SHN(Shutdown Notification)=0 — 이전 shutdown 잔여 비트 클리어. */
 	cc.bits.iosqes = 6; /* SQ entry size == 64 == 2^6 */
+	/* [한국어] IOSQES(I/O SQ Entry Size, log2 byte)=6 → 64 byte. NVMe 표준 SQE 크기. */
 	cc.bits.iocqes = 4; /* CQ entry size == 16 == 2^4 */
+	/* [한국어] IOCQES(I/O CQ Entry Size, log2 byte)=4 → 16 byte. NVMe 표준 CQE 크기. */
 
 	/* Page size is 2 ^ (12 + mps). */
 	cc.bits.mps = spdk_u32log2(ctrlr->page_size) - 12;
+	/* [한국어] MPS(Memory Page Size) 인코딩: log2(page_size) - 12.
+	 *         예: page_size=4KB(2^12) → mps=0, 2MB hugepage(2^21) → mps=9.
+	 *         디바이스가 이 값으로 PRP entry alignment 와 DMA buffer 단위를 결정. */
 
 	/*
 	 * Since NVMe 1.0, a controller should have at least one bit set in CAP.CSS.
@@ -2145,8 +2563,11 @@ nvme_ctrlr_enable(struct spdk_nvme_ctrlr *ctrlr)
 	 * Try to support such a controller regardless.
 	 */
 	if (ctrlr->cap.bits.css == 0) {
+		/* [한국어] CAP.CSS(NVMe §3.1.1 bits 44:37) 가 0 인 디바이스는 spec 위반.
+		 *         호환성 위해 NVM 만 지원한다고 가정하고 진행. */
 		NVME_CTRLR_INFOLOG(ctrlr, "Drive reports no command sets supported. Assuming NVM is supported.\n");
 		ctrlr->cap.bits.css = SPDK_NVME_CAP_CSS_NVM;
+		/* [한국어] 캐시된 cap 값을 직접 수정 — 이후 검증 단계에서도 이 값 사용. */
 	}
 
 	/*
@@ -2154,83 +2575,119 @@ nvme_ctrlr_enable(struct spdk_nvme_ctrlr *ctrlr)
 	 * what can be saved in CC.CSS, use the most reasonable default.
 	 */
 	if (ctrlr->opts.command_set >= CHAR_BIT) {
+		/* [한국어] opts.command_set 의 sentinel 값(CHAR_BIT=8 이상) — 사용자가 명시 안 함.
+		 *         디바이스 capability 기반으로 자동 선택. */
 		if (ctrlr->cap.bits.css & SPDK_NVME_CAP_CSS_IOCS) {
+			/* [한국어] 1순위: I/O Command Sets (NVMe 1.4+ 의 ZNS, KV 등 다중 command set). */
 			ctrlr->opts.command_set = SPDK_NVME_CC_CSS_IOCS;
 		} else if (ctrlr->cap.bits.css & SPDK_NVME_CAP_CSS_NVM) {
+			/* [한국어] 2순위: 표준 NVM (전통적 블록 스토리지). */
 			ctrlr->opts.command_set = SPDK_NVME_CC_CSS_NVM;
 		} else if (ctrlr->cap.bits.css & SPDK_NVME_CAP_CSS_NOIO) {
 			/* Technically we should respond with CC_CSS_NOIO in
 			 * this case, but we use NVM instead to work around
 			 * buggy targets and to match Linux driver behavior.
 			 */
+			/* [한국어] 3순위: Admin Only (I/O 명령 미지원). spec 상 CC_CSS_NOIO(=111b) 가 정답이지만
+			 *         일부 buggy 디바이스 호환성 + Linux 커널 드라이버 동작 모방을 위해 NVM 사용. */
 			ctrlr->opts.command_set = SPDK_NVME_CC_CSS_NVM;
 		} else {
 			/* Invalid supported bits detected, falling back to NVM. */
+			/* [한국어] CAP.CSS 에 알 수 없는 비트만 set — 안전하게 NVM 으로 fallback. */
 			ctrlr->opts.command_set = SPDK_NVME_CC_CSS_NVM;
 		}
 	}
 
 	/* Verify that the selected command set is supported by the controller. */
 	if (!(ctrlr->cap.bits.css & (1u << ctrlr->opts.command_set))) {
+		/* [한국어] 사용자가 명시한(또는 위에서 선택한) command_set 이 CAP.CSS 비트마스크에 없음.
+		 *         (CC.CSS 는 인덱스, CAP.CSS 는 비트마스크 — `1u << command_set` 으로 변환 비교.) */
 		NVME_CTRLR_DEBUGLOG(ctrlr, "Requested I/O command set %u but supported mask is 0x%x\n",
 				    ctrlr->opts.command_set, ctrlr->cap.bits.css);
 		NVME_CTRLR_DEBUGLOG(ctrlr, "Falling back to NVM. Assuming NVM is supported.\n");
 		ctrlr->opts.command_set = SPDK_NVME_CC_CSS_NVM;
+		/* [한국어] 안전한 fallback — 대부분 디바이스가 NVM 을 지원하므로. */
 	}
 
 	cc.bits.css = ctrlr->opts.command_set;
+	/* [한국어] 최종 결정된 command set 인덱스를 CC.CSS 에 반영. */
 
 	switch (ctrlr->opts.arb_mechanism) {
 	case SPDK_NVME_CC_AMS_RR:
+		/* [한국어] Round Robin — 모든 디바이스가 필수로 지원 (NVMe §4.11). 검증 불필요. */
 		break;
 	case SPDK_NVME_CC_AMS_WRR:
 		if (SPDK_NVME_CAP_AMS_WRR & ctrlr->cap.bits.ams) {
+			/* [한국어] Weighted Round Robin with Urgent Priority — CAP.AMS 비트 확인 필요. */
 			break;
 		}
 		return -EINVAL;
+		/* [한국어] 사용자가 WRR 요청했지만 디바이스 미지원 → enable 거부. */
 	case SPDK_NVME_CC_AMS_VS:
 		if (SPDK_NVME_CAP_AMS_VS & ctrlr->cap.bits.ams) {
+			/* [한국어] Vendor Specific arbitration — CAP.AMS bit 확인. */
 			break;
 		}
 		return -EINVAL;
 	default:
 		return -EINVAL;
+		/* [한국어] 알 수 없는 arbitration 옵션 — 사용자 입력 오류. */
 	}
 
 	cc.bits.ams = ctrlr->opts.arb_mechanism;
+	/* [한국어] 검증 통과한 AMS 값을 CC 에 적용. */
 	ctrlr->process_init_cc.raw = cc.raw;
+	/* [한국어] enable 시 사용한 최종 CC 값을 캐시에 백업 — 이후 reset/disable 시 RMW base 로 재사용. */
 
 	if (nvme_ctrlr_set_cc_async(ctrlr, cc.raw, nvme_ctrlr_set_cc_en_done, ctrlr)) {
+		/* [한국어] CC 에 EN=1 + 모든 설정 한 번에 write — admin/MMIO 비동기 발행.
+		 *         완료 시 set_cc_en_done 콜백이 ENABLE_WAIT_FOR_READY_1 상태로 전이. */
 		NVME_CTRLR_ERRLOG(ctrlr, "set_cc() failed\n");
 		return -EIO;
 	}
 
 	return 0;
+	/* [한국어] write 발행 성공 — caller(process_init) 는 다음 iteration 에서 콜백 결과 반영된
+	 *         새 state 로 dispatch. */
 }
 
 /*
  * [한국어]
  * nvme_ctrlr_state_string - controller 상태머신의 모든 상태(40+)를 사람용 문자열로 변환
  *
- * @state: nvme_ctrlr_state enum 값
- * @return 상태 이름 문자열 (NULL 반환 안 함, 미정의 enum은 "unknown").
+ * @state:  nvme_ctrlr_state enum 값
+ * @return: 상태 이름 문자열 (NULL 반환 안 함, 미정의 enum은 "unknown" — defensive)
  *
- * 사용처: 디버그 로그 (NVME_CTRLR_DEBUGLOG의 "setting state to %s") + 에러 메시지.
+ * 동기/배경:
+ *   nvme_ctrlr 의 상태머신(nvme_ctrlr_process_init() 가 dispatch) 은 40+ 상태를 가지며,
+ *   각 상태가 의미하는 admin 명령/register 동작이 다르다. 디버깅·운영 시 enum 정수만으로는
+ *   추적이 불가능하므로 모든 set_state 가 본 함수를 통해 사람-읽기 좋은 문자열로 변환해
+ *   DEBUGLOG 에 출력한다 ("setting state to %s").
  *
- * 상태 그룹 분류:
- *   [INIT 단계]: INIT_DELAY → CONNECT_ADMINQ → WAIT_FOR_CONNECT_ADMINQ → READ_VS → READ_CAP
- *               → CHECK_EN (CC.EN 현재 값 검사)
+ * 사용처:
+ *   - _nvme_ctrlr_set_state: state 전이 시 디버그 로그.
+ *   - nvme_ctrlr_process_init 의 timeout/error 로깅.
+ *
+ * 상태 그룹 분류 (process_init 진행 순서):
+ *   [INIT 단계]:    INIT_DELAY → CONNECT_ADMINQ → WAIT_FOR_CONNECT_ADMINQ → READ_VS → READ_CAP
+ *                  → CHECK_EN (CC.EN 현재 값 검사)
  *   [DISABLE 단계]: SET_EN_0 → DISABLE_WAIT_FOR_READY_0 → DISABLED
- *   [ENABLE 단계]: ENABLE → ENABLE_WAIT_FOR_READY_1 → RESET_ADMIN_QUEUE
- *   [IDENTIFY 단계]: IDENTIFY → CONFIGURE_AER → SET_KEEP_ALIVE_TIMEOUT → IDENTIFY_IOCS_SPECIFIC
- *                   → GET_ZNS_CMD_EFFECTS_LOG → SET_NUM_QUEUES
+ *                  (CC.EN=1 이었으면 controller reset 부터 시작)
+ *   [ENABLE 단계]:  ENABLE → ENABLE_WAIT_FOR_READY_1 → RESET_ADMIN_QUEUE
+ *                  (CC.EN=1 write + CSTS.RDY=1 대기)
+ *   [IDENTIFY 단계]:IDENTIFY → CONFIGURE_AER → SET_KEEP_ALIVE_TIMEOUT → IDENTIFY_IOCS_SPECIFIC
+ *                  → GET_ZNS_CMD_EFFECTS_LOG → SET_NUM_QUEUES
  *   [NS DISCOVERY]: IDENTIFY_ACTIVE_NS → IDENTIFY_NS → IDENTIFY_ID_DESCS → IDENTIFY_NS_IOCS_SPECIFIC
- *   [FEATURES 단계]: SET_SUPPORTED_LOG_PAGES → SET_SUPPORTED_INTEL_LOG_PAGES → SET_SUPPORTED_FEATURES
- *                   → SET_HOST_FEATURE → SET_DB_BUF_CFG → SET_HOST_ID
- *   [최종]: TRANSPORT_READY → READY (정상) / ERROR / DISCONNECTED
+ *   [FEATURES 단계]:SET_SUPPORTED_LOG_PAGES → SET_SUPPORTED_INTEL_LOG_PAGES → SET_SUPPORTED_FEATURES
+ *                  → SET_HOST_FEATURE → SET_DB_BUF_CFG → SET_HOST_ID
+ *   [최종]:         TRANSPORT_READY → READY (정상) / ERROR / DISCONNECTED
  *
- * "WAIT_FOR_*" 패턴: 비동기 admin/register 명령을 발행한 후 응답 대기 중인 상태.
- *                    응답 도착 시 callback이 다음 상태로 전이.
+ * "WAIT_FOR_*" 패턴:
+ *   비동기 admin/register 명령을 발행한 후 응답 대기 중인 상태. process_init 매 호출마다
+ *   admin queue 를 폴링하여 콜백 트리거 → 콜백이 다음 상태로 set_state. timeout 초과 시
+ *   process_init 이 ERROR 상태로 강제 전이.
+ *
+ * 실행 컨텍스트: 모든 컨텍스트 (read-only, lock 불필요).
  */
 static const char *
 nvme_ctrlr_state_string(enum nvme_ctrlr_state state)
@@ -2244,112 +2701,166 @@ nvme_ctrlr_state_string(enum nvme_ctrlr_state state)
                                   /* [한국어] admin qpair connect 시작 — Fabrics면 Connect 명령, PCIe는 SQ/CQ 등록 */
 	case NVME_CTRLR_STATE_WAIT_FOR_CONNECT_ADMINQ:
 		return "wait for connect adminq";
+                                  /* [한국어] adminq connect 비동기 응답 대기 (특히 Fabrics RDMA/TCP 핸드셰이크) */
 	case NVME_CTRLR_STATE_READ_VS:
 		return "read vs";
+                                  /* [한국어] VS(Version, NVMe §3.1.2) 레지스터 read 발행 — 디바이스 spec 버전 식별 */
 	case NVME_CTRLR_STATE_READ_VS_WAIT_FOR_VS:
 		return "read vs wait for vs";
+                                  /* [한국어] VS read 응답 대기 */
 	case NVME_CTRLR_STATE_READ_CAP:
 		return "read cap";
+                                  /* [한국어] CAP(Controller Capabilities, §3.1.1) read — MQES/TO/CSS 등 capability 캐시 */
 	case NVME_CTRLR_STATE_READ_CAP_WAIT_FOR_CAP:
 		return "read cap wait for cap";
+                                  /* [한국어] CAP read 응답 대기 */
 	case NVME_CTRLR_STATE_CHECK_EN:
 		return "check en";
+                                  /* [한국어] CC.EN 현재 값 read — 1이면 controller reset부터 시작, 0이면 바로 ENABLE */
 	case NVME_CTRLR_STATE_CHECK_EN_WAIT_FOR_CC:
 		return "check en wait for cc";
+                                  /* [한국어] CC read 응답 대기 — 콜백이 EN 비트 검사 후 다음 상태 결정 */
 	case NVME_CTRLR_STATE_DISABLE_WAIT_FOR_READY_1:
 		return "disable and wait for CSTS.RDY = 1";
+                                  /* [한국어] reset 전 RDY=1 확인 단계 — CC.EN=1 이지만 RDY=0 이면 wait (NVMe §7.3) */
 	case NVME_CTRLR_STATE_DISABLE_WAIT_FOR_READY_1_WAIT_FOR_CSTS:
 		return "disable and wait for CSTS.RDY = 1 reg";
+                                  /* [한국어] CSTS read 응답 대기 (RDY=1 폴링용) */
 	case NVME_CTRLR_STATE_SET_EN_0:
 		return "set CC.EN = 0";
+                                  /* [한국어] CC.EN=0 write 발행 — controller reset 트리거 (in-flight I/O 전부 abort) */
 	case NVME_CTRLR_STATE_SET_EN_0_WAIT_FOR_CC:
 		return "set CC.EN = 0 wait for cc";
+                                  /* [한국어] EN=0 write 응답 대기 */
 	case NVME_CTRLR_STATE_DISABLE_WAIT_FOR_READY_0:
 		return "disable and wait for CSTS.RDY = 0";
+                                  /* [한국어] EN=0 write 후 RDY가 1→0으로 떨어지길 대기 (NVMe §7.3 controller reset 완료 신호) */
 	case NVME_CTRLR_STATE_DISABLE_WAIT_FOR_READY_0_WAIT_FOR_CSTS:
 		return "disable and wait for CSTS.RDY = 0 reg";
+                                  /* [한국어] CSTS read 응답 대기 (RDY=0 폴링용) */
 	case NVME_CTRLR_STATE_DISABLED:
 		return "controller is disabled";
+                                  /* [한국어] reset 완료 — 이제 ENABLE 단계로 진행 가능 */
 	case NVME_CTRLR_STATE_ENABLE:
 		return "enable controller by writing CC.EN = 1";
+                                  /* [한국어] nvme_ctrlr_enable() 진입 — CC 전체 설정 + EN=1 write 발행 */
 	case NVME_CTRLR_STATE_ENABLE_WAIT_FOR_CC:
 		return "enable controller by writing CC.EN = 1 reg";
+                                  /* [한국어] CC write 응답 대기 — set_cc_en_done 콜백 트리거 */
 	case NVME_CTRLR_STATE_ENABLE_WAIT_FOR_READY_1:
 		return "wait for CSTS.RDY = 1";
+                                  /* [한국어] EN=1 write 후 디바이스가 RDY=1 보고할 때까지 대기 (CAP.TO 시간 안에) */
 	case NVME_CTRLR_STATE_ENABLE_WAIT_FOR_READY_1_WAIT_FOR_CSTS:
 		return "wait for CSTS.RDY = 1 reg";
+                                  /* [한국어] CSTS read 응답 대기 (RDY=1 폴링용) */
 	case NVME_CTRLR_STATE_RESET_ADMIN_QUEUE:
 		return "reset admin queue";
+                                  /* [한국어] enable 직후 admin queue 재초기화 — outstanding 명령 제거, 인덱스 리셋 */
 	case NVME_CTRLR_STATE_IDENTIFY:
 		return "identify controller";
+                                  /* [한국어] Identify Controller (CNS=01h, NVMe §5.15) admin 명령 발행 — cdata 채움 */
 	case NVME_CTRLR_STATE_WAIT_FOR_IDENTIFY:
 		return "wait for identify controller";
+                                  /* [한국어] Identify CPL 대기 */
 	case NVME_CTRLR_STATE_CONFIGURE_AER:
 		return "configure AER";
+                                  /* [한국어] Set Features (FID=0Bh, AER) — 비동기 이벤트 마스크 설정 */
 	case NVME_CTRLR_STATE_WAIT_FOR_CONFIGURE_AER:
 		return "wait for configure aer";
+                                  /* [한국어] AER 설정 CPL 대기 */
 	case NVME_CTRLR_STATE_SET_KEEP_ALIVE_TIMEOUT:
 		return "set keep alive timeout";
+                                  /* [한국어] Set Features (FID=0Fh) — Fabrics 의 keep-alive heartbeat 주기 설정 */
 	case NVME_CTRLR_STATE_WAIT_FOR_KEEP_ALIVE_TIMEOUT:
 		return "wait for set keep alive timeout";
+                                  /* [한국어] keep-alive 설정 CPL 대기 */
 	case NVME_CTRLR_STATE_IDENTIFY_IOCS_SPECIFIC:
 		return "identify controller iocs specific";
+                                  /* [한국어] Identify (CNS=06h) — I/O Command Set 별 specific 데이터 (예: ZNS controller data) */
 	case NVME_CTRLR_STATE_WAIT_FOR_IDENTIFY_IOCS_SPECIFIC:
 		return "wait for identify controller iocs specific";
+                                  /* [한국어] IOCS specific identify CPL 대기 */
 	case NVME_CTRLR_STATE_GET_ZNS_CMD_EFFECTS_LOG:
 		return "get zns cmd and effects log page";
+                                  /* [한국어] Get Log Page (LID=05h, ZNS) — Zoned Namespace 명령별 effects bitmap */
 	case NVME_CTRLR_STATE_WAIT_FOR_GET_ZNS_CMD_EFFECTS_LOG:
 		return "wait for get zns cmd and effects log page";
+                                  /* [한국어] ZNS log CPL 대기 */
 	case NVME_CTRLR_STATE_SET_NUM_QUEUES:
 		return "set number of queues";
+                                  /* [한국어] Set Features (FID=07h, Number of Queues) — 호스트가 요청하는 IOQ 개수 협상 */
 	case NVME_CTRLR_STATE_WAIT_FOR_SET_NUM_QUEUES:
 		return "wait for set number of queues";
+                                  /* [한국어] num_queues CPL 대기 — 응답값으로 실제 할당된 IOSQ/IOCQ 개수 결정 */
 	case NVME_CTRLR_STATE_IDENTIFY_ACTIVE_NS:
 		return "identify active ns";
+                                  /* [한국어] Identify (CNS=02h) — 활성 namespace ID 리스트 가져오기 */
 	case NVME_CTRLR_STATE_WAIT_FOR_IDENTIFY_ACTIVE_NS:
 		return "wait for identify active ns";
+                                  /* [한국어] active NS list CPL 대기 */
 	case NVME_CTRLR_STATE_IDENTIFY_NS:
 		return "identify ns";
+                                  /* [한국어] Identify (CNS=00h) per-NS — LBA size, capacity, format 정보 */
 	case NVME_CTRLR_STATE_WAIT_FOR_IDENTIFY_NS:
 		return "wait for identify ns";
+                                  /* [한국어] per-NS identify CPL 대기 */
 	case NVME_CTRLR_STATE_IDENTIFY_ID_DESCS:
 		return "identify namespace id descriptors";
+                                  /* [한국어] Identify (CNS=03h) — NSID descriptor (UUID, EUI64, NGUID) */
 	case NVME_CTRLR_STATE_WAIT_FOR_IDENTIFY_ID_DESCS:
 		return "wait for identify namespace id descriptors";
+                                  /* [한국어] ID descriptors CPL 대기 */
 	case NVME_CTRLR_STATE_IDENTIFY_NS_IOCS_SPECIFIC:
 		return "identify ns iocs specific";
+                                  /* [한국어] Identify (CNS=05h) per-NS — ZNS 등 command set 별 NS 데이터 */
 	case NVME_CTRLR_STATE_WAIT_FOR_IDENTIFY_NS_IOCS_SPECIFIC:
 		return "wait for identify ns iocs specific";
+                                  /* [한국어] per-NS IOCS specific CPL 대기 */
 	case NVME_CTRLR_STATE_SET_SUPPORTED_LOG_PAGES:
 		return "set supported log pages";
+                                  /* [한국어] supported log pages 마스크 빌드 — 동기 단계 (CPL 대기 없음) */
 	case NVME_CTRLR_STATE_SET_SUPPORTED_INTEL_LOG_PAGES:
 		return "set supported INTEL log pages";
+                                  /* [한국어] Intel vendor-specific log page 검사 (smart, latency 등) */
 	case NVME_CTRLR_STATE_WAIT_FOR_SUPPORTED_INTEL_LOG_PAGES:
 		return "wait for supported INTEL log pages";
+                                  /* [한국어] Intel log page 응답 대기 */
 	case NVME_CTRLR_STATE_SET_SUPPORTED_FEATURES:
 		return "set supported features";
+                                  /* [한국어] Get Features 시도해 디바이스가 지원하는 feature ID 마스크 빌드 */
 	case NVME_CTRLR_STATE_SET_HOST_FEATURE:
 		return "set host behavior support feature";
+                                  /* [한국어] Set Features (FID=16h, Host Behavior Support) — ACRE/LBAFEE 등 */
 	case NVME_CTRLR_STATE_WAIT_FOR_SET_HOST_FEATURE:
 		return "wait for set host behavior support feature";
+                                  /* [한국어] host behavior CPL 대기 */
 	case NVME_CTRLR_STATE_SET_DB_BUF_CFG:
 		return "set doorbell buffer config";
+                                  /* [한국어] Doorbell Buffer Config admin 명령 — shadow doorbell 활성화 (NVMe 1.3+) */
 	case NVME_CTRLR_STATE_WAIT_FOR_DB_BUF_CFG:
 		return "wait for doorbell buffer config";
+                                  /* [한국어] doorbell buffer config CPL 대기 */
 	case NVME_CTRLR_STATE_SET_HOST_ID:
 		return "set host ID";
+                                  /* [한국어] Set Features (FID=81h) — multi-host fabric 환경 호스트 식별자 */
 	case NVME_CTRLR_STATE_WAIT_FOR_HOST_ID:
 		return "wait for set host ID";
+                                  /* [한국어] host ID CPL 대기 */
 	case NVME_CTRLR_STATE_TRANSPORT_READY:
 		return "transport ready";
+                                  /* [한국어] 모든 admin 초기화 완료 — transport-specific ready 훅 호출 단계 */
 	case NVME_CTRLR_STATE_READY:
 		return "ready";
+                                  /* [한국어] 정상 운영 상태 — I/O qpair 할당/제출 가능. process_init 종료 */
 	case NVME_CTRLR_STATE_ERROR:
 		return "error";
+                                  /* [한국어] 회복 불가 에러 — 외부 reset 호출까지 대기, 모든 신규 I/O 거부 */
 	case NVME_CTRLR_STATE_DISCONNECTED:
 		return "disconnected";
+                                  /* [한국어] transport 레벨 disconnect (Fabrics 핸드셰이크 실패 등) */
 	}
 	return "unknown";
+                                  /* [한국어] enum 외 값 (메모리 손상 / enum 추가 후 case 누락) — defensive */
 };
 
 /*
