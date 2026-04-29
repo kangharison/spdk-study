@@ -1410,158 +1410,329 @@ nvme_ctrlr_parse_ana_log_page(struct spdk_nvme_ctrlr *ctrlr,
 	return rc;
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_set_supported_log_pages - 컨트롤러가 지원하는 Log Page 목록 결정
+ *
+ * @ctrlr: 대상 NVMe 컨트롤러 구조체
+ * @return: 성공 시 0, ANA log page 업데이트 실패 시 음수
+ *
+ * 동기/배경:
+ *   사용자가 spdk_nvme_ctrlr_get_log_page() 같은 API 로 특정 log page를 조회하려고 할 때,
+ *   NVMe 컨트롤러가 *실제로 지원* 하는지 사전에 알아야 무용한 admin 명령이 실패하지 않는다.
+ *   이 함수는 controller bring-up 상태머신 의 한 단계로, identify ctrlr 결과(ctrlr->cdata) 의
+ *   비트 필드들을 확인해 log_page_supported[] 비트맵을 구성한다.
+ *
+ * 동작 단계:
+ *   1) 비트맵 0으로 초기화
+ *   2) NVMe 스펙 mandatory log page 3종 무조건 활성화 (Error, Health, Firmware Slot)
+ *   3) Identify Ctrlr 의 LPA(Log Page Attributes).cses 비트 확인 → Command Effects Log
+ *   4) CMIC.anars (ANA reporting support) → ANA log page + (옵션 아니면) 즉시 read+parse
+ *   5) ctratt.fdps (Flexible Data Placement) → FDP 관련 4종 log page
+ *   6) Vendor=Intel + PCIe + quirk 미지정 → Intel vendor log pages 단계로 진행
+ *      그 외 → SET_SUPPORTED_FEATURES 단계로 직접 진행
+ *
+ * 실행 컨텍스트:
+ *   nvme_ctrlr_process_init() state machine 안에서 호출되는 admin worker.
+ *   호출 직전 상태: NVMe_CTRLR_STATE_SET_SUPPORTED_LOG_PAGES.
+ *   동기 호출이지만 ANA log page 가 발생하면 그 안에서 admin queue polling 으로 동기 대기.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_process_init → [이 함수] → nvme_ctrlr_set_state(다음 상태)
+ */
 static int
 nvme_ctrlr_set_supported_log_pages(struct spdk_nvme_ctrlr *ctrlr)
 {
-	int	rc = 0;
+	int	rc = 0;                                                 /* [한국어] 반환 코드 — ANA log page 업데이트가 실패할 수 있어 추적 */
 
+	/* [한국어] log_page_supported 비트맵을 모두 0으로 초기화 — 이후 mandatory + 옵션 비트들을 켬 */
 	memset(ctrlr->log_page_supported, 0, sizeof(ctrlr->log_page_supported));
 	/* Mandatory pages */
-	ctrlr->log_page_supported[SPDK_NVME_LOG_ERROR] = true;
-	ctrlr->log_page_supported[SPDK_NVME_LOG_HEALTH_INFORMATION] = true;
-	ctrlr->log_page_supported[SPDK_NVME_LOG_FIRMWARE_SLOT] = true;
+	/* [한국어] NVMe 스펙 1.x Section 5.16 — 모든 컨트롤러가 의무적으로 지원해야 하는 3종 log page */
+	ctrlr->log_page_supported[SPDK_NVME_LOG_ERROR] = true;          /* [한국어] Error Information (LID=01h) — 펌웨어가 보고하는 에러 큐 */
+	ctrlr->log_page_supported[SPDK_NVME_LOG_HEALTH_INFORMATION] = true; /* [한국어] SMART/Health (LID=02h) — 온도, 마모도, capacity 등 */
+	ctrlr->log_page_supported[SPDK_NVME_LOG_FIRMWARE_SLOT] = true;  /* [한국어] Firmware Slot Info (LID=03h) — 슬롯별 펌웨어 버전 */
+	/* [한국어] Identify Ctrlr LPA(Log Page Attributes).cses 비트 — Command Effects 지원 여부 */
 	if (ctrlr->cdata.lpa.cses) {
-		ctrlr->log_page_supported[SPDK_NVME_LOG_COMMAND_EFFECTS_LOG] = true;
+		ctrlr->log_page_supported[SPDK_NVME_LOG_COMMAND_EFFECTS_LOG] = true; /* [한국어] LID=05h — admin 명령별 부수 효과(데이터 변경/제출 큐 영향 등) */
 	}
 
+	/* [한국어] CMIC(Controller Multi-path & I/O Sharing).anars 비트 — ANA(Asymmetric Namespace Access) reporting 지원 여부 */
 	if (ctrlr->cdata.cmic.anars) {
-		ctrlr->log_page_supported[SPDK_NVME_LOG_ASYMMETRIC_NAMESPACE_ACCESS] = true;
+		ctrlr->log_page_supported[SPDK_NVME_LOG_ASYMMETRIC_NAMESPACE_ACCESS] = true; /* [한국어] LID=0Ch — multi-path 환경에서 namespace 별 path 상태 */
+		/* [한국어] 사용자가 ANA 자동 read를 비활성화하지 않았다면 즉시 ANA log를 받아와 ns 상태에 반영 */
 		if (!ctrlr->opts.disable_read_ana_log_page) {
-			rc = nvme_ctrlr_update_ana_log_page(ctrlr);
+			rc = nvme_ctrlr_update_ana_log_page(ctrlr); /* [한국어] admin GET_LOG_PAGE 동기 호출 + 결과를 ctrlr->ana_log_page 에 저장 */
 			if (rc == 0) {
+				/* [한국어] 받아온 ANA log page를 파싱해 각 ns 의 ana_state(OPTIMIZED/NON-OPTIMIZED/INACCESSIBLE/PERSISTENT_LOSS/CHANGE)를 갱신 */
 				nvme_ctrlr_parse_ana_log_page(ctrlr, nvme_ctrlr_update_ns_ana_states,
 							      ctrlr);
 			}
 		}
 	}
 
+	/* [한국어] CTRATT(Controller Attributes).fdps — Flexible Data Placement (NVMe 2.0+) 지원 여부 */
 	if (ctrlr->cdata.ctratt.bits.fdps) {
-		ctrlr->log_page_supported[SPDK_NVME_LOG_FDP_CONFIGURATIONS] = true;
-		ctrlr->log_page_supported[SPDK_NVME_LOG_RECLAIM_UNIT_HANDLE_USAGE] = true;
-		ctrlr->log_page_supported[SPDK_NVME_LOG_FDP_STATISTICS] = true;
-		ctrlr->log_page_supported[SPDK_NVME_LOG_FDP_EVENTS] = true;
+		/* [한국어] FDP 관련 4종 log page 모두 활성화 — 데이터 배치 정책, 통계, 이벤트 추적용 */
+		ctrlr->log_page_supported[SPDK_NVME_LOG_FDP_CONFIGURATIONS] = true;        /* [한국어] FDP 구성 (RUH/RUH 그룹) */
+		ctrlr->log_page_supported[SPDK_NVME_LOG_RECLAIM_UNIT_HANDLE_USAGE] = true; /* [한국어] RUH 사용량 통계 */
+		ctrlr->log_page_supported[SPDK_NVME_LOG_FDP_STATISTICS] = true;            /* [한국어] FDP 동작 통계 */
+		ctrlr->log_page_supported[SPDK_NVME_LOG_FDP_EVENTS] = true;                /* [한국어] FDP 이벤트 (media wear-out 등) */
 	}
 
+	/* [한국어] Intel 벤더 + PCIe 트랜스포트 + Intel 전용 quirk 비활성 → Intel vendor log pages 단계로 분기
+	 *   (NVMe-oF 트랜스포트에서는 vendor log 가 의미 없으므로 PCIe 만 해당) */
 	if (ctrlr->cdata.vid == SPDK_PCI_VID_INTEL &&
 	    ctrlr->trid.trtype == SPDK_NVME_TRANSPORT_PCIE &&
 	    !(ctrlr->quirks & NVME_INTEL_QUIRK_NO_LOG_PAGES)) {
+		/* [한국어] 다음 상태: Intel 전용 log page 지원 비트맵 설정 (LATENCY_TRACKING 등) */
 		nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_SET_SUPPORTED_INTEL_LOG_PAGES,
 				     ctrlr->opts.admin_timeout_ms);
 
 	} else {
+		/* [한국어] Intel 비대상 → log page 단계 종료, feature 지원 비트맵 단계로 직행 */
 		nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_SET_SUPPORTED_FEATURES,
 				     ctrlr->opts.admin_timeout_ms);
 
 	}
 
-	return rc;
+	return rc;                                                       /* [한국어] ANA log page 동기 read 가 실패했다면 음수, 그 외 0 */
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_set_intel_supported_features - Intel 벤더 전용 feature 비트맵 활성화
+ *
+ * @ctrlr: 대상 NVMe 컨트롤러 (Intel 벤더로 검증된 상태)
+ *
+ * 동기/배경:
+ *   NVMe Set/Get Features 명령의 Feature Identifier 공간 중 C0h~FFh 범위는 vendor-specific.
+ *   Intel SSD 들은 이 영역에 7개의 자체 feature(MAX_LBA, NATIVE_MAX_LBA, POWER_GOVERNOR,
+ *   SMBUS_ADDRESS, LED_PATTERN, RESET_TIMED_WORKLOAD_COUNTERS, LATENCY_TRACKING)을 정의함.
+ *   호출자(set_supported_features)가 vid==INTEL 검증 후 이 함수를 부르므로 unconditional 활성화.
+ *
+ * 동작: feature_supported 비트맵의 7개 Intel 항목을 true 로 마킹 (실제 동작은 사용자가
+ *       Set/Get Features 호출 시 이 비트맵을 보고 반환할 뿐, 컨트롤러에 추가 명령 안 보냄).
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_set_supported_features → [이 함수] (vid==INTEL 시만)
+ */
 static void
 nvme_ctrlr_set_intel_supported_features(struct spdk_nvme_ctrlr *ctrlr)
 {
-	ctrlr->feature_supported[SPDK_NVME_INTEL_FEAT_MAX_LBA] = true;
-	ctrlr->feature_supported[SPDK_NVME_INTEL_FEAT_NATIVE_MAX_LBA] = true;
-	ctrlr->feature_supported[SPDK_NVME_INTEL_FEAT_POWER_GOVERNOR_SETTING] = true;
-	ctrlr->feature_supported[SPDK_NVME_INTEL_FEAT_SMBUS_ADDRESS] = true;
-	ctrlr->feature_supported[SPDK_NVME_INTEL_FEAT_LED_PATTERN] = true;
-	ctrlr->feature_supported[SPDK_NVME_INTEL_FEAT_RESET_TIMED_WORKLOAD_COUNTERS] = true;
-	ctrlr->feature_supported[SPDK_NVME_INTEL_FEAT_LATENCY_TRACKING] = true;
+	ctrlr->feature_supported[SPDK_NVME_INTEL_FEAT_MAX_LBA] = true;                        /* [한국어] FID=C1h — 사용자 가시 LBA 최대값 (Intel quirk) */
+	ctrlr->feature_supported[SPDK_NVME_INTEL_FEAT_NATIVE_MAX_LBA] = true;                 /* [한국어] FID=C2h — 디바이스 native 최대 LBA (provisioning 전) */
+	ctrlr->feature_supported[SPDK_NVME_INTEL_FEAT_POWER_GOVERNOR_SETTING] = true;         /* [한국어] FID=C6h — Power state governor (성능/전력 trade-off) */
+	ctrlr->feature_supported[SPDK_NVME_INTEL_FEAT_SMBUS_ADDRESS] = true;                  /* [한국어] FID=C8h — SMBus 주소 (BMC 통신용) */
+	ctrlr->feature_supported[SPDK_NVME_INTEL_FEAT_LED_PATTERN] = true;                    /* [한국어] FID=C7h — LED indicator 패턴 (식별/locate 용) */
+	ctrlr->feature_supported[SPDK_NVME_INTEL_FEAT_RESET_TIMED_WORKLOAD_COUNTERS] = true;  /* [한국어] FID=D5h — 시간 기반 워크로드 카운터 리셋 */
+	ctrlr->feature_supported[SPDK_NVME_INTEL_FEAT_LATENCY_TRACKING] = true;               /* [한국어] FID=E2h — Intel SSD latency histogram (워크로드 분석용) */
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_set_arbitration_feature - Arbitration(큐 우선순위 가중치) 설정 admin 명령 발행
+ *
+ * @ctrlr: 대상 NVMe 컨트롤러
+ *
+ * 동기/배경:
+ *   NVMe 컨트롤러는 여러 IO Submission Queue 를 라운드 로빈 또는 가중치 기반으로 처리.
+ *   Arbitration Feature(FID=01h) 는 두 가지 파라미터를 설정:
+ *     • Arbitration Burst(AB): 한 번에 fetch 할 SQE 수 (2^AB), 0=금지
+ *     • WRR(Weighted Round Robin) 가중치: HPW/MPW/LPW (high/medium/low priority weight)
+ *   parallelink 같은 응용은 burst 를 키워 throughput, 가중치로 QoS 를 조정 가능.
+ *
+ * 동작 단계:
+ *   1) opts.arbitration_burst==0 → no-op (기본값 유지)
+ *   2) >7 검증 (3-bit 필드) — 잘못된 값이면 warning 출력 후 return
+ *   3) completion poll status 동적 할당 (admin 명령 동기 대기용)
+ *   4) cdw11 비트필드 빌드:
+ *        bits[2:0]   = AB (burst exponent)
+ *        bits[15:8]  = LPW (low priority weight)  — WRR 지원 시
+ *        bits[23:16] = MPW (medium priority weight)
+ *        bits[31:24] = HPW (high priority weight)
+ *   5) Set Features (FID=01h) admin 명령 발행 — 비동기 콜백으로 nvme_completion_poll_cb
+ *   6) nvme_wait_for_adminq_completion 으로 동기 대기 (admin queue polling)
+ *   7) 실패 시 ERRLOG 만 출력하고 다음 단계로 진행 (치명적이지 않음)
+ *
+ * 실행 컨텍스트:
+ *   nvme_ctrlr_set_supported_features 끝부분에서 동기 호출.
+ *   admin queue 를 polling 으로 돌려야 하므로 controller bring-up 단계 또는 idle 한 시점에만 호출.
+ */
 static void
 nvme_ctrlr_set_arbitration_feature(struct spdk_nvme_ctrlr *ctrlr)
 {
-	uint32_t cdw11;
-	struct nvme_completion_poll_status *status;
-	int rc;
+	uint32_t cdw11;                                                    /* [한국어] Set Features 의 Command DWord 11 — AB + WRR weights 인코딩 */
+	struct nvme_completion_poll_status *status;                        /* [한국어] 비동기 콜백이 결과를 채울 동기 폴링 핸들 */
+	int rc;                                                            /* [한국어] wait_for_adminq_completion 반환값 (음수=에러) */
 
+	/* [한국어] 사용자가 arbitration_burst 를 설정 안 했으면(0) 기본값 유지 — 명령 안 보냄 */
 	if (ctrlr->opts.arbitration_burst == 0) {
 		return;
 	}
 
+	/* [한국어] AB 필드는 NVMe 스펙상 3 bit (0~7) — 8 이상은 잘못된 값이므로 거부 */
 	if (ctrlr->opts.arbitration_burst > 7) {
 		NVME_CTRLR_WARNLOG(ctrlr, "Valid arbitration burst values is from 0-7\n");
 		return;
 	}
 
+	/* [한국어] poll status 객체 할당 — nvme_completion_poll_cb 가 done/cpl 채우면
+	 * nvme_wait_for_adminq_completion 이 그걸 보고 동기 대기를 끝냄 */
 	status = calloc(1, sizeof(*status));
 	if (!status) {
 		NVME_CTRLR_ERRLOG(ctrlr, "Failed to allocate status tracker\n");
-		return;
+		return;                                                    /* [한국어] OOM — feature 설정 포기, 디바이스 동작은 계속 (기본값) */
 	}
 
-	cdw11 = ctrlr->opts.arbitration_burst;
+	cdw11 = ctrlr->opts.arbitration_burst;                             /* [한국어] AB(Arbitration Burst) 를 cdw11 의 bits[2:0] 에 배치 */
 
+	/* [한국어] Identify Ctrlr 에서 WRR(Weighted Round Robin) 을 지원한다고 보고했을 때만 가중치 반영
+	 * — 미지원 컨트롤러에 WRR 비트를 보내면 invalid field 에러 */
 	if (spdk_nvme_ctrlr_get_flags(ctrlr) & SPDK_NVME_CTRLR_WRR_SUPPORTED) {
-		cdw11 |= (uint32_t)ctrlr->opts.low_priority_weight << 8;
-		cdw11 |= (uint32_t)ctrlr->opts.medium_priority_weight << 16;
-		cdw11 |= (uint32_t)ctrlr->opts.high_priority_weight << 24;
+		cdw11 |= (uint32_t)ctrlr->opts.low_priority_weight << 8;       /* [한국어] LPW: bits[15:8] — low priority queue 슬롯 가중치 */
+		cdw11 |= (uint32_t)ctrlr->opts.medium_priority_weight << 16;   /* [한국어] MPW: bits[23:16] — medium priority */
+		cdw11 |= (uint32_t)ctrlr->opts.high_priority_weight << 24;     /* [한국어] HPW: bits[31:24] — high priority */
 	}
 
+	/* [한국어] Admin Set Features 명령 발행 — FID=01h(SPDK_NVME_FEAT_ARBITRATION) + cdw11
+	 * 콜백 nvme_completion_poll_cb 는 status->done=true 와 cpl 을 채움, 동기 대기는 wait 함수가 함 */
 	if (spdk_nvme_ctrlr_cmd_set_feature(ctrlr, SPDK_NVME_FEAT_ARBITRATION,
 					    cdw11, 0, NULL, 0,
 					    nvme_completion_poll_cb, status) < 0) {
 		NVME_CTRLR_ERRLOG(ctrlr, "Set arbitration feature failed\n");
-		free(status);
+		free(status);                                              /* [한국어] 명령 자체가 큐에 못 들어갔으므로 status 즉시 해제 */
 		return;
 	}
 
+	/* [한국어] admin queue polling 으로 status->done==true 까지 대기 (true=완료 후 status free)
+	 * 내부적으로 spdk_nvme_qpair_process_completions(ctrlr->adminq) 반복 호출 */
 	rc = nvme_wait_for_adminq_completion(ctrlr, status, true);
 	if (rc) {
+		/* [한국어] 실패 시 ERRLOG만 출력 — 컨트롤러 bring-up은 계속 진행 (치명적 아님) */
 		NVME_CTRLR_ERRLOG(ctrlr, "wait for spdk_nvme_ctrlr_cmd_set_feature failed: rc=%s\n",
 				  spdk_strerror(abs(rc)));
 	}
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_set_supported_features - 컨트롤러 feature 지원 비트맵 + Arbitration 설정
+ *
+ * @ctrlr: 대상 NVMe 컨트롤러
+ *
+ * 동기/배경:
+ *   NVMe Set/Get Features 명령(opcode 09h/0Ah)의 FID(Feature Identifier) 공간 중,
+ *   어느 FID 가 실제로 의미를 갖는지 컨트롤러마다 다름. SPDK 는 Identify Ctrlr 결과의
+ *   비트필드(vwc/apsta/hmpre 등)를 보고 *지원 가능* 한 FID 를 미리 비트맵화해서
+ *   사용자가 spdk_nvme_ctrlr_set_feature() 호출 시 사전 검증에 사용한다.
+ *
+ * 동작 단계:
+ *   1) feature_supported[] 비트맵 0으로 초기화
+ *   2) NVMe 스펙 mandatory 9종 무조건 활성화 (Arbitration, Power Mgmt, ...)
+ *   3) 옵션 feature 3종 — Identify Ctrlr 비트로 분기:
+ *        vwc.present=1 → Volatile Write Cache (FID=06h)
+ *        apsta.supported=1 → Autonomous Power State Transition (FID=0Ch)
+ *        hmpre>0 → Host Memory Buffer (FID=0Dh, NVMe 1.2+)
+ *   4) Intel 벤더면 nvme_ctrlr_set_intel_supported_features 추가 호출 (Intel FID 7종)
+ *   5) nvme_ctrlr_set_arbitration_feature — 사용자 opts.arbitration_burst 가 설정됐으면
+ *      실제 admin Set Features 명령 발행 (지원 비트맵 설정과 다른 작업)
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_process_init → [이 함수] → set_arbitration_feature(동기 admin)
+ *                                      → set_intel_supported_features(Intel 시)
+ */
 static void
 nvme_ctrlr_set_supported_features(struct spdk_nvme_ctrlr *ctrlr)
 {
-	memset(ctrlr->feature_supported, 0, sizeof(ctrlr->feature_supported));
+	memset(ctrlr->feature_supported, 0, sizeof(ctrlr->feature_supported)); /* [한국어] 비트맵 전체 초기화 후 mandatory + 옵션 비트만 켬 */
 	/* Mandatory features */
-	ctrlr->feature_supported[SPDK_NVME_FEAT_ARBITRATION] = true;
-	ctrlr->feature_supported[SPDK_NVME_FEAT_POWER_MANAGEMENT] = true;
-	ctrlr->feature_supported[SPDK_NVME_FEAT_TEMPERATURE_THRESHOLD] = true;
-	ctrlr->feature_supported[SPDK_NVME_FEAT_ERROR_RECOVERY] = true;
-	ctrlr->feature_supported[SPDK_NVME_FEAT_NUMBER_OF_QUEUES] = true;
-	ctrlr->feature_supported[SPDK_NVME_FEAT_INTERRUPT_COALESCING] = true;
-	ctrlr->feature_supported[SPDK_NVME_FEAT_INTERRUPT_VECTOR_CONFIGURATION] = true;
-	ctrlr->feature_supported[SPDK_NVME_FEAT_WRITE_ATOMICITY] = true;
-	ctrlr->feature_supported[SPDK_NVME_FEAT_ASYNC_EVENT_CONFIGURATION] = true;
+	/* [한국어] NVMe 스펙 1.x Section 5.21.1.x — 모든 컨트롤러가 의무적으로 지원하는 9종 feature */
+	ctrlr->feature_supported[SPDK_NVME_FEAT_ARBITRATION] = true;                       /* [한국어] FID=01h — 큐 우선순위 가중치 (Arbitration Burst + WRR) */
+	ctrlr->feature_supported[SPDK_NVME_FEAT_POWER_MANAGEMENT] = true;                  /* [한국어] FID=02h — Power State (PS0~PS31) 선택 */
+	ctrlr->feature_supported[SPDK_NVME_FEAT_TEMPERATURE_THRESHOLD] = true;             /* [한국어] FID=04h — 온도 경고 임계값 */
+	ctrlr->feature_supported[SPDK_NVME_FEAT_ERROR_RECOVERY] = true;                    /* [한국어] FID=05h — TLER (Time-Limited Error Recovery) */
+	ctrlr->feature_supported[SPDK_NVME_FEAT_NUMBER_OF_QUEUES] = true;                  /* [한국어] FID=07h — IO SQ/CQ 개수 협상 */
+	ctrlr->feature_supported[SPDK_NVME_FEAT_INTERRUPT_COALESCING] = true;              /* [한국어] FID=08h — 인터럽트 합치기 (threshold + time) */
+	ctrlr->feature_supported[SPDK_NVME_FEAT_INTERRUPT_VECTOR_CONFIGURATION] = true;    /* [한국어] FID=09h — MSI-X 벡터별 coalescing 설정 */
+	ctrlr->feature_supported[SPDK_NVME_FEAT_WRITE_ATOMICITY] = true;                   /* [한국어] FID=0Ah — write atomicity 보장 단위 (DUN/AWUN) */
+	ctrlr->feature_supported[SPDK_NVME_FEAT_ASYNC_EVENT_CONFIGURATION] = true;         /* [한국어] FID=0Bh — AER 가 보고할 이벤트 종류 마스크 */
 	/* Optional features */
+	/* [한국어] Volatile Write Cache(FID=06h) — 컨트롤러가 휘발성 캐시를 가질 때만 의미 (vwc.present 비트) */
 	if (ctrlr->cdata.vwc.present) {
-		ctrlr->feature_supported[SPDK_NVME_FEAT_VOLATILE_WRITE_CACHE] = true;
+		ctrlr->feature_supported[SPDK_NVME_FEAT_VOLATILE_WRITE_CACHE] = true;      /* [한국어] flush 명령으로 캐시 비울 수 있는지 결정 */
 	}
+	/* [한국어] APST(Autonomous Power State Transition, FID=0Ch) — idle 시 자동 저전력 전환 */
 	if (ctrlr->cdata.apsta.supported) {
 		ctrlr->feature_supported[SPDK_NVME_FEAT_AUTONOMOUS_POWER_STATE_TRANSITION] = true;
 	}
+	/* [한국어] HMB(Host Memory Buffer, FID=0Dh) — 컨트롤러가 호스트 RAM 일부를 working memory로 빌려씀 (DRAM-less SSD 용)
+	 * hmpre(Host Memory Buffer Preferred Size) > 0 이면 컨트롤러가 원함 */
 	if (ctrlr->cdata.hmpre) {
 		ctrlr->feature_supported[SPDK_NVME_FEAT_HOST_MEM_BUFFER] = true;
 	}
+	/* [한국어] Intel 벤더 SSD 면 추가 7종 feature 활성화 (vendor-specific FID C0h~FFh 영역) */
 	if (ctrlr->cdata.vid == SPDK_PCI_VID_INTEL) {
 		nvme_ctrlr_set_intel_supported_features(ctrlr);
 	}
 
+	/* [한국어] 비트맵 설정과 별개로 — 사용자가 opts.arbitration_burst 를 설정했다면
+	 * 실제 admin Set Features 명령으로 컨트롤러에 반영. 위 비트맵은 *어떤 FID가 가능한가* 를 추적하고
+	 * 이 함수는 *실제 명령 발행* 으로 동작이 다름 */
 	nvme_ctrlr_set_arbitration_feature(ctrlr);
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_set_host_feature_done - Set Features (Host Behavior Support) 비동기 완료 콜백
+ *
+ * @arg: cb_arg 로 전달된 spdk_nvme_ctrlr* (set_host_feature 가 등록)
+ * @cpl: NVMe CQE — sc/sct 로 성공/실패 판단
+ *
+ * 동기/배경:
+ *   nvme_ctrlr_set_host_feature 가 비동기로 발행한 admin Set Features (FID=16h, Host Behavior
+ *   Support) 의 완료 콜백. host->lbafee=1 (Extended LBA Format Enabled) 같은 호스트 동작 힌트를
+ *   컨트롤러에 알린 결과를 처리한다.
+ *
+ * 동작:
+ *   1) 사전에 spdk_dma_zmalloc 으로 잡아둔 host buffer (tmp_ptr) 해제 — 이 시점이면 컨트롤러가
+ *      DMA 로 다 읽어갔으므로 안전
+ *   2) CQE error 검사 — 실패면 ctrlr 상태를 ERROR 로 강제 (controller bring-up 중단)
+ *   3) 성공이면 feature_supported 비트맵에 HOST_BEHAVIOR_SUPPORT 마킹
+ *   4) 다음 상태 SET_DB_BUF_CFG (Doorbell Buffer Config — shadow doorbell 설정) 로 전이
+ *
+ * 실행 컨텍스트:
+ *   admin queue completion polling 시 호출. process_init state machine 의 비동기 step.
+ *
+ * 호출 체인:
+ *   admin completion poll → nvme_completion_poll_cb 가 아닌 직접 등록된 콜백 [이 함수]
+ *                       → nvme_ctrlr_set_state(SET_DB_BUF_CFG)
+ */
 static void
 nvme_ctrlr_set_host_feature_done(void *arg, const struct spdk_nvme_cpl *cpl)
 {
-	struct spdk_nvme_ctrlr *ctrlr = (struct spdk_nvme_ctrlr *)arg;
+	struct spdk_nvme_ctrlr *ctrlr = (struct spdk_nvme_ctrlr *)arg;      /* [한국어] cb_arg 캐스팅 — Set Features 발행 시 self 포인터를 cb_arg 로 전달 */
 
+	/* [한국어] Set Features (with data buffer) 의 host buffer 해제
+	 * 컨트롤러가 DMA로 읽고 CQE 가 도착했으니 더 이상 메모리 유지 불필요 */
 	spdk_free(ctrlr->tmp_ptr);
-	ctrlr->tmp_ptr = NULL;
+	ctrlr->tmp_ptr = NULL;                                              /* [한국어] dangling 방지 */
 
+	/* [한국어] CQE 의 status.sct(Status Code Type) + status.sc(Status Code) 로 에러 판단
+	 * 실패 시 admin error log 출력 후 controller 상태를 ERROR 로 강제 — bring-up 중단 */
 	if (spdk_nvme_cpl_is_error(cpl)) {
 		NVME_CTRLR_ERRLOG(ctrlr, "Set host behavior support feature failed: SC %x SCT %x\n",
 				  cpl->status.sc, cpl->status.sct);
-		nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_ERROR, NVME_TIMEOUT_INFINITE);
+		nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_ERROR, NVME_TIMEOUT_INFINITE);  /* [한국어] 에러 상태는 timeout 무한 — 사용자가 reset 결정해야 회복 */
 		return;
 	}
 
+	/* [한국어] 성공 — feature_supported 비트맵에 FID=16h(HOST_BEHAVIOR_SUPPORT) 마킹
+	 * 이후 사용자가 Get Features 로 이 FID 조회 시 사전 검증 통과 */
 	ctrlr->feature_supported[SPDK_NVME_FEAT_HOST_BEHAVIOR_SUPPORT] = true;
 
+	/* [한국어] 다음 단계: Doorbell Buffer Config (FID=7Eh, NVMe 1.3+ shadow doorbell)
+	 * VM virtio-nvme 같은 환경에서 MMIO doorbell write를 host 메모리에 mirror 해 cost 절감 */
 	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_SET_DB_BUF_CFG,
 			     ctrlr->opts.admin_timeout_ms);
 }
@@ -1569,56 +1740,133 @@ nvme_ctrlr_set_host_feature_done(void *arg, const struct spdk_nvme_cpl *cpl)
 /* We do not want to do add synchronous operation anymore.
  * We set the Host Behavior Support feature asynchronousin in different states.
  */
+/*
+ * [한국어]
+ * nvme_ctrlr_set_host_feature - Host Behavior Support feature 비동기 발행 (lbafee=1)
+ *
+ * @ctrlr: 대상 NVMe 컨트롤러
+ * @return: 0 성공(비동기 발행 OK), 음수 = 실패 (state ERROR 로 전이됨)
+ *
+ * 동기/배경:
+ *   NVMe 1.4 + Set Features FID=16h (Host Behavior Support) 의 lbafee 비트는
+ *   "호스트가 LBA Format Extension(64-bit RefTag 등) 을 이해하고 처리할 수 있다" 는 신호.
+ *   ctratt.bits.elbas (Extended LBA Format Support) 가 1인 컨트롤러에 한해 보낸다.
+ *
+ *   영문 주석 의도: 과거에는 동기 호출이었으나, 다른 상태들과 일관되게 *비동기 + state machine* 로 통일.
+ *
+ * 동작 단계:
+ *   1) elbas 미지원 컨트롤러 → 이 단계 skip, SET_DB_BUF_CFG 로 직접 전이 후 return 0
+ *   2) DMA-able 4KB 정렬 buffer 동적 할당 (host_behavior 구조체 담을 자리, OOM 시 error path)
+ *   3) state 를 WAIT_FOR_SET_HOST_FEATURE 로 마킹 (process_init poller 가 완료 콜백 대기)
+ *   4) host->lbafee = 1 설정 (컨트롤러에게 "확장 LBA 포맷 OK" 통지)
+ *   5) spdk_nvme_ctrlr_cmd_set_feature 비동기 호출 — 콜백 = nvme_ctrlr_set_host_feature_done
+ *   6) 발행 실패 시 error label → 메모리 free + state ERROR
+ *
+ * 실행 컨텍스트:
+ *   nvme_ctrlr_process_init state machine 의 SET_HOST_FEATURE 단계.
+ *   비동기 발행이므로 즉시 return, 완료는 done 콜백이 처리.
+ */
 static int
 nvme_ctrlr_set_host_feature(struct spdk_nvme_ctrlr *ctrlr)
 {
-	struct spdk_nvme_host_behavior *host;
-	int rc;
+	struct spdk_nvme_host_behavior *host;                              /* [한국어] DMA buffer 캐스팅용 — Set Features 의 data 페이로드 */
+	int rc;                                                            /* [한국어] 반환 코드 */
 
+	/* [한국어] CTRATT(Controller Attributes).elbas — Extended LBA Format Support 미지원이면
+	 * Host Behavior 도 보낼 필요 없이 다음 단계로 진행 (NVMe < 1.4 컨트롤러 호환) */
 	if (!ctrlr->cdata.ctratt.bits.elbas) {
 		nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_SET_DB_BUF_CFG,
 				     ctrlr->opts.admin_timeout_ms);
-		return 0;
+		return 0;                                                  /* [한국어] no-op 성공 */
 	}
 
+	/* [한국어] DMA buffer 할당 — 4KB 정렬 (PRP 호환), zmalloc 으로 0 초기화
+	 * tmp_ptr 에 보관하다가 done 콜백이 free 함 (수명 = 명령 in-flight 동안) */
 	ctrlr->tmp_ptr = spdk_dma_zmalloc(sizeof(struct spdk_nvme_host_behavior), 4096, NULL);
 	if (!ctrlr->tmp_ptr) {
 		NVME_CTRLR_ERRLOG(ctrlr, "Failed to allocate host behavior support data\n");
 		rc = -ENOMEM;
-		goto error;
+		goto error;                                                /* [한국어] OOM — error label 로 점프 (state ERROR) */
 	}
 
+	/* [한국어] 상태 전이 — process_init poller 가 admin completion 을 기다림
+	 * 이 시점부터 done 콜백이 실행되기 전까지 다른 state 로 진행 안 됨 */
 	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_WAIT_FOR_SET_HOST_FEATURE,
 			     ctrlr->opts.admin_timeout_ms);
 
-	host = ctrlr->tmp_ptr;
+	host = ctrlr->tmp_ptr;                                             /* [한국어] DMA buffer를 spec 구조체 포인터로 alias */
 
-	host->lbafee = 1;
+	host->lbafee = 1;                                                  /* [한국어] LBA Format Extension Enable — 64-bit metadata/RefTag 처리 가능 신호 */
 
+	/* [한국어] Admin Set Features 비동기 발행
+	 * cdw11=0 / cdw12=0 / data buffer + size = host_behavior / 콜백 = done */
 	rc = spdk_nvme_ctrlr_cmd_set_feature(ctrlr, SPDK_NVME_FEAT_HOST_BEHAVIOR_SUPPORT,
 					     0, 0, host, sizeof(struct spdk_nvme_host_behavior),
 					     nvme_ctrlr_set_host_feature_done, ctrlr);
 	if (rc != 0) {
 		NVME_CTRLR_ERRLOG(ctrlr, "Set host behavior support feature failed: %d\n", rc);
-		goto error;
+		goto error;                                                /* [한국어] admin SQ 가득 참 등 발행 실패 — error path */
 	}
 
-	return 0;
+	return 0;                                                          /* [한국어] 비동기 발행 성공 — 완료는 done 콜백이 처리 */
 
 error:
+	/* [한국어] 에러 경로: 할당된 buffer free + state ERROR 마킹 */
 	spdk_free(ctrlr->tmp_ptr);
-	ctrlr->tmp_ptr = NULL;
+	ctrlr->tmp_ptr = NULL;                                             /* [한국어] dangling 방지 */
 
-	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_ERROR, NVME_TIMEOUT_INFINITE);
-	return rc;
+	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_ERROR, NVME_TIMEOUT_INFINITE); /* [한국어] timeout 무한 = 회복 불가, 사용자 reset 필요 */
+	return rc;                                                         /* [한국어] -ENOMEM 또는 set_feature 의 음수 반환 */
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_is_failed - 컨트롤러가 fail 상태인지 단순 조회 (public API)
+ *
+ * @ctrlr: 조회 대상 컨트롤러
+ * @return: true = is_failed 플래그 set, false = 정상
+ *
+ * 동기/배경:
+ *   사용자가 I/O 발행 전, 또는 reset 결정 전 컨트롤러가 정상 상태인지 빠르게 확인하는 용도.
+ *   nvme_ctrlr_fail() 이 호출되면 is_failed 플래그가 set 되며, 회복은 reset 만 가능.
+ *
+ * 동작: 단일 플래그 read — 락 불필요 (atomic read 의미, 정확성 비요구).
+ */
 bool
 spdk_nvme_ctrlr_is_failed(struct spdk_nvme_ctrlr *ctrlr)
 {
-	return ctrlr->is_failed;
+	return ctrlr->is_failed;                                           /* [한국어] 플래그 read — 정확성보다 가시성 우선이라 락 없이 OK */
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_fail - 내부용 fail 진입점 (호출자가 ctrlr lock 보유 가정)
+ *
+ * @ctrlr: fail 처리할 컨트롤러
+ * @hot_remove: true 면 PCIe surprise removal (디바이스가 물리적으로 사라짐)
+ *
+ * 동기/배경:
+ *   컨트롤러가 회복 불가 에러 (펌웨어 패닉, MMIO 응답 없음, hot remove 등) 상태로 진입했을 때
+ *   in-flight IO 모두를 즉시 실패시키지 않고, *플래그만 set + admin qpair disconnect* 한다.
+ *   in-flight IO 의 실제 실패 보고는 process_completions 가 다음 polling 사이클에 처리.
+ *   이 lazy 처리 패턴은 lock 보유 시간을 최소화 + 사용자 callback 컨텍스트 안전 보장 목적.
+ *
+ * 동작 단계:
+ *   1) hot_remove → is_removed 플래그 set (PCIe ENOENT 시 transport 가 검사)
+ *   2) 이미 is_failed → 중복 보고 무시 (idempotent)
+ *   3) 이미 is_disconnecting → reset 진행 중이라 별도 fail 처리 불필요
+ *   4) is_failed = true 마킹 + state = ERROR(timeout 무한)
+ *   5) admin qpair 강제 disconnect (transport 레이어 — PCIe BAR 해제, RDMA QP 파괴 등)
+ *   6) ERRLOG 출력 — 사용자 진단용
+ *
+ * 실행 컨텍스트:
+ *   ★ 호출자가 이미 ctrlr lock 을 잡고 있어야 함 (transport callback 등 내부 경로용).
+ *   외부 사용자는 lock wrapper 인 spdk_nvme_ctrlr_fail() 을 호출.
+ *
+ * 호출 체인:
+ *   PCIe pcie_ctrlr_construct 실패 / transport 에러 / spdk_nvme_ctrlr_fail wrapper → [이 함수]
+ *                       → nvme_transport_ctrlr_disconnect_qpair(adminq)
+ */
 void
 nvme_ctrlr_fail(struct spdk_nvme_ctrlr *ctrlr, bool hot_remove)
 {
@@ -1626,24 +1874,31 @@ nvme_ctrlr_fail(struct spdk_nvme_ctrlr *ctrlr, bool hot_remove)
 	 * Set the flag here and leave the work failure of qpairs to
 	 * spdk_nvme_qpair_process_completions().
 	 */
+	/* [한국어] hot_remove 플래그 — PCIe 디바이스가 surprise removal 된 경우 (사용자 unplug 등)
+	 * transport layer 의 ENOENT 에러를 영구적인 디바이스 부재로 해석하게 함 */
 	if (hot_remove) {
 		ctrlr->is_removed = true;
 	}
 
+	/* [한국어] 이미 failed 상태면 추가 작업 없음 — 여러 경로에서 중복 호출 가능하므로 idempotent */
 	if (ctrlr->is_failed) {
 		NVME_CTRLR_NOTICELOG(ctrlr, "already in failed state\n");
 		return;
 	}
 
+	/* [한국어] reset 진행 중(is_disconnecting=true) 이면 reset 흐름이 alone 처리 — fail 별도 시작 X */
 	if (ctrlr->is_disconnecting) {
 		NVME_CTRLR_DEBUGLOG(ctrlr, "already disconnecting\n");
 		return;
 	}
 
-	ctrlr->is_failed = true;
+	ctrlr->is_failed = true;                                           /* [한국어] 플래그 set — 이후 IO 발행자가 검사하여 EIO 반환 */
+	/* [한국어] state = ERROR + timeout 무한 — process_init 가 진행 중이라면 그 자리에서 정지 */
 	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_ERROR, NVME_TIMEOUT_INFINITE);
+	/* [한국어] admin qpair 강제 disconnect — 더 이상 admin 명령을 디바이스에 보내지 않게
+	 * PCIe면 BAR doorbell write 차단, RDMA면 QP 파괴 등 transport-specific cleanup */
 	nvme_transport_ctrlr_disconnect_qpair(ctrlr, ctrlr->adminq);
-	NVME_CTRLR_ERRLOG(ctrlr, "in failed state.\n");
+	NVME_CTRLR_ERRLOG(ctrlr, "in failed state.\n");                    /* [한국어] 사용자 진단용 — dmesg/syslog 에 명확한 신호 */
 }
 
 /**
@@ -1651,12 +1906,25 @@ nvme_ctrlr_fail(struct spdk_nvme_ctrlr *ctrlr, bool hot_remove)
  * Any private functions being called from a thread already holding
  * the ctrlr lock should call nvme_ctrlr_fail directly.
  */
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_fail - 외부 사용자용 fail 진입점 (lock wrapper)
+ *
+ * @ctrlr: fail 마킹할 컨트롤러
+ *
+ * 동기/배경:
+ *   영문 주석대로 — 외부 사용자(bdev_nvme, 애플리케이션 등) 가 컨트롤러를 강제 실패시킬 때 호출.
+ *   ctrlr lock 을 자동 획득/해제 한다. lock 을 이미 보유한 내부 경로(transport callback 등) 는
+ *   nvme_ctrlr_fail 을 직접 호출해야 deadlock 회피.
+ *
+ * 동작: lock 획득 → nvme_ctrlr_fail(hot_remove=false) → unlock
+ */
 void
 spdk_nvme_ctrlr_fail(struct spdk_nvme_ctrlr *ctrlr)
 {
-	nvme_ctrlr_lock(ctrlr);
-	nvme_ctrlr_fail(ctrlr, false);
-	nvme_ctrlr_unlock(ctrlr);
+	nvme_ctrlr_lock(ctrlr);                                            /* [한국어] ctrlr->ctrlr_lock 획득 — multi-thread 안전성 */
+	nvme_ctrlr_fail(ctrlr, false);                                     /* [한국어] hot_remove=false 외부 호출은 보통 논리적 fail (디바이스는 살아있을 수 있음) */
+	nvme_ctrlr_unlock(ctrlr);                                          /* [한국어] lock 해제 */
 }
 
 static void

@@ -267,9 +267,24 @@ examples/nvme/*, examples/bdev/*, examples/nvmf/*, examples/sock/*, examples/thr
 
 ## 현재 진행 중 파일
 
-- ◐ **lib/nvme/nvme_ctrlr.c** — 5997줄 → 6510줄. v1 핵심 8종 + v2 qpair 관리 10종 = 18종 보강. 잔여 ~90 함수. 다음 세션 Part 3에서 features/reset/AER 우선 진행.
+- ◐ **lib/nvme/nvme_ctrlr.c** — 5997 → 6510 → 6778줄. v1 핵심 8종 + v2 qpair 관리 10종 + v3 features/fail 9종 = 27종 보강. 잔여 ~80 함수. 다음 세션 Part 4에서 shutdown/reset/AER 우선 진행.
 
 ## 최근 완료 파일 (역순 최대 30개)
+
+- 2026-04-29 · **lib/nvme/nvme_ctrlr.c [◐ 부분 v3 — Part 3: features/fail 9종]** — 6510줄 → 6778줄 (+268줄). features 비트맵 + fail 진입점 보강:
+  - **nvme_ctrlr_set_supported_log_pages**: log_page_supported[] 비트맵 결정. mandatory 3종(Error/Health/Firmware Slot) + LPA.cses(Command Effects) + CMIC.anars(ANA, 옵션이면 즉시 read+parse) + ctratt.fdps(FDP 4종) + Intel/PCIe 분기로 SET_SUPPORTED_INTEL_LOG_PAGES 또는 직접 SET_SUPPORTED_FEATURES 로 전이.
+  - **nvme_ctrlr_set_intel_supported_features**: Intel vendor FID 7종 (MAX_LBA C1h / NATIVE_MAX_LBA C2h / POWER_GOVERNOR C6h / SMBUS C8h / LED C7h / TIMED_WORKLOAD D5h / LATENCY_TRACKING E2h) 비트맵만 활성화 (실제 admin 명령 발행 안 함).
+  - **★ nvme_ctrlr_set_arbitration_feature**: 실제 Set Features (FID=01h) admin 발행. AB(3-bit) + WRR HPW/MPW/LPW 가중치 cdw11 비트필드 빌드 + completion poll 동기 대기. AB=0 / >7 / WRR 미지원 분기 처리.
+  - **nvme_ctrlr_set_supported_features**: feature_supported[] 비트맵. mandatory 9종 무조건 + 옵션 3종(VWC/APST/HMB) Identify Ctrlr 비트로 분기 + Intel 추가 + 끝에 set_arbitration_feature 동기 호출.
+  - **nvme_ctrlr_set_host_feature_done**: Set Features (FID=16h Host Behavior) 비동기 완료 콜백. tmp_ptr free → CQE error 검사 (실패=ERROR state) → 성공 시 비트맵 마킹 + SET_DB_BUF_CFG 전이.
+  - **nvme_ctrlr_set_host_feature**: ctratt.elbas 분기 (미지원=skip), DMA buffer 4KB 정렬 zmalloc + state WAIT_FOR_SET_HOST_FEATURE → host->lbafee=1 + 비동기 admin 발행. error label 4단계 cleanup (free + state ERROR).
+  - **spdk_nvme_ctrlr_is_failed**: is_failed 플래그 단순 read public API (락 없음).
+  - **★ nvme_ctrlr_fail**: 내부용 fail 진입점 (호출자 lock 보유 가정). hot_remove → is_removed / 중복 호출 idempotent / is_disconnecting 시 skip / state=ERROR + admin disconnect. ★ "플래그만 set, in-flight IO 실패 보고는 process_completions 가 lazy 처리" 패턴 명시.
+  - **spdk_nvme_ctrlr_fail**: 외부 사용자용 lock wrapper (nvme_ctrlr_lock → fail → unlock).
+
+  **결과 — features 단계 + fail 진입점 완결**: bring-up 의 SET_SUPPORTED_LOG_PAGES → SET_SUPPORTED_INTEL_LOG_PAGES → SET_SUPPORTED_FEATURES → SET_HOST_FEATURE → SET_DB_BUF_CFG 전이가 주석으로 추적 가능. 또 fail 의 두 layer (내부 lock-held 진입 vs 외부 lock-wrapped 진입) 가 명확히 분리.
+
+  **잔여 함수** (다음 세션 Part 4): shutdown_set_cc_done/get_cc_done/async/get_csts_done/poll_async (5종 비동기 chain), get_ready_timeout, set_cc_en_done/enable, state_string(string table), set_state_quiet, free_zns/iocs/doorbell_buffer, set_doorbell_buffer_config_done/cfg, abort_queued_aborts, disconnect/disconnect_done, reconnect_async/reinitialize/reconnect_poll_async, disable/disable_poll, fail_io_qpairs, ★ spdk_nvme_ctrlr_reset/reset_subsystem (사용자 reset API), set_trid, set_remove_cb, AER 처리 일습.
 
 - 2026-04-29 · **4차 병렬 agent 7개 파일 일괄 완료** — nvme_tcp.c(3416→4813, 50종 신규), include 헤더 6개: json.h(353→843), jsonrpc.h(357→715), rpc.h(156→363), trace.h(506→1153), trace_parser.h(131→314), dma.h(472→901). 3개 병렬 agent 동시 실행. **누적**: 원본 5391줄 → 주석 후 9102줄 (+3711줄), 약 130 함수/매크로/구조체 보강. 4섹션 블록 7/7 검증. **핵심 추가**: NVMe-oF TCP의 PDU 인코딩 + R2T flow control + TLS PSK HKDF + recv 상태머신, JSON-RPC 2.0 server/client + SPDK_RPC_REGISTER constructor 자동 등록 + STARTUP/RUNTIME phase gating, lockless trace circular buffer per-lcore + /dev/shm dump + spdk_trace CLI 후처리, DMA memory domain 추상화 + zero-copy I/O accel_sequence 통합.
 
