@@ -8,294 +8,631 @@
  * NVMe over RDMA transport
  */
 
-#include "spdk/stdinc.h"
+/*
+ * [한국어 설명] NVMe-over-Fabrics RDMA 호스트 트랜스포트 구현 (nvme_rdma.c)
+ *
+ * === 파일의 역할 ===
+ * NVMe-oF 1.0/1.1의 **RDMA 트랜스포트(InfiniBand / RoCE / iWARP)** 호스트 측 구현.
+ * SPDK NVMe 드라이버가 원격 NVM 서브시스템과 통신할 때 PCIe BAR MMIO 대신 libibverbs(`ibv_*`)
+ * + librdmacm(`rdma_*`) 위에 NVMe Capsule 메시지 + RDMA READ/WRITE 데이터 페치를 구성한다.
+ * 이 파일이 RDMA 트랜스포트의 **vtable 구현체(rdma_ops)** 와 그 모든 백엔드 함수(QP 생성, CM 핸드셰이크,
+ * Capsule 송수신, 데이터 SGL/UMR/Inline 빌드, 완료 폴링, poll group, hotplug 처리)를 모두 담는다.
+ *
+ * 5대 핵심 책임:
+ *   1) **RDMA QP 라이프사이클**: `rdma_create_id` → `rdma_resolve_addr` → `rdma_resolve_route` →
+ *      `ibv_create_qp` (spdk_rdma_provider_qp_create) → `rdma_connect`/`rdma_disconnect`/`rdma_destroy_id`.
+ *      각 단계는 비동기로 진행되며 `rdma_event_channel`을 통해 RDMA_CM_EVENT_*로 알림이 온다.
+ *   2) **NVMe-oF Fabric CONNECT 핸드셰이크**: RDMA 연결이 ESTABLISHED 된 후 NVMe-oF 표준의 Fabrics
+ *      CONNECT 커맨드를 Capsule로 송신해 컨트롤러/큐페어를 등록 (nvme_fabric.c가 실제 처리, 이 파일은
+ *      상태머신 진행을 담당).
+ *   3) **Capsule + RDMA hybrid I/O 경로**:
+ *        - 작은 Write: NVMe Cmd + 인라인 데이터를 한 SEND WR(2 SGE)로 묶어 송신 (in-capsule data, ICD)
+ *        - 큰 Write/Read: NVMe Cmd만 SEND로 보내고 keyed SGL(rkey)을 첨부 → 타깃이 RDMA_READ/WRITE로
+ *          호스트 메모리에 직접 접근 (zero-copy).
+ *      RECV WR로 응답 Capsule(spdk_nvme_cpl)을 미리 큐잉.
+ *   4) **CQ 폴링과 poll group**: `ibv_poll_cq` → SEND/RECV 완료를 처리해 `nvme_complete_request`까지
+ *      이어지는 hot path. 단일 큐페어 모드와 poll group 공유 CQ + SRQ(Shared Recv Queue) 모드 모두 지원.
+ *   5) **메모리 등록(MR)과 SGL 변환**: 페이로드 버퍼는 미리 `ibv_reg_mr`로 등록되어 있어야 RDMA가 가능 →
+ *      `spdk_rdma_utils_get_translation`으로 lkey/rkey 조회. UMR(메모리 키 가상 매핑) accel 시퀀스도 지원.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * SPDK NVMe 트랜스포트 vtable 구조에서 PCIe(nvme_pcie.c)와 형제뻘인 NVMe-oF RDMA 구현체.
+ * 파일 맨 아래 `SPDK_NVME_TRANSPORT_REGISTER(rdma, &rdma_ops)` 매크로가 main() 진입 전에 nvme_transport.c
+ * 의 전역 TAILQ에 RDMA ops를 삽입 → 이후 상위 레이어(spdk_nvme_probe → nvme_transport_*)가 이 파일의 함수
+ * 들을 vtable로 호출. PCIe와 다른 점: BAR MMIO 대신 nvme_fabric.c의 Property Set/Get 커맨드를 사용
+ * (rdma_ops.ctrlr_set_reg_4 = nvme_fabric_ctrlr_set_reg_4 위임).
+ *
+ * 호출 체인 (Connect 시퀀스):
+ *   [Application]
+ *     → spdk_nvme_connect / spdk_nvme_probe (subnqn=DISCOVERY_NQN 또는 직접 NQN)
+ *     → nvme_transport_ctrlr_construct → ops.ctrlr_construct
+ *         → nvme_rdma_ctrlr_construct ★ — rctrlr 할당, rdma_create_event_channel, admin qpair 생성
+ *     → nvme_transport_ctrlr_connect_qpair → ops.ctrlr_connect_qpair
+ *         → nvme_rdma_ctrlr_connect_qpair ★
+ *             → rdma_create_id (cm_id 할당)
+ *             → nvme_rdma_resolve_addr → rdma_resolve_addr (CM event: ADDR_RESOLVED)
+ *                 → nvme_rdma_addr_resolved (콜백)
+ *                     → rdma_resolve_route (CM event: ROUTE_RESOLVED)
+ *                         → nvme_rdma_route_resolved
+ *                             → nvme_rdma_qpair_init ★ — ibv_create_qp + ibv_create_cq
+ *                             → nvme_rdma_connect ★ — rdma_connect (CM event: ESTABLISHED)
+ *                                 → nvme_rdma_connect_established
+ *                                     → spdk_rdma_utils_create_mem_map (MR 등록 풀)
+ *                                     → nvme_rdma_create_reqs / nvme_rdma_create_rsps (SEND/RECV 풀)
+ *                                     → nvme_rdma_qpair_submit_recvs (RECV WR 사전 큐잉)
+ *                                     → state = FABRIC_CONNECT_SEND
+ *             → nvme_rdma_ctrlr_connect_qpair_poll (상태머신)
+ *                 → nvme_fabric_qpair_connect_async (FABRIC_CONNECT 커맨드 송신)
+ *                 → nvme_fabric_qpair_connect_poll → state = RUNNING
+ *
+ * 호출 체인 (I/O 송신):
+ *   [Application] → spdk_nvme_ns_cmd_read/write
+ *     → nvme_qpair_submit_request → ops.qpair_submit_request
+ *         → nvme_rdma_qpair_submit_request ★
+ *             → nvme_rdma_req_get (free_reqs 풀에서 rdma_req 획득)
+ *             → nvme_rdma_req_init → build_null/contig/sgl_request (SGL/inline 빌드)
+ *             → _nvme_rdma_qpair_submit_request → spdk_rdma_provider_qp_queue_send_wrs
+ *                 → nvme_rdma_qpair_submit_sends → ibv_post_send (SEND WR 게시)
+ *
+ * 호출 체인 (완료 폴링):
+ *   [Reactor poller] → spdk_nvme_qpair_process_completions
+ *     → ops.qpair_process_completions = nvme_rdma_qpair_process_completions
+ *         → nvme_rdma_cq_process_completions → ibv_poll_cq → 각 WC에 대해
+ *             → nvme_rdma_process_recv_completion (RECV WC: 응답 Capsule 도착)
+ *             → nvme_rdma_process_send_completion (SEND WC: 커맨드 송신 ACK)
+ *                 → nvme_rdma_request_ready → nvme_complete_request (cb_fn)
+ *
+ * === 타 모듈과의 연결 ===
+ *  - **상위 호출자**: nvme_transport.c (vtable dispatch), nvme_ctrlr.c (ctrlr 수명/상태머신),
+ *    nvme_qpair.c (큐페어 수명).
+ *  - **하위 의존**:
+ *      * libibverbs (`ibv_*`)            — QP/CQ/MR/SGE/WR (RDMA verbs API)
+ *      * librdmacm  (`rdma_*`)           — 연결 관리(ADDR/ROUTE resolve, connect, event channel)
+ *      * spdk_internal/rdma_provider.h   — SPDK의 verbs 추상 (Mellanox direct verbs/표준 verbs 분기)
+ *      * spdk_internal/rdma_utils.h      — MR 풀 관리, lkey/rkey 변환
+ *      * nvme_fabric.c                   — Fabric CONNECT, Property Set/Get, Discovery 공통
+ *      * nvme_internal.h                 — nvme_request, spdk_nvme_qpair, nvme_complete_request
+ *  - **공유 자료구조**:
+ *      * `struct nvme_rdma_ctrlr`      — spdk_nvme_ctrlr를 감싸는 RDMA 트랜스포트 컨테이너 (cm_channel 보관)
+ *      * `struct nvme_rdma_qpair`      — spdk_nvme_qpair를 감싸 cm_id/rdma_qp/cq/srq 추가
+ *      * `struct nvme_rdma_poller`     — poll group 내부에서 1 RDMA device당 1개 — 공유 CQ/SRQ 보유
+ *      * `struct spdk_nvme_rdma_req`   — NVMe 요청 1개당 1개의 send_wr/send_sgl/cpl 보유
+ *      * `struct spdk_nvme_rdma_rsp`   — RECV WR로 미리 게시된 응답 버퍼 + recv_wr
+ *  - **전역**: `g_nvme_hooks` (사용자 제공 ibv_pd/MR 등록 후크), `rdma_cm_event_str[]` (디버그 문자열).
+ *
+ * === 주요 함수/구조체 요약 ===
+ *  ★ 컨트롤러 수명:
+ *      nvme_rdma_ctrlr_construct        — 컨트롤러 + cm_channel + admin qpair 생성
+ *      nvme_rdma_ctrlr_destruct         — cm_channel 파괴, pending CM 이벤트 ack
+ *  ★ 큐페어 수명/CM 핸드셰이크:
+ *      nvme_rdma_ctrlr_connect_qpair    — rdma_create_id + addr/route 시작 (비동기)
+ *      nvme_rdma_resolve_addr/_addr_resolved/_route_resolved/_connect/_connect_established — 5단계 핸드셰이크
+ *      nvme_rdma_qpair_init             — ibv_create_qp + CQ + PD 결정
+ *      nvme_rdma_ctrlr_disconnect_qpair / _qpair_disconnected / _qpair_wait_until_quiet
+ *      nvme_rdma_qpair_destroy          — QP/CQ/cm_id 해제
+ *  ★ CM 이벤트 처리:
+ *      nvme_rdma_qpair_process_cm_event — 단일 이벤트 디스패치 (ESTABLISHED/DISCONNECTED/...)
+ *      nvme_rdma_poll_events            — cm_channel에서 모든 pending 이벤트 수확
+ *      nvme_rdma_validate_cm_event      — 기대값과 실제 이벤트 비교 (stale conn 검출)
+ *  ★ I/O 빌드 (NVMe-oF SGL 변형):
+ *      nvme_rdma_build_null_request          — 페이로드 없음
+ *      nvme_rdma_build_contig_request        — keyed SGL (RDMA_READ/WRITE)
+ *      nvme_rdma_build_contig_inline_request — in-capsule inline data (SEND 2 SGE)
+ *      nvme_rdma_build_sgl_request           — multi-segment keyed SGL
+ *      nvme_rdma_build_sgl_inline_request    — multi-segment, inline 가능한 첫 segment만
+ *      nvme_rdma_apply_accel_sequence        — UMR (가상 contig MR) 경로
+ *  ★ I/O hot path:
+ *      nvme_rdma_qpair_submit_request   — vtable의 submit 진입점
+ *      _nvme_rdma_qpair_submit_request  — send_wr 큐잉 + post_send
+ *      nvme_rdma_cq_process_completions — ibv_poll_cq → 각 WC를 SEND/RECV로 분기 처리
+ *      nvme_rdma_process_recv_completion / _send_completion / _request_ready
+ *  ★ Poll group:
+ *      nvme_rdma_poll_group_create / _destroy
+ *      nvme_rdma_poller_create / _destroy   — 1 device 당 1개의 공유 CQ/SRQ poller
+ *      nvme_rdma_poll_group_process_completions — 모든 poller의 CQ를 한 사이클에 폴링
+ *  ★ rdma_ops 테이블: 파일 맨 아래에 정의 — vtable로 export.
+ *
+ * === RDMA 핵심 도메인 지식 (이 파일 전반에 등장하는 용어) ===
+ *   - **WR (Work Request)**: 호스트가 RDMA HCA에 게시하는 작업. SEND/RECV/RDMA_READ/RDMA_WRITE 등.
+ *     이 파일에서 RDMA_READ/WRITE는 **타깃이** 발행(서버 측 zero-copy DMA), 호스트는 SEND/RECV만 사용.
+ *   - **SGE (Scatter-Gather Element)**: WR이 가리키는 메모리 영역 {addr, length, lkey}. 다중 SGE로 흩어진 버퍼 표현.
+ *   - **MR (Memory Region)**: ibv_reg_mr로 커널/HCA에 등록된 페이지 핀된 영역. lkey(local) + rkey(remote) 발급.
+ *   - **PD (Protection Domain)**: 같은 HCA 컨텍스트에서 QP/MR이 공유하는 보호 영역.
+ *   - **CQ (Completion Queue)**: WR 완료(WC = Work Completion)가 적재되는 큐. ibv_poll_cq로 수확.
+ *   - **QP (Queue Pair)**: SQ(Send Queue) + RQ(Recv Queue) 한 쌍. 한 RDMA 연결 = 한 QP.
+ *   - **SRQ (Shared Recv Queue)**: 여러 QP가 RECV WR을 공유하는 큐. poll group에서 메모리 절약 목적.
+ *   - **CM (Connection Manager, librdmacm)**: 주소 해상도/연결 협상을 캡슐화한 사용자 라이브러리.
+ *     `rdma_create_id` → `rdma_resolve_addr` → `rdma_resolve_route` → `rdma_connect` → 이벤트 채널로 알림.
+ *   - **Capsule (NVMe-oF)**: NVMe 커맨드 64B + 옵션 in-capsule data를 한 메시지로 묶은 것.
+ *     호스트 → 타깃은 SQE(Submission Queue Entry) Capsule, 타깃 → 호스트는 CQE(Completion) Capsule.
+ *   - **ICD (In-Capsule Data)**: 작은 Write 데이터를 SQE Capsule에 인라인. ioccsz/icdoff 컨트롤러 속성으로 결정.
+ *   - **Keyed SGL**: SGL descriptor에 rkey 포함 → 타깃이 호스트 메모리에 RDMA_READ/WRITE 가능.
+ *   - **UMR (User Mode Memory Region, Mellanox)**: 동적으로 가상 contig MR을 만들어 scatter 버퍼를
+ *     단일 키로 표현. accel sequence와 결합해 zero-copy 변환에 활용.
+ */
 
-#include "spdk/assert.h"
-#include "spdk/dma.h"
-#include "spdk/log.h"
-#include "spdk/trace.h"
-#include "spdk/queue.h"
-#include "spdk/nvme.h"
-#include "spdk/nvmf_spec.h"
-#include "spdk/string.h"
-#include "spdk/endian.h"
-#include "spdk/likely.h"
-#include "spdk/config.h"
+#include "spdk/stdinc.h"				/* [한국어] 표준 C 헤더 (stdint, string, ...) - SPDK 공통 진입점 */
 
-#include "nvme_internal.h"
-#include "spdk_internal/rdma_provider.h"
-#include "spdk_internal/rdma_utils.h"
+#include "spdk/assert.h"				/* [한국어] SPDK_STATIC_ASSERT — 컴파일타임 구조체 크기/오프셋 검증 */
+#include "spdk/dma.h"					/* [한국어] spdk_memory_domain — 하이브리드 DMA 추상 (RDMA/iouring/...) */
+#include "spdk/log.h"					/* [한국어] SPDK_ERRLOG/DEBUGLOG — 통합 로깅 */
+#include "spdk/trace.h"					/* [한국어] SPDK 트레이스 포인트 (현재 파일에서는 미사용에 가까움) */
+#include "spdk/queue.h"					/* [한국어] BSD-style TAILQ/STAILQ 매크로 — free_reqs/outstanding/CM 이벤트 큐에 사용 */
+#include "spdk/nvme.h"					/* [한국어] 공개 NVMe API (spdk_nvme_qpair, spdk_nvme_cpl 등) */
+#include "spdk/nvmf_spec.h"				/* [한국어] NVMe-oF 스펙 헤더: Capsule 구조, fabric private data 정의 */
+#include "spdk/string.h"				/* [한국어] spdk_strerror 등 문자열 헬퍼 */
+#include "spdk/endian.h"				/* [한국어] LE/BE 변환 (RDMA 페이로드는 little-endian이지만 NVMe 스펙도 그러함) */
+#include "spdk/likely.h"				/* [한국어] spdk_likely/unlikely - hot path 분기 예측 */
+#include "spdk/config.h"				/* [한국어] SPDK_CONFIG_RDMA_SET_ACK_TIMEOUT 등 빌드 옵션 매크로 */
 
+#include "nvme_internal.h"				/* [한국어] 드라이버 내부: nvme_request, qpair 상태머신, complete_request */
+#include "spdk_internal/rdma_provider.h"		/* [한국어] SPDK RDMA provider — 표준/Mellanox direct verbs 백엔드 추상 */
+#include "spdk_internal/rdma_utils.h"			/* [한국어] MR 풀 (mem_map), PD 캐시, lkey/rkey 변환 헬퍼 */
+
+/* [한국어] CM(Connection Manager) 동작 타임아웃 — rdma_resolve_addr/route, rdma_connect 등에 공통 사용.
+ *         2초로 짧게 설정해 빠른 실패 감지(끊긴 타깃에 무한 대기 방지). */
 #define NVME_RDMA_TIME_OUT_IN_MS 2000
+/* [한국어] (현재 미사용) 과거 RW 버퍼 크기 상수. 코드 변경하지 않으므로 그대로 둠. */
 #define NVME_RDMA_RW_BUFFER_SIZE 131072
 
 /*
  * NVME RDMA qpair Resource Defaults
  */
+/* [한국어] SEND WR이 가질 SGE 개수 기본값. 보통 2 = [SQE Capsule, In-Capsule Data].
+ *         첫 번째 SGE는 NVMe Cmd, 두 번째는 inline write 데이터 페이로드. */
 #define NVME_RDMA_DEFAULT_TX_SGE		2
+/* [한국어] RECV WR이 가질 SGE 개수 기본값. 응답 Capsule(spdk_nvme_cpl 16B만 받으면 됨)이라 1로 충분. */
 #define NVME_RDMA_DEFAULT_RX_SGE		1
 
 /* Max number of NVMe-oF SGL descriptors supported by the host */
+/* [한국어] 한 NVMe Cmd가 표현할 수 있는 최대 SGL descriptor 수.
+ *         Multi-segment SGL(여러 개의 keyed data block)을 한 캡슐 안에 채울 때 상한. */
 #define NVME_RDMA_MAX_SGL_DESCRIPTORS		16
 
 /* number of STAILQ entries for holding pending RDMA CM events. */
+/* [한국어] cm_channel에서 한꺼번에 읽힌 CM 이벤트 중 즉시 처리할 수 없는 것을 보관할 슬롯 수.
+ *         rdma_get_cm_event는 ack 전까지 새 이벤트를 못 받으므로 큐잉이 필요. */
 #define NVME_RDMA_NUM_CM_EVENTS			256
 
 /* The default size for a shared rdma completion queue. */
+/* [한국어] poll group 모드에서 SRQ를 안 쓰는 경우의 공유 CQ 기본 크기 (WC 슬롯 수). */
 #define DEFAULT_NVME_RDMA_CQ_SIZE		4096
 
 /*
  * In the special case of a stale connection we don't expose a mechanism
  * for the user to retry the connection so we need to handle it internally.
  */
+/* [한국어] Stale connection이란? 타깃이 이전 세션의 잔재(QP context)를 갖고 있어서 새 연결이 거부되는 상황.
+ *         RDMA_CM_EVENT_REJECTED + status=10(IB_CM_REJ_STALE_CONN)로 보고됨.
+ *         스펙상 호스트에 별도 retry API가 노출되지 않으므로 트랜스포트 내부에서 자동 재시도. */
 #define NVME_RDMA_STALE_CONN_RETRY_MAX		5
-#define NVME_RDMA_STALE_CONN_RETRY_DELAY_US	10000
+#define NVME_RDMA_STALE_CONN_RETRY_DELAY_US	10000	/* [한국어] 재시도 간격 10ms — 타깃이 이전 세션 정리할 시간 확보 */
 
 /*
  * Maximum value of transport_retry_count used by RDMA controller
  */
+/* [한국어] rdma_conn_param.retry_count 최대값. RDMA 패킷 손실 시 NACK 후 재전송 시도 횟수. */
 #define NVME_RDMA_CTRLR_MAX_TRANSPORT_RETRY_COUNT	7
 
 /*
  * Maximum value of transport_ack_timeout used by RDMA controller
  */
+/* [한국어] RDMA ACK 대기 타임아웃 (4.096us * 2^timeout). InfiniBand 스펙상 최대 31. */
 #define NVME_RDMA_CTRLR_MAX_TRANSPORT_ACK_TIMEOUT	31
 
 /*
  * Number of microseconds to wait until the lingering qpair becomes quiet.
  */
+/* [한국어] disconnect 후 in-flight WR이 모두 flush될 때까지 기다릴 최대 시간 (1초).
+ *         초과하면 강제로 quiet 상태로 전환 후 자원 해제. */
 #define NVME_RDMA_DISCONNECTED_QPAIR_TIMEOUT_US	1000000ull
 
 /*
  * The max length of keyed SGL data block (3 bytes)
  */
+/* [한국어] NVMe-oF Keyed SGL의 length 필드는 3바이트 → 최대 16MB-1.
+ *         이보다 큰 페이로드는 하나의 SGL로 표현 불가 → 분할 필요. */
 #define NVME_RDMA_MAX_KEYED_SGL_LENGTH ((1u << 24u) - 1)
 
+/* [한국어] queue depth N 큐페어가 필요로 하는 CQ 엔트리 수 = 2*N (SEND 완료 + RECV 완료 각각). */
 #define WC_PER_QPAIR(queue_depth)	(queue_depth * 2)
 
+/* [한국어] WC->qp_num이 특정 rqpair의 RDMA QP 번호와 일치하는지 검사하는 매크로.
+ *         poll group 공유 CQ에서 어느 큐페어 소유의 완료인지 라우팅할 때 사용. */
 #define NVME_RDMA_POLL_GROUP_CHECK_QPN(_rqpair, qpn)				\
 	((_rqpair)->rdma_qp && (_rqpair)->rdma_qp->qp->qp_num == (qpn))	\
 
+/* [한국어] rqpair 기반 로그 매크로 — 내부적으로 qpair 포인터를 추출해 NVME_QPAIR_*LOG으로 위임.
+ *         rqpair NULL 안전(NULL이면 qpair=NULL로 대체)하므로 init 실패 경로에서도 호출 가능. */
 #define NVME_RQPAIR_ERRLOG(rqpair, format, ...) NVME_QPAIR_ERRLOG((rqpair) ? &(rqpair)->qpair : NULL, format, ##__VA_ARGS__)
 #define NVME_RQPAIR_WARNLOG(rqpair, format, ...) NVME_QPAIR_WARNLOG((rqpair) ? &(rqpair)->qpair : NULL, format, ##__VA_ARGS__)
 #define NVME_RQPAIR_NOTICELOG(rqpair, format, ...) NVME_QPAIR_NOTICELOG((rqpair) ? &(rqpair)->qpair : NULL, format, ##__VA_ARGS__)
 #define NVME_RQPAIR_INFOLOG(rqpair, format, ...) NVME_QPAIR_INFOLOG((rqpair) ? &(rqpair)->qpair : NULL, format, ##__VA_ARGS__)
 #define NVME_RQPAIR_DEBUGLOG(rqpair, format, ...) NVME_QPAIR_DEBUGLOG((rqpair) ? &(rqpair)->qpair : NULL, format, ##__VA_ARGS__)
 
+/* [한국어] WR 종류 식별자.
+ * CQ에서 ibv_wc->wr_id로 nvme_rdma_wr 구조체를 복원한 뒤 type을 보고 SEND vs RECV 처리 분기.
+ * (RDMA_READ/WRITE는 호스트가 직접 게시하지 않으므로 여기엔 없음 — 타깃이 발행) */
 enum nvme_rdma_wr_type {
-	RDMA_WR_TYPE_RECV,
-	RDMA_WR_TYPE_SEND,
+	RDMA_WR_TYPE_RECV,	/* [한국어] 응답 Capsule 수신용 RECV WR (spdk_nvme_rdma_rsp 내부) */
+	RDMA_WR_TYPE_SEND,	/* [한국어] 커맨드 Capsule 송신용 SEND WR (spdk_nvme_rdma_req 내부) */
 };
 
+/* [한국어] WR 식별을 위한 미니 헤더. send_wr->wr_id, recv_wr->wr_id가 이 구조체의 주소를 가리킴.
+ * CQ poll 후 SPDK_CONTAINEROF로 부모 spdk_nvme_rdma_req/_rsp를 복원. */
 struct nvme_rdma_wr {
 	/* Using this instead of the enum allows this struct to only occupy one byte. */
 	uint8_t	type;
+	/* [한국어] enum nvme_rdma_wr_type 값. enum 대신 uint8_t 사용 이유는 주석에 적힌 대로 1바이트 고정.
+	 * 설정자: nvme_rdma_create_reqs/_create_rsps 초기화 시.
+	 * 읽는 자: nvme_rdma_cq_process_completions의 switch(rdma_wr->type).
+	 * 값 범위: RDMA_WR_TYPE_RECV(0) 또는 RDMA_WR_TYPE_SEND(1). */
 };
 
+/* [한국어] NVMe-oF Submission Queue Entry (Capsule 본체).
+ * 64B NVMe Cmd 뒤에 in-capsule data 또는 multi-segment SGL descriptor 리스트가 따라옴.
+ * 호스트는 이 구조체를 SEND WR로 송신, 타깃은 RECV WR로 수신. */
 struct spdk_nvmf_cmd {
 	struct spdk_nvme_cmd cmd;
+	/* [한국어] 표준 NVMe 64B 커맨드(opcode, nsid, dptr, cdw10..15). dptr.sgl1 필드가 in-capsule 데이터/SGL 정보.
+	 * 설정자: nvme_rdma_build_*_request 함수들이 dptr.sgl1을 설정.
+	 * 읽는 자: 타깃 측 NVMe-oF 처리기 (서버 측 nvmf_rdma_request). */
 	struct spdk_nvme_sgl_descriptor sgl[NVME_RDMA_MAX_SGL_DESCRIPTORS];
+	/* [한국어] Multi-segment SGL일 때 추가 descriptor 배열 — Cmd의 dptr이 LAST_SEGMENT type을 가리키면 사용.
+	 * 설정자: nvme_rdma_build_sgl_request의 cmd->sgl[num_sgl_desc] = ... 루프.
+	 * 읽는 자: 타깃이 RDMA_READ/WRITE를 발행할 때 각 데이터 블록의 (addr, length, rkey)를 참고. */
 };
 
+/* [한국어] 사용자가 spdk_nvme_rdma_init_hooks로 주입할 수 있는 후크 구조체.
+ * get_ibv_pd: 사용자 정의 PD 제공 (예: GPU Direct RDMA용 PD).
+ * 기본은 빈 구조체 = SPDK 자동 PD 사용. */
 struct spdk_nvme_rdma_hooks g_nvme_hooks = {};
 
 /* STAILQ wrapper for cm events. */
+/* [한국어] CM 이벤트를 미루어 둘 큐 엔트리.
+ * rdma_get_cm_event는 ack 전 한 번에 1개만 반환 → 여러 큐페어 이벤트가 섞이면 다른 큐페어용은 여기 보관. */
 struct nvme_rdma_cm_event_entry {
 	struct rdma_cm_event			*evt;
+	/* [한국어] librdmacm이 할당한 CM 이벤트 객체. ack 전까지 유효, 사용 후 rdma_ack_cm_event 필수.
+	 * 설정자: nvme_rdma_poll_events의 rdma_get_cm_event 결과.
+	 * 읽는 자: nvme_rdma_qpair_process_cm_event가 evt->event/param을 해석. */
 	STAILQ_ENTRY(nvme_rdma_cm_event_entry)	link;
+	/* [한국어] STAILQ 링크. pending_cm_events / free_cm_events 두 큐 사이를 오감. */
 };
 
 /* NVMe RDMA transport extensions for spdk_nvme_ctrlr */
+/* [한국어] 컨트롤러 단위 RDMA 트랜스포트 컨테이너.
+ * spdk_nvme_ctrlr를 임베드하는 형태로 SPDK_CONTAINEROF로 상호 변환.
+ * 컨트롤러당 1개의 cm_channel을 보유 → 모든 큐페어 CM 이벤트가 여기로 들어옴. */
 struct nvme_rdma_ctrlr {
 	struct spdk_nvme_ctrlr			ctrlr;
+	/* [한국어] 임베드된 일반 NVMe 컨트롤러. 첫 필드로 둬서 컨테이너 캐스팅이 자연스러움.
+	 * 설정자: nvme_rdma_ctrlr_construct에서 trid/opts 복사.
+	 * 읽는 자: 모든 ops 함수 (vtable 진입점). */
 
 	uint16_t				max_sge;
+	/* [한국어] 사용 가능한 RDMA HCA들의 최소 max_sge 값 (모든 device를 ibv_query_device로 조회 후 min 집계).
+	 * 큐페어 생성 시 max_send/recv_sge 상한으로 사용. NVME_RDMA_MAX_SGL_DESCRIPTORS와 작은 값을 사용.
+	 * 설정자: nvme_rdma_ctrlr_construct의 device 열거 루프.
+	 * 읽는 자: nvme_rdma_ctrlr_get_max_sges가 컨트롤러 capability 노출 시 참조. */
 
 	struct rdma_event_channel		*cm_channel;
+	/* [한국어] librdmacm 이벤트 채널 — 비동기 CM 이벤트 (ADDR_RESOLVED, ESTABLISHED, DISCONNECTED 등) 전달.
+	 * 컨트롤러에 속한 모든 cm_id가 이 채널을 공유. fd는 nonblock으로 설정 (poll group 통합 가능).
+	 * 설정자: ctrlr_construct에서 rdma_create_event_channel.
+	 * 읽는 자: nvme_rdma_poll_events가 rdma_get_cm_event로 폴. */
 
 	STAILQ_HEAD(, nvme_rdma_cm_event_entry)	pending_cm_events;
+	/* [한국어] 받았지만 아직 처리 안 된 CM 이벤트들. 큐페어가 다른 이벤트를 기다리는 동안 잠시 대기.
+	 * 동시성: ctrlr_lock 보호 (poll_events 함수 주석 참조). */
 
 	STAILQ_HEAD(, nvme_rdma_cm_event_entry)	free_cm_events;
+	/* [한국어] 사전 할당된 free 엔트리 풀. NVME_RDMA_NUM_CM_EVENTS 만큼 생성 후 분배. */
 
 	struct nvme_rdma_cm_event_entry		*cm_events;
+	/* [한국어] cm_events 엔트리 배열의 시작 포인터. ctrlr_destruct에서 spdk_free로 해제. */
 };
 
+/* [한국어] poller 단위 통계 — RPC로 노출되어 운영 모니터링용. */
 struct nvme_rdma_poller_stats {
-	uint64_t polls;
-	uint64_t idle_polls;
-	uint64_t queued_requests;
-	uint64_t completions;
-	struct spdk_rdma_provider_qp_stats rdma_stats;
+	uint64_t polls;					/* [한국어] ibv_poll_cq를 호출한 총 횟수 */
+	uint64_t idle_polls;				/* [한국어] 폴 결과 0 (완료 없음) — busy poll 효율성 지표 */
+	uint64_t queued_requests;			/* [한국어] free_reqs 고갈로 큐잉으로 밀린 요청 수 — backpressure 지표 */
+	uint64_t completions;				/* [한국어] 누적 처리한 WC 개수 (SEND+RECV 합산) */
+	struct spdk_rdma_provider_qp_stats rdma_stats;	/* [한국어] provider 백엔드의 send/recv WR doorbell 통계 */
 };
 
 struct nvme_rdma_poll_group;
 struct nvme_rdma_rsps;
 
+/* [한국어] poll group 내부의 1 RDMA device당 1개의 공유 자원 묶음.
+ * 같은 ibv_context(=같은 HCA)에 속한 여러 큐페어가 한 CQ/SRQ/PD/MR map을 공유 → 메모리 절약과 폴링 효율 ↑. */
 struct nvme_rdma_poller {
 	struct ibv_context		*device;
+	/* [한국어] 이 poller가 담당하는 RDMA HCA 컨텍스트 (rdma_cm_id->verbs와 일치).
+	 * poll_group_get_poller가 device 일치 검색의 키. */
 	struct ibv_cq			*cq;
+	/* [한국어] 공유 Completion Queue. 이 device 위 모든 큐페어의 SEND/RECV 완료가 적재됨.
+	 * ibv_poll_cq로 한 번에 여러 큐페어의 완료를 수확 가능. */
 	struct spdk_rdma_provider_srq	*srq;
+	/* [한국어] (옵션) 공유 RECV Queue. NULL이면 큐페어별 RQ 사용.
+	 * SRQ 사용 시 모든 큐페어 응답 RECV WR이 여기로 모임 → 메모리/스케일 이득. */
 	struct nvme_rdma_rsps		*rsps;
+	/* [한국어] SRQ 모드일 때만 사용 — 공유 응답 버퍼 풀. */
 	struct ibv_pd			*pd;
+	/* [한국어] 이 poller의 PD. SRQ/MR을 위한 보호 도메인. */
 	struct spdk_rdma_utils_mem_map	*mr_map;
+	/* [한국어] SRQ용 MR 풀 — RECV 버퍼 lkey 변환에 사용. */
 	uint32_t			refcnt;
+	/* [한국어] 이 poller를 사용하는 큐페어 수. 0이 되면 destroy.
+	 * get_poller에서 ++, put_poller에서 -- (싱글 스레드 가정 → atomic 불필요). */
 	int				required_num_wc;
+	/* [한국어] 현재 등록된 큐페어들이 요구하는 총 WC 슬롯 수 (sum of WC_PER_QPAIR(num_entries)).
+	 * resize_cq 판단 기준. */
 	int				current_num_wc;
+	/* [한국어] CQ에 현재 할당된 실제 WC 슬롯 수. ibv_resize_cq로 동적 조정. */
 	struct nvme_rdma_poller_stats	stats;
+	/* [한국어] 통계 (위 구조체 참조). */
 	struct nvme_rdma_poll_group	*group;
+	/* [한국어] 부모 poll group 역참조. */
 	STAILQ_ENTRY(nvme_rdma_poller)	link;
+	/* [한국어] poll_group->pollers 리스트 링크. */
 };
 
 struct nvme_rdma_qpair;
 
+/* [한국어] poll group — 여러 큐페어를 한 reactor 스레드에서 일괄 폴링하는 컨테이너.
+ * 같은 group 안에서 같은 device에 속한 큐페어들은 자동으로 같은 poller(=공유 CQ)를 사용. */
 struct nvme_rdma_poll_group {
 	struct spdk_nvme_transport_poll_group		group;
+	/* [한국어] 임베드된 일반 poll group. 첫 필드로 둬 SPDK_CONTAINEROF 변환. */
 	STAILQ_HEAD(, nvme_rdma_poller)			pollers;
+	/* [한국어] 1 device당 1 poller 리스트. nvme_rdma_poll_group_get/put_poller로 관리. */
 	uint32_t					num_pollers;
+	/* [한국어] 통계용 카운트. completions_per_poller 산출에 사용. */
 	TAILQ_HEAD(, nvme_rdma_qpair)			connecting_qpairs;
+	/* [한국어] connect 진행 중인 큐페어들. process_completions에서 connect_qpair_poll 진척시키는 워크큐. */
 	TAILQ_HEAD(, nvme_rdma_qpair)			active_qpairs;
+	/* [한국어] 송신할 WR 또는 미처리 큐잉 요청이 있는 큐페어 — process_submits로 일괄 doorbell. */
 };
 
+/* [한국어] 큐페어 내부 상태머신 — 연결~사용~종료 단계 추적.
+ * connect_qpair_poll/disconnect_qpair_poll에서 switch로 분기. */
 enum nvme_rdma_qpair_state {
-	NVME_RDMA_QPAIR_STATE_INVALID = 0,
-	NVME_RDMA_QPAIR_STATE_STALE_CONN,
-	NVME_RDMA_QPAIR_STATE_INITIALIZING,
-	NVME_RDMA_QPAIR_STATE_FABRIC_CONNECT_SEND,
-	NVME_RDMA_QPAIR_STATE_FABRIC_CONNECT_POLL,
-	NVME_RDMA_QPAIR_STATE_AUTHENTICATING,
-	NVME_RDMA_QPAIR_STATE_RUNNING,
-	NVME_RDMA_QPAIR_STATE_EXITING,
-	NVME_RDMA_QPAIR_STATE_LINGERING,
-	NVME_RDMA_QPAIR_STATE_EXITED,
+	NVME_RDMA_QPAIR_STATE_INVALID = 0,			/* [한국어] 초기값 / 미사용 */
+	NVME_RDMA_QPAIR_STATE_STALE_CONN,			/* [한국어] stale conn 감지 → 재시도 대기 중 */
+	NVME_RDMA_QPAIR_STATE_INITIALIZING,			/* [한국어] CM 핸드셰이크 진행 (ADDR/ROUTE/ESTABLISHED 대기) */
+	NVME_RDMA_QPAIR_STATE_FABRIC_CONNECT_SEND,		/* [한국어] RDMA ESTABLISHED 후 Fabrics CONNECT 커맨드 송신 단계 */
+	NVME_RDMA_QPAIR_STATE_FABRIC_CONNECT_POLL,		/* [한국어] CONNECT 응답 대기 polling */
+	NVME_RDMA_QPAIR_STATE_AUTHENTICATING,			/* [한국어] DH-CHAP 등 인증 진행 중 */
+	NVME_RDMA_QPAIR_STATE_RUNNING,				/* [한국어] 정상 I/O 송수신 가능 */
+	NVME_RDMA_QPAIR_STATE_EXITING,				/* [한국어] disconnect 시작 (rdma_disconnect 호출됨) */
+	NVME_RDMA_QPAIR_STATE_LINGERING,			/* [한국어] 미완료 WR flush 대기 (timeout 시 강제 quiet) */
+	NVME_RDMA_QPAIR_STATE_EXITED,				/* [한국어] 자원 해제 완료 — 안전하게 free 가능 */
 };
 
+/* [한국어] CM 이벤트 처리 콜백 시그니처.
+ * 비동기 핸드셰이크 단계별로 다음 단계로 진행하는 후속 작업을 콜백으로 등록.
+ * @rqpair: 이벤트 대상 큐페어. @ret: validate_cm_event 결과 (0=성공/그 외 실패). */
 typedef int (*nvme_rdma_cm_event_cb)(struct nvme_rdma_qpair *rqpair, int ret);
 
+/* [한국어] 응답 풀(rsps) 생성 옵션 묶음. 큐페어별 RQ 또는 group 공용 SRQ 양쪽에서 재사용. */
 struct nvme_rdma_rsp_opts {
-	uint16_t				num_entries;
-	struct nvme_rdma_qpair			*rqpair;
-	struct spdk_rdma_provider_srq		*srq;
-	struct spdk_rdma_utils_mem_map		*mr_map;
+	uint16_t				num_entries;	/* [한국어] 만들 RECV 슬롯 수 */
+	struct nvme_rdma_qpair			*rqpair;	/* [한국어] 큐페어 모드일 때 부모. SRQ 모드는 NULL */
+	struct spdk_rdma_provider_srq		*srq;		/* [한국어] SRQ 모드일 때 RECV WR 게시 대상. 큐페어 모드는 NULL */
+	struct spdk_rdma_utils_mem_map		*mr_map;	/* [한국어] 응답 버퍼 lkey 조회용 MR 풀 */
 };
 
+/* [한국어] 응답 풀 — SoA(Struct of Arrays) 레이아웃으로 RECV WR + SGE + 응답 버퍼를 병렬 배열로 관리.
+ * 캐시 친화 + ibv_post_recv 일괄 게시에 유리. */
 struct nvme_rdma_rsps {
 	/* Parallel arrays of response buffers + response SGLs of size num_entries */
 	struct ibv_sge				*rsp_sgls;
+	/* [한국어] RECV WR이 가리키는 SGE 배열. addr=&rsps[i], length=sizeof(spdk_nvme_cpl), lkey=MR lkey. */
 	struct spdk_nvme_rdma_rsp		*rsps;
+	/* [한국어] 실제 응답 버퍼 배열 (DMA 가능한 spdk_zmalloc 메모리).
+	 * 타깃이 SEND한 응답 Capsule이 여기에 RDMA로 직접 적재됨. */
 
 	struct ibv_recv_wr			*rsp_recv_wrs;
+	/* [한국어] RECV WR 배열. wr_id=&rsps[i].rdma_wr 로 설정 (CQ 처리 시 역참조용). */
 
 	/* Count of outstanding recv objects */
 	uint16_t				current_num_recvs;
+	/* [한국어] 현재 게시되어 응답 대기 중인 RECV WR 개수.
+	 * 게시 시 ++, 완료 처리 시 -- (rqpair 단일 스레드 가정 → atomic 불필요). */
 
 	uint16_t				num_entries;
+	/* [한국어] 풀 전체 슬롯 수 (할당 시 고정). */
 };
 
 /* NVMe RDMA qpair extensions for spdk_nvme_qpair */
+/* [한국어] RDMA 트랜스포트 큐페어 — 일반 spdk_nvme_qpair를 임베드하여 RDMA 자원을 추가.
+ * NVMe SQ/CQ 한 쌍 = RDMA QP 한 개 = TCP/IP 소켓 한 개 와 같은 1:1 매핑. */
 struct nvme_rdma_qpair {
 	struct spdk_nvme_qpair			qpair;
+	/* [한국어] 임베드된 일반 큐페어. 첫 필드 → SPDK_CONTAINEROF로 변환. */
 
 	struct spdk_rdma_provider_qp		*rdma_qp;
+	/* [한국어] SPDK provider 추상의 QP 핸들. 내부에 ibv_qp + 송수신 WR 큐잉 버퍼 포함.
+	 * 설정자: nvme_rdma_qpair_init의 spdk_rdma_provider_qp_create.
+	 * 읽는 자: WR 게시 (queue_send_wrs/queue_recv_wrs), CQ 매칭 (qp->qp_num). */
 	struct rdma_cm_id			*cm_id;
+	/* [한국어] librdmacm의 connection identifier. 주소/포트/QP를 묶는 핸들.
+	 * cm_id->verbs = ibv_context, cm_id->qp = 결합된 ibv_qp.
+	 * 설정자: ctrlr_connect_qpair의 rdma_create_id.
+	 * 읽는 자: rdma_resolve_addr/route/connect/disconnect/destroy 모두 cm_id 인자 필요. */
 	struct ibv_cq				*cq;
+	/* [한국어] 이 큐페어의 Completion Queue.
+	 * - poll group 모드: poller->cq를 가리킴 (공유)
+	 * - standalone 모드: ibv_create_cq로 전용 생성 (qpair_destroy에서 ibv_destroy_cq) */
 	struct spdk_rdma_provider_srq		*srq;
+	/* [한국어] (옵션) poll group의 공유 SRQ. NULL이면 큐페어 전용 RQ 사용. */
 
 	struct	spdk_nvme_rdma_req		*rdma_reqs;
+	/* [한국어] 사전 할당된 RDMA 요청 풀 (num_entries 개). free_reqs/outstanding_reqs 큐에 분배.
+	 * 설정자: nvme_rdma_create_reqs.
+	 * 읽는 자: 모든 I/O 경로 (req_get/put). */
 
 	uint32_t				max_send_sge;
+	/* [한국어] 이 QP의 send SGE 최대치 (HCA 능력과 NVME_RDMA_DEFAULT_TX_SGE 중 작은 값).
+	 * ibv_create_qp가 attr.cap.max_send_sge를 실제 가능값으로 줄일 수 있어 별도 보관. */
 
 	uint16_t				num_entries;
+	/* [한국어] 큐 깊이 (qsize - 1). NVMe 스펙상 큐 사이즈 N이면 동시에 N-1개만 outstanding 가능. */
 
 	bool					delay_cmd_submit;
+	/* [한국어] true면 send_wr를 큐잉만 하고 doorbell(post_send) 보류 → 배치 효과.
+	 * process_completions 끝에서 일괄 flush. 인라인 작은 IO에서 효율 ↑. */
 	/* Append copy task even if no accel sequence is attached to IO.
 	 * Result is UMR configured per IO data buffer */
 	bool					append_copy;
+	/* [한국어] 모든 I/O에 자동으로 accel copy 시퀀스를 첨부 (UMR 사용)할지 여부.
+	 * IO마다 가상 contig MR을 만들어 multi-segment 페이로드를 단일 SGL로 표현 가능. */
 
 	uint32_t				num_completions;
+	/* [한국어] 현재 폴링 사이클에서 처리한 완료 수. 매 호출마다 0으로 리셋. */
 	uint32_t				num_outstanding_reqs;
+	/* [한국어] outstanding_reqs 리스트 길이의 빠른 카운터 (TAILQ 길이 O(N) 회피용). */
 
 	struct nvme_rdma_rsps			*rsps;
+	/* [한국어] 응답 풀 — 큐페어 전용(create_rsps 호출 결과) 또는 SRQ 모드의 공유 포인터.
+	 * SRQ 모드는 poller->rsps와 같음. */
 
 	/*
 	 * Array of num_entries NVMe commands registered as RDMA message buffers.
 	 * Indexed by rdma_req->id.
 	 */
 	struct spdk_nvmf_cmd			*cmds;
+	/* [한국어] 사전 할당된 NVMe Cmd Capsule 버퍼 배열 — DMA 가능 메모리이므로 ibv_reg_mr 등록 가능.
+	 * rdma_req->id로 인덱스. send_sgl[0].addr이 cmds[id]를 가리킴. */
 
 	struct spdk_rdma_utils_mem_map		*mr_map;
+	/* [한국어] 큐페어 전용 MR 풀. spdk_rdma_utils_create_mem_map으로 생성, IBV_ACCESS_LOCAL_WRITE|REMOTE_READ|REMOTE_WRITE 권한.
+	 * 데이터 페이로드 lkey/rkey 변환에 사용. */
 
 	TAILQ_HEAD(, spdk_nvme_rdma_req)	free_reqs;
+	/* [한국어] 사용 가능한 rdma_req 풀. submit 시 head에서 pop, complete 시 head에 push (LIFO=캐시 친화). */
 	TAILQ_HEAD(, spdk_nvme_rdma_req)	outstanding_reqs;
+	/* [한국어] 송신 후 응답 대기 중인 rdma_req. timeout 검사와 abort 시 순회. */
 
 	/* Count of outstanding send objects */
 	uint16_t				current_num_sends;
+	/* [한국어] 게시되었지만 SEND 완료가 안 온 WR 수. SQ overflow 방지 + flush 시 reset_failed_sends에서 감소. */
 	/* Number of requests submitted to accel framework */
 	uint16_t				num_active_accel_reqs;
+	/* [한국어] accel 시퀀스 처리 중인 요청 수. disconnect 시 모두 완료될 때까지 LINGERING 상태 유지. */
 
 	TAILQ_ENTRY(nvme_rdma_qpair)		link_active;
+	/* [한국어] poll_group->active_qpairs 링크. 송신할 일이 있을 때만 enqueued. */
 
 	/* Placed at the end of the struct since it is not used frequently */
 	struct rdma_cm_event			*evt;
+	/* [한국어] 현재 처리 대기 중인 CM 이벤트 (없으면 NULL). 처리 후 rdma_ack_cm_event + NULL. */
 	struct nvme_rdma_poller			*poller;
+	/* [한국어] 소속 poller 역참조 (poll group 모드에서만). */
 
 	uint64_t				evt_timeout_ticks;
+	/* [한국어] 다음 CM 이벤트 또는 lingering 종료 데드라인 (spdk_get_ticks 단위). */
 	nvme_rdma_cm_event_cb			evt_cb;
+	/* [한국어] 기대 이벤트 도착 시 호출할 콜백 (route_resolved → connect_established 등 체인 진행). */
 	enum rdma_cm_event_type			expected_evt_type;
+	/* [한국어] 다음에 기대하는 이벤트 종류. validate_cm_event가 다른 이벤트 도착 시 에러 처리. */
 
 	enum nvme_rdma_qpair_state		state;
+	/* [한국어] 큐페어 내부 상태머신 (위 enum). connect/disconnect 진행 추적. */
 
 	uint8_t					stale_conn_retry_count;
+	/* [한국어] stale connection 자동 재시도 누적 횟수. NVME_RDMA_STALE_CONN_RETRY_MAX 도달 시 포기. */
 	bool					need_destroy;
+	/* [한국어] DEVICE_REMOVAL 같은 비복구 이벤트 발생 시 set → 강제 정리. */
 	bool					connected;
+	/* [한국어] CM ESTABLISHED 도달 후 true. disconnect 시 false → rdma_disconnect 발사 여부 결정. */
 	TAILQ_ENTRY(nvme_rdma_qpair)		link_connecting;
+	/* [한국어] poll_group->connecting_qpairs 링크. CONNECT 완료 시 detach. */
 };
 
+/* [한국어] 한 NVMe 요청은 SEND WR 1개 + 그에 대응하는 RECV WR 1개로 완료됨.
+ * 두 WC가 모두 도착해야 호스트 입장에서 완료 처리 가능 → 비트마스크로 진행 추적.
+ * (RECV가 SEND보다 먼저 올 수도 있으므로 OR로 누적) */
 enum NVME_RDMA_COMPLETION_FLAGS {
-	NVME_RDMA_SEND_COMPLETED = 1u << 0,
-	NVME_RDMA_RECV_COMPLETED = 1u << 1,
+	NVME_RDMA_SEND_COMPLETED = 1u << 0,	/* [한국어] SEND WR 완료됨 (커맨드 송신 ACK) */
+	NVME_RDMA_RECV_COMPLETED = 1u << 1,	/* [한국어] RECV WR 완료됨 (응답 Capsule 수신) */
 };
 
+/* [한국어] 한 NVMe-oF I/O 요청을 표현하는 RDMA 트랜스포트 객체.
+ * rqpair->rdma_reqs[id] 배열 슬롯이며, free 풀과 outstanding 풀 사이를 오감.
+ * SEND WR 1개와 ibv_sge 배열을 임베드해 zero-allocation hot path 보장. */
 struct spdk_nvme_rdma_req {
 	uint16_t				id;
+	/* [한국어] rdma_reqs[id] 배열 인덱스 (= 응답 cpl.cid가 가리키는 값).
+	 * RECV 처리 시 cpl.cid → rdma_reqs[cid]로 빠른 역참조 가능. */
 	uint16_t				completion_flags: 2;
+	/* [한국어] NVME_RDMA_SEND_COMPLETED|RECV_COMPLETED 비트마스크. 둘 다 set 되면 request_ready 호출.
+	 * 비트필드 2개로 압축 → 캐시 라인 절약. req_put에서 0으로 리셋. */
 	uint16_t				in_progress_accel: 1;
+	/* [한국어] accel 시퀀스 처리 중. abort 시에도 강제 종료 못 하므로 LINGERING 대기. */
 	uint16_t				reserved: 13;
+	/* [한국어] 비트필드 패딩 — 향후 확장 용도. */
 	/* if completion of RDMA_RECV received before RDMA_SEND, we will complete nvme request
 	 * during processing of RDMA_SEND. To complete the request we must know the response
 	 * received in RDMA_RECV, so store it in this field */
 	struct spdk_nvme_rdma_rsp		*rdma_rsp;
+	/* [한국어] RECV가 먼저 도착했을 때 그 응답 객체 포인터를 보관 → SEND 완료 시 함께 처리. */
 
 	struct spdk_nvme_cpl			cpl;
+	/* [한국어] rdma_rsp->cpl을 복사한 로컬 cpl. transfer_cpl_cb 경로에서 사용. */
 
 	struct nvme_rdma_wr			rdma_wr;
+	/* [한국어] WR 헤더 (type=SEND). send_wr.wr_id가 이 멤버를 가리킴 → CQ에서 rdma_req 복원. */
 
 	struct ibv_send_wr			send_wr;
+	/* [한국어] libibverbs SEND WR. opcode=IBV_WR_SEND, send_flags=IBV_SEND_SIGNALED.
+	 * sg_list = send_sgl, num_sge = 1 또는 2 (inline data 여부). */
 
 	struct nvme_request			*req;
+	/* [한국어] 상위 NVMe 레이어의 일반 요청 객체. cb_fn/cb_arg/payload 보유. */
 
 	struct ibv_sge				send_sgl[NVME_RDMA_DEFAULT_TX_SGE];
+	/* [한국어] SEND WR의 SGE 배열 (최대 2개).
+	 * [0] = NVMe Cmd Capsule (rqpair->cmds[id]).
+	 * [1] = (옵션) inline 데이터 페이로드 (작은 Write에 한해). */
 
 	TAILQ_ENTRY(spdk_nvme_rdma_req)		link;
+	/* [한국어] free_reqs 또는 outstanding_reqs 리스트 링크. */
 
 	/* Fields below are not used in regular IO path, keep them last */
+	/* [한국어] 일반 I/O 경로에서 안 쓰이는 필드 — 캐시 라인을 분리해 hot path 캐시 적중률 ↑. */
 	spdk_memory_domain_data_cpl_cb		transfer_cpl_cb;
+	/* [한국어] memory_domain_transfer_data 콜백 (UMR 경로 등). NULL이면 일반 NVMe 완료 경로 사용. */
 	void					*transfer_cpl_cb_arg;
+	/* [한국어] transfer_cpl_cb의 cb_arg. */
 	/* Accel sequence API works with iovec pointer, we need to store result of next_sge callback */
 	struct iovec				iovs[NVME_RDMA_MAX_SGL_DESCRIPTORS];
+	/* [한국어] accel 시퀀스용 iovec 임시 버퍼 — payload SGL을 iovec으로 변환해 accel API에 전달. */
 };
 
+/* [한국어] 응답 Capsule을 받기 위해 미리 ibv_post_recv 해 두는 객체.
+ * 풀에 num_entries 만큼 만들어두고, 사용 후 다시 RECV 게시 (slot recycling). */
 struct spdk_nvme_rdma_rsp {
 	struct spdk_nvme_cpl	cpl;
+	/* [한국어] 16바이트 NVMe 완료 큐 엔트리. 타깃이 RDMA로 직접 적재.
+	 * 설정자: 타깃 (RDMA SEND inbound).
+	 * 읽는 자: nvme_rdma_process_recv_completion → cpl.cid로 rdma_req 복원. */
 	struct nvme_rdma_qpair	*rqpair;
+	/* [한국어] 소속 큐페어. SRQ가 없을 때 process_recv_completion이 빠르게 큐페어 추적. */
 	struct ibv_recv_wr	*recv_wr;
+	/* [한국어] 이 응답 슬롯이 사용한 RECV WR. 처리 후 다시 게시할 때 재사용. */
 	struct nvme_rdma_wr	rdma_wr;
+	/* [한국어] WR 헤더 (type=RECV). recv_wr->wr_id가 이 멤버 주소. */
 };
 
+/* [한국어] 메모리 변환 결과 임시 컨테이너 — 페이로드 버퍼 → RDMA 키 변환을 함수 인자로 모음. */
 struct nvme_rdma_memory_translation_ctx {
-	void *addr;
-	size_t length;
-	uint32_t lkey;
-	uint32_t rkey;
+	void *addr;	/* [한국어] 변환 대상 가상 주소 (= I/O 페이로드 시작) */
+	size_t length;	/* [한국어] 길이. NVME_RDMA_MAX_KEYED_SGL_LENGTH 이내여야 함 */
+	uint32_t lkey;	/* [한국어] Local key — 호스트 측 RDMA 접근용 (SEND inline 시 sg_list.lkey) */
+	uint32_t rkey;	/* [한국어] Remote key — 타깃이 RDMA_READ/WRITE할 때 dptr.sgl1.keyed.key에 박힘 */
 };
 
 static const char *rdma_cm_event_str[] = {
