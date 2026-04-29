@@ -2947,111 +2947,347 @@ inf:
 
 /*
  * [한국어]
- * nvme_ctrlr_set_state - 상태 전이 + timeout (디버그 로그 출력)
+ * nvme_ctrlr_set_state - 상태 전이 + timeout 갱신 (DEBUGLOG 동반)
+ *
+ * @ctrlr        : 상태 전이 대상 컨트롤러. 호출자가 ctrlr_lock 보유 가정.
+ * @state        : 전이할 새 상태(nvme_ctrlr_state enum, 40+ 상태 — DELAY/CONNECT_ADMINQ/
+ *                 READ_VS/CHECK_EN/SET_EN_0/DISABLE_WAIT_FOR_READY_0/ENABLE/IDENTIFY/...
+ *                 /TRANSPORT_READY/READY/ERROR/DISCONNECTED).
+ * @timeout_in_ms: 새 상태에서 머물 수 있는 최대 시간(ms). 특수값 두 개:
+ *                 - NVME_TIMEOUT_INFINITE  : 무한 대기(timeout 검사 비활성화).
+ *                 - NVME_TIMEOUT_KEEP_EXISTING: 기존 state_timeout_tsc 유지(같은 폴링
+ *                   루프를 돌면서 상태만 바꿀 때, timer 가 누적되지 않게).
+ * @return: 없음.
+ *
+ * 동기/배경:
+ *   nvme_ctrlr 의 진입(bring-up)·종료(disconnect)·재초기화(reset) 흐름은 모두
+ *   nvme_ctrlr_process_init() 폴링 함수가 dispatch 하는 거대한 상태머신으로 모델링된다.
+ *   본 함수는 그 상태 전이 시 단 하나의 진입점이며, "상태 + timeout" 한 쌍을 원자적으로
+ *   갱신한다. 매 전이마다 DEBUGLOG 를 남겨 bring-up 흐름을 사후 추적할 수 있다.
+ *
+ * 동작 단계:
+ *   [1] _nvme_ctrlr_set_state(... quiet=false) 로 위임.
+ *   [2] 헬퍼는 ctrlr->state 즉시 갱신 + state_timeout_tsc 절대 시각 계산
+ *       (now_ticks + ms * ticks_per_ms, overflow 시 INFINITE 로 fallback).
+ *   [3] DEBUGLOG 에 "setting state to <name> (timeout N ms / no timeout)" 출력.
+ *
+ * 실행 컨텍스트:
+ *   - process_init 폴링 컨텍스트(보통 management thread).
+ *   - admin completion 콜백(예: set_cc_en_done, identify_cb 등).
+ *   - 호출자는 항상 ctrlr_lock 보유 가정.
+ *
+ * 호출 체인:
+ *   <상태머신 dispatch / admin completion 콜백> →
+ *     [nvme_ctrlr_set_state] → _nvme_ctrlr_set_state → ctrlr->state, state_timeout_tsc 갱신
  */
 static void
 nvme_ctrlr_set_state(struct spdk_nvme_ctrlr *ctrlr, enum nvme_ctrlr_state state,
 		     uint64_t timeout_in_ms)
 {
 	_nvme_ctrlr_set_state(ctrlr, state, timeout_in_ms, false);
-                                  /* [한국어] quiet=false — 모든 전이를 로그로 기록 (bring-up 추적용) */
+	/* [한국어] quiet=false — 본 헬퍼는 "한 번만 진입하는" 정상 전이용으로 매 전이마다 DEBUGLOG.
+	 *         bring-up·reset 시퀀스 추적에 필수 — 어떤 admin write/read 가 다음 상태를 트리거했는지
+	 *         log 만 보고도 재구성할 수 있어야 함. */
 }
 
 /*
  * [한국어]
- * nvme_ctrlr_set_state_quiet - 상태 전이 + timeout (로그 없음)
+ * nvme_ctrlr_set_state_quiet - 상태 전이 + timeout 갱신 (로그 없는 조용한 버전)
  *
- * 사용처: 같은 상태 머무르며 반복 polling 진입 시 (예: WAIT_FOR_READY_1 폴링) — 로그 폭주 방지.
+ * @ctrlr        : 상태 전이 대상 컨트롤러. ctrlr_lock 보유 가정.
+ * @state        : 전이할 새 상태. 보통 set_state 와 동일한 상태로 재진입할 때 사용
+ *                 (예: NVME_CTRLR_STATE_ENABLE_WAIT_FOR_READY_1 polling 자체 재진입).
+ * @timeout_in_ms: 새 timeout(ms). KEEP_EXISTING/INFINITE 동일 의미.
+ * @return: 없음.
+ *
+ * 동기/배경:
+ *   상태머신 일부 단계는 admin write 응답이 늦거나, register polling 이 한 번에 끝나지
+ *   않아 같은 상태로 수십~수백 번 재진입한다. 이때 set_state 처럼 매번 DEBUGLOG 를 남기면
+ *   로그 파일이 폭주하고 진짜 전이가 묻혀 디버깅 가독성이 망가진다. quiet 버전은
+ *   "상태/timeout 은 갱신하되 DEBUGLOG 는 남기지 않는다" 를 위한 변형이다.
+ *
+ *   대표 사용처:
+ *     - WAIT_FOR_READY_1 / WAIT_FOR_READY_0 의 CSTS polling 재진입 (폴링 한 번이 끝나지
+ *       않았으면 같은 상태 그대로 + timeout 만 KEEP_EXISTING 로 갱신).
+ *     - admin completion 직전·직후의 "상태는 동일, 카운터만 갱신" 헬퍼들.
+ *
+ * 동작 단계:
+ *   [1] _nvme_ctrlr_set_state(... quiet=true) 로 위임.
+ *   [2] 헬퍼가 ctrlr->state, state_timeout_tsc 갱신.
+ *   [3] DEBUGLOG 출력은 skip — 로그 폭주 방지.
+ *
+ * 실행 컨텍스트: process_init 폴링 컨텍스트, 또는 admin completion 콜백. ctrlr_lock 보유.
+ *
+ * 호출 체인:
+ *   <상태머신 polling 헬퍼> → [nvme_ctrlr_set_state_quiet] → _nvme_ctrlr_set_state → 상태 갱신
  */
 static void
 nvme_ctrlr_set_state_quiet(struct spdk_nvme_ctrlr *ctrlr, enum nvme_ctrlr_state state,
 			   uint64_t timeout_in_ms)
 {
 	_nvme_ctrlr_set_state(ctrlr, state, timeout_in_ms, true);
-                                  /* [한국어] quiet=true — 같은 상태 반복 진입 시에도 로그 한 번만 (가독성 유지) */
+	/* [한국어] quiet=true — 같은 상태 반복 재진입 시에도 DEBUGLOG 출력 skip.
+	 *         WAIT_FOR_* 폴링 재진입처럼 초당 수백 번 set_state 가 호출되는 경로에서
+	 *         로그 폭주를 방지하고, "처음 진입한 set_state" 한 번만 보이게 하기 위함. */
 }
 
 /*
  * [한국어]
- * nvme_ctrlr_free_zns_specific_data - ZNS Identify 데이터 해제
+ * nvme_ctrlr_free_zns_specific_data - ZNS Identify Controller IOCS-specific 데이터 해제
  *
- * IDENTIFY_IOCS_SPECIFIC 단계에서 할당된 cdata_zns(ZNS-specific identify controller data) 해제.
- * destruct 시 호출.
+ * @ctrlr: 대상 컨트롤러. ctrlr_lock 보유 가정.
+ * @return: 없음.
+ *
+ * 동기/배경:
+ *   NVMe 1.4+ 부터 도입된 I/O Command Sets(IOCS) 메커니즘은 컨트롤러가 동시에 여러
+ *   command set(NVM, ZNS, KV ...) 을 지원할 수 있게 한다. 각 command set 마다 별도의
+ *   "Identify Controller IOCS-specific" 데이터(CSI=각 set 의 코드, NS=ctrlr) 가 있어,
+ *   ZNS 의 경우 zone size, max active/open zones 등 zone-related capability 가 담긴다.
+ *
+ *   이 IOCS-specific 데이터는 process_init 의 IDENTIFY_IOCS_SPECIFIC 단계에서 디바이스로부터
+ *   read 되어 ctrlr->cdata_zns 에 캐시된다. 컨트롤러 reset/disconnect 시점에는 이 캐시를
+ *   "stale" 로 간주하고 폐기 — reset 후 디바이스가 capability 를 바꿨을 가능성이 있어
+ *   다시 IDENTIFY_IOCS_SPECIFIC 을 거쳐 새로 받아야 한다.
+ *
+ * 동작 단계:
+ *   [1] spdk_free(cdata_zns) — DPDK hugepage 메모리 반환 (NULL-safe).
+ *   [2] 포인터 = NULL 로 dangling 방지.
+ *
+ * 실행 컨텍스트:
+ *   - destruct 경로 (spdk_nvme_ctrlr_destruct 하위).
+ *   - reset 경로 (nvme_ctrlr_disconnect_done 하위, IOCS-specific data invalidation).
+ *   ctrlr_lock 보유.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_disconnect_done / spdk_nvme_ctrlr_destruct →
+ *     nvme_ctrlr_free_iocs_specific_data → [본 함수] → spdk_free
  */
 static void
 nvme_ctrlr_free_zns_specific_data(struct spdk_nvme_ctrlr *ctrlr)
 {
 	spdk_free(ctrlr->cdata_zns);
-                                  /* [한국어] NULL-safe spdk_free — DMA-capable hugepage 메모리 반환 */
+	/* [한국어] DPDK hugepage 영역에서 할당된 ZNS Identify Controller IOCS-specific
+	 *         캐시 해제. spdk_free 는 NULL 인자 안전 — 미할당 상태에서도 호출 가능. */
 	ctrlr->cdata_zns = NULL;
-                                  /* [한국어] dangling 방지 */
+	/* [한국어] dangling 포인터 방지. 다음 IDENTIFY_IOCS_SPECIFIC 단계에서 재할당될 때까지
+	 *         cdata_zns == NULL 가 "ZNS capability 미캐시" 의 sentinel 로 동작. */
 }
 
 /*
  * [한국어]
- * nvme_ctrlr_free_iocs_specific_data - 모든 IOCS-specific identify 데이터 해제
+ * nvme_ctrlr_free_iocs_specific_data - 모든 IOCS-specific Identify 데이터 해제 (dispatcher)
  *
- * 현재는 ZNS만 지원 — 향후 다른 IOCS(KV 등) 추가 시 여기에 cleanup 추가.
+ * @ctrlr: 대상 컨트롤러. ctrlr_lock 보유 가정.
+ * @return: 없음.
+ *
+ * 동기/배경:
+ *   NVMe 1.4+ I/O Command Sets(IOCS) 는 NVM/ZNS/KV 등 여러 command set 을 동시 지원.
+ *   각 set 마다 IOCS-specific Identify Controller 데이터를 별도 캐시한다.
+ *   본 함수는 그 모든 IOCS 캐시를 한 번에 정리하는 dispatcher — 현재 SPDK 가 지원하는
+ *   IOCS 가 ZNS 뿐이지만, 향후 KV 등 추가 시 여기에 free 호출 한 줄을 더하는 식으로
+ *   확장한다.
+ *
+ *   호출 시점:
+ *     - reset (disconnect_done): 캐시된 IOCS 데이터는 reset 시 stale 로 간주.
+ *       reset 후 다시 IDENTIFY_IOCS_SPECIFIC 단계를 거쳐 새로 받음.
+ *     - destruct: 컨트롤러 자체가 해제되므로 모든 IOCS 캐시도 free.
+ *
+ * 동작 단계:
+ *   [1] ZNS 전용 캐시 free 위임 (nvme_ctrlr_free_zns_specific_data).
+ *   [2] (향후) KV 등 다른 IOCS 가 추가되면 여기에 free 호출 추가.
+ *
+ * 실행 컨텍스트: destruct / reset 경로. ctrlr_lock 보유.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_disconnect_done / spdk_nvme_ctrlr_destruct →
+ *     [본 함수] → nvme_ctrlr_free_zns_specific_data → spdk_free
  */
 static void
 nvme_ctrlr_free_iocs_specific_data(struct spdk_nvme_ctrlr *ctrlr)
 {
 	nvme_ctrlr_free_zns_specific_data(ctrlr);
-                                  /* [한국어] ZNS만 위임 — 다른 IOCS 추가 시 여기에 함께 호출 */
+	/* [한국어] 현재 SPDK 가 캐시하는 IOCS-specific 데이터는 ZNS 뿐이므로 ZNS free 만 위임.
+	 *         향후 KV/Computational Storage 등 다른 IOCS 가 추가되면, 그에 대응하는
+	 *         free_<set>_specific_data 를 여기 한 줄씩 추가하는 패턴. */
 }
 
 /*
  * [한국어]
- * nvme_ctrlr_free_doorbell_buffer - shadow doorbell 버퍼 해제
+ * nvme_ctrlr_free_doorbell_buffer - Shadow Doorbell / EventIdx 버퍼 해제 (DBBUF spec)
  *
- * NVMe 1.3+ doorbell buffer config 기능이 활성화된 경우 shadow doorbell이 hugepage에 할당됨.
- * destruct 시 해제.
+ * @ctrlr: 대상 컨트롤러. ctrlr_lock 보유 가정.
+ * @return: 없음.
  *
- * Shadow doorbell: 호스트가 매번 MMIO doorbell write 대신 RAM의 shadow value만 갱신하면
- *                  controller가 polling으로 인지 → MMIO 비용 절감 (특히 가상화 환경).
+ * 동기/배경:
+ *   NVMe 1.3 §5.7 (Doorbell Buffer Config, DBBUF) 는 가상화 환경(특히 PCIe pass-through 가
+ *   아닌 emulation) 에서 매 SQ tail / CQ head doorbell write 가 VM-exit 을 유발해
+ *   매우 비싸다는 문제를 해결하기 위해 도입. 호스트가 doorbell 값을 RAM 의 두 페이지
+ *   ("Shadow Doorbell Buffer" 와 "EventIdx Buffer") 에 미러링하고, 컨트롤러는 이 두 RAM
+ *   영역을 polling 함으로써 MMIO write 자체를 줄이거나 생략할 수 있다.
+ *
+ *   - shadow_doorbell : 호스트가 갱신하는 SQ/CQ doorbell 값 ("이게 진짜 새 값") — 한 페이지.
+ *   - eventidx        : 컨트롤러가 polling 시 사용하는 "마지막으로 본 doorbell 값" — 한 페이지.
+ *                       호스트가 shadow != eventidx 가 되면 그제서야 진짜 MMIO write 한 번
+ *                       (race-free 한 wake-up).
+ *
+ *   두 페이지 모두 DMA-capable hugepage 에서 할당 (spdk_zmalloc DMA|SHARE) 되며,
+ *   doorbell_buffer_config admin 명령으로 PRP1/PRP2 = 두 페이지 물리주소를 디바이스에 등록.
+ *
+ *   호출 시점:
+ *     - reset (disconnect_done): reset 후 디바이스 컨텍스트가 날아가므로 doorbell buffer 등록도
+ *       무효 → 캐시 free 후 reset 완료 시 다시 SET_DB_BUF_CFG 단계에서 재등록.
+ *     - destruct: 컨트롤러 정리 시 hugepage 반환.
+ *
+ * 동작 단계:
+ *   [1] shadow_doorbell != NULL 이면 hugepage free + NULL 화.
+ *   [2] eventidx != NULL 이면 hugepage free + NULL 화.
+ *   (DBBUF 미사용 컨트롤러나 PCIe 외 transport 는 둘 다 NULL — no-op.)
+ *
+ * 실행 컨텍스트:
+ *   - destruct 경로.
+ *   - disconnect_done (reset 시 invalidate).
+ *   ctrlr_lock 보유.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_disconnect_done / nvme_ctrlr_destruct_async / set_doorbell_buffer_config error →
+ *     [본 함수] → spdk_free × 2
  */
 static void
 nvme_ctrlr_free_doorbell_buffer(struct spdk_nvme_ctrlr *ctrlr)
 {
 	if (ctrlr->shadow_doorbell) {
-                                  /* [한국어] doorbell buffer config 활성화된 경우만 해제 */
+		/* [한국어] DBBUF 가 활성화되어 shadow_doorbell 페이지가 할당된 경우만 해제.
+		 *         NVMe 1.3 미만 / Fabrics / OACS.dbcs=0 디바이스에서는 NULL 인 상태로
+		 *         이 분기 자체를 skip. */
 		spdk_free(ctrlr->shadow_doorbell);
+		/* [한국어] DPDK hugepage 영역(SPDK_MALLOC_DMA|SHARE) 에서 할당된 1 page 반환. */
 		ctrlr->shadow_doorbell = NULL;
+		/* [한국어] dangling 방지 — NULL 화 후 다음 SET_DB_BUF_CFG 단계에서 재할당. */
 	}
 
 	if (ctrlr->eventidx) {
+		/* [한국어] EventIdx 페이지(컨트롤러가 polling 시 비교에 쓰는 "마지막 본 값")가
+		 *         별도로 할당돼 있으면 함께 해제. shadow_doorbell 과 짝이 되어 항상
+		 *         두 페이지가 같이 살거나 같이 죽음. */
 		spdk_free(ctrlr->eventidx);
+		/* [한국어] hugepage 1 page 반환. */
 		ctrlr->eventidx = NULL;
+		/* [한국어] dangling 방지. */
 	}
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_set_doorbell_buffer_config_done - Doorbell Buffer Config admin 응답 콜백
+ *
+ * @arg: cb_arg = 본 발행 시 등록된 ctrlr 포인터.
+ * @cpl: admin CQE — 성공/실패 상태 코드 포함.
+ * @return: 없음.
+ *
+ * 동기/배경:
+ *   NVMe 1.3 §5.7 Doorbell Buffer Config 명령(opcode 0x7C)이 비동기 완료되면 호출.
+ *   디바이스가 shadow_doorbell + eventidx 페이지의 PRP1/PRP2 를 등록하고 ACK 한 시점.
+ *   이후로는 SQ/CQ doorbell write 가 RAM 페이지를 거쳐 polling 될 수 있음.
+ *
+ * 동작 단계:
+ *   [1] CPL 에러면 WARN 로그만 — DBBUF 는 best-effort 최적화이므로 실패해도 컨트롤러는
+ *       계속 사용 가능 (전통적 MMIO doorbell 로 fallback). reset 으로 가지 않음.
+ *   [2] 성공이면 INFO 로그.
+ *   [3] 어느 경우든 다음 상태 = SET_HOST_ID 로 전이 (process_init 진행 계속).
+ *
+ * 실행 컨텍스트: admin completion 콜백. ctrlr_lock 보유 (admin 처리 폴링 컨텍스트).
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_set_doorbell_buffer_config (admin 발행) →
+ *     nvme_ctrlr_cmd_doorbell_buffer_config →
+ *       (admin completion) [본 함수] →
+ *         set_state(NVME_CTRLR_STATE_SET_HOST_ID)
+ */
 static void
 nvme_ctrlr_set_doorbell_buffer_config_done(void *arg, const struct spdk_nvme_cpl *cpl)
 {
 	struct spdk_nvme_ctrlr *ctrlr = (struct spdk_nvme_ctrlr *)arg;
+	/* [한국어] cb_arg 로 등록된 ctrlr 복원 — admin 발행 시 본 함수와 ctrlr 페어로 등록. */
 
 	if (spdk_nvme_cpl_is_error(cpl)) {
+		/* [한국어] DBBUF 등록 실패 — best-effort 기능이므로 전체 init 실패시키지 않고
+		 *         WARN 만 남기고 진행. 디바이스는 일반 MMIO doorbell write 로 동작. */
 		NVME_CTRLR_WARNLOG(ctrlr, "Doorbell buffer config failed\n");
 	} else {
+		/* [한국어] 성공 — 이후 SQ/CQ doorbell update 시 RAM 페이지 동기화 path 유효화. */
 		NVME_CTRLR_INFOLOG(ctrlr, "Doorbell buffer config enabled\n");
 	}
 	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_SET_HOST_ID,
 			     ctrlr->opts.admin_timeout_ms);
+	/* [한국어] 성공/실패 무관: 다음 상태 = SET_HOST_ID 로 전이.
+	 *         process_init 의 다음 iteration 이 set_host_id admin 발행. */
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_set_doorbell_buffer_config - Shadow Doorbell 버퍼 두 페이지 할당 + 등록 admin 발행
+ *
+ * @ctrlr : 대상 컨트롤러. ctrlr_lock 보유 가정.
+ * @return:
+ *   - 0       : DBBUF 미지원/스킵 또는 admin 발행 성공 (실제 활성화는 *_done 콜백 시점).
+ *   - -ENOMEM : hugepage 할당 실패.
+ *   - -EFAULT : virt→phys 변환 실패 또는 페이지 경계 mismatch.
+ *   - 기타    : nvme_ctrlr_cmd_doorbell_buffer_config 의 admin queue submission 에러.
+ *
+ * 동기/배경:
+ *   process_init 상태머신의 NVME_CTRLR_STATE_SET_DB_BUF_CFG 진입 시 호출.
+ *   NVMe 1.3 §5.7 Doorbell Buffer Config 명령으로 호스트가 두 hugepage 의 물리 주소
+ *   (shadow_doorbell, eventidx) 를 디바이스에 알려준다. 디바이스는 이 RAM 영역을 polling
+ *   하여 MMIO doorbell write 를 줄이거나 완전히 생략 가능 (특히 가상화 환경의 VM-exit
+ *   비용 절감).
+ *
+ *   조건: OACS.dbcs(=Optional Admin Command Support, Doorbell Buffer Config bit) 가 1 이고
+ *         transport 가 PCIe 인 경우만. Fabrics(RDMA/TCP) 는 doorbell 자체가 transport 메시지에
+ *         피기백되므로 의미 없음.
+ *
+ * 동작 단계:
+ *   [1] OACS.dbcs == 0 → DBBUF 미지원. 다음 상태 = SET_HOST_ID 로 skip.
+ *   [2] transport != PCIe → DBBUF 의미 없음. 동일하게 skip.
+ *   [3] shadow_doorbell hugepage 1 page 할당 (DMA|SHARE).
+ *   [4] virt→phys (PRP1) 추출, 페이지 경계 체크 (vtophys 가 page_size 보다 작은 contiguous
+ *       범위 반환할 가능성 — 페이지 단위 보장 검증).
+ *   [5] eventidx hugepage 1 page 할당 + PRP2 추출 + 검증.
+ *   [6] 상태 = WAIT_FOR_DB_BUF_CFG 로 전이 후 doorbell_buffer_config admin 발행
+ *       (cb=set_doorbell_buffer_config_done).
+ *   [7] 에러 시 ERROR 상태로 전이 + 부분 할당된 페이지 정리.
+ *
+ * 실행 컨텍스트: process_init 폴링 컨텍스트. ctrlr_lock 보유.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_process_init (state=SET_DB_BUF_CFG) →
+ *     [본 함수] →
+ *       nvme_ctrlr_cmd_doorbell_buffer_config (admin 발행) →
+ *         (completion) nvme_ctrlr_set_doorbell_buffer_config_done →
+ *           set_state(SET_HOST_ID)
+ */
 static int
 nvme_ctrlr_set_doorbell_buffer_config(struct spdk_nvme_ctrlr *ctrlr)
 {
 	int rc = 0;
+	/* [한국어] 반환 코드 — 0=성공/skip, 음수=오류. error 라벨에서 free 후 반환. */
 	uint64_t prp1, prp2, len;
+	/* [한국어] prp1/prp2 = shadow_doorbell/eventidx 의 물리주소(NVMe DBBUF 명령의 PRP 슬롯).
+	 *         len = vtophys 에서 contiguous 범위 검사용. */
 
 	if (!ctrlr->cdata.oacs.dbcs) {
+		/* [한국어] OACS.DBCS(NVMe §5.21 Identify Controller, Optional Admin Command Support
+		 *         bit "Doorbell Buffer Config Supported")=0 이면 디바이스 미지원.
+		 *         조용히 skip 하고 다음 init 단계로 진행. */
 		nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_SET_HOST_ID,
 				     ctrlr->opts.admin_timeout_ms);
+		/* [한국어] 다음 상태 = SET_HOST_ID — DBBUF skip 시에도 init flow 깨지지 않게. */
 		return 0;
 	}
 
 	if (ctrlr->trid.trtype != SPDK_NVME_TRANSPORT_PCIE) {
+		/* [한국어] DBBUF 는 PCIe MMIO doorbell 비용 절감용 — Fabrics(RDMA/TCP/FC) 에선
+		 *         doorbell 이 transport 메시지로 전달되므로 본 최적화가 무의미.
+		 *         transport != PCIe 면 skip. */
 		nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_SET_HOST_ID,
 				     ctrlr->opts.admin_timeout_ms);
 		return 0;
@@ -3061,14 +3297,26 @@ nvme_ctrlr_set_doorbell_buffer_config(struct spdk_nvme_ctrlr *ctrlr)
 	ctrlr->shadow_doorbell = spdk_zmalloc(ctrlr->page_size, ctrlr->page_size,
 					      NULL, SPDK_ENV_LCORE_ID_ANY,
 					      SPDK_MALLOC_DMA | SPDK_MALLOC_SHARE);
+	/* [한국어] Shadow Doorbell 버퍼 1 page 를 hugepage 에서 할당.
+	 *         - size=page_size, align=page_size : NVMe DBBUF 가 PRP entry 로 받으므로
+	 *           반드시 page-aligned 여야 함.
+	 *         - SPDK_MALLOC_DMA  : 디바이스가 DMA 로 polling 하므로 IOMMU/물리연속 보장 필요.
+	 *         - SPDK_MALLOC_SHARE: multi-process 시 secondary process 도 매핑 가능.
+	 *         - LCORE_ANY        : 특정 NUMA node 강제 안 함. */
 	if (ctrlr->shadow_doorbell == NULL) {
+		/* [한국어] hugepage 부족 — DPDK 메모리 풀 고갈 또는 page 단편화. */
 		rc = -ENOMEM;
 		goto error;
 	}
 
 	len = ctrlr->page_size;
+	/* [한국어] vtophys 에 input/output: in=찾고 싶은 contiguous 길이, out=실제 contiguous 길이. */
 	prp1 = spdk_vtophys(ctrlr->shadow_doorbell, &len);
+	/* [한국어] 가상주소 → 물리(또는 IOVA) 변환. DPDK hugepage 에서 받은 페이지는 보통 page
+	 *         경계로 contiguous 보장되지만, 안전을 위해 직접 검증. */
 	if (prp1 == SPDK_VTOPHYS_ERROR || len != ctrlr->page_size) {
+		/* [한국어] vtophys 실패(IOMMU 미설정 등) 또는 contiguous 길이가 한 페이지 미만 —
+		 *         page-aligned PRP 보장 안 되므로 실패 처리. */
 		rc = -EFAULT;
 		goto error;
 	}
@@ -3076,6 +3324,8 @@ nvme_ctrlr_set_doorbell_buffer_config(struct spdk_nvme_ctrlr *ctrlr)
 	ctrlr->eventidx = spdk_zmalloc(ctrlr->page_size, ctrlr->page_size,
 				       NULL, SPDK_ENV_LCORE_ID_ANY,
 				       SPDK_MALLOC_DMA | SPDK_MALLOC_SHARE);
+	/* [한국어] EventIdx 버퍼 1 page 를 동일 조건으로 할당. shadow_doorbell 과 짝이 되어
+	 *         항상 둘 다 활성. */
 	if (ctrlr->eventidx == NULL) {
 		rc = -ENOMEM;
 		goto error;
@@ -3083,6 +3333,7 @@ nvme_ctrlr_set_doorbell_buffer_config(struct spdk_nvme_ctrlr *ctrlr)
 
 	len = ctrlr->page_size;
 	prp2 = spdk_vtophys(ctrlr->eventidx, &len);
+	/* [한국어] EventIdx 의 물리주소 추출 — DBBUF 명령의 PRP2 로 사용. */
 	if (prp2 == SPDK_VTOPHYS_ERROR || len != ctrlr->page_size) {
 		rc = -EFAULT;
 		goto error;
@@ -3090,38 +3341,156 @@ nvme_ctrlr_set_doorbell_buffer_config(struct spdk_nvme_ctrlr *ctrlr)
 
 	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_WAIT_FOR_DB_BUF_CFG,
 			     ctrlr->opts.admin_timeout_ms);
+	/* [한국어] admin 발행 직전 상태 전이 — 이후 *_done 콜백이 SET_HOST_ID 로 전이.
+	 *         발행 전에 미리 WAIT 상태로 둬야 race 없이 timeout 추적 가능. */
 
 	rc = nvme_ctrlr_cmd_doorbell_buffer_config(ctrlr, prp1, prp2,
 			nvme_ctrlr_set_doorbell_buffer_config_done, ctrlr);
+	/* [한국어] NVMe Spec §5.7 Doorbell Buffer Config (opcode 0x7C) admin 발행.
+	 *         PRP1=Shadow Doorbell phys, PRP2=EventIdx phys. 응답은 *_done 콜백. */
 	if (rc != 0) {
+		/* [한국어] admin queue submission 자체 실패 — admin 슬롯 고갈/qpair 비정상 등. */
 		goto error;
 	}
 
 	return 0;
+	/* [한국어] 발행 성공. 실제 활성화는 콜백 시점. */
 
 error:
+	/* [한국어] 모든 실패 경로의 공통 cleanup. ERROR 상태로 영구 전이 후 부분 할당된 페이지 정리. */
 	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_ERROR, NVME_TIMEOUT_INFINITE);
+	/* [한국어] DBBUF 자체는 best-effort 지만, 메모리 할당/vtophys 실패는 시스템 레벨 문제 —
+	 *         ERROR 로 전이해 외부 reset 으로 복구. INFINITE = timeout 검사 disable. */
 	nvme_ctrlr_free_doorbell_buffer(ctrlr);
+	/* [한국어] 부분 성공한 페이지(shadow 할당, eventidx 실패 케이스 등) 회수. NULL-safe. */
 	return rc;
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_abort_queued_aborts - reset 시점에 admin queue 에 미발행 대기 중인 Abort 요청 정리
+ *
+ * @ctrlr: 대상 컨트롤러. ctrlr_lock 보유 가정.
+ * @return: 없음.
+ *
+ * 동기/배경:
+ *   NVMe Spec §5.1 (Admin Command Set), Abort 명령(opcode 0x08)은 진행 중인 다른 명령을
+ *   취소 요청한다. 그러나 디바이스가 동시에 처리 가능한 abort 수에는 제한이 있어
+ *   (Identify Controller cdata.acl + 1, "Abort Command Limit"), SPDK 는 이 한도를 넘는
+ *   abort 요청을 admin queue 에 직접 발행하지 않고 ctrlr->queued_aborts STAILQ 에
+ *   대기시킨다 (outstanding_aborts < acl 가 되면 하나씩 발행).
+ *
+ *   reset (disconnect) 시점에는 admin queue 가 폐기되므로 이 대기 큐도 비워야 한다 —
+ *   대기 중인 abort 들은 "발행 자체를 못 했으니" 디바이스에는 영향이 없지만, 호출자에게
+ *   "취소됨(SC_ABORTED_SQ_DELETION)" 을 통보해야 호출자의 cb_fn 이 정리된다.
+ *
+ *   상태 코드 선택: NVMe spec 의 SC=SQ Deletion (Generic SCT) — "큐가 사라져 명령이
+ *   처리되지 못했다" 의 표준 코드. 실제로 SQ deletion 이 일어나지 않더라도 reset 시
+ *   호스트가 동일 의미로 사용하는 관행.
+ *
+ * 동작 단계:
+ *   [1] 모든 cb 에 전달할 공통 CPL 을 zero 초기화 후 SC/SCT 세팅.
+ *   [2] STAILQ 를 SAFE 순회하면서:
+ *       - HEAD 에서 빼내고 outstanding_aborts++ (다음 [3] 의 nvme_complete_request 가 abort
+ *         완료 콜백으로 outstanding_aborts-- 하므로 여기서 ++ 해 균형 유지).
+ *       - nvme_complete_request 로 호출자 cb_fn 호출 → 호출자 입장에서는 "abort 가
+ *         실패(SQ Deletion)" 로 보임.
+ *
+ * 실행 컨텍스트:
+ *   - nvme_ctrlr_disconnect 시작 시 (reset chain 의 첫 정리 step).
+ *   - destruct 시 (남아있는 큐 비우기).
+ *   ctrlr_lock 보유 — STAILQ 접근 동기화 책임은 caller.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_disconnect (reset 시작) →
+ *     [본 함수] →
+ *       nvme_complete_request × N (cb 통보) → outstanding_aborts 카운터 일관 유지
+ */
 void
 nvme_ctrlr_abort_queued_aborts(struct spdk_nvme_ctrlr *ctrlr)
 {
 	struct nvme_request	*req, *tmp;
+	/* [한국어] STAILQ_FOREACH_SAFE 용 — req=현재, tmp=다음. SAFE 매크로는 현재 노드를
+	 *         REMOVE 해도 다음 노드를 잃지 않게 미리 백업. */
 	struct spdk_nvme_cpl	cpl = {};
+	/* [한국어] 모든 취소 통보에 공통으로 사용할 가짜 CQE. zero 초기화로 status 외 필드 0. */
 
 	cpl.status.sc = SPDK_NVME_SC_ABORTED_SQ_DELETION;
+	/* [한국어] Status Code = "Aborted - Submission Queue Deletion" (NVMe §4.6.1.2.1, Generic SC).
+	 *         "큐가 삭제되어 명령이 폐기됨" — reset/disconnect 시 호스트 측에서 사용하는 표준 코드. */
 	cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+	/* [한국어] Status Code Type = Generic Command Status (NVMe §4.6.1, type=0). */
 
 	STAILQ_FOREACH_SAFE(req, &ctrlr->queued_aborts, stailq, tmp) {
+		/* [한국어] 대기 중인 abort 요청 리스트 순회. SAFE 형 — 본문에서 req 를 큐에서
+		 *         빼내(REMOVE_HEAD)고 free 해도 tmp 가 살아있어 다음 iteration 안전. */
 		STAILQ_REMOVE_HEAD(&ctrlr->queued_aborts, stailq);
+		/* [한국어] HEAD 에서 빼내기 — req 는 항상 현재 HEAD 이므로 REMOVE_HEAD 가 안전·O(1). */
 		ctrlr->outstanding_aborts++;
+		/* [한국어] 카운터 균형 — 아래 nvme_complete_request 안에서 abort completion 콜백이
+		 *         outstanding_aborts-- 를 수행하므로, 여기서 미리 ++ 해야 0 으로 수렴.
+		 *         (정상 발행 경로에서는 발행 시 ++, 완료 시 --. 본 경로는 발행 단계를
+		 *         건너뛰고 곧장 완료 시뮬레이션이라 ++ 를 직접 해줘야 함.) */
 
 		nvme_complete_request(req->cb_fn, req->cb_arg, req->qpair, req, &cpl);
+		/* [한국어] 호출자 cb 에 "Aborted - SQ Deletion" CQE 로 통보.
+		 *         req 는 mempool 로 반환됨. 호출자는 abort 가 거부된 것으로 인식하고
+		 *         자체 정리. */
 	}
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_disconnect - 컨트롤러 disconnect 시작점 (reset chain 진입의 첫 단계)
+ *
+ * @ctrlr: disconnect 대상 컨트롤러. 호출자가 ctrlr_lock 보유 가정.
+ * @return:
+ *   - 0      : disconnect 시퀀스 시작 성공. 호출자는 이후 reset_poll 로 완료 폴링.
+ *   - -EBUSY : 이미 reset 중 (is_resetting=true) — 중복 reset 거부.
+ *   - -ENXIO : 컨트롤러가 hot-removed 됨 (is_removed=true) — 더 이상 reset 의미 없음.
+ *
+ * 동기/배경:
+ *   NVMe Spec §7.3 Reset Processing 의 "Controller Reset" 흐름 중 disconnect 단계.
+ *   사용자가 spdk_nvme_ctrlr_reset / spdk_nvme_ctrlr_disconnect 를 호출했거나,
+ *   I/O 에러/AER fatal 등으로 컨트롤러가 자동 reset 되어야 할 때 진입.
+ *
+ *   reset 은 "disconnect → (사용자 폴링) → reconnect" 의 비동기 2-step:
+ *     1) disconnect : 본 함수 — admin/io qpair 끊기, 진행 중 명령 모두 abort, hardware
+ *                     레벨에서 controller 와의 connection 단절.
+ *     2) reconnect  : spdk_nvme_ctrlr_reconnect_async (state=INIT 으로 되돌림) →
+ *                     reset_poll_async 가 process_init 을 다시 돌려 활성 상태로 복원.
+ *
+ * 동작 단계:
+ *   [1] 이미 reset 중(is_resetting) 또는 removed(is_removed) 이면 즉시 return — 중복 방지.
+ *   [2] 플래그 set:
+ *       - is_resetting=true   : 다른 reset 진입 차단.
+ *       - is_failed=false     : reset 시작 시 failed 플래그 클리어 (재시도 의미).
+ *       - is_disconnecting=true: disconnect_done 까지의 transient 상태.
+ *       - prepare_for_reset=true: I/O qpair 들이 새 명령 발행 멈추도록 신호.
+ *   [3] keep_alive interval=0 — keep-alive admin 명령 재발행 중단 (reset 후 재초기화 시 복구).
+ *   [4] queued_aborts 큐의 모든 대기 abort 를 SC=SQ_DELETION 으로 통보 후 폐기.
+ *   [5] 진행 중 AER(Asynchronous Event Request) 들을 transport hook 으로 abort.
+ *   [6] adminq 의 transport_failure_reason = LOCAL — "호스트 측이 끊는다" 표시.
+ *   [7] transport-specific disconnect_qpair(adminq) — PCIe 면 SQ/CQ delete + admin SQ disable,
+ *       Fabrics 면 transport connection 종료.
+ *
+ *   이후 사용자(또는 polling 루프)가 reset 를 진행하면 disconnect_done → DISCONNECTED 상태
+ *   → reconnect_async(INIT) → process_init 이 활성화 시퀀스 재실행.
+ *
+ * 실행 컨텍스트:
+ *   - 사용자 호출 (spdk_nvme_ctrlr_disconnect / spdk_nvme_ctrlr_reset 의 일부).
+ *   - 자동 reset 경로 (예: AER fatal 또는 transport timeout 시 management thread).
+ *   ctrlr_lock 보유.
+ *
+ * 호출 체인:
+ *   spdk_nvme_ctrlr_disconnect / spdk_nvme_ctrlr_reset →
+ *     [nvme_ctrlr_disconnect] →
+ *       nvme_ctrlr_abort_queued_aborts (대기 abort 정리) +
+ *       nvme_transport_admin_qpair_abort_aers (진행 중 AER abort) +
+ *       nvme_transport_ctrlr_disconnect_qpair (transport 레벨 disconnect)
+ *     ... → (poll) nvme_ctrlr_disconnect_done → state=DISCONNECTED →
+ *     spdk_nvme_ctrlr_reconnect_async → state=INIT → process_init 재실행
+ */
 static int
 nvme_ctrlr_disconnect(struct spdk_nvme_ctrlr *ctrlr)
 {
@@ -3131,73 +3500,255 @@ nvme_ctrlr_disconnect(struct spdk_nvme_ctrlr *ctrlr)
 		 *  immediately since there is no need to kick off another
 		 *  reset in these cases.
 		 */
+		/* [한국어] 두 sentinel 의미:
+		 *   - is_resetting : 이미 다른 호출자가 reset 진행 중 → 중복 reset 시작 안 됨.
+		 *     EBUSY 반환으로 caller 에게 "잠시 후 다시" 신호.
+		 *   - is_removed   : PCIe surprise removal 이나 명시적 remove 후 — controller
+		 *     자체가 의미 없음. ENXIO 로 영구 실패 신호. */
 		return ctrlr->is_resetting ? -EBUSY : -ENXIO;
 	}
 
 	ctrlr->is_resetting = true;
+	/* [한국어] reset 진입 마커 — 다른 reset/disconnect 를 EBUSY 로 거부. disconnect_done 후
+	 *         이어지는 reconnect_async 가 process_init 마지막에 false 로 클리어. */
 	ctrlr->is_failed = false;
+	/* [한국어] reset 자체가 회복 시도이므로 failed 플래그 클리어. 이전 fatal 표시 제거. */
 	ctrlr->is_disconnecting = true;
+	/* [한국어] disconnect 진행 중 transient 상태 — disconnect_done 에서 false 로 토글.
+	 *         외부에서 "지금이 disconnect-only 상태인가" 를 확인하는 용도. */
 	ctrlr->prepare_for_reset = true;
+	/* [한국어] I/O qpair poll 들이 본 플래그를 보고 "더 이상 새 I/O 발행 금지" 모드 진입.
+	 *         이미 in-flight 인 I/O 는 transport disconnect 에서 abort 됨. */
 
 	NVME_CTRLR_NOTICELOG(ctrlr, "resetting controller\n");
+	/* [한국어] 운영 가시성 — reset 시작 시점을 NOTICE 레벨로 명시 (운영 로그에서 잘 보이게). */
 
 	/* Disable keep-alive, it'll be re-enabled as part of the init process */
 	ctrlr->keep_alive_interval_ticks = 0;
+	/* [한국어] Keep-Alive admin 자동 재발행 disable — disconnect 중에는 admin queue 자체가
+	 *         사라지므로 발행 시도가 무의미. process_init 의 SET_KEEP_ALIVE_TIMEOUT 단계에서
+	 *         재설정됨. */
 
 	/* Abort all of the queued abort requests */
 	nvme_ctrlr_abort_queued_aborts(ctrlr);
+	/* [한국어] 발행 대기 중이던 abort 요청들을 SC=SQ_DELETION 으로 호출자에게 통보 후 폐기.
+	 *         admin queue 가 곧 disconnect 되므로 "발행될 일이 없음". */
 
 	nvme_transport_admin_qpair_abort_aers(ctrlr->adminq);
+	/* [한국어] 진행 중인 AER(Asynchronous Event Request, NVMe §5.2 Spec) 들을 transport hook
+	 *         으로 abort. AER 은 디바이스가 비동기 이벤트(temperature, error, NS change 등)를
+	 *         호스트에 통지할 때 쓰는 long-poll admin 명령. reset 시 모두 회수. */
 
 	ctrlr->adminq->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_LOCAL;
+	/* [한국어] qpair 가 죽은 이유를 "LOCAL"(호스트 측에서 끊음) 로 명시 — transport
+	 *         disconnect 가 in-flight 명령을 fail-completion 처리할 때 이 값을 status 로
+	 *         사용. 디바이스 fault 와 호스트 reset 을 구분하는 단서. */
 	nvme_transport_ctrlr_disconnect_qpair(ctrlr, ctrlr->adminq);
+	/* [한국어] transport-specific 실제 disconnect — PCIe: admin SQ/CQ delete + EN=0 까지
+	 *         밀어 controller stop, Fabrics: transport connection close (TCP socket
+	 *         close / RDMA QP destroy). 이 호출 후 adminq 는 사용 불가 상태. */
 
 	return 0;
+	/* [한국어] disconnect 시퀀스 시작 성공. 실제 완료(disconnect_done) 는 reset_poll_async
+	 *         또는 process_init 의 polling 진행에서 감지·호출됨. */
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_disconnect_done - disconnect 완료 처리: 캐시 invalidate + 상태=DISCONNECTED
+ *
+ * @ctrlr: disconnect 완료된 컨트롤러. ctrlr_lock 보유 가정.
+ * @return: 없음.
+ *
+ * 동기/배경:
+ *   nvme_ctrlr_disconnect 가 시작한 disconnect 시퀀스의 종결 함수. transport-level
+ *   disconnect_qpair 가 실제로 끝났음(I/O 모두 abort, qpair 자원 회수)이 process_init 의
+ *   폴링 또는 reset_poll_async 에서 확인되면 호출된다.
+ *
+ *   이 시점에 컨트롤러는 "전기적으로는 살아 있을 수 있지만 SPDK 측 컨텍스트는 모두
+ *   stale" 인 상태. 따라서 reset 후 디바이스가 다시 줄 수 있는 모든 정보(IOCS-specific
+ *   identify, doorbell 등록 정보, free I/O queue ID bitmap)를 폐기하고, 상태머신을
+ *   DISCONNECTED 로 되돌려 reconnect 진입을 기다린다.
+ *
+ * 동작 단계:
+ *   [1] is_failed == false 검증 (assert) — disconnect_done 은 정상 disconnect 종료의
+ *       "정리" 함수이므로, fatal failure 와는 다른 경로.
+ *   [2] is_disconnecting=false — disconnect 시퀀스 종료 신호.
+ *   [3] Doorbell Buffer Config 캐시 free — reset 후 재등록 필요.
+ *   [4] IOCS-specific identify 데이터(ZNS 등) 캐시 free — reset 후 재read 필요.
+ *   [5] free_io_qids bitmap free — I/O queue ID 풀 무효화 (reset 후 재할당).
+ *   [6] state=DISCONNECTED + INFINITE timeout — reconnect_async 가 INIT 으로 전이시킬 때까지
+ *       대기.
+ *
+ * 실행 컨텍스트:
+ *   - process_init / reset_poll_async polling 컨텍스트.
+ *   - ctrlr_lock 보유.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_disconnect (시작) → ... transport disconnect 진행 ... →
+ *     [본 함수] → state=DISCONNECTED →
+ *       (호출자가 폴링 루프에서 감지) →
+ *         spdk_nvme_ctrlr_reconnect_async → state=INIT →
+ *           nvme_ctrlr_process_init 재실행 (CONNECT_ADMINQ → ... → READY)
+ */
 static void
 nvme_ctrlr_disconnect_done(struct spdk_nvme_ctrlr *ctrlr)
 {
 	assert(ctrlr->is_failed == false);
+	/* [한국어] 본 함수는 "정상 disconnect 종료" 경로. is_failed=true 이면 fatal failure
+	 *         경로(별도 정리)를 타야 하므로 디버그 빌드에서 trip. */
 	ctrlr->is_disconnecting = false;
+	/* [한국어] disconnect transient 상태 종료. 이 토글 후 외부에서 "disconnect 끝났음" 인지. */
 
 	/* Doorbell buffer config is invalid during reset */
 	nvme_ctrlr_free_doorbell_buffer(ctrlr);
+	/* [한국어] reset 시 디바이스 컨텍스트가 날아가므로 등록한 shadow_doorbell/eventidx PRP 도
+	 *         디바이스 측에선 잊혀진 상태. 호스트 캐시도 같이 free 해 stale 사용 방지.
+	 *         재초기화 시 SET_DB_BUF_CFG 단계에서 새로 할당·등록. */
 
 	/* I/O Command Set Specific Identify Controller data is invalidated during reset */
 	nvme_ctrlr_free_iocs_specific_data(ctrlr);
+	/* [한국어] reset 후 디바이스가 ZNS/IOCS 관련 capability 를 변경했을 가능성 — stale 캐시
+	 *         사용 방지. 재초기화 시 IDENTIFY_IOCS_SPECIFIC 단계에서 다시 read. */
 
 	spdk_bit_array_free(&ctrlr->free_io_qids);
+	/* [한국어] I/O queue ID 풀(bit array) 해제. reset 후 디바이스의 max I/O queues 가
+	 *         바뀌었을 가능성을 고려해 풀 자체를 재생성 — SET_NUM_QUEUES 단계에서 새로 할당. */
 
 	/* Set the state back to DISCONNECTED to cause a full hardware reset. */
 	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_DISCONNECTED, NVME_TIMEOUT_INFINITE);
+	/* [한국어] 상태=DISCONNECTED. INFINITE timeout 으로 외부 reconnect 진입까지 무한 대기.
+	 *         이 상태에서 process_init 이 호출돼도 dispatch 가 no-op (state 가 곧
+	 *         reconnect_async 에 의해 INIT 으로 바뀔 것을 기대). */
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_disconnect - 외부 사용자용 disconnect 진입 API (locking wrapper)
+ *
+ * @ctrlr: 사용자가 spdk_nvme_probe / spdk_nvme_attach 등으로 얻은 컨트롤러 핸들.
+ * @return:
+ *   - 0      : disconnect 시퀀스 시작 성공. 사용자는 spdk_nvme_ctrlr_reconnect_poll_async
+ *              로 완료 폴링 후 spdk_nvme_ctrlr_reconnect_async 로 재연결.
+ *   - -EBUSY : 이미 reset/disconnect 진행 중 — 잠시 후 재시도.
+ *   - -ENXIO : 컨트롤러 hot-removed.
+ *
+ * 동기/배경:
+ *   SPDK 공개 API (include/spdk/nvme.h 에 선언) 의 진입점.
+ *   사용자(예: bdev_nvme 모듈)가 hot-plug 이벤트 처리, 스토리지 fault recovery, 또는
+ *   사용자 명시적 reset 시 호출. 내부 nvme_ctrlr_disconnect 와 동일한 일을 하지만
+ *   외부 호출이므로 ctrlr_lock 을 자체적으로 acquire/release.
+ *
+ *   대비: nvme_ctrlr_disconnect 는 internal — 호출자가 이미 lock 보유 가정.
+ *
+ * 동작 단계:
+ *   [1] ctrlr_lock acquire — 다른 admin 처리/reset 진입과 직렬화.
+ *   [2] nvme_ctrlr_disconnect 위임.
+ *   [3] ctrlr_lock release — 본 함수 return 후 사용자는 lock 안 잡고 다음 단계 호출 가능.
+ *
+ * 실행 컨텍스트:
+ *   - 사용자 thread (보통 management thread).
+ *   - lock 미보유 상태에서 호출.
+ *
+ * 호출 체인:
+ *   <사용자 코드(bdev_nvme reset_poll, etc.)> →
+ *     [spdk_nvme_ctrlr_disconnect] (lock acquire) →
+ *       nvme_ctrlr_disconnect → (transport disconnect, abort 정리, ...)
+ *     (lock release)
+ *   ... 사용자가 reconnect_async 로 ctrlr 활성 복원 ...
+ */
 int
 spdk_nvme_ctrlr_disconnect(struct spdk_nvme_ctrlr *ctrlr)
 {
 	int rc;
+	/* [한국어] 내부 disconnect 의 반환 코드를 lock release 후에도 보존하기 위한 임시 변수. */
 
 	nvme_ctrlr_lock(ctrlr);
+	/* [한국어] 외부 API 진입 — ctrlr_lock 획득. 동시에 호출되는 admin completion poller
+	 *         /reset 진입 등과 직렬화 (lock 은 pthread_mutex / 단일 process 에선 흔히 spin). */
 	rc = nvme_ctrlr_disconnect(ctrlr);
+	/* [한국어] 실제 disconnect 로직 위임. 호출자(본 함수)가 lock 을 보유하므로
+	 *         nvme_ctrlr_disconnect 의 사전조건 만족. */
 	nvme_ctrlr_unlock(ctrlr);
+	/* [한국어] 사용자 코드로 return 하기 전 lock 해제. */
 
 	return rc;
+	/* [한국어] -EBUSY/-ENXIO/0 그대로 전달. 사용자는 EBUSY 면 재시도, ENXIO 면 detach. */
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_reconnect_async - 컨트롤러 재초기화 시작 (reset chain 의 후반 진입점)
+ *
+ * @ctrlr: 이미 disconnect 단계를 마친 컨트롤러 (state=DISCONNECTED 또는 INIT 직전).
+ * @return: 없음 (비동기 — 진행 상황은 reconnect_poll_async 로 확인).
+ *
+ * 동기/배경:
+ *   reset chain 은 두 단계로 나뉜다:
+ *     1) disconnect 단계: spdk_nvme_ctrlr_disconnect → nvme_ctrlr_disconnect →
+ *        (poll) nvme_ctrlr_disconnect_done → state=DISCONNECTED.
+ *     2) reconnect 단계: 본 함수 → state=INIT → 사용자 폴링(spdk_nvme_ctrlr_reconnect_poll_async)
+ *        이 nvme_ctrlr_process_init 을 반복 호출 → READY.
+ *
+ *   "reconnect_async" 는 이 두 번째 단계의 시작점이다. 함수 자체는 짧지만 의미가 큼:
+ *   상태머신을 INIT 으로 강제 되돌림으로써 process_init 이 처음부터(CONNECT_ADMINQ →
+ *   READ_VS → READ_CAP → CHECK_EN → ...) 다시 진행해 컨트롤러를 활성 상태로 끌어올린다.
+ *
+ *   특이점 - lock 보유 정책:
+ *   본 함수는 lock 을 "acquire 만 하고 unlock 하지 않은 채 return". 의도적인 설계 —
+ *   reconnect 진행 중에는 다른 admin/reset 진입을 차단해야 하기 때문. lock 은 사용자가
+ *   spdk_nvme_ctrlr_reconnect_poll_async 를 반복 호출하다가 0(완료) 을 받으면 그쪽에서
+ *   unlock 한다. 즉 "reconnect_async 는 lock 잡기, reconnect_poll_async 는 lock 풀기" 의
+ *   비대칭 lock 페어링.
+ *
+ * 동작 단계:
+ *   [1] ctrlr_lock acquire (이후 unlock 안 함 — reconnect 진행 동안 보유 유지).
+ *   [2] prepare_for_reset=false — disconnect 진입 시 set 한 "I/O 발행 차단" 신호 해제.
+ *       이제 process_init 이 admin 명령을 재발행할 수 있게 됨.
+ *   [3] state=INIT + INFINITE timeout — process_init 이 CONNECT_ADMINQ 부터 다시 시작.
+ *   [4] 의도적으로 unlock 안 하고 return.
+ *
+ * 실행 컨텍스트:
+ *   - 사용자 thread.
+ *   - 진입 시 lock 미보유, 종료 시 lock 보유 (caller 가 보유 상태로 계속 진행).
+ *
+ * 호출 체인:
+ *   ... spdk_nvme_ctrlr_disconnect → disconnect_done → state=DISCONNECTED ...
+ *   <사용자 코드> →
+ *     [spdk_nvme_ctrlr_reconnect_async] (lock 획득) →
+ *       set_state(INIT) → (return, lock 보유)
+ *   <사용자 폴링 루프> →
+ *     spdk_nvme_ctrlr_reconnect_poll_async → nvme_ctrlr_process_init → ... → READY
+ *     (마지막에 lock release)
+ */
 void
 spdk_nvme_ctrlr_reconnect_async(struct spdk_nvme_ctrlr *ctrlr)
 {
 	nvme_ctrlr_lock(ctrlr);
+	/* [한국어] reconnect 시퀀스 진입 — lock 획득. 이 lock 은 본 함수에서 unlock 하지 않고,
+	 *         사용자가 이후 reconnect_poll_async 를 호출해 process_init 이 READY 에 도달
+	 *         (또는 ERROR 로 실패) 한 시점에서 unlock 됨. */
 
 	ctrlr->prepare_for_reset = false;
+	/* [한국어] disconnect 진입 시 set 했던 "I/O qpair 들이 새 명령 발행 금지" 플래그 해제.
+	 *         이제 process_init 의 admin 발행과 후속 I/O qpair reinitialize 가 정상 동작. */
 
 	/* Set the state back to INIT to cause a full hardware reset. */
 	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_INIT, NVME_TIMEOUT_INFINITE);
+	/* [한국어] 상태머신을 INIT 으로 reset — process_init 이 다음 호출에서 init flow 처음
+	 *         (CONNECT_ADMINQ → READ_VS → READ_CAP → CHECK_EN → SET_EN_0 → ENABLE → ...
+	 *          → IDENTIFY → SET_NUM_QUEUES → SET_DB_BUF_CFG → SET_HOST_ID →
+	 *          TRANSPORT_READY → READY) 부터 재진행하게 만든다.
+	 *         INFINITE timeout — process_init 자체가 단계별 timeout 을 다시 세팅하므로
+	 *         초기값은 무한으로 두고 시작. */
 
 	/* Return without releasing ctrlr_lock. ctrlr_lock will be released when
 	 * spdk_nvme_ctrlr_reset_poll_async() returns 0.
 	 */
+	/* [한국어] 명시적 의도: lock 보유한 채 return. reconnect 진행이 끝날 때까지 (poll 함수가
+	 *         0=READY 또는 영구 실패를 보고할 때까지) 다른 reset/admin 진입을 차단하기 위함.
+	 *         사용자가 lock 을 풀지 않으면 deadlock — API 사용 계약 상 반드시
+	 *         spdk_nvme_ctrlr_reconnect_poll_async 를 폴링해야 함. */
 }
 
 int

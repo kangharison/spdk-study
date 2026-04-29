@@ -3,20 +3,79 @@
  *   All rights reserved.
  */
 
+/*
+ * [한국어 설명] NVMe 64비트 CRC (Rocksoft, 다항식 0xAD93D23594C93659) 계산
+ *               (crc64.c)
+ *
+ * === 파일의 역할 ===
+ * NVMe 2.0 사양이 도입한 64비트 CRC(흔히 "NVMe 64b CRC" 또는
+ * "Rocksoft Plain CRC-64")를 계산하는 `spdk_crc64_nvme()`를 제공한다.
+ * 빌드 환경에 ISA-L이 있으면 어셈블리 가속 `crc64_rocksoft_refl()`을, 없으면
+ * 코드 내 256-엔트리 사전 계산 lookup table 기반의 자체 구현을 사용한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * NVMe 2.0의 Protection Information(PI) 64-bit Guard Field 계산에 사용된다.
+ * 16-bit T10 CRC(crc16.c)나 32-bit CRC(crc32c.c)에 비해 더 강력한 오류
+ * 검출이 필요한 PI 모드에서 활성화. 호출 흐름 예:
+ *   bdev write → DIF 헬퍼(lib/util/dif.c)가 PI 형식을 봐서 64b 모드 분기 →
+ *   spdk_crc64_nvme(데이터, len, seed) → guard field에 결과 기록.
+ *
+ * === 타 모듈과의 연결 ===
+ * - 의존: `crc_internal.h`(SPDK_CONFIG_ISAL/ISA-L 헤더 분기),
+ *   `spdk/crc64.h`(공개 prototype). ISA-L 빌드 시
+ *   `isa-l/include/crc64.h`의 crc64_rocksoft_refl 사용.
+ * - 호출자: lib/util/dif.c의 64-bit guard 경로, NVMe 컨트롤러 시뮬레이터,
+ *   blob 등 무결성 검증 경로(필요 시).
+ * - 공유 상태: 폴백 빌드에서 사용하는 정적 const lookup table(읽기 전용).
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - spdk_crc64_nvme(buf, len, crc): 64비트 CRC를 누적 갱신. ISA-L 또는 폴백.
+ * - crc64_rocksoft_refl_table[256] (폴백 only): 비트 반사 다항식
+ *   0x9A6C9329AC4BC9B5(=0xAD93D23594C93659의 반사)에 대한 사전 계산 테이블.
+ * - crc64_rocksoft_refl_base() (폴백 static): byte-by-byte lookup 알고리즘.
+ *   초기 보수(~seed)와 최종 보수(~crc) 적용으로 NVMe 사양 준수.
+ */
+
 #include "crc_internal.h"
+/* [한국어] SPDK_CONFIG_ISAL 매크로 가시성과 ISA-L 헤더 인클루드 분기. */
 #include "spdk/crc64.h"
+/* [한국어] 공개 prototype: spdk_crc64_nvme. */
 
 #ifdef SPDK_CONFIG_ISAL
 #include "isa-l/include/crc64.h"
+/* [한국어] ISA-L의 crc64_rocksoft_refl prototype 포함. PCLMULQDQ 기반
+ * folding 알고리즘으로 매우 빠르게 처리. */
 
+/*
+ * [한국어]
+ * spdk_crc64_nvme (ISA-L 가속판) - NVMe 64-bit Rocksoft CRC 갱신.
+ *
+ * @buf, @len, @crc: 입력 버퍼/길이/누적 CRC seed.
+ * @return: 갱신된 CRC.
+ *
+ * crc64_rocksoft_refl는 ISA-L이 제공하는 가속 함수로, 내부에서 보수 처리 등
+ * NVMe 사양에 정확히 맞춘 형태를 따른다.
+ *
+ * 호출 체인: lib/util/dif.c 등 → spdk_crc64_nvme → ISA-L crc64_rocksoft_refl.
+ */
 uint64_t
 spdk_crc64_nvme(const void *buf, size_t len, uint64_t crc)
 {
 	return crc64_rocksoft_refl(crc, (const uint8_t *)buf, len);
+	/* [한국어] ISA-L 시그니처는 (seed, buf, len) 순. SPDK 측 시그니처
+	 * (buf, len, crc)와 다르므로 인자 순서를 맞춰 위임. */
 }
 
 #else
+/* [한국어] ISA-L이 없는 빌드 — 자체 SW 구현 사용. */
 
+/* [한국어] CRC-64 Rocksoft (비트 반사) lookup table.
+ * - 다항식: 0xAD93D23594C93659 (Rocksoft, NVMe 2.0 PI 64b mode).
+ *   비트 반사된 형태가 0x9A6C9329AC4BC9B5.
+ * - 256개의 사전 계산값. 매 입력 바이트당 1회 lookup으로 8비트 시프트 누적.
+ * - 설정자: 컴파일 시 const 초기화. 런타임 setup 불필요.
+ * - 읽는 자: crc64_rocksoft_refl_base 한 곳.
+ * - 동기화: 컴파일 타임 const → read-only data 영역에 배치, lockless. */
 static const uint64_t crc64_rocksoft_refl_table[256] = {
 	0x0000000000000000ULL, 0x7f6ef0c830358979ULL,
 	0xfedde190606b12f2ULL, 0x81b31158505e9b8bULL,
@@ -148,22 +207,55 @@ static const uint64_t crc64_rocksoft_refl_table[256] = {
 	0x55b4a08fdfd90e51ULL, 0x2ada5047efec8728ULL
 };
 
+/*
+ * [한국어]
+ * crc64_rocksoft_refl_base [static] - 폴백 byte-by-byte CRC-64 갱신.
+ *
+ * @seed: 호출자가 넘긴 누적 CRC seed.
+ * @buf: 입력 바이트 시작.
+ * @len: 입력 길이.
+ * @return: 새 누적 CRC.
+ *
+ * 동기: NVMe 64-bit guard는 "초기 보수 ~seed → 매 바이트 lookup XOR →
+ * 최종 보수 ~crc" 형태. ISA-L이 없는 환경에서도 동일한 결과를 내야 한다.
+ *
+ * 호출 체인: spdk_crc64_nvme(폴백) → crc64_rocksoft_refl_base.
+ */
 static inline uint64_t
 crc64_rocksoft_refl_base(uint64_t seed, const uint8_t *buf, uint64_t len)
 {
 	uint64_t i, crc = ~seed;
+	/* [한국어] CRC 표준 컨벤션상 누적 시작 시 입력 seed의 보수를 취한다.
+	 * 첫 호출의 seed=0이라면 crc는 0xFFFF...FFFF로 시작. */
 
 	for (i = 0; i < len; i++) {
 		uint8_t byte = buf[i];
+		/* [한국어] 현재 처리할 입력 바이트. */
 		crc = crc64_rocksoft_refl_table[(uint8_t) crc ^ byte] ^ (crc >> 8);
+		/* [한국어] 비트 반사 알고리즘:
+		 *   - (uint8_t)crc: 현재 CRC의 하위 8비트.
+		 *   - 그것에 새 byte를 XOR해 lookup 인덱스 생성.
+		 *   - table[index]: 8비트 진행분에 해당하는 사전 계산값.
+		 *   - (crc >> 8): 상위 56비트 보존, 하위 8비트 폐기.
+		 *   - 두 값을 XOR해 새 64비트 누적값 생성. */
 	}
 
 	return ~crc;
+	/* [한국어] 사양상 결과의 보수를 취해 반환. (~~seed = seed 도식의 대칭) */
 }
 
+/*
+ * [한국어]
+ * spdk_crc64_nvme (폴백판) - byte-by-byte 알고리즘 호출.
+ *
+ * 가속 경로(ISA-L)가 없을 때만 컴파일됨.
+ *
+ * 호출 체인: lib/util/dif.c 등 → spdk_crc64_nvme → crc64_rocksoft_refl_base.
+ */
 uint64_t
 spdk_crc64_nvme(const void *buf, size_t len, uint64_t crc)
 {
 	return crc64_rocksoft_refl_base(crc, (const uint8_t *)buf, len);
+	/* [한국어] 인자 순서를 정렬해 base 함수에 위임. */
 }
 #endif

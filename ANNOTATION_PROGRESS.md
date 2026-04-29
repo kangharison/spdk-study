@@ -267,9 +267,25 @@ examples/nvme/*, examples/bdev/*, examples/nvmf/*, examples/sock/*, examples/thr
 
 ## 현재 진행 중 파일
 
-- ◐ **lib/nvme/nvme_ctrlr.c** — 5997 → 6510 → 6778 → 7289줄. v1 8종 + v2 qpair 10종 + v3 features/fail 9종 + v4 shutdown chain/enable/state_string 9종 = **36종 보강**. 잔여 ~70 함수. 다음 세션 Part 5에서 reset/disconnect/reconnect/AER 우선 진행.
+- ◐ **lib/nvme/nvme_ctrlr.c** — 5997 → 6510 → 6778 → 7289 → 7840줄. v1 8종 + v2 qpair 10종 + v3 features/fail 9종 + v4 shutdown 9종 + v5 disconnect/reconnect 12종 = **48종 보강**. 잔여 ~58 함수. 다음 세션 Part 6에서 reinitialize/reconnect_poll/disable/reset/AER 우선 진행.
 
 ## 최근 완료 파일 (역순 최대 30개)
+
+- 2026-04-29 · **6차 병렬 agent 4개 작업 동시 실행** — 22개 파일 + nvme_ctrlr Part 5 일괄 완료. **누적**: 원본 4,302줄 → 주석 후 7,776줄 (+3,474줄, 1.81×). 4섹션 블록 22/22 PASS.
+
+  **agent A — lib/util/ 작은 파일 12개 (894 → 2,902, +2,008)**:
+    strerror_tls.c (15→81), crc32_ieee.c (21→107), math.c (46→133), md5.c (62→185), crc32.c (79→213), hexlify.c (85→217), zipf.c (111→277), crc32c.c (133→308), fd.c (134→282), file.c (145→322), xor.c (145→316), crc64.c (169→261). **인사이트**: CRC 4종(IEEE blob/CRC32C NVMe-oF HDGST·DDGST·iSCSI Digest·DIF guard/CRC64 NVMe 2.0 64-bit PI guard) 다항식 spec + ISA-L/SSE4.2/ARM CRC32/SW 4가지 빌드 분기, MD5 = iSCSI CHAP, hexlify = NQN/UUID·DH-HMAC-CHAP, zipf = bdevperf 워크로드 모사 (Gray '94), xor = RAID-5 ISA-L 32B 정렬, fd/file = aio bdev + env_dpdk PCI sysfs.
+
+  **agent B — lib/util/ 중간 파일 6개 (1,609 → 2,981, +1,372)**:
+    uuid.c (209→455), iov.c (243→489), base64.c (250→441), net.c (209→376), cpuset.c (329→585), pipe.c (369→635). **인사이트**: pipe.c 는 형식적으로는 SPSC ring 이지만 SPDK 일반 사용은 producer(socket recv)+consumer(PDU parser) 가 같은 reactor 스레드에서 직렬 호출되어 atomic load 없이 정확성 유지 — lock-free 근거 명시. cpuset.c 의 parse_mask(/sys/cpumask 콤마 표기) + parse_list([a,b-c] 표기) 가 동일 비트맵으로 정규화 → --cpumask 옵션 두 표현 모두 지원.
+
+  **agent C — lib/log/ 전체 (610 → 1,694, +1,084)**:
+    log.c (316→855), log_flags.c (150→410), log_deprecated.c (144→429). **★ log.c sink + level 필터 메커니즘**: spdk_vlog 가 g_log_opts.log 콜백 등록 시 즉시 위임 (포맷팅·필터링 SPDK가 손 떼고), 미등록 시 두 단계 컷오프 (g_spdk_log_print_level → stderr / g_spdk_log_level → syslog). 메시지 빌드는 1KB 스택 버퍼 vsnprintf 시도 → 초과 시 va_copy + vasprintf 동적 할당으로 잘림 회피. log_flags.c = SPDK_LOG_REGISTER_COMPONENT constructor 자동 등록 비트 토글, log_deprecated.c = N회 fire 마다 출력 + RPC log_get_deprecation_history.
+
+  **agent D — lib/nvme/nvme_ctrlr.c Part 5: disconnect/reconnect chain 12종 (7289→7840, +551)**:
+    set_state, set_state_quiet (silent 변형, WAIT_FOR_* 폴링 재진입용), free_zns_specific_data, free_iocs_specific_data, free_doorbell_buffer (DBBUF NVMe §5.7 shadow/eventidx 페이지), set_doorbell_buffer_config_done, set_doorbell_buffer_config (DBBUF 두 hugepage 할당 + PRP 추출 + 발행), abort_queued_aborts (queued_aborts STAILQ 를 SC_ABORTED_SQ_DELETION 통보·폐기), ★ disconnect (reset chain 시작점), disconnect_done (캐시 invalidate + state=DISCONNECTED), spdk_nvme_ctrlr_disconnect (외부 lock wrapper), ★ spdk_nvme_ctrlr_reconnect_async (lock 보유 채 return, prepare_for_reset=false, state=INIT → process_init 재실행). **★ 비대칭 lock 페어링**: reconnect_async 가 lock acquire / reconnect_poll_async 가 release 명시. NVMe Spec §5.7(DBBUF)/§5.1·5.2(Abort/AER)/§7.3(Reset Processing) 인용.
+
+  **누적 — nvme_ctrlr.c 48종 보강**: v1 핵심 8종 + v2 qpair 10종 + v3 features/fail 9종 + v4 shutdown 9종 + v5 disconnect/reconnect 12종. **잔여 ~58 함수** (Part 6): reinitialize_io_qpair, reconnect_poll_async, disable/disable_poll, fail_io_qpairs, ★ spdk_nvme_ctrlr_reset/reset_subsystem (사용자 reset API), set_trid/set_remove_cb, AER 처리 일습.
 
 - 2026-04-29 · **5차 병렬 agent 4개 작업 동시 실행** — 7개 파일 일괄 완료:
   - **include/spdk/event.h** (384→851, +467) — agent A. 14함수 + spdk_app_opts 40+ 필드 + spdk_app_parse_args_rvals enum 3값 + 매크로 SPDK_APP_GETOPT_STRING/SPDK_STATIC_ASSERT + typedef 3 + 전방선언 2. **인사이트**: spdk_app_opts 의 4중 ABI 안전장치 (`__attribute__((packed))` + reserved 홀 + caller opts_size + STATIC_ASSERT) 명시.
