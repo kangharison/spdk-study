@@ -121,38 +121,55 @@
 #include "spdk/log.h"
 
 extern pid_t g_spdk_nvme_pid;
+                                  /* [한국어] SPDK 초기화 시점에 한 번 캐싱된 호스트 PID
+                                   *  - 설정자: nvme.c의 spdk_nvme_driver_init() 한 번
+                                   *  - 읽는 자: 모든 nvme_request 할당 코드(req->pid에 저장),
+                                   *    multi-process 공유 컨트롤러에서 admin 완료 시 어느 프로세스의
+                                   *    request인지 식별하는 키
+                                   *  - 다른 프로세스가 attach해도 자기 프로세스의 PID로만 비교 */
 
 extern struct spdk_nvme_transport_opts g_spdk_nvme_transport_opts;
+                                  /* [한국어] 전역 트랜스포트 옵션 (NVMe-oF용 ack timeout, ToS, RDMA srq 등)
+                                   *  - spdk_nvme_transport_set_opts()로 사용자가 갱신
+                                   *  - 모든 트랜스포트가 qpair/ctrlr 생성 시 이 전역 값을 참조 */
 
 /*
  * Some Intel devices support vendor-unique read latency log page even
  * though the log page directory says otherwise.
  */
 #define NVME_INTEL_QUIRK_READ_LATENCY 0x1
+                                  /* [한국어] Intel 벤더 quirk: log page 디렉토리에는 미보고 상태로
+                                   *  벤더 read latency log page(0xC1)를 실제로 지원 — 강제로 supported 처리 */
 
 /*
  * Some Intel devices support vendor-unique write latency log page even
  * though the log page directory says otherwise.
  */
 #define NVME_INTEL_QUIRK_WRITE_LATENCY 0x2
+                                  /* [한국어] 위와 동일하나 write latency log page(0xC2) 버전 */
 
 /*
  * The controller needs a delay before starts checking the device
  * readiness, which is done by reading the NVME_CSTS_RDY bit.
  */
 #define NVME_QUIRK_DELAY_BEFORE_CHK_RDY	0x4
+                                  /* [한국어] 일부 컨트롤러는 reset 후 즉시 CSTS.RDY 폴링하면 잘못된 값 반환
+                                   *  - 초기화 상태머신이 RDY 체크 전 추가 sleep 삽입 */
 
 /*
  * The controller performs best when I/O is split on particular
  * LBA boundaries.
  */
 #define NVME_INTEL_QUIRK_STRIPING 0x8
+                                  /* [한국어] 특정 Intel SSD의 최적 I/O 경계 — sectors_per_stripe로
+                                   *  noted, 호스트가 이 경계 넘는 I/O를 split 시 성능 향상 */
 
 /*
  * The controller needs a delay after allocating an I/O queue pair
  * before it is ready to accept I/O commands.
  */
 #define NVME_QUIRK_DELAY_AFTER_QUEUE_ALLOC 0x10
+                                  /* [한국어] CREATE_IO_SQ/CQ 완료 후 곧장 I/O 발행 시 무응답 — 추가 delay 필요 */
 
 /*
  * Earlier NVMe devices do not indicate whether unmapped blocks
@@ -160,11 +177,14 @@ extern struct spdk_nvme_transport_opts g_spdk_nvme_transport_opts;
  * device does in fact read all zeroes after an unmap event
  */
 #define NVME_QUIRK_READ_ZERO_AFTER_DEALLOCATE 0x20
+                                  /* [한국어] DSM Deallocate 후 읽으면 0 보장 (구형 SSD에서 NS 식별자에 명시 X)
+                                   *  - bdev_nvme가 read_zero_after_deallocate 능력 비트 강제 설정 */
 
 /*
  * The controller doesn't handle Identify value others than 0 or 1 correctly.
  */
 #define NVME_QUIRK_IDENTIFY_CNS 0x40
+                                  /* [한국어] Identify CNS=00,01만 정상 처리 — CNS=02 이상은 회피 */
 
 /*
  * The controller supports Open Channel command set if matching additional
@@ -172,6 +192,7 @@ extern struct spdk_nvme_transport_opts g_spdk_nvme_transport_opts;
  * bits of the namespace identify structure is set.
  */
 #define NVME_QUIRK_OCSSD 0x80
+                                  /* [한국어] Open-Channel SSD 호환 — Identify NS 벤더 영역 첫 바이트 0x1로 식별 */
 
 /*
  * The controller has an Intel vendor ID but does not support Intel vendor-specific
@@ -179,6 +200,7 @@ extern struct spdk_nvme_transport_opts g_spdk_nvme_transport_opts;
  * ID but do not support these log pages.
  */
 #define NVME_INTEL_QUIRK_NO_LOG_PAGES 0x100
+                                  /* [한국어] Intel VID 보고하지만 벤더 log page 미지원 (QEMU 에뮬레이션 등) */
 
 /*
  * The controller does not set SHST_COMPLETE in a reasonable amount of time.  This
@@ -186,12 +208,14 @@ extern struct spdk_nvme_transport_opts g_spdk_nvme_transport_opts;
  * error message that on VMWare NVMe SSDs, the shutdown timeout may be expected.
  */
 #define NVME_QUIRK_SHST_COMPLETE 0x200
+                                  /* [한국어] CSTS.SHST가 complete로 안 가는 가상 SSD — 진단 메시지만 첨부 */
 
 /*
  * The controller requires an extra delay before starting the initialization process
  * during attach.
  */
 #define NVME_QUIRK_DELAY_BEFORE_INIT 0x400
+                                  /* [한국어] attach 시 초기화 시작 전 추가 wait — 펌웨어가 ready되기 전 액세스 방지 */
 
 /*
  * Some SSDs exhibit poor performance with the default SPDK NVMe IO queue size.
@@ -201,6 +225,7 @@ extern struct spdk_nvme_transport_opts g_spdk_nvme_transport_opts;
  * a new queue pair.
  */
 #define NVME_QUIRK_MINIMUM_IO_QUEUE_SIZE 0x800
+                                  /* [한국어] 기본 256 대신 1024 큐 사이즈 강제 — 일부 SSD가 작은 큐에서 저성능 */
 
 /**
  * The maximum access width to PCI memory space is 8 Bytes, don't use AVX2 or
@@ -208,47 +233,60 @@ extern struct spdk_nvme_transport_opts g_spdk_nvme_transport_opts;
  * 8 Bytes.
  */
 #define NVME_QUIRK_MAXIMUM_PCI_ACCESS_WIDTH 0x1000
+                                  /* [한국어] PCI MMIO 영역에 대해 8B 초과 SIMD(AVX2/SSE) 접근 금지
+                                   *  - 메모리 복사/세팅 시 일반 mov로 fallback */
 
 /**
  * The SSD does not support OPAL even through it sets the security bit in OACS.
  */
 #define NVME_QUIRK_OACS_SECURITY 0x2000
+                                  /* [한국어] OACS에 security 비트가 1이지만 실제로 OPAL 미지원 — 가짜 능력 무시 */
 
 /**
  * Intel P55XX SSDs can't support Dataset Management command with SGL format,
  * so use PRP with DSM command.
  */
 #define NVME_QUIRK_NO_SGL_FOR_DSM 0x4000
+                                  /* [한국어] DSM (opcode 0x09)은 PRP만 사용 — Intel P55XX는 SGL DSM 처리 불가 */
 
 /**
  * Maximum Data Transfer Size(MDTS) excludes interleaved metadata.
  */
 #define NVME_QUIRK_MDTS_EXCLUDE_MD 0x8000
+                                  /* [한국어] MDTS 계산 시 interleaved metadata 길이 제외 — split 결정의 기반 */
 
 /**
  * Force not to use SGL even the controller report that it can
  * support it.
  */
 #define NVME_QUIRK_NOT_USE_SGL 0x10000
+                                  /* [한국어] 컨트롤러가 SGL 지원 비트 설정해도 PRP만 사용 강제 (호환성 회피) */
 
 /*
  * Some SSDs require the admin submission queue size to equate to an even
  * 4KiB multiple.
  */
 #define NVME_QUIRK_MINIMUM_ADMIN_QUEUE_SIZE 0x20000
+                                  /* [한국어] admin SQ 크기를 4KiB 정렬 (entry size 64B → 64 entry 단위) 요구 */
 
 /*
  * Some Micron SSD models do not allocate an extra MSI-X vector for the admin
  * queue.
  */
 #define NVME_QUIRK_MSIX_VECTOR_COUNT 0x40000
+                                  /* [한국어] admin 전용 MSI-X 벡터 미할당 SSD — 인터럽트 매핑 시 보정 필요 */
 
 #define NVME_MAX_ASYNC_EVENTS	(8)
+                                  /* [한국어] AER 슬롯 최대 개수 — 호스트가 컨트롤러에 동시 발행 가능한 AER 수 상한
+                                   *  - struct spdk_nvme_ctrlr.aer[]의 배열 크기 */
 
 #define NVME_MAX_ADMIN_TIMEOUT_IN_SECS	(30)
+                                  /* [한국어] 컨트롤러 초기화 admin 명령들의 기본 timeout (30초)
+                                   *  - state_timeout_tsc 계산 기반 */
 
 /* Maximum log page size to fetch for AERs. */
 #define NVME_MAX_AER_LOG_SIZE		(4096)
+                                  /* [한국어] AER 수신 후 fetch할 log page 최대 크기 — Changed NS List 등 */
 
 /*
  * NVME_MAX_IO_QUEUES in nvme_spec.h defines the 64K spec-limit, but this
@@ -256,21 +294,32 @@ extern struct spdk_nvme_transport_opts g_spdk_nvme_transport_opts;
  *  try to configure, if available.
  */
 #define DEFAULT_MAX_IO_QUEUES		(1024)
+                                  /* [한국어] SPDK가 실제로 시도하는 I/O 큐 수 상한 (스펙 한도 65535 vs 실용 한도) */
 #define MAX_IO_QUEUES_WITH_INTERRUPTS	(256)
+                                  /* [한국어] 인터럽트 모드에서 더 작은 상한 — MSI-X 벡터 부족 회피 */
 #define DEFAULT_ADMIN_QUEUE_SIZE	(32)
+                                  /* [한국어] admin SQ/CQ 기본 entry 수 (충분히 작아 메모리 절약) */
 #define DEFAULT_IO_QUEUE_SIZE		(256)
+                                  /* [한국어] I/O SQ/CQ 기본 entry 수 — opts에서 변경 가능 */
 #define DEFAULT_IO_QUEUE_SIZE_FOR_QUIRK	(1024) /* Matches Linux kernel driver */
+                                  /* [한국어] MINIMUM_IO_QUEUE_SIZE quirk 적용 SSD에 사용되는 1024 — 리눅스 드라이버 기본값과 일치 */
 
 #define DEFAULT_IO_QUEUE_REQUESTS	(512)
+                                  /* [한국어] qpair당 nvme_request 풀 기본 크기 — 동시 in-flight 한도 */
 
 #define SPDK_NVME_DEFAULT_RETRY_COUNT	(4)
+                                  /* [한국어] 일반 명령 기본 재시도 횟수 — req->retries 비교 기준 */
 
 #define SPDK_NVME_TRANSPORT_ACK_TIMEOUT_DISABLED	(0)
+                                  /* [한국어] NVMe-oF transport-level ACK timeout 비활성 (0=disable) */
 #define SPDK_NVME_DEFAULT_TRANSPORT_ACK_TIMEOUT	SPDK_NVME_TRANSPORT_ACK_TIMEOUT_DISABLED
+                                  /* [한국어] 트랜스포트 ACK timeout 기본값 (== disable) */
 
 #define SPDK_NVME_TRANSPORT_TOS_DISABLED	(0)
+                                  /* [한국어] TCP/IP DSCP(ToS) 비활성 — QoS 표시 안 함 */
 
 #define MIN_KEEP_ALIVE_TIMEOUT_IN_MS	(10000)
+                                  /* [한국어] Keep Alive Timeout 최소 10초 — NVMe-oF 연결 liveness */
 
 /* We want to fit submission and completion rings each in a single 2MB
  * hugepage to ensure physical address contiguity.
@@ -278,17 +327,24 @@ extern struct spdk_nvme_transport_opts g_spdk_nvme_transport_opts;
 #define MAX_IO_QUEUE_ENTRIES		(VALUE_2MB / spdk_max( \
 						sizeof(struct spdk_nvme_cmd), \
 						sizeof(struct spdk_nvme_cpl)))
+                                  /* [한국어] 2MB hugepage 한 장에 들어가는 SQ/CQ entry 수 상한
+                                   *  - SQE=64B, CQE=16B 중 큰 쪽으로 나눠 안전한 한계 산정
+                                   *  - hugepage 1장이면 물리 주소가 연속 보장 → DMA 컨트롤러가 PRP/SGL 단순화 가능 */
 
 /* Default timeout for fabrics connect commands. */
 #ifdef DEBUG
 #define NVME_FABRIC_CONNECT_COMMAND_TIMEOUT 0
+                                  /* [한국어] DEBUG 빌드: connect timeout 무한 — 디버깅 중 멈춤 허용 */
 #else
 /* 500 millisecond timeout. */
 #define NVME_FABRIC_CONNECT_COMMAND_TIMEOUT 500000
+                                  /* [한국어] release 빌드: 500ms timeout (마이크로초 단위) — 응답 없으면 실패 처리 */
 #endif
 
 /* This value indicates that a read from a PCIe register is invalid. This can happen when a device is no longer present */
 #define SPDK_NVME_INVALID_REGISTER_VALUE 0xFFFFFFFFu
+                                  /* [한국어] PCIe MMIO read 결과가 0xFFFFFFFF면 디바이스 부재(hot-removal 등)로 간주
+                                   *  - 정상 register 값과 충돌 가능성 있으나 PCIe spec상 missing device의 표준 응답값 */
 
 /* [한국어] 요청 페이로드 표현 방식
  *  - CONTIG: 단일 연속 가상 메모리 버퍼. PRP 빌드 시 호스트가 직접 주소를 계산
@@ -392,13 +448,27 @@ nvme_payload_type(const struct nvme_payload *payload) {
                                   /* [한국어] 한 줄 판정: 콜백이 설정돼 있으면 SGL, 아니면 CONTIG */
 }
 
+/*
+ * [한국어] struct nvme_error_cmd — 에러 주입(error injection) 룰 엔트리
+ *
+ * 테스트 목적으로 특정 opcode의 명령에 대해 강제로 에러 응답을 발생시키는 메커니즘.
+ * spdk_nvme_qpair_add_cmd_error_injection()으로 등록되며, qpair->err_cmd_head에 매달림.
+ * nvme_qpair_submit_request 또는 nvme_complete_request 경로에서 룰 매칭 → CQE 변조.
+ */
 struct nvme_error_cmd {
 	bool				do_not_submit;
+	                                  /* [한국어] true면 장치에 제출조차 하지 않고 즉시 에러 완료 (트랜스포트까지 안 감)
+	                                   *  - false면 정상 제출 후 완료 시점에 CQE의 status를 조작 */
 	uint64_t			timeout_tsc;
+	                                  /* [한국어] 이 룰의 만료 시각 (틱) — 일정 기간만 적용하는 시간제 에러 주입 */
 	uint32_t			err_count;
+	                                  /* [한국어] 남은 적용 횟수 — 매 매칭마다 1 감소, 0이 되면 룰 비활성 */
 	uint8_t				opc;
+	                                  /* [한국어] 매칭 대상 NVMe opcode — req->cmd.opc와 비교 */
 	struct spdk_nvme_status		status;
+	                                  /* [한국어] 주입할 status (sct/sc 필드) — CQE.status로 복사됨 */
 	TAILQ_ENTRY(nvme_error_cmd)	link;
+	                                  /* [한국어] qpair->err_cmd_head 리스트 링크 (등록 순서) */
 };
 
 /*
@@ -979,7 +1049,16 @@ struct spdk_nvme_ns {
                                   /* [한국어] 컨트롤러의 활성 NS RB 트리 링크 (NSID 기준 인덱스) */
 };
 
+/* [한국어] ===== 컨트롤러/큐페어 컨텍스트 로깅 매크로 =====
+ *
+ * 모든 NVMe 드라이버 로그 라인 앞에 컨트롤러/qpair 식별 정보를 자동으로 붙이기
+ * 위한 매크로 군. 멀티 컨트롤러·멀티 qpair 환경에서 어느 디바이스/큐의 로그인지
+ * 즉시 식별할 수 있도록 표준화된 prefix 포맷을 강제한다.
+ */
 #define NVME_CTRLR_LOG_FMT "%s%s%s%s%s,cntlid:%u"
+                                  /* [한국어] 컨트롤러 식별 prefix 포맷:
+                                   *  fabrics인 경우 "<hostnqn>,<subnqn>,<traddr>,cntlid:<id>"
+                                   *  PCIe인 경우 빈 hostnqn/subnqn/콤마 → "<traddr>,cntlid:<id>" */
 #define NVME_CTRLR_LOG_ARGS(ctrlr) \
   spdk_nvme_trtype_is_fabrics((ctrlr)->trid.trtype) ? (ctrlr)->opts.hostnqn : "", \
   spdk_nvme_trtype_is_fabrics((ctrlr)->trid.trtype) ? "," : "", \
@@ -987,11 +1066,16 @@ struct spdk_nvme_ns {
   spdk_nvme_trtype_is_fabrics((ctrlr)->trid.trtype) ? "," : "", \
   (ctrlr)->trid.traddr, \
   (ctrlr)->cntlid
+                                  /* [한국어] 위 포맷에 대응하는 인자 튜플 — 트랜스포트 종류에 따라 hostnqn/subnqn 포함 여부 가변
+                                   *  - PCIe: traddr=BDF (e.g., "0000:01:00.0")
+                                   *  - NVMe-oF: traddr=IP/포트 + NQN 식별자 */
 
 #define NVME_QPAIR_LOG_FMT "qid:%u,qpair:%p"
+                                  /* [한국어] qpair 식별 prefix 포맷 — qid + 포인터(주소) */
 #define NVME_QPAIR_LOG_ARGS(qpair) \
   (qpair)->id, \
   (qpair)
+                                  /* [한국어] 위 포맷 인자 — qpair->id (admin=0, I/O=1+) + 주소 */
 
 #define NVME_CTRLR_LOG(type, ctrlr, format, ...) do { \
 	if ((ctrlr)) { \
@@ -1000,6 +1084,8 @@ struct spdk_nvme_ns {
 		SPDK_##type##LOG("[null ctrlr] " format, ##__VA_ARGS__); \
 	} \
 } while (0)
+                                  /* [한국어] 일반 로그 변형 — type은 ERR/WARN/NOTICE 등의 SPDK 매크로 prefix
+                                   *  - ctrlr이 NULL이면 "[null ctrlr]" 출력 (early-init/teardown 안전) */
 
 #define NVME_CTRLR_LOG2(type, component, ctrlr, format, ...) do { \
 	if ((ctrlr)) { \
@@ -1008,11 +1094,17 @@ struct spdk_nvme_ns {
 		SPDK_##type##LOG(component, "[null ctrlr] " format, ##__VA_ARGS__); \
 	} \
 } while (0)
+                                  /* [한국어] component(서브시스템 태그)를 받는 변형 — INFO/DEBUG 같은 categorical log
+                                   *  - SPDK_INFOLOG/DEBUGLOG는 component 인자 필수 */
 
 #define NVME_CTRLR_ERRLOG(ctrlr, format, ...) NVME_CTRLR_LOG(ERR, ctrlr, format, ##__VA_ARGS__)
+                                  /* [한국어] 컨트롤러 컨텍스트 ERROR 로그 */
 #define NVME_CTRLR_WARNLOG(ctrlr, format, ...) NVME_CTRLR_LOG(WARN, ctrlr, format, ##__VA_ARGS__)
+                                  /* [한국어] 컨트롤러 컨텍스트 WARN 로그 */
 #define NVME_CTRLR_NOTICELOG(ctrlr, format, ...) NVME_CTRLR_LOG(NOTICE, ctrlr, format, ##__VA_ARGS__)
+                                  /* [한국어] 컨트롤러 컨텍스트 NOTICE 로그 */
 #define NVME_CTRLR_INFOLOG(ctrlr, format, ...) NVME_CTRLR_LOG2(INFO, nvme, ctrlr, format, ##__VA_ARGS__)
+                                  /* [한국어] INFO 로그 (component="nvme" 고정) — log flag로 토글 가능 */
 
 #define NVME_QPAIR_LOG(type, qpair, format, ...) do { \
 	if (!(qpair)) { \
@@ -1023,6 +1115,8 @@ struct spdk_nvme_ns {
 		SPDK_##type##LOG("["NVME_CTRLR_LOG_FMT","NVME_QPAIR_LOG_FMT",%s] " format, NVME_CTRLR_LOG_ARGS((qpair)->ctrlr), NVME_QPAIR_LOG_ARGS(qpair), nvme_qpair_state_string((qpair)->state), ##__VA_ARGS__); \
 	} \
 } while (0)
+                                  /* [한국어] qpair 컨텍스트 로그 — ctrlr+qpair 식별 + state 문자열까지 prefix
+                                   *  - 3단계 NULL 안전성: qpair NULL → ctrlr NULL → 정상 풀 표시 */
 
 #define NVME_QPAIR_LOG2(type, component, qpair, format, ...) do { \
 	if (!(qpair)) { \
@@ -1033,18 +1127,27 @@ struct spdk_nvme_ns {
 		SPDK_##type##LOG(component, "["NVME_CTRLR_LOG_FMT","NVME_QPAIR_LOG_FMT"] " format, NVME_CTRLR_LOG_ARGS((qpair)->ctrlr), NVME_QPAIR_LOG_ARGS(qpair), ##__VA_ARGS__); \
 	} \
 } while (0)
+                                  /* [한국어] component 인자 받는 qpair 로그 변형 — INFO/DEBUG에서 사용 */
 
 #define NVME_QPAIR_ERRLOG(qpair, format, ...) NVME_QPAIR_LOG(ERR, qpair, format, ##__VA_ARGS__)
+                                  /* [한국어] qpair 컨텍스트 ERROR */
 #define NVME_QPAIR_WARNLOG(qpair, format, ...) NVME_QPAIR_LOG(WARN, qpair, format, ##__VA_ARGS__)
+                                  /* [한국어] qpair 컨텍스트 WARN */
 #define NVME_QPAIR_NOTICELOG(qpair, format, ...) NVME_QPAIR_LOG(NOTICE, qpair, format, ##__VA_ARGS__)
+                                  /* [한국어] qpair 컨텍스트 NOTICE */
 #define NVME_QPAIR_INFOLOG(qpair, format, ...) NVME_QPAIR_LOG2(INFO, nvme, qpair, format, ##__VA_ARGS__)
+                                  /* [한국어] qpair 컨텍스트 INFO (component="nvme") */
 
 #ifdef DEBUG
 #define NVME_CTRLR_DEBUGLOG(ctrlr, format, ...) NVME_CTRLR_LOG2(DEBUG, nvme, ctrlr, format, ##__VA_ARGS__)
+                                  /* [한국어] DEBUG 빌드 전용 컨트롤러 디버그 로그 */
 #define NVME_QPAIR_DEBUGLOG(qpair, format, ...) NVME_QPAIR_LOG2(DEBUG, nvme, qpair, format, ##__VA_ARGS__)
+                                  /* [한국어] DEBUG 빌드 전용 qpair 디버그 로그 */
 #else
 #define NVME_CTRLR_DEBUGLOG(...) do { } while (0)
+                                  /* [한국어] release 빌드: NOP — 디버그 비용 제거 */
 #define NVME_QPAIR_DEBUGLOG(...) do { } while (0)
+                                  /* [한국어] release 빌드: NOP */
 #endif
 
 /**
@@ -2199,35 +2302,86 @@ int nvme_ns_cmd_zone_appendv_with_md(struct spdk_nvme_ns *ns, struct spdk_nvme_q
 				     spdk_nvme_req_next_sge_cb next_sge_fn, void *metadata,
 				     uint16_t apptag_mask, uint16_t apptag);
 
+/*
+ * [한국어] ===== NVMe-oF Fabrics 전용 프로토타입 =====
+ *
+ * Fabrics 트랜스포트(RDMA/TCP/FC)에서는 PCIe와 달리 MMIO 직접 접근이 불가능하므로
+ * Property Get/Set Fabrics 커맨드를 통해 NVMe 컨트롤러 레지스터를 read/write한다.
+ * NVMe-oF spec §3.6 (Properties)에 정의됨.
+ *
+ * 호출 체인:
+ *   nvme_transport_ctrlr_set_reg_4 (트랜스포트 vtable)
+ *     → fabrics면 nvme_fabric_ctrlr_set_reg_4 [이 헤더]
+ *       → Property Set Fabrics command 발행 (opcode 7Fh, fctype=00h)
+ */
 int	nvme_fabric_ctrlr_set_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t value);
+                                  /* [한국어] Fabrics property write (4B) — 동기 — 내부에서 nvme_wait_for_completion */
 int	nvme_fabric_ctrlr_set_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t value);
+                                  /* [한국어] Fabrics property write (8B) — CAP/ASQ/ACQ 같은 64-bit 레지스터 */
 int	nvme_fabric_ctrlr_get_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t *value);
+                                  /* [한국어] Fabrics property read (4B) — CC/CSTS/AQA 등 */
 int	nvme_fabric_ctrlr_get_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t *value);
+                                  /* [한국어] Fabrics property read (8B) — CAP/ASQ/ACQ 등 */
 int	nvme_fabric_ctrlr_set_reg_4_async(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
 		uint32_t value, spdk_nvme_reg_cb cb_fn, void *cb_arg);
+                                  /* [한국어] 비동기 set_reg_4 — 초기화 상태머신용 (블로킹 안 함)
+                                   *  완료 시 register_operations 큐에 추가, cb_fn 호출 */
 int	nvme_fabric_ctrlr_set_reg_8_async(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
 		uint64_t value, spdk_nvme_reg_cb cb_fn, void *cb_arg);
+                                  /* [한국어] 비동기 set_reg_8 */
 int	nvme_fabric_ctrlr_get_reg_4_async(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
 		spdk_nvme_reg_cb cb_fn, void *cb_arg);
+                                  /* [한국어] 비동기 get_reg_4 */
 int	nvme_fabric_ctrlr_get_reg_8_async(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
 		spdk_nvme_reg_cb cb_fn, void *cb_arg);
+                                  /* [한국어] 비동기 get_reg_8 */
 int	nvme_fabric_ctrlr_scan(struct spdk_nvme_probe_ctx *probe_ctx, bool direct_connect);
+                                  /* [한국어] Fabrics discovery 또는 직접 연결 스캔
+                                   *  @direct_connect: true면 trid에 명시된 NQN에 직접 connect, false면 discovery 서비스 조회
+                                   *  - discovery: 'nqn.2014-08.org.nvmexpress.discovery' subsystem에 connect → discovery log page 읽음 */
 int	nvme_fabric_ctrlr_discover(struct spdk_nvme_ctrlr *ctrlr,
 				   struct spdk_nvme_probe_ctx *probe_ctx);
+                                  /* [한국어] discovery controller에서 log page 가져와 진짜 target들에 probe */
 int	nvme_fabric_qpair_connect(struct spdk_nvme_qpair *qpair, uint32_t num_entries);
+                                  /* [한국어] Fabrics CONNECT 동기 발행 — 각 qpair는 admin/IO 마다 connect 필요
+                                   *  @num_entries: queue size (SQE 수)
+                                   *  연결 완료 후 RDMA QP/TCP socket이 NVMe-oF qpair로 인식됨 */
 int	nvme_fabric_qpair_connect_async(struct spdk_nvme_qpair *qpair, uint32_t num_entries);
+                                  /* [한국어] CONNECT 비동기 시작 — 초기화 상태머신용 */
 int	nvme_fabric_qpair_connect_poll(struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] CONNECT 진행 폴링 — 0=완료, -EAGAIN=진행 중, 음수=에러 */
 bool	nvme_fabric_qpair_auth_required(struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] CONNECT 응답의 authreq 비트로 인증 필요 여부 판정 */
 int	nvme_fabric_qpair_authenticate_async(struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] DH-HMAC-CHAP 인증 시작 — qpair->auth.state를 NEGOTIATE로 */
 int	nvme_fabric_qpair_authenticate_poll(struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] 인증 진행 폴링 — auth state machine 한 단계 진행 */
 void	nvme_fabric_qpair_poll_cleanup(struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] connect 폴링 중단 시 자원 정리 (실패 경로) */
 void	nvme_fabric_qpair_auth_cleanup(struct spdk_nvme_qpair *qpair, int status);
+                                  /* [한국어] 인증 종료 정리 — status를 사용자 cb_fn에 전달 */
 
 typedef int (*spdk_nvme_parse_ana_log_page_cb)(
 	const struct spdk_nvme_ana_group_descriptor *desc, void *cb_arg);
+                                  /* [한국어] ANA log page 파싱 콜백 타입 — 각 그룹 디스크립터마다 호출
+                                   *  @return: 0이면 계속, 음수면 중단 */
 int	nvme_ctrlr_parse_ana_log_page(struct spdk_nvme_ctrlr *ctrlr,
 				      spdk_nvme_parse_ana_log_page_cb cb_fn, void *cb_arg);
+                                  /* [한국어] ctrlr->ana_log_page를 순회하며 cb_fn 호출 — multipath 상태 갱신 */
 
+/*
+ * [한국어]
+ * nvme_request_clear - nvme_request의 hot 영역을 zero-clear
+ *
+ * @req: 클리어할 request (free_req 풀에서 막 꺼낸 객체)
+ *
+ * 성능 최적화: 전체 구조체를 memset하지 않고 payload_size 이전 영역만 0으로
+ * 초기화. children TAILQ_ENTRY 등 cold 필드는 split이 실제로 일어날 때만
+ * nvme_request_add_child()에서 초기화됨 → 일반 (비분할) I/O는 추가
+ * 캐시라인을 건드리지 않음.
+ *
+ * 호출 체인: nvme_allocate_request → NVME_INIT_REQUEST → [이 함수]
+ */
 static inline void
 nvme_request_clear(struct nvme_request *req)
 {
@@ -2243,21 +2397,62 @@ nvme_request_clear(struct nvme_request *req)
 	 *  if the request is split.
 	 */
 	memset(req, 0, offsetof(struct nvme_request, payload_size));
+	                                  /* [한국어] cmd 필드부터 payload_size 직전까지 zero — split 관련 필드는 보존
+	                                   *  - offsetof로 컴파일 타임 결정된 영역만 클리어 */
 }
 
+/*
+ * [한국어] NVME_INIT_REQUEST - request의 사용자 지정 필드 일괄 초기화
+ *
+ * @_cb_fn:        완료 콜백
+ * @_cb_arg:       콜백 컨텍스트
+ * @_payload:      nvme_payload 값 (CONTIG 또는 SGL)
+ * @_payload_size: 데이터 바이트 수
+ * @_md_size:      메타데이터 바이트 수
+ *
+ * - clear → cb/payload/pid 채움 → submit_tick=0 (timeout 추적은 제출 시점에 갱신)
+ * - pid는 g_spdk_nvme_pid (multi-process에서 admin 완료 라우팅 키)
+ * - accel_sequence는 호출자가 필요시 별도 설정
+ */
 #define NVME_INIT_REQUEST(req, _cb_fn, _cb_arg, _payload, _payload_size, _md_size)	\
 	do {						\
 		nvme_request_clear(req);		\
+		                                  /* [한국어] hot 영역 클리어 */ \
 		req->cb_fn = _cb_fn;			\
+		                                  /* [한국어] 완료 콜백 등록 */ \
 		req->cb_arg = _cb_arg;			\
+		                                  /* [한국어] 콜백 컨텍스트 */ \
 		req->payload = _payload;		\
+		                                  /* [한국어] 페이로드 디스크립터 (CONTIG/SGL) */ \
 		req->payload_size = _payload_size;	\
+		                                  /* [한국어] 데이터 크기 */ \
 		req->md_size = _md_size;		\
+		                                  /* [한국어] 메타데이터 크기 (PI 등) */ \
 		req->pid = g_spdk_nvme_pid;		\
+		                                  /* [한국어] 발행 프로세스 PID — multi-process 필터 */ \
 		req->submit_tick = 0;			\
+		                                  /* [한국어] 제출 시점 갱신 (지금은 0) */ \
 		req->accel_sequence = NULL;		\
+		                                  /* [한국어] accel offload 비활성 (필요 시 호출자 갱신) */ \
 	} while (0);
 
+/*
+ * [한국어]
+ * nvme_allocate_request - qpair 풀에서 nvme_request 하나 획득 + 초기화
+ *
+ * @qpair:        대상 qpair (req->qpair에 저장됨)
+ * @payload:      페이로드 디스크립터 (CONTIG 또는 SGL)
+ * @payload_size: 데이터 바이트 수
+ * @md_size:      메타데이터 바이트 수
+ * @cb_fn/cb_arg: 완료 콜백
+ *
+ * @return: 성공 시 req 포인터, 풀 고갈 시 NULL (호출자가 -ENOMEM 반환)
+ *
+ * lockless: qpair는 단일 SPDK 스레드 소유이므로 free_req 리스트 접근에 락 불필요.
+ * num_outstanding_reqs 증가 — 사용자 코드가 outstanding 요청 수 모니터링용.
+ *
+ * 호출 체인 예: spdk_nvme_ns_cmd_read → nvme_ns_cmd_rw → [이 함수] → SQE 채움 → submit
+ */
 static inline struct nvme_request *
 nvme_allocate_request(struct spdk_nvme_qpair *qpair,
 		      const struct nvme_payload *payload, uint32_t payload_size, uint32_t md_size,
@@ -2266,18 +2461,30 @@ nvme_allocate_request(struct spdk_nvme_qpair *qpair,
 	struct nvme_request *req;
 
 	req = STAILQ_FIRST(&qpair->free_req);
+	                                  /* [한국어] 풀의 head 확인 — STAILQ_FIRST는 매크로 (포인터 read만) */
 	if (req == NULL) {
 		return req;
+	                                  /* [한국어] 풀 고갈 → 호출자가 NO_MEM 처리 또는 queued_req 대기 */
 	}
 
 	STAILQ_REMOVE_HEAD(&qpair->free_req, stailq);
+	                                  /* [한국어] head pop — head를 다음 노드로 갱신 */
 	qpair->num_outstanding_reqs++;
+	                                  /* [한국어] 미완료 카운트 증가 (free_req에서 제거되면 outstanding으로 간주) */
 
 	NVME_INIT_REQUEST(req, cb_fn, cb_arg, *payload, payload_size, md_size);
+	                                  /* [한국어] 핵심 필드 초기화 (cb/payload/pid/...) */
 
-	return req;
+	return req;                       /* [한국어] 호출자가 cmd 필드 채워 submit */
 }
 
+/*
+ * [한국어]
+ * nvme_allocate_request_contig - 단일 연속 버퍼용 편의 래퍼
+ *
+ * NVME_PAYLOAD_CONTIG로 payload 구조체를 임시 생성한 뒤 nvme_allocate_request 호출.
+ * read/write 등 일반 I/O 경로의 가장 흔한 변형.
+ */
 static inline struct nvme_request *
 nvme_allocate_request_contig(struct spdk_nvme_qpair *qpair,
 			     void *buffer, uint32_t payload_size,
@@ -2286,10 +2493,16 @@ nvme_allocate_request_contig(struct spdk_nvme_qpair *qpair,
 	struct nvme_payload payload;
 
 	payload = NVME_PAYLOAD_CONTIG(buffer, NULL);
+	                                  /* [한국어] CONTIG 모드 디스크립터 생성 (메타데이터 없음) */
 
 	return nvme_allocate_request(qpair, &payload, payload_size, 0, cb_fn, cb_arg);
 }
 
+/*
+ * [한국어]
+ * nvme_allocate_request_null - 페이로드 없는 명령용 (FLUSH 등)
+ * 버퍼 NULL, 크기 0인 contig 요청 — FLUSH/Format 등 데이터 전송 없는 admin/I/O 명령.
+ */
 static inline struct nvme_request *
 nvme_allocate_request_null(struct spdk_nvme_qpair *qpair, spdk_nvme_cmd_cb cb_fn, void *cb_arg)
 {
@@ -2299,31 +2512,71 @@ nvme_allocate_request_null(struct spdk_nvme_qpair *qpair, spdk_nvme_cmd_cb cb_fn
 struct nvme_request *nvme_allocate_request_user_copy(struct spdk_nvme_qpair *qpair,
 		void *buffer, uint32_t payload_size,
 		spdk_nvme_cmd_cb cb_fn, void *cb_arg, bool host_to_controller);
+                                  /* [한국어] 사용자 버퍼가 DMA-fit 아닐 때 SPDK가 별도 hugepage 버퍼 할당+복사
+                                   *  @host_to_controller: write 방향이면 즉시 사용자→내부 복사
+                                   *  - 완료 시 내부 콜백이 read 방향이면 내부→사용자 복사 후 사용자 cb 호출
+                                   *  - user_cb_fn/user_cb_arg/user_buffer 필드에 원본 보관 */
 
+/*
+ * [한국어]
+ * _nvme_free_request - request를 free_req 풀로 반환
+ *
+ * @req:   해제할 request (children 모두 완료된 상태여야 함)
+ * @qpair: req->qpair와 동일하지만 caller-provided로 받음 (캐시라인 절약 — 아래 주석 참조)
+ *
+ * reserved_req(Fabrics CONNECT 전용)는 풀에 넣지 않고 그대로 보관 — 다음 connect에서 재사용.
+ */
 static inline void
 _nvme_free_request(struct nvme_request *req, struct spdk_nvme_qpair *qpair)
 {
 	assert(req != NULL);
 	assert(req->num_children == 0);
+	                                  /* [한국어] split된 parent가 child 미완료 상태에서 free되면 안 됨 */
 	assert(qpair != NULL);
 
 	/* The reserved_req does not go in the free_req STAILQ - it is
 	 * saved only for use with a FABRICS/CONNECT command.
 	 */
 	if (spdk_likely(qpair->reserved_req != req)) {
+	                                  /* [한국어] 일반 경로: 풀로 반환 */
 		STAILQ_INSERT_HEAD(&qpair->free_req, req, stailq);
+		                                  /* [한국어] head에 push — LIFO로 동작 (가장 최근 free된 게 먼저 재사용 → 캐시 친화) */
 
 		assert(qpair->num_outstanding_reqs > 0);
 		qpair->num_outstanding_reqs--;
+		                                  /* [한국어] 미완료 카운트 감소 */
 	}
+	                                  /* [한국어] reserved_req라면 풀에 넣지 않고 그대로 둠 — connect 재시도용으로 보존 */
 }
 
+/*
+ * [한국어]
+ * nvme_free_request - req->qpair 사용한 단순 래퍼
+ */
 static inline void
 nvme_free_request(struct nvme_request *req)
 {
 	_nvme_free_request(req, req->qpair);
 }
 
+/*
+ * [한국어]
+ * nvme_complete_request - 완료 처리 핵심 — 에러 주입 → free → 사용자 콜백 호출
+ *
+ * @cb_fn/cb_arg: 사용자 완료 콜백 (req->cb_fn과 동일하지만 캐시라인 회피용으로 분리 전달)
+ * @qpair:        소속 qpair (마찬가지로 req->qpair 회피)
+ * @req:          완료된 request
+ * @cpl:          하드웨어 CQE
+ *
+ * 구조: 캐시라인 최적화 — req 객체 자체에서 cb_fn/qpair를 다시 읽지 않도록 caller가 전달.
+ * 트랜스포트의 process_completions가 tracker→req 매핑할 때 이미 그 정보를 알고 있음.
+ *
+ * 처리 순서:
+ *   1) accel_sequence 정리 (실패 경로에서만 set 상태로 남음)
+ *   2) error injection 룰 매칭 — 성공 CQE를 가짜 에러로 변조
+ *   3) request를 free_req 풀로 반환
+ *   4) 사용자 cb_fn 호출 (req는 이미 free됨 → cb 안에서 req 접근 금지)
+ */
 static inline void
 nvme_complete_request(spdk_nvme_cmd_cb cb_fn, void *cb_arg, struct spdk_nvme_qpair *qpair,
 		      struct nvme_request *req, struct spdk_nvme_cpl *cpl)
@@ -2332,6 +2585,8 @@ nvme_complete_request(spdk_nvme_cmd_cb cb_fn, void *cb_arg, struct spdk_nvme_qpa
 	struct nvme_error_cmd           *cmd;
 
 	if (spdk_unlikely(req->accel_sequence != NULL)) {
+	                                  /* [한국어] 정상 완료라면 트랜스포트가 sequence를 실행하고 NULL로 클리어했어야 함
+	                                   *  - non-NULL 잔존 = 명령 실패 시나리오 */
 		assert(qpair->poll_group != NULL);
 		struct spdk_nvme_poll_group *pg = qpair->poll_group->group;
 
@@ -2339,6 +2594,7 @@ nvme_complete_request(spdk_nvme_cmd_cb cb_fn, void *cb_arg, struct spdk_nvme_qpa
 		 * If it's left non-NULL it must mean the request is failed. */
 		assert(spdk_nvme_cpl_is_error(cpl));
 		pg->accel_fn_table.abort_sequence(req->accel_sequence);
+		                                  /* [한국어] accel 시퀀스 abort — 가속 엔진의 보류 작업 취소 */
 		req->accel_sequence = NULL;
 	}
 
@@ -2347,21 +2603,29 @@ nvme_complete_request(spdk_nvme_cmd_cb cb_fn, void *cb_arg, struct spdk_nvme_qpa
 	 */
 	if (spdk_unlikely(!TAILQ_EMPTY(&qpair->err_cmd_head) &&
 			  !spdk_nvme_cpl_is_error(cpl))) {
+	                                  /* [한국어] 룰 존재 + CQE가 성공 — 변조 후보
+	                                   *  - 이미 에러인 CQE는 변조하지 않음 (실제 에러 우선) */
 		TAILQ_FOREACH(cmd, &qpair->err_cmd_head, link) {
 
 			if (cmd->do_not_submit) {
 				continue;
+	                                  /* [한국어] 이 룰은 제출 단계에서 처리되는 룰 — 완료 단계에선 무시 */
 			}
 
 			if ((cmd->opc == req->cmd.opc) && cmd->err_count) {
+	                                  /* [한국어] opcode 일치 + 남은 적용 횟수 > 0 → 매칭 */
 
 				err_cpl = *cpl;
+				                                  /* [한국어] 원본 CQE 복사 후 status만 변조 */
 				err_cpl.status.sct = cmd->status.sct;
 				err_cpl.status.sc = cmd->status.sc;
 
 				cpl = &err_cpl;
+				                                  /* [한국어] 사용자 cb에 변조된 CQE 전달 */
 				cmd->err_count--;
+				                                  /* [한국어] 룰 적용 횟수 차감 */
 				break;
+				                                  /* [한국어] 첫 매칭만 적용 */
 			}
 		}
 	}
@@ -2372,60 +2636,120 @@ nvme_complete_request(spdk_nvme_cmd_cb cb_fn, void *cb_arg, struct spdk_nvme_qpa
 	 * of getting it from the req.
 	 */
 	_nvme_free_request(req, qpair);
+	                                  /* [한국어] req를 free_req로 반환 — 이후 req 접근 금지 (다른 코드가 재할당 가능) */
 
 	if (spdk_likely(cb_fn)) {
+	                                  /* [한국어] 사용자 콜백 호출 (없는 경우는 없지만 방어) */
 		cb_fn(cb_arg, cpl);
 	}
 }
 
+/*
+ * [한국어]
+ * nvme_cleanup_user_req - user_copy 경로 임시 자원 해제
+ *
+ * nvme_allocate_request_user_copy()가 할당한 내부 DMA 버퍼와 user 콜백 정보 정리.
+ * 일반 zero-copy 경로에서는 user_buffer가 NULL이므로 영향 없음.
+ */
 static inline void
 nvme_cleanup_user_req(struct nvme_request *req)
 {
 	if (req->user_buffer && req->payload_size) {
+	                                  /* [한국어] user_copy 경로에서만 임시 DMA 버퍼 할당됨 */
 		spdk_free(req->payload.contig_or_cb_arg);
+		                                  /* [한국어] hugepage DMA 버퍼 해제 (spdk_zmalloc과 짝) */
 		req->user_buffer = NULL;
 	}
 
-	req->user_cb_arg = NULL;
+	req->user_cb_arg = NULL;          /* [한국어] 사용자 콜백 정보 클리어 */
 	req->user_cb_fn = NULL;
 }
 
+/*
+ * [한국어]
+ * nvme_request_abort_match - abort 요청 cb_arg 매칭 판정
+ *
+ * 사용자가 spdk_nvme_ctrlr_cmd_abort()/qpair abort에 cb_arg를 지정하면, 같은 cb_arg를
+ * 가진 request 모두를 abort 후보로 식별. user_copy 경로(user_cb_arg)와 split parent 경유
+ * (parent->cb_arg)도 모두 검사 — 사용자가 본 콜백 인자라면 어디에 저장되어 있든 매칭.
+ */
 static inline bool
 nvme_request_abort_match(struct nvme_request *req, void *cmd_cb_arg)
 {
 	return req->cb_arg == cmd_cb_arg ||
+	                                  /* [한국어] 직접 cb_arg 일치 */
 	       req->user_cb_arg == cmd_cb_arg ||
+	                                  /* [한국어] user_copy 경로 — 내부 cb_arg가 다른 임시값으로 교체된 경우 */
 	       (req->parent != NULL && req->parent->cb_arg == cmd_cb_arg);
+	                                  /* [한국어] split child — parent의 cb_arg와 매칭하면 같은 사용자 요청의 일부 */
 }
 
 const char *nvme_qpair_state_string(enum nvme_qpair_state state);
+                                  /* [한국어] qpair state enum을 문자열로 — 로깅용 */
 
+/*
+ * [한국어]
+ * nvme_qpair_set_state - qpair 상태 전이 + DEBUG 로그 + is_new_qpair 클리어
+ *
+ * ENABLED로 전이하는 시점이 "qpair가 처음 정상 동작 시작"이므로 is_new_qpair=false 갱신.
+ * 매크로 형태인 이유: NVME_QPAIR_DEBUGLOG가 release 빌드에서 NOP되어야 함 + state는
+ * bit-field라 함수 인자 전달 시 컴파일러 경고 회피.
+ */
 #define nvme_qpair_set_state(_qpair, _state) do { \
 	NVME_QPAIR_DEBUGLOG((_qpair), "setting qpair state to %s\n", nvme_qpair_state_string((_state))); \
+	                                  /* [한국어] DEBUG 빌드에서 상태 전이 추적 */ \
 	(_qpair)->state = (_state); \
+	                                  /* [한국어] 실제 상태 갱신 */ \
 	if ((_state) == NVME_QPAIR_ENABLED) { \
 		(_qpair)->is_new_qpair = false; \
+		                                  /* [한국어] 첫 ENABLED 진입 = 정상 동작 시작 표시 */ \
 	} \
 } while (0)
 
+/*
+ * [한국어]
+ * nvme_qpair_get_state - 현재 상태 read (단순 getter)
+ */
 static inline enum nvme_qpair_state
 nvme_qpair_get_state(struct spdk_nvme_qpair *qpair) {
 	return qpair->state;
 }
 
+/*
+ * [한국어]
+ * nvme_request_remove_child - parent의 children 리스트에서 child 제거
+ *
+ * split parent의 자식이 완료되었을 때 호출. parent->num_children 감소 + child->parent 해제.
+ * 호출자(nvme_cb_complete_child)가 num_children==0이면 parent 완료 트리거.
+ */
 static inline void
 nvme_request_remove_child(struct nvme_request *parent, struct nvme_request *child)
 {
 	assert(parent != NULL);
 	assert(child != NULL);
-	assert(child->parent == parent);
+	assert(child->parent == parent);  /* [한국어] 잘못된 parent 전달 방지 */
 	assert(parent->num_children != 0);
 
-	parent->num_children--;
-	child->parent = NULL;
+	parent->num_children--;           /* [한국어] 미완료 child 카운트 차감 */
+	child->parent = NULL;             /* [한국어] child의 parent 링크 해제 */
 	TAILQ_REMOVE(&parent->children, child, child_tailq);
+	                                  /* [한국어] children TAILQ에서 분리 */
 }
 
+/*
+ * [한국어]
+ * nvme_cb_complete_child - split child의 완료 콜백
+ *
+ * @child_arg: child request 자기 자신 (nvme_request_add_child가 cb_arg로 자기를 등록)
+ * @cpl:       하드웨어 CQE
+ *
+ * 동작:
+ *   1) parent의 children 리스트에서 자기 제거
+ *   2) child가 에러면 parent_status로 에러 집약 (가장 최근 에러로 덮어쓰기 — 디자인 선택)
+ *   3) parent의 모든 child 완료 시 (num_children==0) parent의 사용자 cb_fn 호출
+ *
+ * 호출 체인: 트랜스포트 process_completions → child의 cb_fn (=이 함수) → parent의 cb_fn
+ */
 static inline void
 nvme_cb_complete_child(void *child_arg, const struct spdk_nvme_cpl *cpl)
 {
@@ -2433,23 +2757,39 @@ nvme_cb_complete_child(void *child_arg, const struct spdk_nvme_cpl *cpl)
 	struct nvme_request *parent = child->parent;
 
 	nvme_request_remove_child(parent, child);
+	                                  /* [한국어] 1) parent의 children에서 분리 */
 
 	if (spdk_nvme_cpl_is_error(cpl)) {
 		memcpy(&parent->parent_status, cpl, sizeof(*cpl));
+	                                  /* [한국어] 2) 에러 집약 — 마지막 에러가 parent_status에 보존됨 */
 	}
 
 	if (parent->num_children == 0) {
+	                                  /* [한국어] 3) 모든 child 완료 → parent를 정식 완료 처리 */
 		nvme_complete_request(parent->cb_fn, parent->cb_arg, parent->qpair,
 				      parent, &parent->parent_status);
+	                                  /* [한국어] 사용자 cb 호출 — 에러 있으면 parent_status, 없으면 success(0) */
 	}
 }
 
+/*
+ * [한국어]
+ * nvme_request_add_child - parent에 child 연결 + child의 cb를 wrapper로 교체
+ *
+ * 첫 child 추가 시 children TAILQ를 lazy 초기화 (cold 캐시라인 회피 패턴).
+ * child의 cb_fn을 nvme_cb_complete_child로 교체 — 즉, 사용자가 지정한 cb는
+ * parent에만 보존되고 child는 내부 wrapper만 가짐.
+ *
+ * 호출 위치: nvme_ns_cmd_*가 split이 필요하다고 판단했을 때.
+ */
 static inline void
 nvme_request_add_child(struct nvme_request *parent, struct nvme_request *child)
 {
 	assert(parent->num_children != UINT16_MAX);
+	                                  /* [한국어] uint16 wrap 방지 (현실적으로 그렇게 많은 split은 없음) */
 
 	if (parent->num_children == 0) {
+	                                  /* [한국어] 첫 child — children TAILQ를 지금 초기화 (cold cacheline 지연 접근) */
 		/*
 		 * Defer initialization of the children TAILQ since it falls
 		 *  on a separate cacheline.  This ensures we do not touch this
@@ -2457,67 +2797,123 @@ nvme_request_add_child(struct nvme_request *parent, struct nvme_request *child)
 		 *  relatively rare.
 		 */
 		TAILQ_INIT(&parent->children);
-		parent->parent = NULL;
+		parent->parent = NULL;    /* [한국어] parent의 parent는 없음 (체인 깊이 1) */
 		memset(&parent->parent_status, 0, sizeof(struct spdk_nvme_cpl));
+		                                  /* [한국어] 에러 집약 슬롯 초기화 */
 	}
 
 	parent->num_children++;
 	TAILQ_INSERT_TAIL(&parent->children, child, child_tailq);
+	                                  /* [한국어] FIFO 순서 — 보통 LBA 순서대로 split된 child가 차례로 추가 */
 	child->parent = parent;
 	child->cb_fn = nvme_cb_complete_child;
-	child->cb_arg = child;
+	                                  /* [한국어] child 완료 시 wrapper가 받아 parent로 라우팅 */
+	child->cb_arg = child;            /* [한국어] cb_arg = self → wrapper에서 child 객체 식별 */
 }
 
+/*
+ * [한국어]
+ * nvme_request_free_children - parent를 strict하게 해제하기 전 모든 child를 free
+ *
+ * abort/실패 경로 등 정상 완료 흐름이 아닐 때 사용. 재귀적으로 child의 child도 모두 free.
+ * 정상 완료 경로에서는 각 child가 nvme_cb_complete_child로 자체 free됨 → 이 함수 불필요.
+ */
 static inline void
 nvme_request_free_children(struct nvme_request *req)
 {
 	struct nvme_request *child, *tmp;
 
 	if (req->num_children == 0) {
-		return;
+		return;                   /* [한국어] split 없는 일반 req — 즉시 반환 */
 	}
 
 	/* free all child nvme_request */
 	TAILQ_FOREACH_SAFE(child, &req->children, child_tailq, tmp) {
+	                                  /* [한국어] SAFE 변형 — 순회 중 element 제거 안전 */
 		nvme_request_remove_child(req, child);
+		                                  /* [한국어] children에서 분리 */
 		nvme_request_free_children(child);
+		                                  /* [한국어] 재귀 — child도 split된 경우 (드물지만 대비) */
 		nvme_free_request(child);
+		                                  /* [한국어] child를 free_req 풀로 반환 */
 	}
 }
 
 int	nvme_request_check_timeout(struct nvme_request *req, uint16_t cid,
 				   struct spdk_nvme_ctrlr_process *active_proc, uint64_t now_tick);
+                                  /* [한국어] 단일 request의 timeout 검사 — submit_tick 기준 + active_proc->timeout_*_ticks 비교
+                                   *  @cid: 트랜스포트가 부여한 command ID (CQE 매칭용)
+                                   *  timeout 도달 시 active_proc->timeout_cb_fn 호출 + req->timed_out=1 */
 uint64_t nvme_get_quirks(const struct spdk_pci_id *id);
+                                  /* [한국어] PCI VID/DID/SSVID/SSID로 NVME_QUIRK_* 비트마스크 조회 (테이블 lookup) */
 
 int	nvme_robust_mutex_init_shared(pthread_mutex_t *mtx);
+                                  /* [한국어] PTHREAD_PROCESS_SHARED + ROBUST 속성으로 mutex 초기화 — multi-process 공유 */
 int	nvme_robust_mutex_init_recursive_shared(pthread_mutex_t *mtx);
+                                  /* [한국어] 위 + RECURSIVE — 재진입 가능 mutex (드라이버 ctrlr_lock 등) */
 
 bool	nvme_completion_is_retry(const struct spdk_nvme_cpl *cpl);
+                                  /* [한국어] CQE의 status가 retry 가능한 transient 에러인지 (CRD 비트 등) — req->retries 한도 내 재제출 결정 */
 
 struct spdk_nvme_ctrlr *nvme_get_ctrlr_by_trid_unsafe(
 	const struct spdk_nvme_transport_id *trid, const char *hostnqn);
+                                  /* [한국어] 전역 컨트롤러 리스트에서 trid+hostnqn으로 검색
+                                   *  - "_unsafe": 호출자가 g_spdk_nvme_driver->lock 보유해야 함 */
 
 const struct spdk_nvme_transport *nvme_get_transport(const char *transport_name);
+                                  /* [한국어] 이름 ("PCIE", "RDMA", "TCP" 등)으로 트랜스포트 vtable 조회 */
 const struct spdk_nvme_transport *nvme_get_first_transport(void);
+                                  /* [한국어] 등록된 트랜스포트 리스트의 첫 항목 — 순회 시작점 */
 const struct spdk_nvme_transport *nvme_get_next_transport(const struct spdk_nvme_transport
 		*transport);
+                                  /* [한국어] 다음 트랜스포트 — NULL이면 끝. probe 시 모든 트랜스포트 시도용 */
 
 /* Transport specific functions */
+/*
+ * [한국어] ===== 트랜스포트 추상화 vtable 디스패치 함수 =====
+ *
+ * 모든 nvme_transport_* 함수는 ctrlr/qpair에서 트랜스포트 vtable(struct spdk_nvme_transport)
+ * 을 꺼내 해당 트랜스포트의 함수 포인터로 디스패치하는 단순 wrapper.
+ *
+ * 트랜스포트 종류:
+ *   - PCIe (lib/nvme/nvme_pcie.c, nvme_pcie_common.c) — MMIO BAR + PRP/SGL DMA
+ *   - RDMA (lib/nvme/nvme_rdma.c) — InfiniBand/RoCE Verbs
+ *   - TCP  (lib/nvme/nvme_tcp.c) — POSIX/uring socket NVMe-oF
+ *   - VFIO_USER (lib/nvme/nvme_vfio_user.c) — libvfio-user 기반
+ *   - FC, custom 등
+ *
+ * 각 트랜스포트는 SPDK_NVME_TRANSPORT_REGISTER 매크로로 vtable 등록,
+ * nvme_get_transport()로 이름 검색.
+ */
 struct spdk_nvme_ctrlr *nvme_transport_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
 		const struct spdk_nvme_ctrlr_opts *opts,
 		void *devhandle);
+                                  /* [한국어] 트랜스포트별 ctrlr 객체 생성 (nvme_pcie_ctrlr/nvme_rdma_ctrlr 등 super-set 구조체) */
 int nvme_transport_ctrlr_destruct(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] 트랜스포트별 ctrlr 자원 해제 */
 int nvme_transport_ctrlr_scan(struct spdk_nvme_probe_ctx *probe_ctx, bool direct_connect);
+                                  /* [한국어] 트랜스포트가 발견 가능한 모든 디바이스 스캔
+                                   *  - PCIe: VFIO/UIO 디바이스 열거
+                                   *  - Fabrics: discovery 또는 직접 connect */
 int nvme_transport_ctrlr_scan_attached(struct spdk_nvme_probe_ctx *probe_ctx);
+                                  /* [한국어] 이미 attach된 컨트롤러 재스캔 (multi-process secondary용) */
 int nvme_transport_ctrlr_enable(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] 트랜스포트 레벨 enable — PCIe는 admin SQ/CQ 메모리 할당 등 */
 int nvme_transport_ctrlr_ready(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] 컨트롤러가 READY 상태가 되었음을 트랜스포트에 통지 (트랜스포트별 후속 작업) */
 int nvme_transport_ctrlr_enable_interrupts(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] 인터럽트 모드 활성화 — PCIe MSI-X, NVMe-oF는 이벤트 fd */
 int nvme_transport_ctrlr_set_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t value);
+                                  /* [한국어] 컨트롤러 레지스터 4B write — PCIe는 MMIO, NVMe-oF는 Property Set */
 int nvme_transport_ctrlr_set_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t value);
+                                  /* [한국어] 8B write — CAP/ASQ/ACQ 등 */
 int nvme_transport_ctrlr_get_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t *value);
+                                  /* [한국어] 4B read — CC/CSTS 등 */
 int nvme_transport_ctrlr_get_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t *value);
+                                  /* [한국어] 8B read */
 int nvme_transport_ctrlr_set_reg_4_async(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
 		uint32_t value, spdk_nvme_reg_cb cb_fn, void *cb_arg);
+                                  /* [한국어] 비동기 4B write — 초기화 상태머신용 */
 int nvme_transport_ctrlr_set_reg_8_async(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
 		uint64_t value, spdk_nvme_reg_cb cb_fn, void *cb_arg);
 int nvme_transport_ctrlr_get_reg_4_async(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
@@ -2525,78 +2921,142 @@ int nvme_transport_ctrlr_get_reg_4_async(struct spdk_nvme_ctrlr *ctrlr, uint32_t
 int nvme_transport_ctrlr_get_reg_8_async(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
 		spdk_nvme_reg_cb cb_fn, void *cb_arg);
 uint32_t nvme_transport_ctrlr_get_max_xfer_size(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] 트랜스포트가 1회 I/O로 처리 가능한 최대 바이트 — split 결정에 반영
+                                   *  - RDMA는 max_inline_data, TCP는 ICDOFF에 영향 받음 */
 uint16_t nvme_transport_ctrlr_get_max_sges(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] 트랜스포트의 SGE 최대 개수 — qpair->max_sges 초기값 */
 struct spdk_nvme_qpair *nvme_transport_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr,
 		uint16_t qid, const struct spdk_nvme_io_qpair_opts *opts);
+                                  /* [한국어] I/O qpair 생성 — PCIe는 SQ/CQ 메모리 할당 + Create IO SQ/CQ admin 명령
+                                   *  Fabrics는 RDMA QP 생성 + Fabrics CONNECT 발행 */
 int nvme_transport_ctrlr_reserve_cmb(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] CMB(Controller Memory Buffer) 영역 예약 — PCIe SR-IOV/CMB 전용 */
 void *nvme_transport_ctrlr_map_cmb(struct spdk_nvme_ctrlr *ctrlr, size_t *size);
+                                  /* [한국어] CMB MMIO 매핑 — 호스트 메모리 대신 컨트롤러 RAM에 SQE/data 배치 */
 int nvme_transport_ctrlr_unmap_cmb(struct spdk_nvme_ctrlr *ctrlr);
 int nvme_transport_ctrlr_enable_pmr(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] PMR(Persistent Memory Region) 활성화 — NVMe 1.4 영구 메모리 */
 int nvme_transport_ctrlr_disable_pmr(struct spdk_nvme_ctrlr *ctrlr);
 void *nvme_transport_ctrlr_map_pmr(struct spdk_nvme_ctrlr *ctrlr, size_t *size);
+                                  /* [한국어] PMR MMIO 매핑 (BAR2 또는 BAR4) */
 int nvme_transport_ctrlr_unmap_pmr(struct spdk_nvme_ctrlr *ctrlr);
 void nvme_transport_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr,
 		struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] I/O qpair 제거 — Delete IO SQ/CQ admin 명령 (prepare_for_reset 시 생략) */
 int nvme_transport_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr,
 				       struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] qpair 연결 — PCIe는 즉시, Fabrics는 CONNECT 핸드셰이크 */
 void nvme_transport_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr,
 		struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] qpair 연결 해제 시작 (비동기) */
 void nvme_transport_ctrlr_disconnect_qpair_done(struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] disconnect 완료 통지 — DISCONNECTED state로 전환 */
 int nvme_transport_ctrlr_get_memory_domains(const struct spdk_nvme_ctrlr *ctrlr,
 		struct spdk_memory_domain **domains, int array_size);
+                                  /* [한국어] 트랜스포트가 지원하는 memory domain 목록 — RDMA는 PD, GPU 메모리 등 */
 int nvme_transport_ctrlr_process_transport_events(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] 트랜스포트 이벤트 처리 (RDMA CM 이벤트, TCP epoll 이벤트 등) */
 void nvme_transport_qpair_abort_reqs(struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] in-flight 요청들을 즉시 abort 처리 (트랜스포트 강제 종료 시) */
 int nvme_transport_qpair_reset(struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] qpair reset — SQ/CQ 헤드/테일 0으로, in-flight 정리 */
 int nvme_transport_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request *req);
+                                  /* [한국어] ★ hot path ★ — 요청을 트랜스포트에 제출
+                                   *  - PCIe: tracker 할당 → PRP/SGL 빌드 → SQE 기록 → doorbell write
+                                   *  - RDMA: WR 빌드 → ibv_post_send
+                                   *  - TCP: capsule 빌드 → socket send */
 int nvme_transport_qpair_get_fd(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair,
 				struct spdk_event_handler_opts *opts);
+                                  /* [한국어] 인터럽트 모드 fd 조회 — epoll에 등록할 wakeup fd */
 int32_t nvme_transport_qpair_process_completions(struct spdk_nvme_qpair *qpair,
 		uint32_t max_completions);
+                                  /* [한국어] ★ hot path ★ — CQ에서 완료 수확
+                                   *  - PCIe: CQ phase tag 검사 → CQE 파싱 → tracker → req → cb_fn
+                                   *  - RDMA: ibv_poll_cq → WC → req
+                                   *  - TCP: socket recv → response capsule 파싱
+                                   *  @return 처리한 완료 수, 음수면 에러 */
 void nvme_transport_admin_qpair_abort_aers(struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] admin qpair의 outstanding AER 요청들을 abort (reset 경로) */
 int nvme_transport_qpair_iterate_requests(struct spdk_nvme_qpair *qpair,
 		int (*iter_fn)(struct nvme_request *req, void *arg),
 		void *arg);
+                                  /* [한국어] qpair 내 모든 in-flight 요청 순회 — 통계, abort by cb_arg 등에 사용 */
 int nvme_transport_qpair_authenticate(struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] qpair 인증 시작 (DH-HMAC-CHAP) */
 
 struct spdk_nvme_transport_poll_group *nvme_transport_poll_group_create(
 	const struct spdk_nvme_transport *transport);
+                                  /* [한국어] 트랜스포트별 poll subgroup 생성 (PCIe/RDMA/TCP 각각) */
 int nvme_transport_poll_group_add(struct spdk_nvme_transport_poll_group *tgroup,
 				  struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] qpair를 그룹에 추가 — 그룹 단위 process_completions 대상에 포함 */
 int nvme_transport_poll_group_remove(struct spdk_nvme_transport_poll_group *tgroup,
 				     struct spdk_nvme_qpair *qpair);
 int nvme_transport_poll_group_disconnect_qpair(struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] 그룹 컨텍스트에서 qpair disconnect — connected → disconnected 리스트 이동 */
 int nvme_transport_poll_group_connect_qpair(struct spdk_nvme_qpair *qpair);
 int64_t nvme_transport_poll_group_process_completions(struct spdk_nvme_transport_poll_group *tgroup,
 		uint32_t completions_per_qpair, spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb);
+                                  /* [한국어] 그룹 단위 batch 완료 수확 — RDMA/TCP는 단일 ibv_poll_cq/epoll로
+                                   *  여러 qpair 완료 동시 수확 가능 (성능 최적화). disconnected_qpair_cb은
+                                   *  순회 중 발견된 끊긴 qpair 통지용 */
 void nvme_transport_poll_group_check_disconnected_qpairs(
 	struct spdk_nvme_transport_poll_group *tgroup,
 	spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb);
+                                  /* [한국어] disconnected_qpairs 리스트 순회 + cb 호출 */
 int nvme_transport_poll_group_destroy(struct spdk_nvme_transport_poll_group *tgroup);
 int nvme_transport_poll_group_get_stats(struct spdk_nvme_transport_poll_group *tgroup,
 					struct spdk_nvme_transport_poll_group_stat **stats);
+                                  /* [한국어] 그룹별 통계 조회 (요청/완료 수, 트랜스포트별 메트릭) */
 void nvme_transport_poll_group_free_stats(struct spdk_nvme_transport_poll_group *tgroup,
 		struct spdk_nvme_transport_poll_group_stat *stats);
 enum spdk_nvme_transport_type nvme_transport_get_trtype(const struct spdk_nvme_transport
 		*transport);
+                                  /* [한국어] 트랜스포트 vtable에서 trtype enum 추출 */
 /*
  * Below ref related functions must be called with the global
  *  driver lock held for the multi-process condition.
  *  Within these functions, the per ctrlr ctrlr_lock is also
  *  acquired for the multi-thread condition.
  */
+/*
+ * [한국어] 아래 ref 카운트 함수들은 g_spdk_nvme_driver->lock 보유 하에 호출해야 함 (multi-process 안전).
+ * 함수 내부에서는 ctrlr_lock도 추가 획득 (multi-thread 안전 — 같은 프로세스 내 여러 스레드).
+ * 두 락을 다 잡는 이유: 공유 컨트롤러는 프로세스 간/스레드 간 모두 경합 가능.
+ */
 void	nvme_ctrlr_proc_get_ref(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] 현재 프로세스의 ctrlr_process->ref 증가 — 이중 attach 시 카운팅 */
 void	nvme_ctrlr_proc_put_ref(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] ref 감소. 0이 되면 이 프로세스의 process 엔트리 제거 */
 int	nvme_ctrlr_get_ref_count(struct spdk_nvme_ctrlr *ctrlr);
+                                  /* [한국어] 모든 프로세스의 ref 합산 — 0이면 컨트롤러 자원 해제 가능 */
 
 int	nvme_ctrlr_reinitialize_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair);
+                                  /* [한국어] reset 후 기존 I/O qpair 재초기화 — Create IO SQ/CQ 재발행, queued_req drain */
 int	nvme_parse_addr(struct sockaddr_storage *sa, int family,
 			const char *addr, const char *service, long int *port);
+                                  /* [한국어] NVMe-oF 주소 파싱 — TCP/IP "1.2.3.4:4420" → struct sockaddr_*
+                                   *  @family: AF_INET/AF_INET6, @service: 포트 문자열 */
 int	nvme_get_default_hostnqn(char *buf, int len);
+                                  /* [한국어] /etc/nvme/hostnqn 파일 또는 random UUID 기반 기본 hostnqn 생성 */
 
+/*
+ * [한국어]
+ * _is_page_aligned - address가 page_size 경계에 정렬됐는지 검사
+ *
+ * @page_size: 2의 멱승이어야 함 (PAGE_SIZE, MPS, hugepage 크기 등)
+ * @return: true면 정렬됨
+ *
+ * NVMe PRP 빌드 시 PRP1/PRP2 주소 정렬 검증, hugepage 경계 검사 등에 사용.
+ * 비트 연산(address & (page_size-1))으로 modulo 회피 → hot path 친화.
+ */
 static inline bool
 _is_page_aligned(uint64_t address, uint64_t page_size)
 {
 	return (address & (page_size - 1)) == 0;
+	                                  /* [한국어] 2의 멱승 page_size에 대해 (page_size - 1) 마스크의 0 비트가
+	                                   *  정렬된 주소면 모두 0 → AND 결과 0이면 정렬 */
 }
 
 #endif /* __NVME_INTERNAL_H__ */
+                                  /* [한국어] include guard 종료 */
