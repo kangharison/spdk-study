@@ -93,13 +93,13 @@ shared_lib/            # 빌드 산출 .so
 
 | 상태 | 파일 | 라인 | 비고 |
 |------|------|-----:|------|
-| ☐ | include/spdk/env.h | 1587 | DPDK 추상화 (hugepage, DMA, PCI) |
-| ☐ | include/spdk/env_dpdk.h | ? | DPDK 직결 API |
+| ☑ | include/spdk/env.h | 2722 | 2026-05-06 **완료** (병렬 agent, 재시도) — 원본 1587 → 2722줄. 함수 ~90 / 구조체 7 (필드 약 41 + reserved) / enum 3 (7값) / 매크로 18 / typedef 7. env.h 는 SPDK↔OS 경계 — DPDK EAL 구현은 lib/env_dpdk 이고 헤더 자체는 백엔드 독립적(no-DPDK 빌드/vfio-user 교체 가능). vtophys 가 NVMe polled-mode PRP/SGL DMA 핵심, mempool(코어별 캐시)+ring(MP_SC) lockless 가 bdev_io 풀링·send_msg 핫패스 토대. (1차 시도는 단일 Write stall — 섹션별 Edit 누적 방식으로 재시도 성공) |
+| ☑ | include/spdk/env_dpdk.h | 418 | 2026-05-06 **완료** (병렬 agent) — 원본 269 → 418줄. 함수 5 / 구조체 1 (필드 6) / 매크로 1. env.h 가 DPDK 를 감추는 추상화라면 env_dpdk.h 는 DPDK lifecycle 이 외부 앱 소유일 때 SPDK 가 EAL 위에 "부착"만 하기 위한 직결 진입점. post_fini 가 rte_eal_cleanup 을 호출하지 않는 것이 lifecycle 분리 핵심 규칙. |
 | ☑ | include/spdk/thread.h | 2860 | 2026-04-30 **완료** (병렬 agent) — 원본 1338 → 2860줄. 4섹션 상단 블록 + 모든 함수/매크로/구조체 필드 주석. spdk_thread/poller/io_channel/io_device/iobuf/spinlock/interrupt 5개 영역 공개 API. 1 reactor=1 thread 모델, lockless ring 기반 send_msg, per-thread io_channel 캐시 + ref count, period_us=0 즉시 폴링, fd_group epoll interrupt 모드. |
-| ☐ | include/spdk/event.h | 384 | 애플리케이션 수명주기 |
-| ☐ | include/spdk/init.h | 154 | 서브시스템 초기화 |
-| ☐ | include/spdk/scheduler.h | ? | 스레드 스케줄러 |
-| ☐ | include/spdk/conf.h | ? | 구성 파일 |
+| ☑ | include/spdk/event.h | 1079 | 2026-05-06 **완료** (병렬 agent) — 원본 851 → 1079줄. 함수 15 / 구조체 1 (spdk_app_opts 사용 28 + reserved 7 = 35) / enum 1 (3값) / 매크로 2 + STATIC_ASSERT / typedef 4. event_call(lcore, 2-arg, reactor 직행) vs send_msg(thread, 1-arg, thread_poll) 차이 명시. spdk_app_opts ABI 4중 안전장치(packed + reserved + opts_size + STATIC_ASSERT). |
+| ☑ | include/spdk/init.h | 580 | 2026-05-06 **완료** (병렬 agent) — 원본 366 → 580줄. 함수 9 / 구조체 1 (spdk_rpc_opts) / 매크로 2 / typedef 2. SPDK_SUBSYSTEM_REGISTER+DEPEND constructor → 전역 TAILQ 의존엣지 → 위상정렬 init_fn 비동기 체인 → STARTUP→RUNTIME phase 승격. spdk_app_start → spdk_subsystem_init → load_config → rpc_initialize lifecycle. |
+| ☑ | include/spdk/scheduler.h | 936 | 2026-05-06 **완료** (병렬 agent) — 원본 605 → 936줄. 공개 함수 10 + vtable 콜백 15 / 구조체 5 (필드 30) / 매크로 3. governor(P-state 주파수) 와 scheduler(thread→core 재배치) 의도적 분리 — latency-sensitive 환경(NVMe-oF)은 governor 끄고 BIOS 고정 권장. busy_ratio = poll 루프 BUSY/IDLE TSC 누적 → balance() 결과는 thread_info.lcore 직접 쓰기 + lib/event/scheduler 가 send_msg 로 안전 이동. |
+| ☑ | include/spdk/conf.h | 596 | 2026-05-06 **완료** (병렬 agent) — 원본 448 → 596줄. 함수 17 / 구조체 4 (모두 opaque) / 매크로 2 (헤더 가드 + extern "C"). SPDK 18.04 이전의 INI 파서 진입점 — 현재 표준은 init.h+json.h+jsonrpc.h 의 spdk_subsystem_load_config (JSON) 경로. 후방호환을 위한 동결된 legacy API. |
 | ☑ | include/spdk/dma.h | 901 | 2026-04-29 **완료** (병렬 agent) — 원본 472 → 901줄. 매크로 1 + enum 5값 + 콜백 typedef 7 + 구조체 5 + 함수 18. DMA memory domain 추상화 — bdev I/O 시 메모리 위치(host RAM/GPU/RDMA registered/CMB) 표현 + translate로 zero-copy I/O. accel_sequence와 결합. |
 
 ### Phase 2 — NVMe 스펙·드라이버 공개 API
