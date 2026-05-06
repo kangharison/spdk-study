@@ -1044,6 +1044,13 @@ spdk_iobuf_register_module(const char *name)
  * @return: 0 성공, -ENOENT 미등록.
  *
  * 보통 spdk_iobuf_finish 가 일괄 정리하지만, 모듈이 동적으로 빠질 수 있는 경우 직접 호출.
+ * 호출 시점 가정: 이 모듈이 만든 모든 spdk_iobuf_channel 은 이미 channel_fini 됐음.
+ * 그래야 wait queue 에 자기 모듈 소유 엔트리가 남아 있지 않다 (channel_node_fini 의 assert 와
+ * iobuf_unregister_cb 의 strdup name free 가 모순 없이 동작).
+ * 실행 컨텍스트: 부팅/종료 단일 스레드 가정 (락 없음).
+ *
+ * 호출 체인:
+ *   모듈 deinit (예: 동적 모듈 unload) → [spdk_iobuf_unregister_module] → free(name) / free(module)
  */
 int
 spdk_iobuf_unregister_module(const char *name)
@@ -1103,7 +1110,18 @@ iobuf_pool_for_each_entry(struct spdk_iobuf_channel *ch, struct spdk_iobuf_pool_
  * [한국어]
  * spdk_iobuf_for_each_entry — 모든 NUMA 슬롯의 small/large wait queue 를 자기 모듈 한정 순회.
  *
+ * @ch    : 자기 모듈을 식별하는 채널 (entry->module == ch->module 인 것만 콜백).
+ * @cb_fn : 매칭되는 entry 마다 호출될 콜백 (0 반환 = 계속, non-zero = 즉시 종료).
+ * @cb_ctx: cb_fn 의 사용자 컨텍스트.
+ * @return: 0 정상 종료, cb_fn 이 반환한 non-zero 값(중단 사유).
+ *
  * 모듈이 종료 시 "내 wait queue 엔트리들 모두 강제 종료" 같은 흐름에 사용.
+ * 같은 reactor 에 여러 모듈이 동거하므로, ch->module 일치하는 엔트리만 순회 대상이다.
+ * 실행 컨텍스트: 채널 소유 SPDK thread 안 — 락 없이 안전.
+ *
+ * 호출 체인:
+ *   bdev/NVMe-oF module shutdown / abort 처리 → [spdk_iobuf_for_each_entry]
+ *     → IOBUF_FOREACH_NUMA_ID → iobuf_pool_for_each_entry × 2(small/large) → cb_fn
  */
 int
 spdk_iobuf_for_each_entry(struct spdk_iobuf_channel *ch,
@@ -1174,6 +1192,19 @@ iobuf_entry_abort_node(struct spdk_iobuf_channel *ch, int32_t numa_id,
 /*
  * [한국어]
  * spdk_iobuf_entry_abort — 모든 NUMA 슬롯에서 entry 떼어내기 시도.
+ *
+ * @ch   : 채널 (small/large 분류용 cache 보유).
+ * @entry: 떼어낼 wait 엔트리 (포인터 비교).
+ * @len  : 원래 요청 길이 (small/large 분류 결정).
+ *
+ * spdk_iobuf_get() 으로 wait queue 에 매단 엔트리를 콜백 도달 전에 취소할 때 사용.
+ * 어느 NUMA 슬롯의 큐에 매달렸는지 호출자가 모르므로 모든 NUMA 슬롯에 대해 시도한다.
+ * 엔트리는 reactor 안의 한 큐에만 매달려 있으므로 최대 한 슬롯에서만 발견된다.
+ * 실행 컨텍스트: 채널 소유 SPDK thread 안 — 락 없이 안전.
+ *
+ * 호출 체인:
+ *   I/O 취소/타임아웃 처리 → [spdk_iobuf_entry_abort]
+ *     → IOBUF_FOREACH_NUMA_ID → iobuf_entry_abort_node
  */
 void
 spdk_iobuf_entry_abort(struct spdk_iobuf_channel *ch, struct spdk_iobuf_entry *entry,
@@ -1186,7 +1217,19 @@ spdk_iobuf_entry_abort(struct spdk_iobuf_channel *ch, struct spdk_iobuf_entry *e
 	}
 }
 
-/* [한국어] get/put 에서 글로벌 ring 과 cache 사이를 한 번에 옮기는 batch 크기. */
+/*
+ * [한국어]
+ * IOBUF_BATCH_SIZE — get/put 의 hot path 에서 per-thread cache 와 글로벌 spdk_ring 사이를
+ * 한 번에 옮기는 버퍼 개수.
+ *
+ * 한 번의 글로벌 ring dequeue/enqueue 비용(원자 인덱스 갱신, cacheline 동기화)이 batch 안의
+ * 모든 항목에 분산되도록 32 로 잡혔다. 너무 크면 cache 가 차/비는 데 시간이 오래 걸려
+ * 워커 간 부하 불균형이 커지고, 너무 작으면 hot path 에서 ring 호출이 잦아져 lockless ring 의
+ * 이점이 사라진다. populate 시점의 IOBUF_POPULATE_BATCH_SIZE(64) 와는 별개로, hot path
+ * 전용으로 분리되어 있다.
+ *
+ * 사용처: spdk_iobuf_get() (cache miss → ring dequeue), spdk_iobuf_put() (cache 초과 → ring flush).
+ */
 #define IOBUF_BATCH_SIZE 32
 
 /*
