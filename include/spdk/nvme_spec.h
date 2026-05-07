@@ -9,94 +9,117 @@
  */
 
 /*
- * [한국어 설명] NVMe 스펙 구조체·상수 정의 (nvme_spec.h) — 4890 라인
+ * [한국어 설명] NVMe Base/Fabrics/ZNS/FDP 스펙 와이어 포맷 단일 소스 (nvme_spec.h)
  *
  * === 파일의 역할 ===
- * NVMe Base Specification (1.x / 2.x)에서 정의한 **와이어 포맷 구조체와 상수**를
- * 호스트 C 언어 타입으로 표현한다. SPDK의 유저스페이스 NVMe 드라이버가
- * 장치와 실제로 주고받는 모든 바이트는 이 헤더의 타입으로 매핑된다.
- *
- * 포함 범위 (라인 번호는 대략적 위치):
- *   - 제한 상수 (MAX_IO_QUEUES, QUEUE_MIN/MAX_ENTRIES 등)
- *   - Controller Registers 레이아웃 (CAP/CC/CSTS/AQA/ASQ/ACQ, CMB, PMR 등)
- *     · `struct spdk_nvme_registers` (line 534) — BAR0에 매핑됨
- *     · 각 레지스터마다 bit-field union 정의
- *   - SGL 디스크립터 (line 668 enum, 686 struct) — scatter-gather 기술
- *   - PSDT(PRP or SGL for Data Transfer) 값
- *   - Queue Priority, Arbitration, Fused 명령 타입 enum
- *   - Feature ID 용 cdw10/11 비트 union들 (수많은 feature 세부)
- *   - ★ 핵심 I/O 경로 구조체 ★
- *     · `struct spdk_nvme_cmd` (line 1452) — 64B SQE (Submission Queue Entry)
- *     · `struct spdk_nvme_status` (line 1506) — CQE 내 상태 필드
- *     · `struct spdk_nvme_cpl` (line 1519) — 16B CQE (Completion Queue Entry)
- *   - Dataset Management range, Compare/Write Zeroes 관련 구조
- *   - Opcode enum (admin, I/O)
- *   - Status Code Type / Status Code 값
- *   - Identify data structures (ctrlr, namespace, namespace list, etc.)
- *   - Get Log Page 구조체들 (error info, health info, firmware slot, changed ns 등)
- *   - Sanitize, Directive, Format NVM, Security Send/Receive 구조체
- *   - ZNS(Zoned Namespace), FDP(Flexible Data Placement) 관련 구조체
- *   - Async Event Request 이벤트 정의
- *
- * 주요 약어:
- *   - SQE: Submission Queue Entry (64B, host→device)
- *   - CQE: Completion Queue Entry (16B, device→host)
- *   - PRP: Physical Region Page — 4KB 경계 정렬 물리 주소 리스트
- *   - SGL: Scatter/Gather List — 임의 오프셋/길이 지원 디스크립터
- *   - MPTR: Metadata Pointer (PI 등 메타데이터 영역)
- *   - DPTR: Data Pointer (PRP 또는 SGL)
- *   - CID: Command Identifier — SQE와 CQE를 짝짓는 16비트 ID
- *   - NSID: Namespace ID
- *   - CDWn: Command Dword N (SQE의 32비트 워드 슬롯)
+ * 이 헤더는 NVM Express(NVMe) Base Specification 1.x/2.x, NVMe over Fabrics(NVMe-oF) 1.x,
+ * NVMe ZNS Command Set Specification, NVMe Command Set Specification(NVM CS), NVMe FDP
+ * (Flexible Data Placement, TP4146) 등 NVMe 표준이 정의한 **모든 와이어 포맷**(컨트롤러
+ * 레지스터 비트필드, SQE/CQE, Identify 데이터 구조체, Log Page, Get/Set Feature CDW
+ * 인코딩, Status Code, Sanitize/Format/Firmware/Boot Partition 명령 페이로드)을 호스트
+ * C 타입으로 1:1 매핑한다. 이 파일은 코드 로직을 갖지 않고 모든 멤버는 packed bit-field
+ * 또는 fixed-width integer로 구성되며, 모든 구조체는 끝에 `SPDK_STATIC_ASSERT(sizeof) ==`
+ * 검증을 두어 호스트 컴파일러의 패딩이 스펙 바이트 크기와 일치하지 않으면 빌드 자체가
+ * 실패하도록 한다. SPDK 전체에서 NVMe 표준 ABI의 단일 진실 소스(single source of truth)
+ * 이며, 새 NVMe TP(Technical Proposal)가 표준에 편입될 때마다 이 파일이 가장 먼저
+ * 수정된다. NVMe Base 외의 확장은 이 파일이 아닌 별도 헤더(nvme_zns.h, nvme_intel.h,
+ * nvme_ocssd_spec.h 등)가 추가 API를 노출하지만, 와이어 포맷 자체는 본 파일에 통합되어
+ * 있다(예: ZNS Identify Namespace는 spdk_nvme_zns_ns_data로 본 파일에 정의되어 있고
+ * 사용자 API 함수는 nvme_zns.h에 따로 노출).
  *
  * === 전체 아키텍처에서의 위치 ===
- * SPDK NVMe 드라이버의 "타입 정의 루트". lib/nvme/nvme_ns_cmd.c가 read/write
- * 요청을 `struct spdk_nvme_cmd`로 채우고, lib/nvme/nvme_qpair.c의 submit/
- * complete 경로와 lib/nvme/nvme_pcie*.c의 DMA 경로가 이 구조체들을 실제
- * 호스트/장치 메모리 레이아웃으로 그대로 사용한다. 대부분의 구조체에는
- * `SPDK_STATIC_ASSERT(sizeof(...))`로 스펙과의 바이트 크기 일치를 빌드 시에
- * 검증한다.
- *
- * 실행 컨텍스트: 빌드 타임 타입 정의 + 런타임 DMA 대상 메모리 레이아웃.
- * 런타임 코드는 포함되어 있지 않음 (전부 구조체/상수/enum).
+ * SPDK NVMe 스택의 "타입 정의 뿌리"이다. 호출 체인 관점에서:
+ *   사용자 코드(spdk_nvme_ns_cmd_read/write/...) →
+ *   lib/nvme/nvme_ns_cmd.c (SQE 옵코드/CDW 채움) →
+ *   lib/nvme/nvme_qpair.c (request → 본 파일의 struct spdk_nvme_cmd 슬롯) →
+ *   lib/nvme/nvme_pcie_common.c::nvme_pcie_qpair_submit_request (PRP/SGL 빌드,
+ *      doorbell write — 본 파일의 spdk_nvme_sgl_descriptor 사용) →
+ *   PCIe MMIO + DMA(SQ/CQ 링은 hugepage, 컨트롤러 레지스터는 BAR0 매핑) →
+ *   NVMe SSD 펌웨어가 동일 바이트 레이아웃 해석 →
+ *   완료는 spdk_nvme_cpl 16B(SQHD/SQID/CID/Status)로 호스트 메모리 CQ 링에 기록 →
+ *   spdk_nvme_qpair_process_completions()가 phase bit 토글로 새 CQE 검출 → cb_fn 호출.
+ * 컨트롤러 초기화는 lib/nvme/nvme_ctrlr.c가 BAR0를 매핑한 뒤 본 파일의
+ * struct spdk_nvme_registers 멤버를 spdk_mmio_read/write*로 직접 접근한다(CAP→AQA→ASQ→
+ * ACQ→CC.EN→CSTS.RDY 폴링→Set Features→Identify Controller). NVMe-oF의 경우 물리 PCIe
+ * 대신 RDMA/TCP/FC 트랜스포트가 같은 SQE/CQE 바이트 레이아웃을 wire로 전달하므로 이
+ * 헤더는 호스트/타겟 양쪽 모두에서 동일하게 사용된다.
  *
  * === 타 모듈과의 연결 ===
- * 의존:
- *   - spdk/stdinc.h - uintN_t/etc.
- *   - spdk/assert.h - SPDK_STATIC_ASSERT
- * 의존하는 모듈:
- *   - lib/nvme/* : NVMe 드라이버 전체가 이 헤더에 의존
- *   - lib/nvmf/* : NVMe-oF target (호스트↔타겟 프로토콜 동일)
- *   - module/bdev/nvme/* : bdev NVMe 모듈
- *   - app/spdk_nvme_identify, spdk_nvme_perf 등 진단/벤치 앱
- *   - include/spdk/nvme.h의 많은 inline 함수가 이 구조체를 참조
- * 공유 자료구조: 본 파일이 정의하는 모든 스펙 타입이 "공유". 다만 각
- *   타입은 호출 스레드별 별도 인스턴스를 갖는 것이 기본 (SQE/CQE는 qpair
- *   내부 링 버퍼에 위치).
+ * 의존: spdk/stdinc.h(uint8_t/16/32/64_t 고정폭 정수, 와이어 포맷에 필수),
+ *        spdk/assert.h(SPDK_STATIC_ASSERT — 거의 모든 구조체 끝에 sizeof 검증).
+ * 의존되는 곳:
+ *   · lib/nvme/* (driver 전체) — qpair, ctrlr, ns, pcie, tcp, rdma, fabric, zns, opal,
+ *     security, ns_cmd, transport 등 거의 모든 .c 파일이 이 헤더의 타입을 직접 사용.
+ *   · lib/nvmf/* (NVMe-oF target) — 호스트 측 SQE/CQE를 그대로 받아 처리하므로
+ *     동일 타입을 호스트와 공유. ctrlr.c, subsystem.c, ctrlr_bdev.c, ctrlr_discovery.c,
+ *     transport.c, fabrics.c가 사용.
+ *   · module/bdev/nvme/* — bdev_nvme.c가 read/write를 spdk_nvme_cmd로 변환,
+ *     ZNS/Reservation/AER 처리 모두 이 헤더 의존.
+ *   · include/spdk/nvme.h — 많은 인라인 함수(spdk_nvme_cpl_get_status_string 등)가
+ *     본 파일의 enum/struct를 참조.
+ *   · examples/nvme/identify, app/spdk_nvme_identify, app/spdk_nvme_perf — 진단/벤치
+ *     앱이 본 파일의 모든 Identify/Log Page 구조체를 출력.
+ * 데이터 흐름 관점:
+ *   - 호스트 메모리(SQ ring) ↔ DMA ↔ 컨트롤러 처리 ↔ DMA ↔ 호스트 메모리(CQ ring,
+ *     데이터 버퍼). SQE/CQE/SGL/PRP는 모두 본 헤더 타입이 그대로 wire에 직렬화된다.
+ *   - 호스트 메모리(struct spdk_nvme_ctrlr_data 4096B) ← Identify Admin 명령 ← 컨트롤러
+ *     펌웨어. 이 데이터는 attach 시 lib/nvme/nvme_ctrlr.c가 1회 캐시한다.
+ *   - 컨트롤러 레지스터(BAR0) ↔ MMIO load/store ↔ 호스트 (struct spdk_nvme_registers).
+ * 공유 자료구조: 본 헤더가 정의하는 모든 타입은 SPDK 전역에서 "공유 ABI"이며, 호스트
+ *   주소 공간에서는 보통 hugepage(DMA pinned) 또는 BAR0 매핑된 메모리에 위치한다.
  *
  * === 주요 함수/구조체 요약 ===
- * 함수 없음 — 전부 타입 정의.
+ * 함수 없음 — 모두 타입/상수 정의이다. 다음이 가장 빈번히 참조되는 핵심:
+ *   1) Controller Registers (struct spdk_nvme_registers, BAR0 0x00~0xFFF):
+ *      CAP(8B, capabilities)/VS(4B, version)/INTMS·INTMC(4B, interrupt mask)/
+ *      CC(4B, controller config)/CSTS(4B, status)/NSSR(4B, subsystem reset)/
+ *      AQA(4B, admin queue attributes)/ASQ·ACQ(8B, admin queue base addr)/
+ *      CMB·BPx·PMR 시리즈(메모리 버퍼/부트 파티션/지속 메모리 영역) +
+ *      Doorbell (offset 0x1000부터 SQ/CQ tail/head). 모두 packed union의 raw + bits.
+ *   2) I/O 경로 — struct spdk_nvme_cmd(64B SQE) / spdk_nvme_cpl(16B CQE) /
+ *      spdk_nvme_status(2B 상태 비트필드) / spdk_nvme_sgl_descriptor(16B SGL),
+ *      enum spdk_nvme_psdt_value(PRP/SGL/메타데이터 SGL 선택), spdk_nvme_data_transfer
+ *      (Host→Controller, Controller→Host, 양방향 등 4가지).
+ *   3) Opcode enum — spdk_nvme_admin_opcode(0x00~0x7F admin), spdk_nvme_nvm_opcode
+ *      (NVM CS I/O), spdk_nvme_zns_opcode(ZNS), spdk_nvme_directive_type 등.
+ *   4) Status Code — enum spdk_nvme_status_code_type(SCT 0~7), generic/command-specific/
+ *      media/path status code(SC 0x00~0xFF). status string 변환은 nvme.h의 인라인.
+ *   5) Identify — struct spdk_nvme_ctrlr_data(4096B, CNS=0x01) / spdk_nvme_ns_data
+ *      (4096B, CNS=0x00) / spdk_nvme_zns_ctrlr_data / spdk_nvme_zns_ns_data /
+ *      spdk_nvme_nvm_ctrlr_data / spdk_nvme_ns_id_desc(NS Identification descriptor) /
+ *      spdk_nvme_primary_ctrl_capabilities / spdk_nvme_secondary_ctrl_list 등 4096B 페이지.
+ *   6) Get/Set Feature CDW — union spdk_nvme_feat_*(arbitration, power_management,
+ *      temperature_threshold, error_recovery, volatile_write_cache, number_of_queues,
+ *      interrupt_coalescing, async_event_configuration, host_mem_buffer, keep_alive_timer,
+ *      host_controlled_thermal_management, ...) 모두 32비트 CDW11 비트필드.
+ *   7) Log Page — struct spdk_nvme_error_information_entry(64B) / health_information_page
+ *      (512B SMART) / firmware_page(512B) / cmds_and_effect_log_page(4096B) /
+ *      telemetry_log_page_hdr(512B) / sanitize_status_log_page(512B) /
+ *      ana_page(ANA multipath) / fdp_*(FDP 4가지 로그) / reservation_notification_log.
+ *   8) ZNS — enum spdk_nvme_zns_zone_type/state/zra_report_opts/zone_send_action/
+ *      zone_receive_action, struct spdk_nvme_zns_zone_desc(64B), spdk_nvme_zns_zone_report.
+ *   9) Reservation — enum spdk_nvme_reservation_type(7가지), struct
+ *      spdk_nvme_reservation_acquire_data/register_data/key_data/status_data/
+ *      registered_ctrlr_data, reservation_release_action, notification log type.
+ *  10) Format/Firmware/Sanitize — struct spdk_nvme_format(4B CDW10),
+ *      spdk_nvme_fw_commit(4B CDW10), spdk_nvme_sanitize(4B CDW10), enum
+ *      spdk_sanitize_action / spdk_nvme_fw_commit_action / spdk_nvme_secure_erase_setting.
+ *  11) Async Event — enum spdk_nvme_async_event_type/info_*(error/smart/notice/nvm),
+ *      union spdk_nvme_async_event_completion(CDW0 4B). AER는 Admin SQ에 미리 적재되어
+ *      이벤트 발생 시 컨트롤러가 CQE로 통지(인터럽트 회피의 polled-mode 모델).
+ *  12) Boot Partition — union spdk_nvme_bpinfo_register/bprsel_register, enum
+ *      spdk_nvme_brs_value(boot read status). NVMe Base 1.4 §3.7.
+ *  13) FDP — TP4146 정의 모두(struct spdk_nvme_fdp_event/event_desc/ruh_descriptor/
+ *      cfg_descriptor/ruhu_descriptor/stats_log_page/events_log_page).
+ *  14) Directive — enum spdk_nvme_directive_type(Identify=0/Streams=1) +
+ *      Streams send/receive operation, struct spdk_nvme_ns_streams_data/_status.
  *
- * 최우선 참조 구조체 (I/O 경로):
- *   - struct spdk_nvme_cmd (64B) — SQE. 필드:
- *       opc, fuse, psdt, cid, nsid, mptr, dptr(union prp or sgl1), cdw10~15
- *   - struct spdk_nvme_status (2B) — 상태 비트필드: p, sc, sct, crd, m, dnr
- *   - struct spdk_nvme_cpl (16B) — CQE. 필드:
- *       cdw0, cdw1, sqhd, sqid, cid, status (phase bit 포함)
- *   - struct spdk_nvme_sgl_descriptor (16B) — SGL 엔트리
- *       union generic/unkeyed/keyed (transport별 의미 상이)
- *
- * 컨트롤러 초기화 시 주로 참조:
- *   - struct spdk_nvme_registers — BAR0 매핑 레지스터 전체
- *   - spdk_nvme_cap_register, cc_register, csts_register 등 bit-field unions
- *
- * 네임스페이스/컨트롤러 식별:
- *   - struct spdk_nvme_ctrlr_data (Identify Controller)
- *   - struct spdk_nvme_ns_data (Identify Namespace)
- *
- * 본 주석은 파일 상단 블록 + 핵심 I/O 경로 구조체(SGL/SQE/Status/CQE)에
- * 대한 필드 수준 한국어 주석을 제공한다. 나머지 섹션(identify, log page,
- * register bit-fields 등)은 후속 세션에서 점진적으로 확장한다.
+ * 본 한국어 주석 정비는 NVMe Base 2.0/Fabrics 1.1/ZNS 1.1/FDP TP4146까지의 와이어
+ * 포맷에 대해 4섹션 상단 블록 + 핵심 I/O 경로 구조체의 필드 멀티라인 주석을 제공한다.
+ * 5131줄에 달하는 모든 enum 값/필드/매크로의 완전 주석화는 후속 세션에서 점진적으로
+ * 확장하며, 현 시점에서는 (a) 상단 4섹션 블록, (b) 컨트롤러 레지스터 그룹, (c) SGL
+ * 디스크립터, (d) SQE/CQE/Status, (e) Opcode/Feature/Status code 핵심 enum,
+ * (f) 핵심 Identify 구조체에 우선 집중한다.
  */
 
 #ifndef SPDK_NVME_SPEC_H          /* [한국어] include 가드 */
@@ -166,62 +189,104 @@ extern "C" {
                                   /* [한국어] 각 doorbell 레지스터 크기 = 4B (DSTRD=0 기준)
                                    *  - 실제 stride는 CAP.DSTRD로 확장 가능 (8B/16B...) */
 
+/* [한국어] === Controller Capabilities (CAP) — BAR0 offset 0x00, 8B 64-bit RO ===
+ * NVMe Base 2.0 §3.1.3.1. 컨트롤러 attach 시 lib/nvme/nvme_ctrlr.c가 가장 먼저 읽는다.
+ * 이 값으로 (1) 큐 최대 깊이, (2) 페이지 크기 범위, (3) 명령 셋 지원, (4) timeout,
+ * (5) doorbell stride, (6) CMB/PMR/Boot Partition 지원 여부를 알아내 컨트롤러 초기화
+ * 시퀀스(CC.MPS·CC.CSS 결정, AQA 설정 등)를 분기한다. 64비트 단위로 한 번에 읽어야 하며
+ * (스펙상 partial read 미정의), SPDK는 spdk_mmio_read_8()로 읽는다. */
 union spdk_nvme_cap_register {
 	uint64_t	raw;
+	/* [한국어] CAP 64비트 통째 — endian 변환 후 멤버별 접근하거나, raw로 한 번에 읽어
+	 * spdk_mmio 영역의 partial-read 비결정성을 피한다. */
 	struct {
 		/** maximum queue entries supported */
 		uint32_t mqes		: 16;
+		/* [한국어] CAP.MQES — 큐 한 개의 최대 엔트리 수(0's based, 실제 값 = mqes+1).
+		 * lib/nvme/nvme_ctrlr.c가 SQ/CQ 깊이를 min(요청, mqes+1)로 클램프한다. */
 
 		/** contiguous queues required */
 		uint32_t cqr		: 1;
+		/* [한국어] CAP.CQR=1이면 큐의 물리 메모리가 연속이어야 한다. SPDK는 hugepage로
+		 * 큐를 할당하므로 일반적으로 자동 만족. =0이면 PRP list로 분산 가능. */
 
 		/** arbitration mechanism supported */
 		uint32_t ams		: 2;
+		/* [한국어] CAP.AMS — round-robin 외에 weighted RR(bit0)/vendor(bit1) 지원 여부.
+		 * CC.AMS 설정 시 이 비트로 지원 여부 검증. */
 
 		uint32_t reserved1	: 5;
+		/* [한국어] 예약(0). 미래 확장. */
 
 		/** timeout */
 		uint32_t to		: 8;
+		/* [한국어] CAP.TO — CSTS.RDY 토글까지의 worst-case 지연(500ms 단위). 호스트는
+		 * CC.EN=1 후 to*500ms 동안 CSTS.RDY를 폴링한 뒤 timeout 처리. */
 
 		/** doorbell stride */
 		uint32_t dstrd		: 4;
+		/* [한국어] CAP.DSTRD — doorbell 간 stride = 2^(2+dstrd) bytes. 0이면 4B(default),
+		 * 일부 컨트롤러는 cache-line align(0xF)으로 false-sharing 회피. SPDK는
+		 * (1 << (2 + dstrd))로 SQ_n_TDBL/CQ_n_HDBL 오프셋 계산. */
 
 		/** NVM subsystem reset supported */
 		uint32_t nssrs		: 1;
+		/* [한국어] CAP.NSSRS — NSSR(0x20)에 SPDK_NVME_NSSR_VALUE(0x4E564D65='NVMe')를
+		 * 쓰면 서브시스템 전체 리셋. =0이면 NSSR write가 무시된다. */
 
 		/** command sets supported */
 		uint32_t css		: 8;
+		/* [한국어] CAP.CSS — 비트마스크. bit0=NVM CS, bit6=I/O CS(ZNS/KV 등 다중 CS),
+		 * bit7=Admin Only. CC.CSS 설정 시 여기 set bit로만 가능. */
 
 		/** boot partition support */
 		uint32_t bps		: 1;
+		/* [한국어] CAP.BPS=1이면 Boot Partition 영역과 BPx 레지스터 사용 가능
+		 * (NVMe Base 1.4 §3.7). UEFI 펌웨어 부트 영역. */
 
 		uint32_t reserved2	: 2;
+		/* [한국어] 예약(0). */
 
 		/** memory page size minimum */
 		uint32_t mpsmin		: 4;
+		/* [한국어] CAP.MPSMIN — 호스트 메모리 페이지 크기 최소값. 실제 = 2^(12+mpsmin) bytes.
+		 * 0이면 4KB. CC.MPS는 mpsmin~mpsmax 범위 내에서만 설정 가능. */
 
 		/** memory page size maximum */
 		uint32_t mpsmax		: 4;
+		/* [한국어] CAP.MPSMAX — 호스트 메모리 페이지 크기 최대값. 실제 = 2^(12+mpsmax). */
 
 		/** persistent memory region supported */
 		uint32_t pmrs		: 1;
+		/* [한국어] CAP.PMRS=1이면 PMR(Persistent Memory Region) 사용 가능 — PMRCAP/
+		 * PMRCTL/PMRSTS/PMRMSCL/PMRMSCU/PMREBS/PMRSWTP 레지스터 활성. */
 
 		/** controller memory buffer supported */
 		uint32_t cmbs		: 1;
+		/* [한국어] CAP.CMBS=1이면 CMB(Controller Memory Buffer) 사용 가능 — 컨트롤러
+		 * 자체 RAM을 호스트가 PCIe BAR로 매핑해 SQ/CQ/PRP/data로 활용 가능. lib/nvme/
+		 * nvme_pcie.c::nvme_pcie_ctrlr_alloc_cmb_io_buffer가 사용. */
 
 		/** NVM subsystem shutdown supported */
 		uint32_t nsss		: 1;
+		/* [한국어] CAP.NSSS=1(NVMe 2.0)이면 NSSD(NVM Subsystem Shutdown) 명령 지원. */
 
 		/** controller ready with media support */
 		uint32_t crwms		: 1;
+		/* [한국어] CAP.CRWMS — Controller Ready With Media Support. =1이면 CC.EN=1 후
+		 * media 준비까지 기다려서 RDY 보고 가능(NVMe 2.0). */
 
 		/** controller ready independent of media support */
 		uint32_t crims		: 1;
+		/* [한국어] CAP.CRIMS — media 준비 이전에도 CSTS.RDY=1 가능. CC.CRIME=1과 짝.
+		 * 부팅 시간을 단축하지만 첫 I/O는 NVMe error로 reject 될 수 있음. */
 
 		uint32_t reserved3	: 3;
+		/* [한국어] 예약(0). */
 	} bits;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_cap_register) == 8, "Incorrect size");
+/* [한국어] CAP는 정확히 8B여야 한다 — 컴파일러 패딩 발생 시 BAR0 매핑이 어긋난다. */
 
 /**
  * I/O Command Set Selected
@@ -231,114 +296,184 @@ SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_cap_register) == 8, "Incorrect size");
  * Admin Command Set. With 1.4c and Namespace Types, additional I/O Command Sets
  * are available.
  */
+/* [한국어] === CC.CSS — Controller Configuration의 I/O Command Set Selected 필드 ===
+ * NVMe 1.3 이전엔 NVM CS만 존재해 CSS=0이 사실상 유일했다. NVMe 1.4c에서 Namespace
+ * Type/I/O Command Set Combination을 도입하면서 CSS=6(One or more I/O CS, 즉 ZNS/KV/NVM
+ * 혼합)이 추가되었고, CSS=7(No I/O)은 Admin Only 컨트롤러(예: Discovery, MI). */
 enum spdk_nvme_cc_css {
 	SPDK_NVME_CC_CSS_NVM		= 0x0,	/**< NVM command set */
+	/* [한국어] 0x0 — NVM Command Set만 사용. 가장 일반적인 모드.
+	 * I/O 큐에서 read/write/flush 등 NVM CS opcode만 발행 가능. */
 	SPDK_NVME_CC_CSS_IOCS		= 0x6,	/**< One or more I/O command sets */
+	/* [한국어] 0x6 — Multi-Command-Set 모드. 네임스페이스마다 CSI(Command Set Identifier)
+	 * 로 NVM/ZNS/KV 중 선택. lib/nvme가 ZNS namespace를 사용하려면 이 값으로 enable. */
 	SPDK_NVME_CC_CSS_NOIO		= 0x7,	/**< No I/O, only admin */
+	/* [한국어] 0x7 — I/O 큐 없이 Admin만 동작. Discovery 컨트롤러 / NVMe-MI 전용. */
 };
 
 #define SPDK_NVME_CAP_CSS_NVM (1u << SPDK_NVME_CC_CSS_NVM) /**< NVM command set supported */
+/* [한국어] CAP.CSS bit0 — NVM CS 지원 여부. CC.CSS=0 설정 시 이 비트가 1이어야 함. */
 #define SPDK_NVME_CAP_CSS_IOCS (1u << SPDK_NVME_CC_CSS_IOCS) /**< One or more I/O Command sets supported */
+/* [한국어] CAP.CSS bit6 — Multi I/O CS 지원 여부. ZNS/KV 사용 전 필수 검증. */
 #define SPDK_NVME_CAP_CSS_NOIO (1u << SPDK_NVME_CC_CSS_NOIO) /**< No I/O, only admin */
+/* [한국어] CAP.CSS bit7 — Admin Only 컨트롤러 지원 여부. Discovery/MI 컨트롤러는 1. */
 
+/* [한국어] === Controller Configuration (CC) — BAR0 offset 0x14, 4B RW ===
+ * 호스트가 컨트롤러에 "동작 시작/정지" 신호를 주는 메인 레지스터. NVMe Base 2.0 §3.1.3.5.
+ * 초기화 시퀀스: CC.EN=0 → CSTS.RDY=0 대기 → AQA/ASQ/ACQ 설정 → CC.CSS/MPS/AMS 설정 →
+ * CC.IOSQES=6/IOCQES=4(SQE=64B/CQE=16B 인코딩) → CC.EN=1 → CSTS.RDY=1 폴링.
+ * 종료 시: CC.SHN=01b/10b 설정 → CSTS.SHST=10b 대기 후 PCI off. */
 union spdk_nvme_cc_register {
 	uint32_t	raw;
+	/* [한국어] CC 32비트 통째 — 일반적으로 raw 단위로 RMW 후 spdk_mmio_write_4. */
 	struct {
 		/** enable */
 		uint32_t en		: 1;
+		/* [한국어] CC.EN — 0→1로 토글하면 컨트롤러가 admin 큐 활성화 시작.
+		 * CSTS.RDY가 1이 될 때까지 CAP.TO*500ms 폴링. 1→0이면 reset(데이터 손실 위험). */
 
 		uint32_t reserved1	: 3;
+		/* [한국어] 예약(0). */
 
 		/** i/o command set selected */
 		uint32_t css		: 3;
+		/* [한국어] CC.CSS — 위 enum 참조. CC.EN=0 상태에서만 변경 가능. */
 
 		/** memory page size */
 		uint32_t mps		: 4;
+		/* [한국어] CC.MPS — 호스트 메모리 페이지 크기 = 2^(12+mps). PRP1/PRP2 정렬과
+		 * 데이터 transfer chunk 단위에 영향. CAP.MPSMIN~MAX 범위 내에서만 설정. */
 
 		/** arbitration mechanism selected */
 		uint32_t ams		: 3;
+		/* [한국어] CC.AMS — 0=Round Robin(default), 1=Weighted RR with Urgent class,
+		 * 7=Vendor specific. CAP.AMS에서 지원 여부 확인 후 설정. */
 
 		/** shutdown notification */
 		uint32_t shn		: 2;
+		/* [한국어] CC.SHN — 0=No shutdown, 1=Normal(데이터 flush 후 종료),
+		 * 2=Abrupt(즉시 종료, 데이터 손실 가능). CSTS.SHST로 진행 상태 확인. */
 
 		/** i/o submission queue entry size */
 		uint32_t iosqes		: 4;
+		/* [한국어] CC.IOSQES — SQE 크기 = 2^iosqes bytes. NVM CS는 64B이므로 6. */
 
 		/** i/o completion queue entry size */
 		uint32_t iocqes		: 4;
+		/* [한국어] CC.IOCQES — CQE 크기 = 2^iocqes bytes. NVM CS는 16B이므로 4. */
 
 		/** controller ready independent of media enable */
 		uint32_t crime		: 1;
+		/* [한국어] CC.CRIME — CAP.CRIMS=1일 때만 의미. 1이면 media 미준비여도 RDY=1.
+		 * 부팅 시간 단축용; 첫 read는 status code Namespace Not Ready로 떨어질 수 있음. */
 
 		uint32_t reserved2	: 7;
+		/* [한국어] 예약(0). */
 	} bits;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_cc_register) == 4, "Incorrect size");
+/* [한국어] CC는 정확히 4B(32비트). */
 
+/* [한국어] === Shutdown Notification 값 (CC.SHN) ===
+ * NVMe Base 2.0 §3.1.3.5 Table 24. */
 enum spdk_nvme_shn_value {
 	SPDK_NVME_SHN_NORMAL		= 0x1,
+	/* [한국어] 0x1 — Normal shutdown. 컨트롤러는 미완료 명령을 처리하고 캐시를
+	 * media에 flush한다. 호스트는 CSTS.SHST=2(complete)까지 대기 후 PCI off. */
 	SPDK_NVME_SHN_ABRUPT		= 0x2,
+	/* [한국어] 0x2 — Abrupt shutdown. 즉시 종료. 캐시되지 않은 데이터가 손실 가능.
+	 * 비상 종료(전원 손실 직전 등)에만 사용. */
 };
 
+/* [한국어] === Controller Status (CSTS) — BAR0 offset 0x1C, 4B RO ===
+ * 컨트롤러의 현재 상태. CC 변경의 결과 확인용. NVMe Base 2.0 §3.1.3.6. */
 union spdk_nvme_csts_register {
 	uint32_t	raw;
+	/* [한국어] CSTS 32비트 raw — polled-mode 컨트롤러 상태 폴링에 자주 읽힌다. */
 	struct {
 		/** ready */
 		uint32_t rdy		: 1;
+		/* [한국어] CSTS.RDY — CC.EN과 함께 변동. 1이면 admin 큐 처리 가능. 호스트는
+		 * CC.EN=1 후 CAP.TO*500ms 동안 이 비트가 1이 되길 폴링. */
 
 		/** controller fatal status */
 		uint32_t cfs		: 1;
+		/* [한국어] CSTS.CFS — 1이면 컨트롤러 내부 fatal error. 모든 I/O 정지, 리셋 필수. */
 
 		/** shutdown status */
 		uint32_t shst		: 2;
+		/* [한국어] CSTS.SHST — 0=Normal, 1=Shutdown 진행 중, 2=Shutdown 완료. */
 
 		/** NVM subsystem reset occurred */
 		uint32_t nssro		: 1;
+		/* [한국어] CSTS.NSSRO — 1이면 NSSR(NVM Subsystem Reset)이 발생했었음. RWC. */
 
 		/** Processing paused */
 		uint32_t pp		: 1;
+		/* [한국어] CSTS.PP — 1이면 명령 처리 일시 정지(thermal/power 이슈 등). */
 
 		uint32_t reserved1	: 26;
 	} bits;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_csts_register) == 4, "Incorrect size");
 
+/* [한국어] === Shutdown Status (CSTS.SHST) === NVMe Base 2.0 §3.1.3.6 Table 25. */
 enum spdk_nvme_shst_value {
 	SPDK_NVME_SHST_NORMAL		= 0x0,
+	/* [한국어] 0x0 — 정상 동작 중. shutdown 진행 안 함. */
 	SPDK_NVME_SHST_OCCURRING	= 0x1,
+	/* [한국어] 0x1 — shutdown 처리 중. flush 완료 대기. */
 	SPDK_NVME_SHST_COMPLETE		= 0x2,
+	/* [한국어] 0x2 — shutdown 완료. 호스트가 PCI off 가능. */
 };
 
+/* [한국어] === Admin Queue Attributes (AQA) — BAR0 offset 0x24, 4B RW ===
+ * Admin SQ/CQ의 큐 깊이를 설정. NVMe Base 2.0 §3.1.3.7. CC.EN=0 상태에서만 변경. */
 union spdk_nvme_aqa_register {
 	uint32_t	raw;
 	struct {
 		/** admin submission queue size */
 		uint32_t asqs		: 12;
+		/* [한국어] AQA.ASQS — Admin SQ 깊이(0's based, 실제 값 = asqs+1). 최대 4096(0xFFF+1).
+		 * lib/nvme/nvme_ctrlr.c::nvme_ctrlr_construct_admin_qpair에서 설정. */
 
 		uint32_t reserved1	: 4;
+		/* [한국어] 예약(0). */
 
 		/** admin completion queue size */
 		uint32_t acqs		: 12;
+		/* [한국어] AQA.ACQS — Admin CQ 깊이(0's based). 일반적으로 ASQS와 같게 설정. */
 
 		uint32_t reserved2	: 4;
+		/* [한국어] 예약(0). */
 	} bits;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_aqa_register) == 4, "Incorrect size");
+/* [한국어] AQA는 정확히 4B. */
 
+/* [한국어] === Version (VS) — BAR0 offset 0x08, 4B RO ===
+ * 컨트롤러가 구현한 NVMe 스펙 버전. NVMe Base 2.0 §3.1.3.2. 호스트는 이 값으로
+ * 1.x vs 2.x 호환성 분기(ANA, ZNS, FDP 등 신규 기능 활성화 여부 결정)를 한다. */
 union spdk_nvme_vs_register {
 	uint32_t	raw;
 	struct {
 		/** indicates the tertiary version */
 		uint32_t ter		: 8;
+		/* [한국어] VS.TER — 3차 버전(예: 1.4.1의 .1). 패치 레벨. */
 		/** indicates the minor version */
 		uint32_t mnr		: 8;
+		/* [한국어] VS.MNR — minor 버전(예: 1.4의 4). */
 		/** indicates the major version */
 		uint32_t mjr		: 16;
+		/* [한국어] VS.MJR — major 버전(예: 1.4의 1). 16비트는 미래 확장 여유. */
 	} bits;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_vs_register) == 4, "Incorrect size");
 
 /** Generate raw version in the same format as \ref spdk_nvme_vs_register for comparison. */
+/* [한국어] SPDK_NVME_VERSION(mjr,mnr,ter) — VS 레지스터 raw 값과 직접 비교 가능한
+ * 32비트 인코딩 생성. 예: SPDK_NVME_VERSION(1,4,0) == 0x00010400. lib/nvme 코드에서
+ * "if (vs.raw >= SPDK_NVME_VERSION(1,4,0)) { /* 1.4 features */ }" 패턴으로 사용. */
 #define SPDK_NVME_VERSION(mjr, mnr, ter) \
 	(((uint32_t)(mjr) << 16) | \
 	((uint32_t)(mnr) << 8) | \
@@ -348,122 +483,178 @@ SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_vs_register) == 4, "Incorrect size");
 SPDK_STATIC_ASSERT(SPDK_NVME_VERSION(1, 0, 0) == 0x00010000, "version macro error");
 SPDK_STATIC_ASSERT(SPDK_NVME_VERSION(1, 2, 1) == 0x00010201, "version macro error");
 
+/* [한국어] === Controller Memory Buffer Location (CMBLOC) — offset 0x38, 4B RO ===
+ * CMB는 컨트롤러가 자체 RAM을 PCIe BAR에 노출해 호스트가 SQ/CQ/PRP list/data를 지연 없이
+ * 접근하게 하는 기능. CAP.CMBS=1일 때만 유효. NVMe Base 2.0 §3.1.3.10. */
 union spdk_nvme_cmbloc_register {
 	uint32_t	raw;
 	struct {
 		/** indicator of BAR which contains controller memory buffer(CMB) */
 		uint32_t bir		: 3;
+		/* [한국어] CMBLOC.BIR — CMB가 매핑된 PCIe BAR 인덱스(0~5). lib/nvme/nvme_pcie.c가
+		 * 이 BAR를 mmap해서 CMB IO buffer로 사용한다. */
 		uint32_t reserved1	: 9;
+		/* [한국어] 예약(0). */
 		/** offset of CMB in multiples of the size unit */
 		uint32_t ofst		: 20;
+		/* [한국어] CMBLOC.OFST — BAR 내 CMB 시작 오프셋 = ofst * (CMBSZ.szu 크기 단위).
+		 * 즉 실제 BAR 주소 = BAR base + ofst * 4KB(szu=0 기준). */
 	} bits;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_cmbloc_register) == 4, "Incorrect size");
 
+/* [한국어] === Controller Memory Buffer Size (CMBSZ) — offset 0x3C, 4B RO ===
+ * CMB 크기와 어떤 종류의 데이터를 CMB에 둘 수 있는지(SQ/CQ/PRP list/read data/write data). */
 union spdk_nvme_cmbsz_register {
 	uint32_t	raw;
 	struct {
 		/** support submission queues in CMB */
 		uint32_t sqs		: 1;
+		/* [한국어] CMBSZ.SQS — 1이면 CMB에 SQ 배치 가능(I/O latency 감소). */
 		/** support completion queues in CMB */
 		uint32_t cqs		: 1;
+		/* [한국어] CMBSZ.CQS — 1이면 CMB에 CQ 배치 가능(드물게 지원). */
 		/** support PRP and SGLs lists in CMB */
 		uint32_t lists		: 1;
+		/* [한국어] CMBSZ.LISTS — 1이면 PRP list/SGL을 CMB에 둬서 컨트롤러가 fetch 시
+		 * 호스트 메모리 trip을 절약. */
 		/** support read data and metadata in CMB */
 		uint32_t rds		: 1;
+		/* [한국어] CMBSZ.RDS — 1이면 read 결과 데이터/메타데이터를 CMB에 직접 받기 가능. */
 		/** support write data and metadata in CMB */
 		uint32_t wds		: 1;
+		/* [한국어] CMBSZ.WDS — 1이면 write 데이터를 CMB에 두고 컨트롤러가 PRP/SGL로
+		 * CMB 주소를 가리켜 zero-copy. */
 		uint32_t reserved1	: 3;
+		/* [한국어] 예약(0). */
 		/** indicates the granularity of the size unit */
 		uint32_t szu		: 4;
+		/* [한국어] CMBSZ.SZU — size unit. 0=4KB, 1=64KB, 2=1MB, ..., 6=4GB. */
 		/** size of CMB in multiples of the size unit */
 		uint32_t sz		: 20;
+		/* [한국어] CMBSZ.SZ — CMB 크기 = sz * (szu 단위). 0이면 CMB 비활성. */
 	} bits;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_cmbsz_register) == 4, "Incorrect size");
 
+/* [한국어] === CMB Memory Space Control (CMBMSC) — offset 0x50, 8B RW (NVMe 1.4+) ===
+ * CMB를 호스트가 임의 PCIe 주소 공간에 매핑할 수 있게 하는 controller memory space.
+ * NVMe Base 2.0 §3.1.3.16. */
 union spdk_nvme_cmbmsc_register {
 	uint64_t	raw;
 	struct {
 		/** capability registers enabled */
 		uint64_t cre		: 1;
+		/* [한국어] CMBMSC.CRE — capability register access enable. 1이면 CMB 영역 첫 부분에
+		 * 컨트롤러가 노출하는 capability registers(추가 제어용)를 참조 가능. */
 
 		/** controller memory space enable */
 		uint64_t cmse		: 1;
+		/* [한국어] CMBMSC.CMSE — controller memory space enable. 1이면 컨트롤러가 호스트의
+		 * 일반 시스템 메모리처럼 CMB를 PCIe target 주소(CBA)로 응답. zero-copy 전제. */
 
 		uint64_t reserved	: 10;
+		/* [한국어] 예약(0). */
 
 		/** controller base address */
 		uint64_t cba		: 52;
+		/* [한국어] CMBMSC.CBA — controller base address. (cba << 12)이 CMB의 PCIe target
+		 * 주소. 호스트는 이 값을 SQE PRP/SGL에 직접 적어 컨트롤러가 자기 RAM에 DMA. */
 	} bits;
 
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_cmbmsc_register) == 8, "Incorrect size");
 
+/* [한국어] === CMB Status (CMBSTS) — offset 0x58, 4B RO === */
 union spdk_nvme_cmbsts_register {
 	uint32_t	raw;
 	struct {
 		/** controller base address invalid */
 		uint32_t cbai		: 1;
+		/* [한국어] CMBSTS.CBAI — 1이면 CMBMSC.CBA가 잘못 설정됨(BAR 범위 밖 등). */
 
 		uint32_t reserved	: 31;
+		/* [한국어] 예약(0). */
 	} bits;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_cmbsts_register) == 4, "Incorrect size");
 
+/* [한국어] === CMB Elasticity Buffer Size (CMBEBS) — offset 0x5C, 4B RO ===
+ * NVMe 2.0에서 CMB write가 즉시 media에 가지 않고 elasticity 버퍼에 누적되는 경우의 크기. */
 union spdk_nvme_cmbebs_register {
 	uint32_t	raw;
 	struct {
 		/** CMB Elasticity Buffer Size Units */
 		uint32_t cmbszu		: 4;
+		/* [한국어] CMBEBS.CMBSZU — 단위(0=Bytes, 1=KiB, 2=MiB, 3=GiB). */
 		/** CMB Read Bypass Behavior */
 		uint32_t cmbrbb		: 1;
+		/* [한국어] CMBEBS.CMBRBB — read가 elasticity buffer를 우회하는지 여부. */
 
 		uint32_t reserved	: 3;
+		/* [한국어] 예약(0). */
 		/** CMB elasticity buffer size base */
 		uint32_t cmbwbz		: 24;
+		/* [한국어] CMBEBS.CMBWBZ — 실제 elasticity buffer 크기 = cmbwbz * (cmbszu 단위). */
 	} bits;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_cmbebs_register) == 4, "Incorrect size");
 
+/* [한국어] === CMB Sustained Write Throughput (CMBSWTP) — offset 0x60, 4B RO ===
+ * CMB로의 sustained write 처리량 보장값. */
 union spdk_nvme_cmbswtp_register {
 	uint32_t	raw;
 	struct {
 		/** CMB Sustained Write Throughput Units */
 		uint32_t cmbswtu	: 4;
+		/* [한국어] CMBSWTP.CMBSWTU — 단위(0=B/s, 1=KiB/s, 2=MiB/s, 3=GiB/s). */
 
 		uint32_t reserved	: 4;
+		/* [한국어] 예약(0). */
 		/** CMB Sustained Write Throughput */
 		uint32_t cmbswtv	: 24;
+		/* [한국어] CMBSWTP.CMBSWTV — 처리량 = cmbswtv * (cmbswtu 단위). */
 	} bits;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_cmbswtp_register) == 4, "Incorrect size");
 
+/* [한국어] === Controller Ready Timeouts (CRTO) — offset 0x68, 4B RO (NVMe 2.0) ===
+ * CAP.TO를 대체하는 16비트 타임아웃(부팅 시간이 길어짐에 따라 8비트로 부족). */
 union spdk_nvme_crto_register {
 	uint32_t	raw;
 	struct {
 		/** Controller Ready With Media Timeout */
 		uint32_t crwmt	: 16;
+		/* [한국어] CRTO.CRWMT — CAP.CRWMS=1이고 CC.CRIME=0일 때의 RDY 대기 시간(100ms 단위). */
 		/** Controller Ready Independent of Media Timeout */
 		uint32_t crimt	: 16;
+		/* [한국어] CRTO.CRIMT — CC.CRIME=1일 때의 RDY 대기 시간(100ms 단위, 보통 더 짧다). */
 	} bits;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_crto_register) == 4, "Incorrect size");
 
 
+/* [한국어] === Persistent Memory Region Capabilities (PMRCAP) — offset 0xE00, 4B RO ===
+ * PMR은 컨트롤러가 노출하는 비휘발성 메모리 영역(예: 컨트롤러 측 NVDIMM/MRAM)으로,
+ * 호스트는 PCIe BAR를 통해 byte-addressable로 접근 가능. CMB의 비휘발 버전.
+ * NVMe Base 2.0 §3.1.4. */
 union spdk_nvme_pmrcap_register {
 	uint32_t	raw;
 	struct {
 		uint32_t reserved1	: 3;
+		/* [한국어] 예약(0). */
 
 		/** read data support */
 		uint32_t rds		: 1;
+		/* [한국어] PMRCAP.RDS — 1이면 PMR 영역 read 가능. */
 
 		/** write data support */
 		uint32_t wds		: 1;
+		/* [한국어] PMRCAP.WDS — 1이면 PMR 영역 write 가능. */
 
 		/** base indicator register */
 		uint32_t bir		: 3;
+		/* [한국어] PMRCAP.BIR — PMR이 매핑된 PCIe BAR 인덱스. */
 
 		/**
 		 * persistent memory region time units
@@ -471,42 +662,56 @@ union spdk_nvme_pmrcap_register {
 		 * 01b: minutes
 		 */
 		uint32_t pmrtu		: 2;
+		/* [한국어] PMRCAP.PMRTU — PMRTO 단위(00=500ms, 01=분). 부팅 시 PMR ready
+		 * 대기 시간 계산용. */
 
 		/** persistent memory region write barrier mechanisms */
 		uint32_t pmrwbm		: 4;
+		/* [한국어] PMRCAP.PMRWBM — write durability 보장 메커니즘(컨트롤러가 power-fail
+		 * 시 데이터 안정 보장하는 방식). */
 
 		uint32_t reserved2	: 2;
+		/* [한국어] 예약(0). */
 
 		/** persistent memory region timeout */
 		uint32_t pmrto		: 8;
+		/* [한국어] PMRCAP.PMRTO — PMRCTL.EN=1 후 ready까지 timeout(pmrtu 단위). */
 
 		/** controller memory space supported */
 		uint32_t cmss		: 1;
+		/* [한국어] PMRCAP.CMSS — CMB와 같은 controller memory space 매핑 가능 여부. */
 
 		uint32_t reserved3	: 7;
+		/* [한국어] 예약(0). */
 	} bits;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_pmrcap_register) == 4, "Incorrect size");
 
+/* [한국어] === PMR Control (PMRCTL) — offset 0xE04, 4B RW === */
 union spdk_nvme_pmrctl_register {
 	uint32_t	raw;
 	struct {
 		/** enable */
 		uint32_t en		: 1;
+		/* [한국어] PMRCTL.EN — 1로 토글하면 PMR 활성화 시작. PMRSTS.NRDY=0 폴링 대기. */
 
 		uint32_t reserved	: 31;
+		/* [한국어] 예약(0). */
 	} bits;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_pmrctl_register) == 4, "Incorrect size");
 
+/* [한국어] === PMR Status (PMRSTS) — offset 0xE08, 4B RO === */
 union spdk_nvme_pmrsts_register {
 	uint32_t	raw;
 	struct {
 		/** err */
 		uint32_t err		: 8;
+		/* [한국어] PMRSTS.ERR — PMR 진입 시 에러 코드. */
 
 		/** not ready */
 		uint32_t nrdy		: 1;
+		/* [한국어] PMRSTS.NRDY — 1이면 PMR 미준비. PMRCTL.EN=1 후 timeout 동안 0 폴링. */
 
 		/**
 		 * health status
@@ -516,15 +721,20 @@ union spdk_nvme_pmrsts_register {
 		 * 011b: Unreliable
 		 */
 		uint32_t hsts		: 3;
+		/* [한국어] PMRSTS.HSTS — 0=Normal, 1=Restore Error(전원 복구 실패),
+		 * 2=Read Only(쓰기 불가), 3=Unreliable(데이터 신뢰 불가). */
 
 		/** controller base address invalid */
 		uint32_t cbai		: 1;
+		/* [한국어] PMRSTS.CBAI — PMRMSCL/PMRMSCU CBA 잘못 설정 시 1. */
 
 		uint32_t reserved	: 19;
+		/* [한국어] 예약(0). */
 	} bits;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_pmrsts_register) == 4, "Incorrect size");
 
+/* [한국어] === PMR Elasticity Buffer Size (PMREBS) — offset 0xE0C, 4B RO === */
 union spdk_nvme_pmrebs_register {
 	uint32_t	raw;
 	struct {
@@ -536,18 +746,23 @@ union spdk_nvme_pmrebs_register {
 		 * 3h: 1 GiB
 		 */
 		uint32_t pmrszu		: 4;
+		/* [한국어] PMREBS.PMRSZU — 단위(0=B, 1=KiB, 2=MiB, 3=GiB). */
 
 		/** read bypass behavior */
 		uint32_t rbb		: 1;
+		/* [한국어] PMREBS.RBB — read가 elasticity buffer를 우회하는지 여부. */
 
 		uint32_t reserved	: 3;
+		/* [한국어] 예약(0). */
 
 		/** pmr elasticity buffer size base */
 		uint32_t pmrwbz		: 24;
+		/* [한국어] PMREBS.PMRWBZ — 실제 크기 = pmrwbz * (pmrszu 단위). */
 	} bits;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_pmrebs_register) == 4, "Incorrect size");
 
+/* [한국어] === PMR Sustained Write Throughput (PMRSWTP) — offset 0xE10, 4B RO === */
 union spdk_nvme_pmrswtp_register {
 	uint32_t	raw;
 	struct {
@@ -559,39 +774,54 @@ union spdk_nvme_pmrswtp_register {
 		 * 3h: 1 GiB / s
 		 */
 		uint32_t pmrswtu	: 4;
+		/* [한국어] PMRSWTP.PMRSWTU — 단위(0=B/s, 1=KiB/s, 2=MiB/s, 3=GiB/s). */
 
 		uint32_t reserved	: 4;
+		/* [한국어] 예약(0). */
 
 		/** pmr sustained write throughput */
 		uint32_t pmrswtv	: 24;
+		/* [한국어] PMRSWTP.PMRSWTV — 처리량 = pmrswtv * (pmrswtu 단위). */
 	} bits;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_pmrswtp_register) == 4, "Incorrect size");
 
+/* [한국어] === PMR Memory Space Control Lower (PMRMSCL) — offset 0xE14, 4B RW === */
 union spdk_nvme_pmrmscl_register {
 	uint32_t	raw;
 	struct {
 		uint32_t reserved1	: 1;
+		/* [한국어] 예약(0). */
 
 		/** controller memory space enable */
 		uint32_t cmse		: 1;
+		/* [한국어] PMRMSCL.CMSE — controller memory space enable(1이면 PMRMSCU/L의 CBA로
+		 * PCIe target 주소 노출). */
 
 		uint32_t reserved2	: 10;
+		/* [한국어] 예약(0). */
 
 		/** controller base address */
 		uint32_t cba		: 20;
+		/* [한국어] PMRMSCL.CBA — controller base address 하위 32비트(PMRMSCU가 상위).
+		 * 실제 base = ((PMRMSCU<<32) | (cba<<12)). */
 	} bits;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_pmrmscl_register) == 4, "Incorrect size");
 
+/* [한국어] === Boot Partition Information (BPINFO) — offset 0x40, 4B RO ===
+ * NVMe Base 1.4 §3.7. UEFI 펌웨어가 OS 부팅 전에 NVMe로부터 boot image를 읽기 위한 기능.
+ * CAP.BPS=1일 때만 유효. */
 /** Boot partition information */
 union spdk_nvme_bpinfo_register	{
 	uint32_t	raw;
 	struct {
 		/** Boot partition size in 128KB multiples */
 		uint32_t bpsz		: 15;
+		/* [한국어] BPINFO.BPSZ — boot partition 크기 = bpsz * 128KB. 0이면 BP 미지원. */
 
 		uint32_t reserved1	: 9;
+		/* [한국어] 예약(0). */
 
 		/**
 		 * Boot read status
@@ -601,69 +831,117 @@ union spdk_nvme_bpinfo_register	{
 		 * 11b: Error completing Boot Partition read
 		 */
 		uint32_t brs		: 2;
+		/* [한국어] BPINFO.BRS — boot read 진행 상태. enum spdk_nvme_brs_value 참조. */
 
 		uint32_t reserved2	: 5;
+		/* [한국어] 예약(0). */
 
 		/** Active Boot Partition ID */
 		uint32_t abpid		: 1;
+		/* [한국어] BPINFO.ABPID — 현재 활성 부팅 파티션 ID(0 또는 1, A/B 더블 버퍼). */
 	} bits;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_bpinfo_register) == 4, "Incorrect size");
 
 /** Boot read status values */
+/* [한국어] === Boot Read Status (BPINFO.BRS) === NVMe Base 1.4 §3.7. */
 enum spdk_nvme_brs_value {
 	SPDK_NVME_BRS_NO_READ		= 0x0,
+	/* [한국어] 0x0 — 아직 boot read 요청 없음. */
 	SPDK_NVME_BRS_READ_IN_PROGRESS	= 0x1,
+	/* [한국어] 0x1 — boot read 진행 중. 호스트는 폴링 대기. */
 	SPDK_NVME_BRS_READ_SUCCESS	= 0x2,
+	/* [한국어] 0x2 — boot read 성공. BPMBL이 가리키는 호스트 메모리에 데이터 도착. */
 	SPDK_NVME_BRS_READ_ERROR	= 0x3,
+	/* [한국어] 0x3 — boot read 실패(부팅 이미지 손상/통신 오류). */
 };
 
+/* [한국어] === Boot Partition Read Select (BPRSEL) — offset 0x44, 4B RW ===
+ * BPID, 읽을 오프셋과 크기를 설정 후 컨트롤러가 BPMBL이 가리키는 메모리로 DMA. */
 /** Boot partition read select */
 union spdk_nvme_bprsel_register {
 	uint32_t	raw;
 	struct {
 		/** Boot partition read size in multiples of 4KB */
 		uint32_t bprsz		: 10;
+		/* [한국어] BPRSEL.BPRSZ — read 크기 = bprsz * 4KB. */
 
 		/** Boot partition read offset in multiples of 4KB */
 		uint32_t bprof		: 20;
+		/* [한국어] BPRSEL.BPROF — boot partition 내 시작 오프셋 = bprof * 4KB. */
 
 		uint32_t reserved	: 1;
+		/* [한국어] 예약(0). */
 
 		/** Boot Partition Identifier */
 		uint32_t bpid		: 1;
+		/* [한국어] BPRSEL.BPID — 어느 BP를 읽을지(0=BP0, 1=BP1, A/B 더블 버퍼). */
 	} bits;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_bprsel_register) == 4, "Incorrect size");
 
 /** Value to write to NSSR to indicate a NVM subsystem reset ("NVMe") */
+/* [한국어] NSSR 매직 값 — 'NVMe' ASCII = 0x4E 0x56 0x4D 0x65. NSSR(offset 0x20)에 이 값을
+ * write하면 CAP.NSSRS=1인 컨트롤러가 NVM subsystem 전체 리셋 수행. 다른 값은 무시.
+ * lib/nvme/nvme_ctrlr.c::nvme_ctrlr_subsystem_reset()이 사용. */
 #define SPDK_NVME_NSSR_VALUE	0x4E564D65
 
+/* [한국어] === Controller Registers (BAR0) — 메모리 매핑 레지스터 전체 레이아웃 ===
+ * NVMe Base 2.0 §3.1.3. 컨트롤러의 모든 제어 레지스터가 PCIe BAR0에 메모리 매핑되어 있고
+ * lib/nvme/nvme_pcie.c::nvme_pcie_ctrlr_attach()가 이 영역을 mmap하여 struct
+ * spdk_nvme_registers 포인터로 캐스트한다. 이후 모든 레지스터 read/write는
+ * spdk_mmio_read_4/8(), spdk_mmio_write_4/8()로 수행 — 이는 일반 load/store가 아니라
+ * 컴파일러 reorder를 막고 strong ordering을 보장하는 mmio 전용 매크로이다.
+ * 메모리 레이아웃은 NVMe 스펙이 고정한 오프셋과 정확히 일치해야 하므로 이 구조체 끝에
+ * SPDK_STATIC_ASSERT(offsetof) 검증이 줄지어 있다(아래 참조).
+ *
+ * 주요 오프셋:
+ *   0x00 CAP, 0x08 VS, 0x0C INTMS, 0x10 INTMC, 0x14 CC, 0x1C CSTS, 0x20 NSSR,
+ *   0x24 AQA, 0x28 ASQ, 0x30 ACQ, 0x38 CMBLOC, 0x3C CMBSZ, 0x40 BPINFO,
+ *   0x44 BPRSEL, 0x48 BPMBL, 0x50 CMBMSC, 0x58 CMBSTS, 0x5C CMBEBS, 0x60 CMBSWTP,
+ *   0x64 NSSD, 0x68 CRTO, 0xE00 PMRCAP, 0xE04 PMRCTL, 0xE08 PMRSTS, 0xE0C PMREBS,
+ *   0xE10 PMRSWTP, 0xE14 PMRMSCL, 0xE18 PMRMSCU, 0x1000+ Doorbells.
+ * Doorbell은 별도의 동적 stride(CAP.DSTRD)로 계산되므로 본 struct 마지막에 배치된다. */
 struct spdk_nvme_registers {
 	/** controller capabilities */
 	union spdk_nvme_cap_register	cap;
+	/* [한국어] CAP @ 0x00 — 8B RO. 부팅 시 가장 먼저 읽히는 capability bitmap. */
 
 	/** version of NVMe specification */
 	union spdk_nvme_vs_register	vs;
+	/* [한국어] VS @ 0x08 — 4B RO. NVMe 스펙 버전(major.minor.tertiary). */
 	uint32_t			intms; /* interrupt mask set */
+	/* [한국어] INTMS @ 0x0C — 4B RW1S. bit n에 1을 쓰면 vector n 인터럽트 마스크. SPDK는
+	 * polled-mode이므로 일반적으로 사용하지 않으나, MSI-X 인터럽트 모드 폴백 시 사용. */
 	uint32_t			intmc; /* interrupt mask clear */
+	/* [한국어] INTMC @ 0x10 — 4B RW1C. bit n에 1을 쓰면 마스크 해제. */
 
 	/** controller configuration */
 	union spdk_nvme_cc_register	cc;
+	/* [한국어] CC @ 0x14 — 4B RW. 호스트가 컨트롤러 동작을 제어하는 메인 레지스터. */
 
 	uint32_t			reserved1;
+	/* [한국어] 예약 @ 0x18 — 4B. 미래 확장 슬롯. */
 	union spdk_nvme_csts_register	csts; /* controller status */
+	/* [한국어] CSTS @ 0x1C — 4B RO. CC 변경의 결과(RDY/CFS/SHST 등) 폴링 대상. */
 	uint32_t			nssr; /* NVM subsystem reset */
+	/* [한국어] NSSR @ 0x20 — 4B WO. SPDK_NVME_NSSR_VALUE 쓰면 NVM subsystem reset. */
 
 	/** admin queue attributes */
 	union spdk_nvme_aqa_register	aqa;
+	/* [한국어] AQA @ 0x24 — 4B RW. Admin SQ/CQ 깊이 설정. */
 
 	uint64_t			asq; /* admin submission queue base addr */
+	/* [한국어] ASQ @ 0x28 — 8B RW. Admin SQ의 PCIe target address(보통 호스트 hugepage
+	 * 물리 주소). lib/nvme/nvme_pcie_common.c가 hugepage SQ 링 할당 후 이 값에 기록. */
 	uint64_t			acq; /* admin completion queue base addr */
+	/* [한국어] ACQ @ 0x30 — 8B RW. Admin CQ의 PCIe target address. */
 	/** controller memory buffer location */
 	union spdk_nvme_cmbloc_register	cmbloc;
+	/* [한국어] CMBLOC @ 0x38 — 4B RO. CAP.CMBS=1일 때만 유효. */
 	/** controller memory buffer size */
 	union spdk_nvme_cmbsz_register	cmbsz;
+	/* [한국어] CMBSZ @ 0x3C — 4B RO. CMB 크기와 지원되는 데이터 종류. */
 
 	/** boot partition information */
 	union spdk_nvme_bpinfo_register	bpinfo;
@@ -679,47 +957,75 @@ struct spdk_nvme_registers {
 
 	/** controller memory buffer status */
 	union spdk_nvme_cmbsts_register	cmbsts;
+	/* [한국어] CMBSTS @ 0x58 — 4B RO. CMB CBA 유효성 등 상태. */
 
 	/** controller memory buffer elasticity buffer size */
 	union spdk_nvme_cmbebs_register	cmbebs;
+	/* [한국어] CMBEBS @ 0x5C — 4B RO. */
 
 	/** controller memory buffer sustained write throughput */
 	union spdk_nvme_cmbswtp_register cmbswtp;
+	/* [한국어] CMBSWTP @ 0x60 — 4B RO. */
 
 	/** NVM subsystem shutdown */
 	uint32_t			nssd;
+	/* [한국어] NSSD @ 0x64 — 4B WO (NVMe 2.0). 서브시스템 전체 graceful shutdown 명령. */
 
 	/** controller ready timeouts */
 	union spdk_nvme_crto_register	crto;
+	/* [한국어] CRTO @ 0x68 — 4B RO (NVMe 2.0). CAP.TO 16비트 확장. */
 
 	uint32_t			reserved2[0x365];
+	/* [한국어] 예약 영역 @ 0x6C ~ 0xDFC. 미래 확장 영역. 0x365 dword = 0xD94 bytes. */
 
 	/** persistent memory region capabilities */
 	union spdk_nvme_pmrcap_register	pmrcap;
+	/* [한국어] PMRCAP @ 0xE00 — 4B RO. PMR 영역의 capability bitmap. */
 
 	/** persistent memory region control */
 	union spdk_nvme_pmrctl_register	pmrctl;
+	/* [한국어] PMRCTL @ 0xE04 — 4B RW. PMR enable/disable. */
 
 	/** persistent memory region status */
 	union spdk_nvme_pmrsts_register	pmrsts;
+	/* [한국어] PMRSTS @ 0xE08 — 4B RO. PMR ready/health 상태. */
 
 	/** persistent memory region elasticity buffer size */
 	union spdk_nvme_pmrebs_register	pmrebs;
+	/* [한국어] PMREBS @ 0xE0C — 4B RO. */
 
 	/** persistent memory region sustained write throughput */
 	union spdk_nvme_pmrswtp_register	pmrswtp;
+	/* [한국어] PMRSWTP @ 0xE10 — 4B RO. */
 
 	/** persistent memory region memory space control lower */
 	union spdk_nvme_pmrmscl_register	pmrmscl;
+	/* [한국어] PMRMSCL @ 0xE14 — 4B RW. PMR base address 하위 32비트. */
 
 	uint32_t			pmrmscu; /* persistent memory region memory space control upper */
+	/* [한국어] PMRMSCU @ 0xE18 — 4B RW. PMR base address 상위 32비트. */
 
 	uint32_t			reserved3[0x79];
+	/* [한국어] 예약 영역 @ 0xE1C ~ 0xFFC. 0x79 dword = 0x1E4 bytes. 0x1000부터 doorbell. */
 
+	/* [한국어] === Doorbell 영역 @ 0x1000 부터 ===
+	 * Doorbell은 호스트가 SQ에 새 SQE를 enqueue 한 후 컨트롤러에게 "처리하라"고 알리는
+	 * 가장 hot한 핵심 메모리 매핑이다. CAP.DSTRD에 따라 stride가 4B/8B/.../64B로 가변이며,
+	 * SQ_n_TDBL과 CQ_n_HDBL이 페어로 배치된다 (n=0이 admin, 1~N이 I/O queue). 본 구조체는
+	 * 1쌍만 정적 할당해 두고, 실제 접근은 (uintptr_t)doorbell + n*(2*stride) 형태로
+	 * 동적으로 인덱싱한다(lib/nvme/nvme_pcie.c::nvme_pcie_qpair_construct).
+	 * SPDK polled-mode I/O 핫패스: SQE 작성 → smp_wmb → spdk_mmio_write_4(sq_tdbl, new_tail). */
 	struct {
 		uint32_t	sq_tdbl;	/* submission queue tail doorbell */
+		/* [한국어] SQ tail doorbell — 호스트가 새 SQE 위치(tail+1)를 컨트롤러에 알림.
+		 * 새 명령 발행 시 한 번 write되며, 이게 NVMe I/O 경로의 가장 비싼 단일 동작
+		 * (PCIe MMIO write, ~수백 ns). SPDK는 batching으로 doorbell write를 줄여 throughput 향상. */
 		uint32_t	cq_hdbl;	/* completion queue head doorbell */
+		/* [한국어] CQ head doorbell — 호스트가 CQE를 처리한 위치(head+1)를 컨트롤러에 알림.
+		 * spdk_nvme_qpair_process_completions()가 N개의 CQE를 일괄 수확한 뒤 한 번만 write. */
 	} doorbell[1];
+	/* [한국어] flexible array(N=1) — 실제 doorbell 개수는 (1+I/O 큐 수). 인덱싱 시
+	 * sizeof(doorbell[0]) 대신 (4 << CAP.DSTRD)*2를 stride로 사용해야 한다. */
 };
 
 /* NVMe controller register space offsets */
@@ -1821,13 +2127,28 @@ SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_scc_source_range) == 32, "Incorrect s
 /**
  * Status code types
  */
+/* [한국어] === Status Code Type (SCT) — CQE의 status.sct 3비트 필드 ===
+ * NVMe Base 2.0 §4.6.1.2.1. (SCT, SC) 쌍이 한 상태를 고유하게 결정한다. SPDK는
+ * lib/nvme/nvme_qpair.c의 spdk_nvme_qpair_print_completion()이 sct/sc를 디코딩해 사람용
+ * 문자열로 변환한다. */
 enum spdk_nvme_status_code_type {
 	SPDK_NVME_SCT_GENERIC		= 0x0,
+	/* [한국어] 0x0 — Generic 카테고리. opcode/필드/SGL/SQ 자체에 대한 일반 오류
+	 * (Invalid Field, Invalid Opcode, Aborted by Request 등). enum
+	 * spdk_nvme_generic_command_status_code 참조. */
 	SPDK_NVME_SCT_COMMAND_SPECIFIC	= 0x1,
+	/* [한국어] 0x1 — Command Specific. 특정 admin/I/O 명령에서만 발생하는 오류
+	 * (Invalid Queue Identifier, Invalid Firmware Slot 등). enum
+	 * spdk_nvme_command_specific_status_code 참조. */
 	SPDK_NVME_SCT_MEDIA_ERROR	= 0x2,
+	/* [한국어] 0x2 — Media/DI(Data Integrity) Error. 미디어 자체의 손상, PI(Protection
+	 * Information) 검증 실패, Compare 실패 등. enum spdk_nvme_media_error_status_code 참조. */
 	SPDK_NVME_SCT_PATH		= 0x3,
+	/* [한국어] 0x3 — Path-related (NVMe 1.4+). ANA 경로 손실, 비대칭 접근 비활성, host
+	 * path error 등. NVMe-oF/multipath 시나리오에서 자주 등장. */
 	/* 0x4-0x6 - reserved */
 	SPDK_NVME_SCT_VENDOR_SPECIFIC	= 0x7,
+	/* [한국어] 0x7 — 벤더 확장. SC 의미는 컨트롤러 벤더가 정의. */
 };
 
 /**
@@ -1985,76 +2306,165 @@ enum spdk_nvme_path_status_code {
 };
 
 #define SPDK_NVME_MAX_OPC 0xff
+/* [한국어] NVMe opcode 8비트 폭의 최대값 — opcode supported bitmap의 크기 결정. */
 
 /**
  * Admin opcodes
  */
+/* [한국어] === Admin Command Opcode (CDW0.OPC) ===
+ * NVMe Base 2.0 §5. Admin SQ(QID=0)에서만 발행 가능. opcode의 하위 2비트는 데이터 방향
+ * (spdk_nvme_data_transfer)을 인코딩한다 — bit0=H2C, bit1=C2H. 따라서 IDENTIFY(0x06)
+ * 처럼 bit1=1인 opcode는 컨트롤러→호스트 데이터 전송이 있고, FW_DOWNLOAD(0x11)처럼
+ * bit0=1이면 호스트→컨트롤러. 0x80 이상은 NVM Command Set 관리 명령(Format/Sanitize 등). */
 enum spdk_nvme_admin_opcode {
 	SPDK_NVME_OPC_DELETE_IO_SQ			= 0x00,
+	/* [한국어] 0x00 — Delete I/O Submission Queue. CDW10[QID]가 삭제할 SQ ID. 큐를 짝짓는
+	 * 모든 미완료 요청은 abort 처리되며 호스트는 Delete IO CQ 발행 전에 SQ를 먼저 삭제. */
 	SPDK_NVME_OPC_CREATE_IO_SQ			= 0x01,
+	/* [한국어] 0x01 — Create I/O Submission Queue. CDW10[QID]+CDW10[QSIZE]+CDW11[CQID,
+	 * QPRIO,PC,IV]+PRP1(SQ 메모리 주소). lib/nvme/nvme_pcie_common.c가 io qpair 생성 시 발행. */
 	SPDK_NVME_OPC_GET_LOG_PAGE			= 0x02,
+	/* [한국어] 0x02 — Get Log Page. CDW10[LID,LSP,RAE]+CDW10[NUMDL]+CDW11[NUMDU,LSI]+
+	 * CDW12-13[LPOL/LPOU 64비트 오프셋]+CDW14[UUID]. SMART/Error/FW slot/Telemetry 등 모두
+	 * 이 명령으로 수확. enum spdk_nvme_log_page 참조. 데이터 방향 = C2H. */
 	/* 0x03 - reserved */
 	SPDK_NVME_OPC_DELETE_IO_CQ			= 0x04,
+	/* [한국어] 0x04 — Delete I/O Completion Queue. 해당 CQ를 사용하는 SQ가 모두 삭제된
+	 * 후에만 발행 가능. 순서: DELETE_IO_SQ → DELETE_IO_CQ. */
 	SPDK_NVME_OPC_CREATE_IO_CQ			= 0x05,
+	/* [한국어] 0x05 — Create I/O Completion Queue. 순서: CREATE_IO_CQ → CREATE_IO_SQ.
+	 * CDW11[IEN,IV] 인터럽트 활성/벡터 인덱스 설정(SPDK polled-mode는 IEN=0). */
 	SPDK_NVME_OPC_IDENTIFY				= 0x06,
+	/* [한국어] 0x06 — Identify. CDW10[CNS]+CDW10[CNTID]+CDW11[NVMSETID,CNS_SPECIFIC]+
+	 * CDW14[UUID]. CNS=0x01(Identify Controller, 4096B), CNS=0x00(Active NS), CNS=0x02
+	 * (NS list), CNS=0x05(I/O CS specific NS), CNS=0x06(I/O CS specific Controller, ZNS) 등.
+	 * 데이터 방향 = C2H. 컨트롤러/네임스페이스 capability 발견의 핵심. */
 	/* 0x07 - reserved */
 	SPDK_NVME_OPC_ABORT				= 0x08,
+	/* [한국어] 0x08 — Abort. CDW10[SQID,CID]로 대상 명령 식별. 컨트롤러는 best-effort로
+	 * 취소 시도; CQE.CDW0[bit0]=1이면 abort 실패(이미 처리 중). */
 	SPDK_NVME_OPC_SET_FEATURES			= 0x09,
+	/* [한국어] 0x09 — Set Features. CDW10[FID,SAVE]+CDW11~CDW13(feature별 인코딩, union
+	 * spdk_nvme_feat_* 참조). enum spdk_nvme_feat 참조. */
 	SPDK_NVME_OPC_GET_FEATURES			= 0x0a,
+	/* [한국어] 0x0a — Get Features. CDW10[FID,SEL]; SEL=0(current), 1(default), 2(saved),
+	 * 3(supported capability). 결과는 CQE.CDW0와 옵션 데이터 페이로드(C2H). */
 	/* 0x0b - reserved */
 	SPDK_NVME_OPC_ASYNC_EVENT_REQUEST		= 0x0c,
+	/* [한국어] 0x0c — Asynchronous Event Request. 호스트가 미리 N개(<=AERL+1)를 admin SQ에
+	 * 적재. 컨트롤러는 임의 시점 이벤트(ANA 변경, SMART critical, NS attribute 변경 등)
+	 * 발생 시 그 SQE를 완료시켜 통지(CQE.CDW0에 type/info/log_page). polled-mode 인터럽트
+	 * 회피의 핵심 패턴. lib/nvme/nvme_ctrlr.c::nvme_ctrlr_construct_aer 참조. */
 	SPDK_NVME_OPC_NS_MANAGEMENT			= 0x0d,
+	/* [한국어] 0x0d — Namespace Management (NVMe 1.2+). CDW10[SEL]=0(Create)/1(Delete).
+	 * Create는 호스트 메모리(4096B)에 ns_data를 채워 PRP/SGL로 전달. */
 	/* 0x0e-0x0f - reserved */
 	SPDK_NVME_OPC_FIRMWARE_COMMIT			= 0x10,
+	/* [한국어] 0x10 — Firmware Commit. CDW10[FS,CA]로 firmware slot과 commit action 지정
+	 * (struct spdk_nvme_fw_commit). */
 	SPDK_NVME_OPC_FIRMWARE_IMAGE_DOWNLOAD		= 0x11,
+	/* [한국어] 0x11 — Firmware Image Download. CDW10[NUMD]+CDW11[OFST] 전송 단위 분할.
+	 * 데이터 방향 = H2C. 큰 펌웨어를 여러 번 나눠서 송신 후 COMMIT으로 적용. */
 
 	SPDK_NVME_OPC_DEVICE_SELF_TEST			= 0x14,
+	/* [한국어] 0x14 — Device Self-Test. CDW10[STC]=1(short)/2(extended). 결과는 Get Log
+	 * Page LID=0x06으로 회수. */
 	SPDK_NVME_OPC_NS_ATTACHMENT			= 0x15,
+	/* [한국어] 0x15 — Namespace Attachment. CDW10[SEL]=0(Attach)/1(Detach). H2C로
+	 * 컨트롤러 ID 리스트 전달. multi-controller subsystem용. */
 
 	SPDK_NVME_OPC_KEEP_ALIVE			= 0x18,
+	/* [한국어] 0x18 — Keep Alive. NVMe-oF에서 호스트가 주기적으로 발행해 컨트롤러가
+	 * 호스트 생존 확인. KATO(Keep Alive Timeout) Feature로 주기 설정. */
 	SPDK_NVME_OPC_DIRECTIVE_SEND			= 0x19,
+	/* [한국어] 0x19 — Directive Send. Streams 등 directive 활성화/구성. */
 	SPDK_NVME_OPC_DIRECTIVE_RECEIVE			= 0x1a,
+	/* [한국어] 0x1a — Directive Receive. directive 상태 조회. */
 
 	SPDK_NVME_OPC_VIRTUALIZATION_MANAGEMENT		= 0x1c,
+	/* [한국어] 0x1c — Virtualization Management. SR-IOV/secondary controller resource 할당. */
 	SPDK_NVME_OPC_NVME_MI_SEND			= 0x1d,
+	/* [한국어] 0x1d — NVMe-MI Send. NVMe Management Interface 메시지 in-band 전달. */
 	SPDK_NVME_OPC_NVME_MI_RECEIVE			= 0x1e,
+	/* [한국어] 0x1e — NVMe-MI Receive. */
 
 	SPDK_NVME_OPC_DOORBELL_BUFFER_CONFIG		= 0x7c,
+	/* [한국어] 0x7c — Doorbell Buffer Config (가상화 환경). 호스트가 doorbell shadow 영역과
+	 * EventIdx 영역을 컨트롤러에 등록해 hypervisor에 의한 트랩 비용 절감. */
 
 	SPDK_NVME_OPC_FORMAT_NVM			= 0x80,
+	/* [한국어] 0x80 — Format NVM. CDW10[LBAF,MSET,PI,PIL,SES] (struct spdk_nvme_format).
+	 * LBA 포맷/PI 타입/secure erase 옵션 변경. 모든 데이터 파괴. */
 	SPDK_NVME_OPC_SECURITY_SEND			= 0x81,
+	/* [한국어] 0x81 — Security Send. CDW10[SECP=protocol,SPSP]. SECP=0x01이면 TCG Opal
+	 * 토큰 스트림 전달(opal_spec.h). 데이터 방향 = H2C. */
 	SPDK_NVME_OPC_SECURITY_RECEIVE			= 0x82,
+	/* [한국어] 0x82 — Security Receive. SECP=0x01 + Level 0 Discovery로 디바이스 보안
+	 * capability 회수 등. 데이터 방향 = C2H. */
 
 	SPDK_NVME_OPC_SANITIZE				= 0x84,
+	/* [한국어] 0x84 — Sanitize. struct spdk_nvme_sanitize (CDW10) — Block Erase/
+	 * Crypto Erase/Overwrite. 진행 상태는 Get Log Page LID=0x81 (sanitize_status_log_page). */
 
 	SPDK_NVME_OPC_GET_LBA_STATUS			= 0x86,
+	/* [한국어] 0x86 — Get LBA Status (NVMe 1.4+). 특정 LBA range의 미디어 손상 여부 조회. */
 	SPDK_NVME_OPC_VENDOR_SPECIFIC_START		= 0xC0,
+	/* [한국어] 0xC0 — 0xC0~0xFF 영역은 vendor-specific. Intel, Samsung 등이 자체 진단/
+	 * 펌웨어 명령에 사용 (예: nvme_intel.h가 이 영역의 LID/FID를 정의). */
 };
 
 /**
  * NVM command set opcodes
  */
+/* [한국어] === NVM Command Set I/O Opcode (CDW0.OPC) ===
+ * NVMe NVM Command Set Specification §3. I/O SQ(QID>=1)에서 발행. opcode 하위 2비트가
+ * 데이터 방향 인코딩. */
 enum spdk_nvme_nvm_opcode {
 	SPDK_NVME_OPC_FLUSH				= 0x00,
+	/* [한국어] 0x00 — Flush. 컨트롤러의 휘발성 캐시를 media에 동기화. NSID=0xFFFFFFFF로
+	 * 발행 시 모든 NS flush(컨트롤러 지원 시). 데이터 전송 없음. */
 	SPDK_NVME_OPC_WRITE				= 0x01,
+	/* [한국어] 0x01 — Write. CDW10/11=SLBA(64), CDW12[NLB,FUA,LR,PRINFO,DTYPE], CDW13
+	 * [DSM,DSPEC]. 데이터 방향=H2C. lib/nvme/nvme_ns_cmd.c::spdk_nvme_ns_cmd_write가 발행. */
 	SPDK_NVME_OPC_READ				= 0x02,
+	/* [한국어] 0x02 — Read. CDW10/11=SLBA(64), CDW12[NLB,FUA,LR,PRINFO]. 데이터=C2H. */
 	/* 0x03 - reserved */
 	SPDK_NVME_OPC_WRITE_UNCORRECTABLE		= 0x04,
+	/* [한국어] 0x04 — Write Uncorrectable. 지정 LBA를 의도적으로 "uncorrectable"로 표시
+	 * (RAID 시뮬레이션/테스트). */
 	SPDK_NVME_OPC_COMPARE				= 0x05,
+	/* [한국어] 0x05 — Compare. 호스트 버퍼와 미디어 데이터를 컨트롤러가 비교; 불일치 시
+	 * status code COMPARE_FAILURE(0x85, SCT=Media). FUSE_FIRST와 짝지어
+	 * Compare-and-Write atomic 구현. */
 	/* 0x06-0x07 - reserved */
 	SPDK_NVME_OPC_WRITE_ZEROES			= 0x08,
+	/* [한국어] 0x08 — Write Zeroes. 데이터 전송 없이 컨트롤러가 지정 LBA range를 0으로
+	 * 채움 (실제로는 thin-provision/dealloc 처리). bdev unmap의 fallback 또는 zero-fill. */
 	SPDK_NVME_OPC_DATASET_MANAGEMENT		= 0x09,
+	/* [한국어] 0x09 — Dataset Management (TRIM/Discard). CDW10[NR=range count-1]+CDW11
+	 * [Attribute=AD/IDR/IDW]+PRP1=struct spdk_nvme_dsm_range[N]. SSD에 LBA 영역 dealloc
+	 * 알려서 GC/wear-leveling 효율화. */
 
 	SPDK_NVME_OPC_VERIFY				= 0x0c,
+	/* [한국어] 0x0c — Verify (NVMe 1.4+). 호스트 데이터 전송 없이 컨트롤러가 LBA range의
+	 * media integrity 검증(읽어서 PI 검사). */
 	SPDK_NVME_OPC_RESERVATION_REGISTER		= 0x0d,
+	/* [한국어] 0x0d — Reservation Register. host_id를 NS reservation table에 등록/등록 해제. */
 	SPDK_NVME_OPC_RESERVATION_REPORT		= 0x0e,
+	/* [한국어] 0x0e — Reservation Report. 현재 NS의 모든 등록자/소유자 정보 회수(C2H). */
 
 	SPDK_NVME_OPC_RESERVATION_ACQUIRE		= 0x11,
+	/* [한국어] 0x11 — Reservation Acquire. 등록된 host가 reservation 획득(쓰기 독점 등). */
 	SPDK_NVME_OPC_IO_MANAGEMENT_RECEIVE		= 0x12,
+	/* [한국어] 0x12 — I/O Management Receive (FDP TP4146). FDP RUH 상태 조회. */
 	SPDK_NVME_OPC_RESERVATION_RELEASE		= 0x15,
+	/* [한국어] 0x15 — Reservation Release. reservation 해제 또는 모든 등록자 clear. */
 
 	SPDK_NVME_OPC_COPY				= 0x19,
+	/* [한국어] 0x19 — Copy (NVMe 2.0). 호스트 데이터 미경유, 컨트롤러 내부에서 source LBA
+	 * range를 dest LBA range로 복사(struct spdk_nvme_scc_source_range[] PRP). */
 	SPDK_NVME_OPC_IO_MANAGEMENT_SEND		= 0x1D,
+	/* [한국어] 0x1D — I/O Management Send (FDP). RUH update. */
 };
 
 /**
@@ -2063,10 +2473,18 @@ enum spdk_nvme_nvm_opcode {
  * In addition to the opcodes of the NVM command set, the Zoned Namespace
  * command set supports the following opcodes.
  */
+/* [한국어] === ZNS Command Set 추가 opcode (NVM CS opcode와 별개로 추가) ===
+ * NVMe ZNS Command Set Specification §3.4. nvme_zns.h에서 사용자 API로 노출. */
 enum spdk_nvme_zns_opcode {
 	SPDK_NVME_OPC_ZONE_MGMT_SEND			= 0x79,
+	/* [한국어] 0x79 — Zone Management Send. CDW13[ZSA] = Open/Close/Finish/Reset/Offline/
+	 * Set Descriptor Extension. zone state machine 전이 제어. */
 	SPDK_NVME_OPC_ZONE_MGMT_RECV			= 0x7a,
+	/* [한국어] 0x7a — Zone Management Receive. CDW13[ZRA]=0(Report)/1(Extended Report).
+	 * 페이로드(C2H)는 spdk_nvme_zns_zone_report + zone_desc 배열. */
 	SPDK_NVME_OPC_ZONE_APPEND			= 0x7d,
+	/* [한국어] 0x7d — Zone Append. ZSLBA(zone start)만 지정; 컨트롤러가 실제 write LBA
+	 * 결정 후 CQE.CDW0/1로 회신. write pointer 추적 불필요한 multi-producer. */
 };
 
 /**
@@ -2074,15 +2492,22 @@ enum spdk_nvme_zns_opcode {
  *
  * \sa spdk_nvme_opc_get_data_transfer
  */
+/* [한국어] === Data Transfer 방향 (opcode 하위 2비트) === NVMe Base 2.0 §5. opcode 인코딩
+ * 규칙으로 bit0=H2C 존재, bit1=C2H 존재를 표시. SPDK는 spdk_nvme_opc_get_data_transfer()
+ * 인라인으로 추출해 PRP/SGL 빌드 시 read/write 방향을 결정. */
 enum spdk_nvme_data_transfer {
 	/** Opcode does not transfer data */
 	SPDK_NVME_DATA_NONE				= 0,
+	/* [한국어] 0 — 데이터 전송 없음 (Flush, Verify, Abort 등). */
 	/** Opcode transfers data from host to controller (e.g. Write) */
 	SPDK_NVME_DATA_HOST_TO_CONTROLLER		= 1,
+	/* [한국어] 1 — H2C (Write, FW Download, Security Send, DSM 등). */
 	/** Opcode transfers data from controller to host (e.g. Read) */
 	SPDK_NVME_DATA_CONTROLLER_TO_HOST		= 2,
+	/* [한국어] 2 — C2H (Read, Identify, Get Log Page, Security Receive 등). */
 	/** Opcode transfers data both directions */
 	SPDK_NVME_DATA_BIDIRECTIONAL			= 3
+	/* [한국어] 3 — 양방향 (특수 명령 일부). */
 };
 
 /**
@@ -2185,42 +2610,74 @@ enum spdk_nvme_fdp_mgmt_send_mo {
 	SPDK_NVME_FDP_IO_MGMT_SEND_VS		= 0xFF,
 };
 
+/* [한국어] === Feature Identifier (FID) — Get/Set Features (CDW10[FID]) ===
+ * NVMe Base 2.0 §5.27/§5.15 Tables. 컨트롤러의 동작 모드/임계값/큐 구성을 RW로 제어.
+ * 각 FID마다 CDW11(~CDW13)의 비트 인코딩이 다르며 union spdk_nvme_feat_* 가 정의한다.
+ * Set: opcode=0x09, CDW10[FID,SAVE]+CDW11~13. Get: opcode=0x0A, CDW10[FID,SEL]. */
 enum spdk_nvme_feat {
 	/* 0x00 - reserved */
 
 	/** cdw11 layout defined by \ref spdk_nvme_feat_arbitration */
 	SPDK_NVME_FEAT_ARBITRATION				= 0x01,
+	/* [한국어] 0x01 — Arbitration. WRR(weighted round robin) 가중치 LPW/MPW/HPW와
+	 * Arbitration Burst(AB) 설정. CC.AMS=1일 때만 의미. */
 	/** cdw11 layout defined by \ref spdk_nvme_feat_power_management */
 	SPDK_NVME_FEAT_POWER_MANAGEMENT				= 0x02,
+	/* [한국어] 0x02 — Power Management. PS(power state) 0~31 + WH(workload hint). */
 	/** cdw11 layout defined by \ref spdk_nvme_feat_lba_range_type */
 	SPDK_NVME_FEAT_LBA_RANGE_TYPE				= 0x03,
+	/* [한국어] 0x03 — LBA Range Type. NS 내 partition별 type 분류 (data/cache/swap 등). */
 	/** cdw11 layout defined by \ref spdk_nvme_feat_temperature_threshold */
 	SPDK_NVME_FEAT_TEMPERATURE_THRESHOLD			= 0x04,
+	/* [한국어] 0x04 — Temperature Threshold. THSEL=0(over)/1(under) + TMPSEL(센서 인덱스)
+	 * + TMPTH(임계 온도 켈빈). 초과/미만 시 AER 발생 가능. */
 	/** cdw11 layout defined by \ref spdk_nvme_feat_error_recovery */
 	SPDK_NVME_FEAT_ERROR_RECOVERY				= 0x05,
+	/* [한국어] 0x05 — Error Recovery. TLER(Time Limited Error Recovery, 100ms 단위) +
+	 * DULBE(Deallocated/Unwritten Logical Block Error Enable). */
 	/** cdw11 layout defined by \ref spdk_nvme_feat_volatile_write_cache */
 	SPDK_NVME_FEAT_VOLATILE_WRITE_CACHE			= 0x06,
+	/* [한국어] 0x06 — Volatile Write Cache. WCE(write cache enable) 1비트. 끄면 모든 write가
+	 * media 도달 후에만 완료(latency↑, 안전↑). bdev_nvme의 'enable_caching' 옵션과 매핑. */
 	/** cdw11 layout defined by \ref spdk_nvme_feat_number_of_queues */
 	SPDK_NVME_FEAT_NUMBER_OF_QUEUES				= 0x07,
+	/* [한국어] 0x07 — Number of Queues. CDW11=요청 SQ/CQ 수(0-based), CQE.CDW0=실제 할당.
+	 * lib/nvme/nvme_ctrlr.c가 init 시 발행해 max I/O qpair 수 결정. */
 	/** cdw11 layout defined by \ref spdk_nvme_feat_interrupt_coalescing */
 	SPDK_NVME_FEAT_INTERRUPT_COALESCING			= 0x08,
+	/* [한국어] 0x08 — Interrupt Coalescing. THR(threshold)+TIME(100us 단위). polled-mode
+	 * 에서는 의미 없음. */
 	/** cdw11 layout defined by \ref spdk_nvme_feat_interrupt_vector_configuration */
 	SPDK_NVME_FEAT_INTERRUPT_VECTOR_CONFIGURATION		= 0x09,
+	/* [한국어] 0x09 — Interrupt Vector Config. 벡터별 CD(Coalescing Disable). */
 	/** cdw11 layout defined by \ref spdk_nvme_feat_write_atomicity */
 	SPDK_NVME_FEAT_WRITE_ATOMICITY				= 0x0A,
+	/* [한국어] 0x0A — Write Atomicity Normal. DN(Disable Normal) AWUN/AWUPF 사용 여부. */
 	/** cdw11 layout defined by \ref spdk_nvme_feat_async_event_configuration */
 	SPDK_NVME_FEAT_ASYNC_EVENT_CONFIGURATION		= 0x0B,
+	/* [한국어] 0x0B — Async Event Config. 어떤 종류의 AER을 허용할지(SMART critical/
+	 * NS attribute changed/FW activation/telemetry 등) 비트마스크. */
 	/** cdw11 layout defined by \ref spdk_nvme_feat_autonomous_power_state_transition */
 	SPDK_NVME_FEAT_AUTONOMOUS_POWER_STATE_TRANSITION	= 0x0C,
+	/* [한국어] 0x0C — Autonomous Power State Transition. APSTE 활성화 시 컨트롤러가
+	 * idle 시간에 따라 자동 power state 전환. */
 	/** cdw11 layout defined by \ref spdk_nvme_feat_host_mem_buffer */
 	SPDK_NVME_FEAT_HOST_MEM_BUFFER				= 0x0D,
+	/* [한국어] 0x0D — Host Memory Buffer (HMB). 호스트가 컨트롤러에 DMA-able 메모리를
+	 * 할당해줘 DRAMless SSD가 FTL 매핑 캐시로 사용. SPDK는 hugepage 영역을 EHM=1로 등록. */
 	SPDK_NVME_FEAT_TIMESTAMP				= 0x0E,
+	/* [한국어] 0x0E — Timestamp. 호스트가 ms 단위 timestamp를 컨트롤러에 동기화 — error
+	 * log entry 의 timestamp 필드에 사용. */
 	/** cdw11 layout defined by \ref spdk_nvme_feat_keep_alive_timer */
 	SPDK_NVME_FEAT_KEEP_ALIVE_TIMER				= 0x0F,
+	/* [한국어] 0x0F — Keep Alive Timer. KATO(ms). NVMe-oF에서 호스트 dead 검출 타임아웃. */
 	/** cdw11 layout defined by \ref spdk_nvme_feat_host_controlled_thermal_management */
 	SPDK_NVME_FEAT_HOST_CONTROLLED_THERMAL_MANAGEMENT	= 0x10,
+	/* [한국어] 0x10 — HCTM. TMT1(non-critical)/TMT2(critical) 임계 온도. */
 	/** cdw11 layout defined by \ref spdk_nvme_feat_non_operational_power_state_config */
 	SPDK_NVME_FEAT_NON_OPERATIONAL_POWER_STATE_CONFIG	= 0x11,
+	/* [한국어] 0x11 — Non-Op Power State Config. NOPPME 활성화 시 non-operational PS도
+	 * APST 전환에 포함. */
 
 	SPDK_NVME_FEAT_READ_RECOVERY_LEVEL_CONFIG		= 0x12,
 	SPDK_NVME_FEAT_PREDICTABLE_LATENCY_MODE_CONFIG		= 0x13,
@@ -2318,60 +2775,95 @@ struct spdk_nvme_power_state {
 SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_power_state) == 32, "Incorrect size");
 
 /** Identify command CNS value */
+/* [한국어] === Identify(0x06) CNS — Controller or Namespace Structure 선택자 ===
+ * NVMe Base 2.0 §5.17. Identify 명령 CDW10 하위 8비트로 어떤 4096B 데이터 구조체를
+ * 받을지 결정. lib/nvme/nvme_ctrlr.c가 attach 시 IDENTIFY_CTRLR(0x01) → ACTIVE_NS_LIST
+ * (0x02) → NS_IOCS(0x05)/NS(0x00) → NS_ID_DESCRIPTOR_LIST(0x03) 순으로 발행해 컨트롤러/
+ * 네임스페이스 식별 정보를 캐시한다. CSI(Command Set Identifier)별 변형은 IOCS suffix를
+ * 가진 CNS(0x05/0x06/0x07/0x1a/0x1b)를 사용. */
 enum spdk_nvme_identify_cns {
 	/** Identify namespace indicated in CDW1.NSID */
 	SPDK_NVME_IDENTIFY_NS				= 0x00,
+	/* [한국어] 0x00 — Identify Namespace (NVM CS 한정). 결과는 struct spdk_nvme_ns_data
+	 * (4096B). NSID는 CDW1로 지정. */
 
 	/** Identify controller */
 	SPDK_NVME_IDENTIFY_CTRLR			= 0x01,
+	/* [한국어] 0x01 — Identify Controller. 결과는 struct spdk_nvme_ctrlr_data (4096B).
+	 * VID/SSVID/SN/MN/FR/RAB/IEEE/CMIC/MDTS/CNTLID/VER/RTD3R/RTD3E/OAES/CTRATT/RRLS/...
+	 * 모든 컨트롤러 capability 한 번에 회수. */
 
 	/** List active NSIDs greater than CDW1.NSID */
 	SPDK_NVME_IDENTIFY_ACTIVE_NS_LIST		= 0x02,
+	/* [한국어] 0x02 — Active Namespace List. 결과는 uint32_t[1024]. CDW1.NSID보다 큰
+	 * NSID들을 오름차순으로 반환(0으로 종료). */
 
 	/** List namespace identification descriptors */
 	SPDK_NVME_IDENTIFY_NS_ID_DESCRIPTOR_LIST	= 0x03,
+	/* [한국어] 0x03 — Namespace Identification Descriptor list. EUI64/NGUID/UUID/CSI 등
+	 * 영구 식별자 4096B. struct spdk_nvme_ns_id_desc 가변 길이 배열. */
 
 	/** Identify namespace indicated in CDW1.NSID, specific to CDW11.CSI */
 	SPDK_NVME_IDENTIFY_NS_IOCS			= 0x05,
+	/* [한국어] 0x05 — I/O CS specific Identify Namespace. CDW11.CSI=0x02면 ZNS namespace
+	 * (struct spdk_nvme_zns_ns_data 4096B), CSI=0x00이면 NVM CS의 추가 식별. */
 
 	/** Identify controller, specific to CDW11.CSI */
 	SPDK_NVME_IDENTIFY_CTRLR_IOCS			= 0x06,
+	/* [한국어] 0x06 — I/O CS specific Identify Controller. CSI=0x02면 spdk_nvme_zns_ctrlr_data
+	 * (ZASL 등 ZNS controller 한도). nvme_zns.h::spdk_nvme_zns_ctrlr_get_data가 이 캐시 반환. */
 
 	/** List active NSIDs greater than CDW1.NSID, specific to CDW11.CSI */
 	SPDK_NVME_IDENTIFY_ACTIVE_NS_LIST_IOCS		= 0x07,
+	/* [한국어] 0x07 — CSI 한정 Active NS list. CSI별 NSID 필터. */
 
 	/** I/O Command Set Independent Identify Namespace */
 	SPDK_NVME_IDENTIFY_NS_IOCS_INDEPENDENT		= 0x08,
+	/* [한국어] 0x08 — CS-independent NS identify (NVMe 2.0). LBSTM/NSFEAT/NMIC 등 CS와
+	 * 무관한 공통 속성. */
 
 	/** List allocated NSIDs greater than CDW1.NSID */
 	SPDK_NVME_IDENTIFY_ALLOCATED_NS_LIST		= 0x10,
+	/* [한국어] 0x10 — Allocated(생성됐지만 attach 안 된 것 포함) NS list. NS Management 후
+	 * 사용. */
 
 	/** Identify namespace if CDW1.NSID is allocated */
 	SPDK_NVME_IDENTIFY_NS_ALLOCATED			= 0x11,
+	/* [한국어] 0x11 — allocated NS identify. NS_MANAGEMENT(Create) 직후 사용. */
 
 	/** Get list of controllers starting at CDW10.CNTID that are attached to CDW1.NSID */
 	SPDK_NVME_IDENTIFY_NS_ATTACHED_CTRLR_LIST	= 0x12,
+	/* [한국어] 0x12 — 특정 NSID에 attach된 controller ID list. multi-controller subsystem용. */
 
 	/** Get list of controllers starting at CDW10.CNTID */
 	SPDK_NVME_IDENTIFY_CTRLR_LIST			= 0x13,
+	/* [한국어] 0x13 — subsystem 내 모든 controller ID list. */
 
 	/** Get primary controller capabilities structure */
 	SPDK_NVME_IDENTIFY_PRIMARY_CTRLR_CAP		= 0x14,
+	/* [한국어] 0x14 — Primary Controller Capabilities (struct spdk_nvme_primary_ctrl_capabilities,
+	 * 4096B). SR-IOV PF의 VQ/VI 자원 풀 정보. */
 
 	/** Get secondary controller list */
 	SPDK_NVME_IDENTIFY_SECONDARY_CTRLR_LIST		= 0x15,
+	/* [한국어] 0x15 — Secondary Controller List (VF 컨트롤러 32B 엔트리 배열). */
 
 	/** Get UUID List */
 	SPDK_NVME_IDENTIFY_UUID_LIST			= 0x17,
+	/* [한국어] 0x17 — Vendor-specific UUID list. */
 
 	/** List allocated NSIDs greater than CDW1.NSID, specific to CDW11.CSI */
 	SPDK_NVME_IDENTIFY_ALLOCATED_NS_LIST_IOCS	= 0x1a,
+	/* [한국어] 0x1a — CSI-filtered Allocated NS list. */
 
 	/** Identify namespace if CDW1.NSID is allocated, specific to CDWD11.CSI */
 	SPDK_NVME_IDENTIFY_NS_ALLOCATED_IOCS		= 0x1b,
+	/* [한국어] 0x1b — CSI-filtered allocated NS identify. */
 
 	/** Identify I/O Command Sets */
 	SPDK_NVME_IDENTIFY_IOCS				= 0x1c,
+	/* [한국어] 0x1c — I/O Command Sets supported (struct spdk_nvme_iocs_vector[]).
+	 * NSID 별로 어떤 CSI 조합이 enable 가능한지 반환. CC.CSS=0x6(IOCS 모드)에서 사용. */
 };
 
 /** NVMe over Fabrics controller model */
@@ -3725,26 +4217,38 @@ enum spdk_nvme_dealloc_logical_block_read_value {
 /**
  * Reservation Type Encoding
  */
+/* [한국어] === Reservation Type === NVMe Base 2.0 §8.19.1.
+ * Acquire 시 RTYPE으로 지정. SCSI Persistent Reservation과 1:1 호환되어 dual-stack 클러스터
+ * 환경에서 호스트가 NS를 단일 owner에 lock하거나 multi-host 일관성을 강제. */
 enum spdk_nvme_reservation_type {
 	/* 0x00 - reserved */
 
 	/* Write Exclusive Reservation */
 	SPDK_NVME_RESERVE_WRITE_EXCLUSIVE		= 0x1,
+	/* [한국어] 0x1 — Write Exclusive. owner만 write 가능. read는 모든 host. */
 
 	/* Exclusive Access Reservation */
 	SPDK_NVME_RESERVE_EXCLUSIVE_ACCESS		= 0x2,
+	/* [한국어] 0x2 — Exclusive Access. owner만 read/write. 다른 host는 status code
+	 * Reservation Conflict로 reject. */
 
 	/* Write Exclusive - Registrants Only Reservation */
 	SPDK_NVME_RESERVE_WRITE_EXCLUSIVE_REG_ONLY	= 0x3,
+	/* [한국어] 0x3 — Write Exclusive - Registrants Only. write는 등록된 host만, read는
+	 * 모든 host. */
 
 	/* Exclusive Access - Registrants Only Reservation */
 	SPDK_NVME_RESERVE_EXCLUSIVE_ACCESS_REG_ONLY	= 0x4,
+	/* [한국어] 0x4 — Exclusive Access - Registrants Only. read/write 모두 등록된 host만. */
 
 	/* Write Exclusive - All Registrants Reservation */
 	SPDK_NVME_RESERVE_WRITE_EXCLUSIVE_ALL_REGS	= 0x5,
+	/* [한국어] 0x5 — Write Exclusive - All Registrants. 등록된 모든 host가 write 가능
+	 * (소유자 역할 분산). */
 
 	/* Exclusive Access - All Registrants Reservation */
 	SPDK_NVME_RESERVE_EXCLUSIVE_ACCESS_ALL_REGS	= 0x6,
+	/* [한국어] 0x6 — Exclusive Access - All Registrants. 등록된 모든 host가 read/write. */
 
 	/* 0x7-0xFF - Reserved */
 };
@@ -3760,10 +4264,16 @@ SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_reservation_acquire_data) == 16, "Inc
 /**
  * Reservation Acquire action
  */
+/* [한국어] === Reservation Acquire (0x11) action ===
+ * NVMe Base 2.0 §8.19.4. host가 NS reservation을 잡거나 다른 host의 reservation을 빼앗기. */
 enum spdk_nvme_reservation_acquire_action {
 	SPDK_NVME_RESERVE_ACQUIRE		= 0x0,
+	/* [한국어] 0x0 — Acquire. crkey와 prkey=0으로 reservation 획득(이미 등록된 host만). */
 	SPDK_NVME_RESERVE_PREEMPT		= 0x1,
+	/* [한국어] 0x1 — Preempt. prkey가 가진 reservation을 빼앗기 + 모든 host의 등록 해제.
+	 * 페일오버에 사용. */
 	SPDK_NVME_RESERVE_PREEMPT_ABORT		= 0x2,
+	/* [한국어] 0x2 — Preempt + Abort. preempt에 더해 진행 중 I/O 즉시 abort. */
 };
 
 #pragma pack(push, 1)
@@ -3835,10 +4345,16 @@ enum spdk_nvme_reservation_register_cptpl {
 /**
  * Registration action for Reservation Register command
  */
+/* [한국어] === Reservation Register (0x0d) action ===
+ * NVMe Base 2.0 §8.19.3. host_id를 NS의 등록자 목록에 추가/제거/키 교체. reservation
+ * acquire 전에 register가 선행되어야 함. */
 enum spdk_nvme_reservation_register_action {
 	SPDK_NVME_RESERVE_REGISTER_KEY		= 0x0,
+	/* [한국어] 0x0 — 새 nrkey로 등록. 이미 등록된 host는 status code reservation conflict. */
 	SPDK_NVME_RESERVE_UNREGISTER_KEY	= 0x1,
+	/* [한국어] 0x1 — crkey 일치 시 등록 해제. */
 	SPDK_NVME_RESERVE_REPLACE_KEY		= 0x2,
+	/* [한국어] 0x2 — crkey → nrkey로 키 교체. host_id는 유지. */
 };
 
 struct spdk_nvme_reservation_register_data {
@@ -3858,9 +4374,13 @@ SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_reservation_key_data) == 8, "Incorrec
 /**
  * Reservation Release action
  */
+/* [한국어] === Reservation Release (0x15) action ===
+ * NVMe Base 2.0 §8.19.5. */
 enum spdk_nvme_reservation_release_action {
 	SPDK_NVME_RESERVE_RELEASE		= 0x0,
+	/* [한국어] 0x0 — Release. 자신의 reservation 해제(등록은 유지). */
 	SPDK_NVME_RESERVE_CLEAR			= 0x1,
+	/* [한국어] 0x1 — Clear. 모든 등록 해제 + reservation clear (기존 owner만 가능). */
 };
 
 /**
@@ -3899,110 +4419,166 @@ SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_reservation_notification_log) == 64, 
 /**
  * Log page identifiers for SPDK_NVME_OPC_GET_LOG_PAGE
  */
+/* [한국어] === Log Page Identifier (LID) — Get Log Page (CDW10[LID]) ===
+ * NVMe Base 2.0 §5.16. 컨트롤러 통계/상태/이벤트를 풀(pull) 방식으로 회수. AER가 통지하면
+ * 호스트가 해당 LID로 Get Log Page를 발행해 상세 데이터 수확. SPDK는 spdk_nvme_ctrlr_cmd_
+ * get_log_page() 공개 API로 모든 LID 조회 가능. */
 enum spdk_nvme_log_page {
 	/** Supported log pages (optional) */
 	SPDK_NVME_LOG_SUPPORTED_LOG_PAGES	= 0x00,
+	/* [한국어] 0x00 — Supported Log Pages (NVMe 2.0). 1024B. struct
+	 * spdk_nvme_supported_log_pages — LID별 지원 여부 비트맵. */
 
 	/** Error information (mandatory) - \ref spdk_nvme_error_information_entry */
 	SPDK_NVME_LOG_ERROR			= 0x01,
+	/* [한국어] 0x01 — Error Information (필수). 64B 엔트리 배열, 컨트롤러가 보관한 최근
+	 * 에러 N개. struct spdk_nvme_error_information_entry — error count, SQID, CID,
+	 * status, parameter error location, LBA, NSID, vendor specific. */
 
 	/** SMART / health information (mandatory) - \ref spdk_nvme_health_information_page */
 	SPDK_NVME_LOG_HEALTH_INFORMATION	= 0x02,
+	/* [한국어] 0x02 — SMART/Health (필수). 512B. struct spdk_nvme_health_information_page —
+	 * critical_warning, temperature, available_spare, percentage_used, data_units_r/w,
+	 * host_r/w_commands, controller_busy_time, power_cycles, power_on_hours, unsafe_shutdowns,
+	 * media_errors, num_error_info_log_entries. nvme-cli/spdk_nvme_perf 진단의 핵심. */
 
 	/** Firmware slot information (mandatory) - \ref spdk_nvme_firmware_page */
 	SPDK_NVME_LOG_FIRMWARE_SLOT		= 0x03,
+	/* [한국어] 0x03 — Firmware Slot (필수). 512B. AFI(active firmware info) +
+	 * 7개 firmware revision string. */
 
 	/** Changed namespace list (optional) */
 	SPDK_NVME_LOG_CHANGED_NS_LIST	= 0x04,
+	/* [한국어] 0x04 — Changed NS list. 4096B(uint32_t[1024]). NS attribute 변경 AER 후
+	 * 어떤 NS가 바뀌었는지 회수. */
 
 	/** Command effects log (optional) */
 	SPDK_NVME_LOG_COMMAND_EFFECTS_LOG	= 0x05,
+	/* [한국어] 0x05 — Commands Supported and Effects. 4096B. 각 admin/I/O opcode가 NS/
+	 * Controller capability에 미치는 영향(CSUPP, LBCC, NCC, NIC, CCC). NVMe-oF passthrough
+	 * 안전성 판단에 사용. */
 
 	/** Device self test (optional) */
 	SPDK_NVME_LOG_DEVICE_SELF_TEST	= 0x06,
+	/* [한국어] 0x06 — Device Self-Test 결과. */
 
 	/** Host initiated telemetry log (optional) */
 	SPDK_NVME_LOG_TELEMETRY_HOST_INITIATED	= 0x07,
+	/* [한국어] 0x07 — Host-initiated Telemetry. 호스트가 cdw10[LSP].bit0=1로 새 capture
+	 * 트리거 후 회수. struct spdk_nvme_telemetry_log_page_hdr 헤더 + 가변 데이터 영역
+	 * (3 data area). 펌웨어 디버그 덤프. */
 
 	/** Controller initiated telemetry log (optional) */
 	SPDK_NVME_LOG_TELEMETRY_CTRLR_INITIATED	= 0x08,
+	/* [한국어] 0x08 — Controller-initiated Telemetry. 컨트롤러가 critical event 발생 시
+	 * AER로 통지 후 호스트가 회수. */
 
 	/** Endurance group Information (optional) */
 	SPDK_NVME_LOG_ENDURANCE_GROUP_INFORMATION	= 0x09,
+	/* [한국어] 0x09 — Endurance Group Info. */
 
 	/** Predictable latency per NVM set (optional) */
 	SPDK_NVME_LOG_PREDICATBLE_LATENCY	= 0x0A,
+	/* [한국어] 0x0A — Predictable Latency Mode (PLM) per NVM set. */
 
 	/** Predictable latency event aggregate (optional) */
 	SPDK_NVME_LOG_PREDICTABLE_LATENCY_EVENT	= 0x0B,
+	/* [한국어] 0x0B — PLM 이벤트 집계. */
 
 	/** Asymmetric namespace access log (optional) */
 	SPDK_NVME_LOG_ASYMMETRIC_NAMESPACE_ACCESS = 0x0C,
+	/* [한국어] 0x0C — ANA Log Page. struct spdk_nvme_ana_page + ANA Group Descriptor
+	 * 배열. 각 NSID의 ANA state(Optimized/Non-Optimized/Inaccessible/Persistent Loss/
+	 * Change). NVMe-oF multipath의 핵심. */
 
 	/** Persistent event log (optional) */
 	SPDK_NVME_LOG_PERSISTENT_EVENT_LOG = 0x0D,
+	/* [한국어] 0x0D — Persistent Event Log. 전원 사이클을 넘어 보존되는 이벤트 기록. */
 
 	/* 0x0E NVM command set specific */
 
 	/** Endurance group event aggregate (optional) */
 	SPDK_NVME_LOG_ENDURANCE_GROUP_EVENT = 0x0F,
+	/* [한국어] 0x0F — Endurance Group Event. */
 
 	/** Media unit status (optional) */
 	SPDK_NVME_LOG_MEDIA_UNIT_STATUS = 0x10,
+	/* [한국어] 0x10 — Media Unit Status. */
 
 	/** Supported capacity configuration list (optional) */
 	SPDK_NVME_LOG_CAPACITY_CONFIGURATION_LIST	= 0x11,
+	/* [한국어] 0x11 — Capacity Configuration List. */
 
 	/** Feature identifiers supported and effects (optional) */
 	SPDK_NVME_LOG_FEATURE_IDS_EFFECTS	= 0x12,
+	/* [한국어] 0x12 — Feature Identifiers Supported and Effects. struct
+	 * spdk_nvme_feature_ids_effects_log_page (1024B). 각 FID 지원/저장 가능/CC 영향. */
 
 	/** NVMe-MI commands supported and effects (optional) */
 	SPDK_NVME_LOG_NVME_MI_COMMANDS_EFFECTS	= 0x13,
+	/* [한국어] 0x13 — NVMe-MI 명령 effects. */
 
 	/** Command and feature lockdown (optional) */
 	SPDK_NVME_LOG_COMMAND_FEATURE_LOCKDOWN	= 0x14,
+	/* [한국어] 0x14 — Command/Feature Lockdown. */
 
 	/** Boot partition (optional) */
 	SPDK_NVME_LOG_BOOT_PARTITION	= 0x15,
+	/* [한국어] 0x15 — Boot Partition log. */
 
 	/** Rotational media information (optional) */
 	SPDK_NVME_LOG_ROTATIONAL_MEDIA_INFORMATION	= 0x16,
+	/* [한국어] 0x16 — Rotational Media (HDD)에 대한 NVMe HDD 표준 정보. */
 
 	/* 0x17-0x1f - reserved */
 
 	/** FDP configurations (optional) */
 	SPDK_NVME_LOG_FDP_CONFIGURATIONS	= 0x20,
+	/* [한국어] 0x20 — FDP Configurations (TP4146). struct spdk_nvme_fdp_cfg_log_page +
+	 * cfg_descriptor 배열. */
 
 	/** Reclaim unit handle usage (optional) */
 	SPDK_NVME_LOG_RECLAIM_UNIT_HANDLE_USAGE	= 0x21,
+	/* [한국어] 0x21 — FDP RUH usage. struct spdk_nvme_fdp_ruhu_log_page. */
 
 	/** FDP statistics (optional) */
 	SPDK_NVME_LOG_FDP_STATISTICS	= 0x22,
+	/* [한국어] 0x22 — FDP statistics. struct spdk_nvme_fdp_stats_log_page. */
 
 	/** FDP events (optional) */
 	SPDK_NVME_LOG_FDP_EVENTS	= 0x23,
+	/* [한국어] 0x23 — FDP events log. struct spdk_nvme_fdp_events_log_page. */
 
 	/* 0x24-0x6f - reserved */
 
 	/** Discovery(refer to the NVMe over Fabrics specification) */
 	SPDK_NVME_LOG_DISCOVERY		= 0x70,
+	/* [한국어] 0x70 — NVMe-oF Discovery Log Page. NVMe-oF Discovery 컨트롤러에서 listen
+	 * 가능한 모든 NQN/transport/주소 회수. */
 
 	/* 0x71-0x7f - reserved for NVMe over Fabrics */
 
 	/** Reservation notification (optional) */
 	SPDK_NVME_LOG_RESERVATION_NOTIFICATION	= 0x80,
+	/* [한국어] 0x80 — Reservation Notification. struct spdk_nvme_reservation_notification_log
+	 * (64B). reservation 관련 AER 후 회수. */
 
 	/** Sanitize status (optional) */
 	SPDK_NVME_LOG_SANITIZE_STATUS = 0x81,
+	/* [한국어] 0x81 — Sanitize Status. struct spdk_nvme_sanitize_status_log_page (512B).
+	 * 진행률(SPROG), 상태(SSTAT), 작업 ID(SCDW10), 추정 완료 시간 등. */
 
 	/* 0x82-0xBE - I/O command set specific */
 
 	/** Changed zone list (refer to Zoned Namespace command set) */
 	SPDK_NVME_LOG_CHANGED_ZONE_LIST = 0xBF,
+	/* [한국어] 0xBF — ZNS Changed Zone List. zone state 변경 AER 후 회수. */
 
 	/* 0xC0-0xFF - vendor specific */
 	SPDK_NVME_LOG_VENDOR_SPECIFIC_START	= 0xc0,
+	/* [한국어] 0xC0 — vendor-specific 영역 시작. nvme_intel.h 등에서 정의. */
 	SPDK_NVME_LOG_VENDOR_SPECIFIC_END	= 0xff,
+	/* [한국어] 0xFF — vendor-specific 영역 끝. */
 };
 
 #define spdk_nvme_log_page_is_vendor_specific(lid) ((lid) >= SPDK_NVME_LOG_VENDOR_SPECIFIC_START)
@@ -4258,19 +4834,31 @@ SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_sanitize_status_log_page) == 512, "In
 /**
  * Asynchronous Event Type
  */
+/* [한국어] === Async Event Type (CQE.CDW0[2:0]) ===
+ * NVMe Base 2.0 §5.2.1. AER 명령(0x0c)의 완료 CDW0에서 type/info/log_page_id를 추출.
+ * type으로 카테고리 구분 후 info로 세부 사유 식별, log_page_identifier로 어떤 LID를
+ * Get Log Page로 회수해야 하는지 안내. */
 enum spdk_nvme_async_event_type {
 	/* Error Status */
 	SPDK_NVME_ASYNC_EVENT_TYPE_ERROR	= 0x0,
+	/* [한국어] 0x0 — 컨트롤러 내부 오류(persistent/transient/diagnostic). 호스트는 보통
+	 * Error Information log(LID=0x01)를 회수해 자세한 정보 확인. */
 	/* SMART/Health Status */
 	SPDK_NVME_ASYNC_EVENT_TYPE_SMART	= 0x1,
+	/* [한국어] 0x1 — SMART/Health 임계 초과(온도/spare/reliability). LID=0x02 회수. */
 	/* Notice */
 	SPDK_NVME_ASYNC_EVENT_TYPE_NOTICE	= 0x2,
+	/* [한국어] 0x2 — Notice 카테고리(NS attribute 변경, FW activation, ANA change,
+	 * Discovery log 변경). LID는 info에 따라 0x04/0x0C/0x70 등. */
 	/* 0x3 - 0x5 Reserved */
 
 	/* I/O Command Set Specific Status */
 	SPDK_NVME_ASYNC_EVENT_TYPE_IO		= 0x6,
+	/* [한국어] 0x6 — I/O CS 특화 이벤트(Reservation log available, Sanitize 완료,
+	 * Zone Descriptor 변경). LID=0x80(Reservation), 0x81(Sanitize), 0xBF(ZNS) 등. */
 	/* Vendor Specific */
 	SPDK_NVME_ASYNC_EVENT_TYPE_VENDOR	= 0x7,
+	/* [한국어] 0x7 — vendor 정의 이벤트. */
 };
 
 /**
@@ -4279,16 +4867,23 @@ enum spdk_nvme_async_event_type {
 enum spdk_nvme_async_event_info_error {
 	/* Write to Invalid Doorbell Register */
 	SPDK_NVME_ASYNC_EVENT_WRITE_INVALID_DB		= 0x0,
+	/* [한국어] 0x0 — 호스트가 잘못된 doorbell 주소에 write — 보통 SPDK 버그(잘못된 stride
+	 * 계산 등) 시 발생. */
 	/* Invalid Doorbell Register Write Value */
 	SPDK_NVME_ASYNC_EVENT_INVALID_DB_WRITE		= 0x1,
+	/* [한국어] 0x1 — doorbell에 큐 깊이 초과/0 등 잘못된 값 write. */
 	/* Diagnostic Failure */
 	SPDK_NVME_ASYNC_EVENT_DIAGNOSTIC_FAILURE	= 0x2,
+	/* [한국어] 0x2 — Device Self-Test 실패. */
 	/* Persistent Internal Error */
 	SPDK_NVME_ASYNC_EVENT_PERSISTENT_INTERNAL	= 0x3,
+	/* [한국어] 0x3 — 영구 내부 오류 — 컨트롤러 reset 필요. */
 	/* Transient Internal Error */
 	SPDK_NVME_ASYNC_EVENT_TRANSIENT_INTERNAL	= 0x4,
+	/* [한국어] 0x4 — 일시적 내부 오류 — retry로 복구 가능. */
 	/* Firmware Image Load Error */
 	SPDK_NVME_ASYNC_EVENT_FW_IMAGE_LOAD		= 0x5,
+	/* [한국어] 0x5 — 펌웨어 이미지 로딩 실패. */
 
 	/* 0x6 - 0xFF Reserved */
 };
@@ -4299,10 +4894,13 @@ enum spdk_nvme_async_event_info_error {
 enum spdk_nvme_async_event_info_smart {
 	/* NVM Subsystem Reliability */
 	SPDK_NVME_ASYNC_EVENT_SUBSYSTEM_RELIABILITY	= 0x0,
+	/* [한국어] 0x0 — 신뢰성 저하(media wearout 임박 등). */
 	/* Temperature Threshold */
 	SPDK_NVME_ASYNC_EVENT_TEMPERATURE_THRESHOLD	= 0x1,
+	/* [한국어] 0x1 — 온도 임계 초과/미만 — Set Features TEMPERATURE_THRESHOLD(0x04) 임계. */
 	/* Spare Below Threshold */
 	SPDK_NVME_ASYNC_EVENT_SPARE_BELOW_THRESHOLD	= 0x2,
+	/* [한국어] 0x2 — Available Spare 임계 미만. */
 
 	/* 0x3 - 0xFF Reserved */
 };
@@ -4313,17 +4911,23 @@ enum spdk_nvme_async_event_info_smart {
 enum spdk_nvme_async_event_info_notice {
 	/* Namespace Attribute Changed */
 	SPDK_NVME_ASYNC_EVENT_NS_ATTR_CHANGED		= 0x0,
+	/* [한국어] 0x0 — NS attribute 변경(NS create/delete, capacity 변경 등). LID=0x04
+	 * Changed NS list 회수. */
 	/* Firmware Activation Starting */
 	SPDK_NVME_ASYNC_EVENT_FW_ACTIVATION_START	= 0x1,
+	/* [한국어] 0x1 — Firmware activation 시작 — 호스트는 곧 컨트롤러 reset 가능성 대비. */
 	/* Telemetry Log Changed */
 	SPDK_NVME_ASYNC_EVENT_TELEMETRY_LOG_CHANGED	= 0x2,
+	/* [한국어] 0x2 — controller-initiated telemetry log 갱신. LID=0x08 회수. */
 	/* Asymmetric Namespace Access Change */
 	SPDK_NVME_ASYNC_EVENT_ANA_CHANGE		= 0x3,
+	/* [한국어] 0x3 — ANA state 변경. LID=0x0C 회수해 path 재계산. NVMe-oF multipath 핵심. */
 
 	/* 0x4 - 0xEF Reserved */
 
 	/** Discovery log change event(refer to the NVMe over Fabrics specification) */
 	SPDK_NVME_ASYNC_EVENT_DISCOVERY_LOG_CHANGE	= 0xF0,
+	/* [한국어] 0xF0 — Discovery 컨트롤러의 등록 정보 변경. LID=0x70 회수. */
 
 	/* 0xF1 - 0xFF Reserved */
 };
@@ -4334,8 +4938,10 @@ enum spdk_nvme_async_event_info_notice {
 enum spdk_nvme_async_event_info_nvm_command_set {
 	/* Reservation Log Page Available */
 	SPDK_NVME_ASYNC_EVENT_RESERVATION_LOG_AVAIL	= 0x0,
+	/* [한국어] 0x0 — Reservation 관련 이벤트. LID=0x80 회수. */
 	/* Sanitize Operation Completed */
 	SPDK_NVME_ASYNC_EVENT_SANITIZE_COMPLETED	= 0x1,
+	/* [한국어] 0x1 — Sanitize 완료. LID=0x81로 결과 확인. */
 
 	/* 0x2 - 0xFF Reserved */
 };
@@ -4343,13 +4949,20 @@ enum spdk_nvme_async_event_info_nvm_command_set {
 /**
  * Asynchronous Event Request Completion
  */
+/* [한국어] === AER Completion CDW0 인코딩 ===
+ * AER 명령의 CQE.CDW0에 type+info+log_page_id가 packed로 담긴다. SPDK는 lib/nvme/nvme_ctrlr.c
+ * ::nvme_ctrlr_async_event_cb에서 이 union으로 디코딩 → 사용자 등록 콜백 호출 → 필요 시
+ * Get Log Page로 후속 데이터 회수. */
 union spdk_nvme_async_event_completion {
 	uint32_t raw;
 	struct {
 		uint32_t async_event_type	: 3;
+		/* [한국어] [2:0] type — enum spdk_nvme_async_event_type. */
 		uint32_t reserved1		: 5;
 		uint32_t async_event_info	: 8;
+		/* [한국어] [15:8] info — type별 enum spdk_nvme_async_event_info_*. */
 		uint32_t log_page_identifier	: 8;
+		/* [한국어] [23:16] LID — 호스트가 후속 Get Log Page에 사용할 ID. */
 		uint32_t reserved2		: 8;
 	} bits;
 };
@@ -4383,12 +4996,22 @@ struct spdk_nvme_ana_page {
 SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_ana_page) == 16, "Incorrect size");
 
 /* Asymmetric namespace access state */
+/* [한국어] === ANA(Asymmetric Namespace Access) State === NVMe Base 1.4+ §8.20.
+ * NVMe-oF multipath의 핵심. (controller, ANA group)별 상태로 호스트가 어느 path를 우선
+ * 사용할지 결정. NVMe-oF에서 host는 ANA log(LID=0x0C)와 ANA Change AER로 상태 추적. */
 enum spdk_nvme_ana_state {
 	SPDK_NVME_ANA_OPTIMIZED_STATE		= 0x1,
+	/* [한국어] 0x1 — Optimized. 최적 경로. 호스트는 이 path 우선 사용. */
 	SPDK_NVME_ANA_NON_OPTIMIZED_STATE	= 0x2,
+	/* [한국어] 0x2 — Non-Optimized. 사용 가능하나 latency/throughput 저하 가능. fail-over
+	 * 백업 경로. */
 	SPDK_NVME_ANA_INACCESSIBLE_STATE	= 0x3,
+	/* [한국어] 0x3 — Inaccessible. 일시적으로 접근 불가(상태 전이 중 등). retry로 대체. */
 	SPDK_NVME_ANA_PERSISTENT_LOSS_STATE	= 0x4,
+	/* [한국어] 0x4 — Persistent Loss. 영구 접근 불가(컨트롤러 down 등). 호스트가 path 제거. */
 	SPDK_NVME_ANA_CHANGE_STATE		= 0xF,
+	/* [한국어] 0xF — Change. ANA group 상태가 바뀌는 중. 호스트는 곧 새 상태로 갱신될 것을
+	 * 기대하고 retry 또는 path 재계산. */
 };
 
 /* ANA group descriptor */
@@ -4695,73 +5318,122 @@ struct spdk_nvme_ctrlr_list {
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_ctrlr_list) == 4096, "Incorrect size");
 
+/* [한국어] === Command Set Identifier (CSI) ===
+ * NVMe Base 2.0 §3.1.5. CC.CSS=0x6에서 namespace당 1개. NS Identification descriptor의
+ * nidt=4(CSI)로 노출. */
 enum spdk_nvme_csi {
 	SPDK_NVME_CSI_NVM	= 0x0,
+	/* [한국어] 0x0 — NVM Command Set (read/write/flush 등 표준). */
 	SPDK_NVME_CSI_KV	= 0x1,
+	/* [한국어] 0x1 — Key-Value Command Set (NVMe 2.0). */
 	SPDK_NVME_CSI_ZNS	= 0x2,
+	/* [한국어] 0x2 — Zoned Namespace Command Set. nvme_zns.h 사용자 API 활성. */
 };
 
+/* [한국어] === Format NVM (0x80) - SES (Secure Erase Setting) ===
+ * struct spdk_nvme_format.ses 필드. NVMe Base 2.0 §5.14. */
 enum spdk_nvme_secure_erase_setting {
 	SPDK_NVME_FMT_NVM_SES_NO_SECURE_ERASE	= 0x0,
+	/* [한국어] 0x0 — secure erase 없이 단순 포맷(메타만 변경). */
 	SPDK_NVME_FMT_NVM_SES_USER_DATA_ERASE	= 0x1,
+	/* [한국어] 0x1 — User Data Erase. 모든 LBA를 복구 불가능한 패턴으로 덮어씀. */
 	SPDK_NVME_FMT_NVM_SES_CRYPTO_ERASE	= 0x2,
+	/* [한국어] 0x2 — Cryptographic Erase. 미디어 암호화 키 폐기 — 즉시 모든 데이터 복구
+	 * 불가. 가장 빠르지만 SED 컨트롤러만 지원. */
 };
 
+/* [한국어] === PI(Protection Information) location in metadata === */
 enum spdk_nvme_pi_location {
 	SPDK_NVME_FMT_NVM_PROTECTION_AT_TAIL	= 0x0,
+	/* [한국어] 0x0 — 메타데이터의 뒤(tail)에 PI 8B. NVMe 표준 위치. */
 	SPDK_NVME_FMT_NVM_PROTECTION_AT_HEAD	= 0x1,
+	/* [한국어] 0x1 — 메타데이터의 앞(head)에 PI 8B. SCSI T10 DIF 호환. */
 };
 
+/* [한국어] === PI Type === T10 DIF/DIX type. */
 enum spdk_nvme_pi_type {
 	SPDK_NVME_FMT_NVM_PROTECTION_DISABLE		= 0x0,
+	/* [한국어] 0x0 — PI 비활성. 메타만 사용. */
 	SPDK_NVME_FMT_NVM_PROTECTION_TYPE1		= 0x1,
+	/* [한국어] 0x1 — PI Type 1. RefTag 매 블록마다 +1. AppTag 0xFFFF는 escape. */
 	SPDK_NVME_FMT_NVM_PROTECTION_TYPE2		= 0x2,
+	/* [한국어] 0x2 — PI Type 2. RefTag 호스트 자유 설정. */
 	SPDK_NVME_FMT_NVM_PROTECTION_TYPE3		= 0x3,
+	/* [한국어] 0x3 — PI Type 3. RefTag/AppTag 모두 호스트 자유 설정. */
 };
 
+/* [한국어] === Metadata transfer === */
 enum spdk_nvme_metadata_setting {
 	SPDK_NVME_FMT_NVM_METADATA_TRANSFER_AS_BUFFER	= 0x0,
+	/* [한국어] 0x0 — 메타를 별도 버퍼로 전송(MPTR 사용). DIX 모드. */
 	SPDK_NVME_FMT_NVM_METADATA_TRANSFER_AS_LBA	= 0x1,
+	/* [한국어] 0x1 — 메타를 데이터 LBA에 인터리브 전송(extended LBA). DIF 모드. */
 };
 
 /* Format - Command Dword 10 */
+/* [한국어] === Format NVM (0x80) CDW10 인코딩 ===
+ * NVMe Base 2.0 §5.14. 모든 LBA 데이터가 파괴되므로 신중. NS Management로 NS를
+ * detach 후 발행하는 것이 안전. */
 struct spdk_nvme_format {
 	/* LBA format lower (LSB 4 bits of format index), also called lbafl in 2.0 spec */
 	uint32_t	lbaf		: 4;
+	/* [한국어] LBAF (lower 4 bits) — Identify NS의 lbaf[] 배열 인덱스. 어떤 LBA size +
+	 * MS 조합으로 포맷할지. lbafu와 합쳐 6비트 인덱스. */
 	/* Metadata settings, also called mset in 2.0 spec */
 	uint32_t	ms		: 1;
+	/* [한국어] MS — 메타데이터 전송 모드 (0=별도 버퍼, 1=extended LBA). */
 	/* Protection information */
 	uint32_t	pi		: 3;
+	/* [한국어] PI — enum spdk_nvme_pi_type (0=disable, 1/2/3=Type). */
 	/* Protection information location */
 	uint32_t	pil		: 1;
+	/* [한국어] PIL — 메타 안 PI 위치 (0=tail, 1=head). */
 	/* Secure erase settings */
 	uint32_t	ses		: 3;
+	/* [한국어] SES — enum spdk_nvme_secure_erase_setting. */
 	/* LBA format upper (MSB 2 bits of format index) */
 	uint32_t	lbafu		: 2;
+	/* [한국어] LBAFU (upper 2 bits) — NVMe 2.0에서 lbaf 인덱스가 4→6비트로 확장. */
 	uint32_t	reserved	: 18;
+	/* [한국어] 예약(0). */
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_format) == 4, "Incorrect size");
 
+/* [한국어] === T10 DIF Protection Information (8B) === Read/Write 시 메타데이터 영역에
+ * 포함되어 컨트롤러가 검증. NVMe NVM CS §5.2. */
 struct spdk_nvme_protection_info {
 	uint16_t	guard;
+	/* [한국어] Guard — LBA 데이터의 16비트 CRC (CRC-16 T10). Write 시 호스트가 계산해
+	 * 채우거나 PRACT=1로 컨트롤러에게 위임. */
 	uint16_t	app_tag;
+	/* [한국어] Application Tag — 호스트 정의 16비트 태그. 보통 application/file 식별. */
 	uint32_t	ref_tag;
+	/* [한국어] Reference Tag — 32비트, Type 1에서는 LBA 하위 32비트와 일치 강제,
+	 * Type 3에서는 호스트 자유. */
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_protection_info) == 8, "Incorrect size");
 
 /* Data structures for sanitize command */
 /* Sanitize - Command Dword 10 */
+/* [한국어] === Sanitize (0x84) CDW10 인코딩 ===
+ * NVMe Base 2.0 §5.24. 모든 LBA + 컨트롤러 캐시를 안전하게 폐기. 진행 중에는 일반 I/O
+ * 차단(SC=Sanitize In Progress 0x1d). 진행률은 LID=0x81로 폴링. */
 struct spdk_nvme_sanitize {
 	/* Sanitize Action (SANACT) */
 	uint32_t sanact	: 3;
+	/* [한국어] SANACT — enum spdk_sanitize_action. */
 	/* Allow Unrestricted Sanitize Exit (AUSE) */
 	uint32_t ause	: 1;
+	/* [한국어] AUSE — 1이면 sanitize 중단 시에도 컨트롤러 사용 가능(보안 약화). */
 	/* Overwrite Pass Count (OWPASS) */
 	uint32_t owpass	: 4;
+	/* [한국어] OWPASS — Overwrite 액션의 pass 수(0=16, 1~15=실제). */
 	/* Overwrite Invert Pattern Between Passes */
 	uint32_t oipbp	: 1;
+	/* [한국어] OIPBP — 1이면 각 pass마다 패턴을 반전. */
 	/* No Deallocate after sanitize (NDAS) */
 	uint32_t ndas	: 1;
+	/* [한국어] NDAS — 1이면 sanitize 후 LBA dealloc 안 함(블록 그대로 유지). */
 	/* reserved */
 	uint32_t reserved	: 22;
 };
@@ -4771,12 +5443,16 @@ SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_sanitize) == 4, "Incorrect size");
 enum spdk_sanitize_action {
 	/* Exit Failure Mode */
 	SPDK_NVME_SANITIZE_EXIT_FAILURE_MODE	= 0x1,
+	/* [한국어] 0x1 — sanitize 실패 후 failure mode 탈출. */
 	/* Start a Block Erase sanitize operation */
 	SPDK_NVME_SANITIZE_BLOCK_ERASE		= 0x2,
+	/* [한국어] 0x2 — Block Erase. 모든 NAND 블록 erase. */
 	/* Start an Overwrite sanitize operation */
 	SPDK_NVME_SANITIZE_OVERWRITE		= 0x3,
+	/* [한국어] 0x3 — Overwrite. 호스트가 지정 패턴(CDW11)을 N-pass로 덮어씀. */
 	/* Start a Crypto Erase sanitize operation */
 	SPDK_NVME_SANITIZE_CRYPTO_ERASE		= 0x4,
+	/* [한국어] 0x4 — Crypto Erase. 암호화 키 폐기 — 즉시 모든 데이터 복구 불가. */
 };
 
 /** Parameters for SPDK_NVME_OPC_FIRMWARE_COMMIT cdw10: commit action */
@@ -4863,30 +5539,52 @@ enum spdk_nvme_zns_zra_report_opts {
 	SPDK_NVME_ZRA_LIST_ZSO	= 0x7,
 };
 
+/* [한국어] === ZNS Zone Type === ZNS Spec §3.4.2.1. */
 enum spdk_nvme_zns_zone_type {
 	SPDK_NVME_ZONE_TYPE_SEQWR = 0x2,
+	/* [한국어] 0x2 — Sequential Write Required. ZNS 스펙 1.x에서 정의된 유일한 zone type.
+	 * write는 반드시 write pointer 위치에 sequential. random은 reset 후만 가능. */
 };
 
+/* [한국어] === ZNS Zone State Machine === ZNS Spec §3.4.2.4.
+ * 전이: EMPTY → (write) → IO/EO → (Close) → CLOSED → (Open) → IO/EO →
+ *       (Finish) → FULL → (Reset) → EMPTY. RO/OFFLINE은 미디어 손상 시 진입.
+ * 호스트는 Zone Management Send/Receive로 명시적 전이 또는 write로 자동 전이를 트리거. */
 enum spdk_nvme_zns_zone_state {
 	SPDK_NVME_ZONE_STATE_EMPTY	= 0x1,
+	/* [한국어] 0x1 — EMPTY. WP=ZSLBA, write 가능. reset 직후 또는 신규 zone. */
 	SPDK_NVME_ZONE_STATE_IOPEN	= 0x2,
+	/* [한국어] 0x2 — Implicitly Opened. write 한 번 발생 후 자동 진입. MOR 한도 영향. */
 	SPDK_NVME_ZONE_STATE_EOPEN	= 0x3,
+	/* [한국어] 0x3 — Explicitly Opened. Open 명령으로 진입. host 의도 표현. MOR/MAR 한도. */
 	SPDK_NVME_ZONE_STATE_CLOSED	= 0x4,
+	/* [한국어] 0x4 — CLOSED. Close 명령 또는 컨트롤러 자동 진입. WP는 보존, 자원 해제. */
 	SPDK_NVME_ZONE_STATE_RONLY	= 0xD,
+	/* [한국어] 0xD — Read Only. write 차단(미디어 손상 등 영구 상태). */
 	SPDK_NVME_ZONE_STATE_FULL	= 0xE,
+	/* [한국어] 0xE — FULL. WP=ZSLBA+ZCAP. write 불가. read만 가능. Reset으로 EMPTY 복귀. */
 	SPDK_NVME_ZONE_STATE_OFFLINE	= 0xF,
+	/* [한국어] 0xF — OFFLINE. 미디어 결함으로 read 불가. ZCAP=0. */
 };
 
+/* [한국어] === ZNS Zone Descriptor (64B) === Zone Management Receive 응답 페이로드의
+ * 핵심. 각 zone마다 1개. nvme_zns.h의 report_zones / ext_report_zones API가 이 배열을
+ * 호스트 메모리로 회수해 사용자에게 노출한다. */
 struct spdk_nvme_zns_zone_desc {
 	/** Zone Type */
 	uint8_t zt		: 4;
+	/* [한국어] zt — enum spdk_nvme_zns_zone_type (현재 SEQWR=0x2만 정의). */
 
 	uint8_t rsvd0		: 4;
+	/* [한국어] 예약(0). */
 
 	uint8_t rsvd1		: 4;
+	/* [한국어] 예약(0). */
 
 	/** Zone State */
 	uint8_t zs		: 4;
+	/* [한국어] zs — enum spdk_nvme_zns_zone_state. EMPTY/IOPEN/EOPEN/CLOSED/RONLY/FULL/
+	 * OFFLINE 중 하나. */
 
 	/**
 	 * Zone Attributes
@@ -4897,17 +5595,22 @@ struct spdk_nvme_zns_zone_desc {
 		struct {
 			/** Zone Finished by controller */
 			uint8_t zfc: 1;
+			/* [한국어] ZFC — 1이면 컨트롤러가 자체적으로 zone을 FULL로 전이. */
 
 			/** Finish Zone Recommended */
 			uint8_t fzr: 1;
+			/* [한국어] FZR — 컨트롤러가 호스트에 finish 권고(GC 효율 향상 등). */
 
 			/** Reset Zone Recommended */
 			uint8_t rzr: 1;
+			/* [한국어] RZR — 컨트롤러가 호스트에 reset 권고. */
 
 			uint8_t rsvd3 : 4;
 
 			/** Zone Descriptor Extension Valid */
 			uint8_t zdev: 1;
+			/* [한국어] ZDEV — 1이면 zone descriptor extension(zone-local 메타) 유효.
+			 * Set Zone Desc Extension 명령으로 호스트가 부착. ext_report_zones로 회수. */
 		} bits;
 	} za;
 
@@ -4915,29 +5618,50 @@ struct spdk_nvme_zns_zone_desc {
 
 	/** Zone Capacity (in number of LBAs) */
 	uint64_t zcap;
+	/* [한국어] zcap — 이 zone이 실제로 쓸 수 있는 LBA 수. zone_size보다 작을 수 있음
+	 * (NAND 페이지 정렬 등으로 인한 패딩). */
 
 	/** Zone Start LBA */
 	uint64_t zslba;
+	/* [한국어] zslba — zone의 첫 LBA. zone_size로 정렬됨. */
 
 	/** Write Pointer (LBA) */
 	uint64_t wp;
+	/* [한국어] wp — 다음 write가 일어날 LBA. EMPTY=zslba, FULL=zslba+zcap. */
 
 	uint8_t reserved32[32];
+	/* [한국어] 예약(0). 후속 ZNS 스펙 확장용. ext report 시 이 영역 뒤에 zone descriptor
+	 * extension 가변 길이가 따라옴(ext_size는 ZNS Identify Namespace의 zdes 값). */
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_zns_zone_desc) == 64, "Incorrect size");
 
+/* [한국어] === ZNS Zone Management Receive 응답 헤더 (64B) === 후행 descs[]는 가변 길이
+ * zone descriptor 배열. nr_zones는 partial_report=0면 namespace 전체, =1면 본 응답 페이로드
+ * 안의 개수. */
 struct spdk_nvme_zns_zone_report {
 	uint64_t nr_zones;
+	/* [한국어] nr_zones — partial_report=0이면 namespace 전체 zone 수, =1이면 본 페이로드의
+	 * descs[] 개수. nvme_zns.h::spdk_nvme_zns_report_zones의 partial_report 인자가 결정. */
 	uint8_t reserved8[56];
 	struct spdk_nvme_zns_zone_desc descs[];
+	/* [한국어] descs[] — 가변 길이 zone descriptor 배열. ext report인 경우 각 desc 뒤에
+	 * extension 데이터가 패딩. */
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_zns_zone_report) == 64, "Incorrect size");
 
 /* Directives field */
+/* [한국어] === Directive Type === NVMe Base 1.3+ §8.7.
+ * Directive Send/Receive(0x19/0x1a) 명령의 CDW11[DTYPE]과 write 명령 CDW12[DTYPE]에 사용.
+ * write에 dtype을 부착하면 컨트롤러가 hint 또는 NS 내 classification을 적용. */
 enum spdk_nvme_directive_type {
 	SPDK_NVME_DIRECTIVE_TYPE_IDENTIFY = 0x0,
+	/* [한국어] 0x0 — Identify directive. 지원되는 directive 종류 + enabled 상태 조회. */
 	SPDK_NVME_DIRECTIVE_TYPE_STREAMS = 0x1,
+	/* [한국어] 0x1 — Streams directive. write에 stream id(dspec)를 부착해 SSD가 같은
+	 * stream의 데이터를 NAND block 단위로 그룹화 → GC 효율 향상. (NVMe 1.3) */
 	SPDK_NVME_DIRECTIVE_TYPE_DATA_PLACEMENT = 0x2,
+	/* [한국어] 0x2 — Data Placement directive. FDP(TP4146)의 Reclaim Unit Handle(RUH) 지정.
+	 * write가 어느 RUH에 속할지 결정해 NAND wear/locality 제어. */
 };
 
 enum spdk_nvme_identify_directive_send_operation {
@@ -5089,40 +5813,70 @@ enum spdk_nvme_ctrlr_type {
 	((cpl)->status.sct == SPDK_NVME_SCT_GENERIC &&          \
 	 (cpl)->status.sc == SPDK_NVME_SC_ABORTED_BY_REQUEST)
 
+/* [한국어] === SPDK_NVME_IO_FLAGS — read/write/append API의 io_flags 인자 비트마스크 ===
+ * spdk_nvme_ns_cmd_read/write/append/compare/appendv 등이 모두 io_flags를 받아 SQE의
+ * 적절한 위치(CDW0[fuse] / CDW12[PRACT/PRCHK*/FUA/LR/DTYPE])로 분배. 사용자는 본 헤더의
+ * 매크로를 OR로 조합해 한 번에 전달. 비트 배치는 의도적으로 CDW12 상위 16비트와 1:1
+ * 매핑하여 변환 비용을 0으로 한다(SPDK_NVME_IO_FLAGS_CDW12_MASK). */
+
 /** Set fused operation */
 #define SPDK_NVME_IO_FLAGS_FUSE_FIRST (SPDK_NVME_CMD_FUSE_FIRST << 0)
+/* [한국어] FUSE_FIRST — 두 SQE를 fused pair로 묶어 atomic 실행. Compare-and-Write 시
+ * COMPARE에 FUSE_FIRST, WRITE에 FUSE_SECOND. CDW0의 fuse 필드(bit 8-9)에 들어감. */
 #define SPDK_NVME_IO_FLAGS_FUSE_SECOND (SPDK_NVME_CMD_FUSE_SECOND << 0)
+/* [한국어] FUSE_SECOND — fused pair의 두 번째 명령. */
 #define SPDK_NVME_IO_FLAGS_FUSE_MASK (SPDK_NVME_CMD_FUSE_MASK << 0)
+/* [한국어] FUSE_MASK — fuse 비트 추출 마스크. */
 
 /* Bits 20-31 of SPDK_NVME_IO_FLAGS map directly to their associated bits in
  * cdw12 for NVMe IO commands
  */
 /** For enabling directive types on write-oriented commands */
 #define SPDK_NVME_IO_FLAGS_DIRECTIVE(dtype) (dtype << 20)
+/* [한국어] DIRECTIVE — write 명령의 dtype 4비트(bit 20-23). Streams/Data Placement 등.
+ * dspec(stream id)는 cdw13에 별도. */
 #define SPDK_NVME_IO_FLAGS_STREAMS_DIRECTIVE \
 	SPDK_NVME_IO_FLAGS_DIRECTIVE(SPDK_NVME_DIRECTIVE_TYPE_STREAMS)
+/* [한국어] STREAMS_DIRECTIVE — Streams directive 활성화. NVMe 1.3 Streams. */
 #define SPDK_NVME_IO_FLAGS_DATA_PLACEMENT_DIRECTIVE \
 	SPDK_NVME_IO_FLAGS_DIRECTIVE(SPDK_NVME_DIRECTIVE_TYPE_DATA_PLACEMENT)
+/* [한국어] DATA_PLACEMENT_DIRECTIVE — FDP(TP4146) Data Placement directive. RUH 지정. */
 /** Zone append specific, determines the contents of the reference tag written to the media */
 #define SPDK_NVME_IO_FLAGS_ZONE_APPEND_PIREMAP (1U << 25)
+/* [한국어] PIREMAP (bit25) — Zone Append 시 컨트롤러가 ref_tag을 actual LBA로 자동 재기입.
+ * Type1 PI에서 호스트가 미리 ref_tag을 모를 때(append이므로) 필수. */
 /** Enable protection information checking of the Logical Block Reference Tag field */
 #define SPDK_NVME_IO_FLAGS_PRCHK_REFTAG (1U << 26)
+/* [한국어] PRCHK_REFTAG (bit26) — RefTag 검증 활성화. CDW12 bit 26. */
 /** Enable protection information checking of the Application Tag field */
 #define SPDK_NVME_IO_FLAGS_PRCHK_APPTAG (1U << 27)
+/* [한국어] PRCHK_APPTAG (bit27) — AppTag 검증 활성화. */
 /** Enable protection information checking of the Guard field */
 #define SPDK_NVME_IO_FLAGS_PRCHK_GUARD (1U << 28)
+/* [한국어] PRCHK_GUARD (bit28) — Guard(CRC-16) 검증 활성화. */
 /** The protection information is stripped or inserted when set this bit */
 #define SPDK_NVME_IO_FLAGS_PRACT (1U << 29)
+/* [한국어] PRACT (bit29) — Protection Information Action. write 시 컨트롤러가 PI 자동
+ * 생성/삽입(호스트 PI 미경유), read 시 자동 검증/제거. SPDK accel framework가 사용. */
 #define SPDK_NVME_IO_FLAGS_FORCE_UNIT_ACCESS (1U << 30)
+/* [한국어] FUA (bit30) — Force Unit Access. write 완료 전에 미디어까지 도달 보장
+ * (write cache 우회). read 시에는 cache가 아닌 media에서 직접 읽기. */
 #define SPDK_NVME_IO_FLAGS_LIMITED_RETRY (1U << 31)
+/* [한국어] LR (bit31) — Limited Retry. 컨트롤러가 에러 시 재시도 횟수 제한. 빠른 실패
+ * 우선 시 사용. */
 
 /** Mask of valid io flags mask */
 #define SPDK_NVME_IO_FLAGS_VALID_MASK 0xFFFF0003
+/* [한국어] VALID_MASK — 사용자가 지정 가능한 io_flags 비트 = bit0-1(fuse) + bit16-31. */
 #define SPDK_NVME_IO_FLAGS_CDW12_MASK 0xFFFF0000
+/* [한국어] CDW12_MASK — CDW12 상위 16비트(bit 16-31)와 1:1 매핑되는 영역. SPDK는
+ * (io_flags & CDW12_MASK)을 그대로 cdw12에 OR해서 비트 분배 비용 0. */
 #define SPDK_NVME_IO_FLAGS_PRCHK_MASK 0x1C000000
+/* [한국어] PRCHK_MASK — bit26-28 (REFTAG/APPTAG/GUARD) 검증 비트 묶음. */
 
 /** Identify command buffer response size */
 #define SPDK_NVME_IDENTIFY_BUFLEN 4096
+/* [한국어] Identify 응답 페이로드 크기 — 모든 CNS 변형이 정확히 4096B(NVMe 스펙 강제). */
 
 #ifdef __cplusplus
 }
