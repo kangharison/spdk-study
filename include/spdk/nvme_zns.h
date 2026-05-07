@@ -62,8 +62,11 @@
 
 #ifndef SPDK_NVME_ZNS_H
 /* [한국어] SPDK_NVME_ZNS_H — 헤더 가드. 같은 컴파일 단위에서 nvme_zns.h가 두 번 이상 #include 되어도
- * 함수 선언이 중복되어 컴파일 에러를 일으키지 않도록 보호한다. (typedef/struct 선언 자체는 spdk/nvme.h 쪽에 있다.) */
+ * 함수 선언이 중복되어 컴파일 에러를 일으키지 않도록 보호한다. (typedef/struct 선언 자체는 spdk/nvme.h 쪽에 있다.)
+ * 두 번째 include 시 이 #ifndef 검사가 실패해 파일 끝의 #endif까지 전처리기 단계에서 통째로 스킵된다. */
 #define SPDK_NVME_ZNS_H
+/* [한국어] 헤더 가드 매크로 정의. 이 줄을 거치는 순간 SPDK_NVME_ZNS_H가 빈 토큰으로 정의되어, 같은 translation unit
+ * 안에서 다음번 nvme_zns.h include는 위의 #ifndef에서 곧장 #endif로 점프한다(가드 동작의 핵심). */
 
 #include "spdk/stdinc.h"
 /* [한국어] spdk/stdinc.h — SPDK 전체에서 사용되는 표준 헤더 모음(stddef/stdint/stdbool/string 등)을 한 번에 가져온다.
@@ -304,7 +307,7 @@ uint32_t spdk_nvme_zns_ns_get_max_active_zones(struct spdk_nvme_ns *ns);
  * support the Zoned Command Set.
  */
 /*
- * [한국語]
+ * [한국어]
  * spdk_nvme_zns_ctrlr_get_data - ZNS Command Set Specific Identify Controller 데이터(IDCTL, CSI=0x02) 캐시 반환.
  *
  * @ctrlr: NVMe controller 핸들. probe/attach 단계에서 얻은 불투명 포인터.
@@ -956,9 +959,13 @@ int spdk_nvme_zns_ext_report_zones(struct spdk_nvme_ns *ns, struct spdk_nvme_qpa
 				   spdk_nvme_cmd_cb cb_fn, void *cb_arg);
 
 #ifdef __cplusplus
-/* [한국어] C++ 컴파일러 환경에서 위에서 연 extern "C" 블록을 닫는다. C 컴파일에서는 매크로 미정의로 인해 이 블록이 통째로 무시된다. */
+/* [한국어] C++ 컴파일러 환경에서 위에서 연 extern "C" 블록을 닫는다. C 컴파일에서는 매크로 미정의로 인해 이 블록이 통째로 무시된다.
+ * 이 #ifdef는 라인 72의 #ifdef __cplusplus 블록과 짝을 이루며, 그 사이에 선언된 모든 spdk_nvme_zns_*() 함수가
+ * C 링키지로 노출되도록 보장한다. */
 }
+/* [한국어] extern "C" { 블록의 닫는 중괄호. C 컴파일에서는 위 #ifdef가 거짓이므로 이 라인까지 모두 전처리기 단계에서 사라진다. */
 #endif
 
-#endif
-/* [한국어] SPDK_NVME_ZNS_H 헤더 가드의 종결. 위 #ifndef와 짝을 이룬다. */
+#endif /* SPDK_NVME_ZNS_H */
+/* [한국어] SPDK_NVME_ZNS_H 헤더 가드의 종결. 라인 63의 #ifndef와 짝을 이뤄, 같은 translation unit에서 nvme_zns.h가
+ * 두 번째로 include될 때 본 파일 전체가 비어 있는 것처럼 처리되도록 한다(중복 선언 방지). */
