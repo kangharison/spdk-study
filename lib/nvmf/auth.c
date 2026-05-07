@@ -713,106 +713,212 @@ nvmf_auth_rearm_poller(struct spdk_nvmf_qpair *qpair)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_check_command - AuthSend/AuthRecv 공통 헤더 필드 검증.
+ *
+ * @req:   처리 중인 fabric AuthSend/Recv 요청.
+ * @secp:  Security Protocol 식별자 — 반드시 0xE9 (NVMe-oF Authentication).
+ * @spsp0: Security Protocol Specific 바이트 0 — in-band auth는 1.
+ * @spsp1: Security Protocol Specific 바이트 1 — in-band auth는 1.
+ * @len:   페이로드 길이(SPDK 트랜스포트가 보낸 tl/al 필드) — req->length와 일치 필수.
+ * @return: 0=정상, -EINVAL=프로토콜 위반.
+ *
+ * NVMe TP4022 §3.1 와이어 contract 검증:
+ *   - secp=0xE9 (SPDK_NVMF_AUTH_SECP_NVME): NVMe-oF authentication 임을 식별.
+ *     TCG Storage 와의 다른 secp 값(0xEC=Opal 등)과 구분.
+ *   - spsp0=1, spsp1=1: in-band auth 모드. 향후 TLS 1.3 in-band 0x02/0x03 등 확장 가능.
+ *   - len == req->length: 트랜스포트가 알린 길이와 실제 SGL이 받은 길이가 일치해야 함.
+ *
+ * 호출 컨텍스트: qpair 스레드. 비블로킹.
+ *
+ * 호출 체인:
+ *   nvmf_auth_send_exec / nvmf_auth_recv_exec → [이 함수] (실패 시 INVALID_FIELD 응답)
+ */
 static int
 nvmf_auth_check_command(struct spdk_nvmf_request *req, uint8_t secp,
 			uint8_t spsp0, uint8_t spsp1, uint32_t len)
 {
 	struct spdk_nvmf_qpair *qpair = req->qpair;
+	/* [한국어] qpair 역참조 — 에러 로그 prefix 생성용. */
 
 	if (secp != SPDK_NVMF_AUTH_SECP_NVME) {
+		/* [한국어] secp=0xE9가 아니면 NVMe-oF auth 가 아닌 다른 보안 프로토콜 — 거부.
+		 * TCG Opal(0xEC), TCG Storage(0xEF) 등이 이 fabric command 위에 올 수 있으나
+		 * 본 핸들러는 0xE9만 처리 대상. */
 		AUTH_ERRLOG(qpair, "invalid secp=%u\n", secp);
 		return -EINVAL;
 	}
 	if (spsp0 != 1 || spsp1 != 1) {
+		/* [한국어] in-band auth 는 (spsp0,spsp1)=(1,1) 고정. 다른 조합은 미정의/예약 — 거부. */
 		AUTH_ERRLOG(qpair, "invalid spsp0=%u, spsp1=%u\n", spsp0, spsp1);
 		return -EINVAL;
 	}
 	if (len != req->length) {
+		/* [한국어] 명령에 명시된 length와 실제 수신된 SGL 길이가 다름 — 트랜스포트 무결성 문제.
+		 * RDMA/TCP capsule 파싱 단계에서 정합되어야 정상. */
 		AUTH_ERRLOG(qpair, "invalid length: %"PRIu32" != %"PRIu32"\n", len, req->length);
 		return -EINVAL;
 	}
 
 	return 0;
+	/* [한국어] 모든 검증 통과 — 호출자가 페이로드 디스패치로 진입. */
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_get_message - 인증 페이로드 SGL이 단일 contiguous 버퍼인지 검증하고 포인터 반환.
+ *
+ * @req:  AuthSend/Recv 요청.
+ * @size: 호출자가 기대하는 최소 메시지 크기(공통 헤더 또는 sub-message 구조체 sizeof).
+ * @return: 메시지 시작 포인터 또는 NULL(요건 불충족).
+ *
+ * 인증 메시지는 일반적으로 작은(<=수 KB) 단일 capsule이므로 SPDK가 단일 IOV로 전달.
+ * 다중 IOV(scatter)는 본 코드가 지원하지 않음 — 트랜스포트별 SGL 처리 정책.
+ *
+ * 호출 컨텍스트: qpair 스레드.
+ *
+ * 호출 체인:
+ *   send_exec / recv_failure1 / recv_challenge / recv_success1 → [이 함수]
+ *   실패 시 INCORRECT_PAYLOAD 으로 fail1 진입.
+ */
 static void *
 nvmf_auth_get_message(struct spdk_nvmf_request *req, size_t size)
 {
 	if (req->length > 0 && req->iovcnt == 1 && req->iov[0].iov_len >= size) {
+		/* [한국어] 3가지 조건 동시 만족:
+		 *   - length>0: 페이로드가 비어있지 않음.
+		 *   - iovcnt==1: 단일 IOV (scatter SGL 미지원).
+		 *   - iov_len>=size: 호출자 요구 크기 이상 보유.
+		 * 모두 충족 시 첫 IOV의 base 포인터를 반환 — 호출자가 그대로 구조체 캐스팅. */
 		return req->iov[0].iov_base;
 	}
 
 	return NULL;
+	/* [한국어] 어느 한 조건이라도 미충족 — 호출자가 INCORRECT_PAYLOAD 처리. */
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_negotiate_exec - DH-HMAC-CHAP 1단계 (NEGOTIATE) 처리.
+ *
+ * @req: 호스트가 보낸 AuthSend(NEGOTIATE) 요청.
+ * @msg: AuthSend 페이로드 — struct spdk_nvmf_auth_negotiate (가변 길이, descriptors[] 포함).
+ *
+ * 동작 흐름 (NVMe TP4022 §3.3):
+ *   1) 상태 확인: NVMF_QPAIR_AUTH_NEGOTIATE 여야만 진행.
+ *   2) tid 보존 및 메시지 길이 검증 (sizeof + napd*sizeof(desc)).
+ *   3) sc_c (Secure Channel Concatenation) 확인 — 본 구현은 미지원.
+ *   4) descriptors 배열에서 auth_protocol_id=DHCHAP(0x01) 항목 검색.
+ *   5) digests[] 배열을 강도 순(SHA-512→256)으로 순회 + 정책 허용 여부 확인 →
+ *      호스트 hash_id_list와 교집합 → 가장 강한 것 선택.
+ *   6) dhgroups[] 배열을 동일 방식으로 순회 (8192→NULL) → 가장 강한 것 선택.
+ *   7) timeout poller 재무장.
+ *   8) 상태 → CHALLENGE 로 전이 + NVMe layer success 응답.
+ *
+ * 정책 우선순위 모델: 호스트가 nominate한 셋 중 컨트롤러가 허용하는 것 중 가장 강한 것.
+ * 강도 순서는 코드에 하드코딩 — 정책으로 약한 것을 비활성화 가능.
+ *
+ * 호출 컨텍스트: qpair 스레드. 비블로킹.
+ *
+ * 호출 체인:
+ *   nvmf_auth_send_exec → [이 함수] → set_state(CHALLENGE) → request_complete
+ *   실패 분기 → nvmf_auth_request_fail1 (다음 AuthRecv가 failure1 메시지 송신)
+ */
 static void
 nvmf_auth_negotiate_exec(struct spdk_nvmf_request *req, struct spdk_nvmf_auth_negotiate *msg)
 {
 	struct spdk_nvmf_qpair *qpair = req->qpair;
+	/* [한국어] 요청이 속한 qpair — 상태/식별 prefix용. */
 	struct spdk_nvmf_qpair_auth *auth = qpair->auth;
+	/* [한국어] 인증 컨텍스트 — 협상 결과(digest/dhgroup/tid) 보존 대상. */
 	struct spdk_nvmf_auth_descriptor *desc = NULL;
+	/* [한국어] DHCHAP descriptor — 호스트가 보낸 napd 항목 중 DHCHAP 형 하나만 사용.
+	 * NULL 초기화로 검색 후 미존재 분기 처리. */
 	/* These arrays are sorted from the strongest hash/dhgroup to the weakest, so the strongest
 	 * hash/dhgroup pair supported by the host is always selected
 	 */
+	/* [한국어] 강도 내림차순 — for 루프가 처음 만난 허용/일치 항목을 채택하면 곧 가장 강한 선택. */
 	enum spdk_nvmf_dhchap_hash digests[] = {
-		SPDK_NVMF_DHCHAP_HASH_SHA512,
-		SPDK_NVMF_DHCHAP_HASH_SHA384,
-		SPDK_NVMF_DHCHAP_HASH_SHA256
+		SPDK_NVMF_DHCHAP_HASH_SHA512,	/* [한국어] 64B digest. NIST FIPS 180-4 — 가장 안전. */
+		SPDK_NVMF_DHCHAP_HASH_SHA384,	/* [한국어] 48B digest. SHA-2 family. */
+		SPDK_NVMF_DHCHAP_HASH_SHA256	/* [한국어] 32B digest. NVMe-oF 호환 최소선. */
 	};
 	enum spdk_nvmf_dhchap_dhgroup dhgroups[] = {
-		SPDK_NVMF_DHCHAP_DHGROUP_8192,
-		SPDK_NVMF_DHCHAP_DHGROUP_6144,
-		SPDK_NVMF_DHCHAP_DHGROUP_4096,
-		SPDK_NVMF_DHCHAP_DHGROUP_3072,
-		SPDK_NVMF_DHCHAP_DHGROUP_2048,
-		SPDK_NVMF_DHCHAP_DHGROUP_NULL,
+		SPDK_NVMF_DHCHAP_DHGROUP_8192,	/* [한국어] ffdhe8192 (RFC 7919) — 8192비트 modulus. */
+		SPDK_NVMF_DHCHAP_DHGROUP_6144,	/* [한국어] ffdhe6144. */
+		SPDK_NVMF_DHCHAP_DHGROUP_4096,	/* [한국어] ffdhe4096. */
+		SPDK_NVMF_DHCHAP_DHGROUP_3072,	/* [한국어] ffdhe3072. */
+		SPDK_NVMF_DHCHAP_DHGROUP_2048,	/* [한국어] ffdhe2048 — 최소 안전선. */
+		SPDK_NVMF_DHCHAP_DHGROUP_NULL,	/* [한국어] DH 없음 — PSK 만 사용 (forward secrecy 없음). */
 	};
 	int digest = -1, dhgroup = -1;
+	/* [한국어] 협상 결과 임시 변수 — -1=미선택. 음수면 unusable 실패 분기. */
 	size_t i, j;
+	/* [한국어] 외부 루프(서버 우선순위)/내부 루프(호스트 nominate) 인덱스. */
 
 	if (auth->state != NVMF_QPAIR_AUTH_NEGOTIATE) {
+		/* [한국어] 상태가 NEGOTIATE 가 아닌데 NEGOTIATE 메시지 수신 — 프로토콜 위반.
+		 * 예: 이미 CHALLENGE/REPLY로 진행 중인데 호스트가 NEGOTIATE 재송신. */
 		AUTH_ERRLOG(qpair, "invalid state: %s\n", nvmf_auth_get_state_name(auth->state));
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_INCORRECT_PROTOCOL_MESSAGE);
 		return;
 	}
 
 	auth->tid = msg->t_id;
+	/* [한국어] 호스트가 정한 트랜잭션 ID 보존 — 이후 모든 메시지가 같은 tid 여야 함. */
 	if (req->length < sizeof(*msg) || req->length != sizeof(*msg) + msg->napd * sizeof(*desc)) {
+		/* [한국어] 페이로드 길이 정합성: 헤더 + napd 개의 descriptor.
+		 * 가변 길이 메시지 — napd로 정확히 계산되어야 함. */
 		AUTH_ERRLOG(qpair, "invalid message length: %"PRIu32"\n", req->length);
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_INCORRECT_PAYLOAD);
 		return;
 	}
 
 	if (msg->sc_c != SPDK_NVMF_AUTH_SCC_DISABLED) {
+		/* [한국어] sc_c (Secure Channel Concatenation) — TLS 위에 올린 in-band auth 와의
+		 * concatenation 요구. 본 구현은 SCC=disabled (concatenation 미사용)만 지원.
+		 * 호스트가 SCC 요구 시 SCC_MISMATCH 로 실패. */
 		AUTH_ERRLOG(qpair, "scc mismatch\n");
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_SCC_MISMATCH);
 		return;
 	}
 
 	for (i = 0; i < msg->napd; ++i) {
+		/* [한국어] 호스트가 nominate한 napd(Number of Auth Protocol Descriptors) 만큼 순회.
+		 * 본 구현은 DHCHAP만 지원하므로 첫 DHCHAP 항목 채택. */
 		if (msg->descriptors[i].auth_id == SPDK_NVMF_AUTH_TYPE_DHCHAP) {
 			desc = &msg->descriptors[i];
+			/* [한국어] DHCHAP descriptor 발견 — 이후 hash/dhgroup 협상은 이 desc 안에서. */
 			break;
 		}
 	}
 	if (desc == NULL) {
+		/* [한국어] 호스트 napd 안에 DHCHAP 가 없음 — 본 컨트롤러와 호환 가능 프로토콜 부재.
+		 * NVMe-oF 1.1 추가 프로토콜(예: PUF 기반)이 표준화되면 이 분기 확장. */
 		AUTH_ERRLOG(qpair, "no usable protocol found\n");
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_PROTOCOL_UNUSABLE);
 		return;
 	}
 	if (desc->halen > SPDK_COUNTOF(desc->hash_id_list) ||
 	    desc->dhlen > SPDK_COUNTOF(desc->dhg_id_list)) {
+		/* [한국어] descriptor 내부 halen(hash 개수)/dhlen(dhgroup 개수)이 배열 한도 초과 —
+		 * 와이어 포맷 정합 위반. spec 상 halen<=SPDK_COUNTOF(hash_id_list). */
 		AUTH_ERRLOG(qpair, "invalid halen=%u, dhlen=%u\n", desc->halen, desc->dhlen);
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_INCORRECT_PAYLOAD);
 		return;
 	}
 
 	for (i = 0; i < SPDK_COUNTOF(digests); ++i) {
+		/* [한국어] 외부 루프: 컨트롤러 우선순위 (강한 것부터). */
 		if (!nvmf_auth_digest_allowed(qpair, digests[i])) {
+			/* [한국어] 운영자가 정책으로 비활성화한 digest 는 후보에서 제외. */
 			continue;
 		}
 		for (j = 0; j < desc->halen; ++j) {
+			/* [한국어] 내부 루프: 호스트 nominate 셋. */
 			if (digests[i] == desc->hash_id_list[j]) {
+				/* [한국어] 양측이 모두 받아들이는 첫 매치 — 채택. */
 				AUTH_DEBUGLOG(qpair, "selected digest: %s\n",
 					      spdk_nvme_dhchap_get_digest_name(digests[i]));
 				digest = digests[i];
@@ -820,16 +926,19 @@ nvmf_auth_negotiate_exec(struct spdk_nvmf_request *req, struct spdk_nvmf_auth_ne
 			}
 		}
 		if (digest >= 0) {
+			/* [한국어] 한 번 채택되면 외부 루프도 종료 — 더 약한 것은 보지 않음. */
 			break;
 		}
 	}
 	if (digest < 0) {
+		/* [한국어] 모든 컨트롤러 허용 셋이 호스트 셋과 교집합 0 — 사용 가능 hash 부재. */
 		AUTH_ERRLOG(qpair, "no usable digests found\n");
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_HASH_UNUSABLE);
 		return;
 	}
 
 	for (i = 0; i < SPDK_COUNTOF(dhgroups); ++i) {
+		/* [한국어] dhgroup 협상 — digest와 동일 패턴(서버 우선순위 × 호스트 nominate). */
 		if (!nvmf_auth_dhgroup_allowed(qpair, dhgroups[i])) {
 			continue;
 		}
@@ -846,12 +955,16 @@ nvmf_auth_negotiate_exec(struct spdk_nvmf_request *req, struct spdk_nvmf_auth_ne
 		}
 	}
 	if (dhgroup < 0) {
+		/* [한국어] 사용 가능 dhgroup 부재 — NULL 까지 비활성화된 경우 또는 호스트가 NULL 미제공. */
 		AUTH_ERRLOG(qpair, "no usable dhgroups found\n");
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_DHGROUP_UNUSABLE);
 		return;
 	}
 
 	if (nvmf_auth_rearm_poller(qpair)) {
+		/* [한국어] timeout poller 재무장 실패 — 메모리 부족.
+		 * 응답 포함 완전 실패 처리: NVMe layer error + qpair disconnect.
+		 * fail1 패턴이 아닌 INTERNAL_DEVICE_ERROR — 와이어 protocol 응답 불가능. */
 		nvmf_auth_request_complete(req, SPDK_NVME_SCT_GENERIC,
 					   SPDK_NVME_SC_INTERNAL_DEVICE_ERROR, 1);
 		nvmf_auth_disconnect_qpair(qpair);
@@ -859,96 +972,174 @@ nvmf_auth_negotiate_exec(struct spdk_nvmf_request *req, struct spdk_nvmf_auth_ne
 	}
 
 	auth->digest = digest;
+	/* [한국어] 협상 결과 보존 — 이후 challenge/reply 모두 이 값 사용. */
 	auth->dhgroup = dhgroup;
+	/* [한국어] dhgroup 도 보존 — challenge에서 키페어 생성 여부 결정. */
 	nvmf_auth_set_state(qpair, NVMF_QPAIR_AUTH_CHALLENGE);
+	/* [한국어] 다음 단계로 전이 — 호스트의 AuthRecv(CHALLENGE) 요청 대기. */
 	nvmf_auth_request_complete(req, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, 0);
+	/* [한국어] AuthSend(NEGOTIATE) 자체는 NVMe layer success 로 응답.
+	 * 실제 challenge 페이로드는 호스트가 다음 AuthRecv 보낼 때 전달. */
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_reply_exec - DH-HMAC-CHAP 3단계 (REPLY) 처리.
+ *
+ * @req: 호스트가 보낸 AuthSend(REPLY) — challenge 에 대한 응답.
+ * @msg: 페이로드 — struct spdk_nvmf_dhchap_reply (cvalid, seqnum, rval[host_resp || ctrlr_chal || pubkey] 포함).
+ *
+ * 동작 흐름 (NVMe TP4022 §3.4):
+ *   1) 상태/길이/tid/cvalid/seqnum 정합성 검증.
+ *   2) keyring에서 호스트 PSK key (NVMF_AUTH_KEY_HOST) lookup.
+ *   3) dhgroup != NULL 이면 spdk_nvme_dhchap_dhkey_derive_secret() 으로 DH secret 도출.
+ *      입력: 컨트롤러 private key + 호스트 pubkey(rval[2*hl..])
+ *   4) spdk_nvme_dhchap_calculate("HostHost", ...) 로 기대 응답 R_h 계산.
+ *      HMAC 입력: K_h(host PSK) + C_t(auth->cval) + tid + seqnum + transcript ...
+ *   5) memcmp(msg->rval, response, hl) — 호스트가 보낸 응답과 일치하는지 검증.
+ *      실패 시 → AUTH_FAILED 로 fail1.
+ *   6) msg->cvalid=1 이면 (상호 인증 요청):
+ *      - 컨트롤러 key (NVMF_AUTH_KEY_CTRLR) lookup.
+ *      - spdk_nvme_dhchap_calculate("Controller", ...) 로 R_c 계산 후 auth->cval 에 저장.
+ *      - 이 R_c 는 success1 메시지에서 호스트로 송신.
+ *   7) timeout poller 재무장 + 상태 SUCCESS1 전이.
+ *
+ * 핵심 보안 핸들링:
+ *   - HMAC 검증 실패도 INCORRECT_PAYLOAD 가 아닌 AUTH_FAILED — 메시지 형식은 정상이지만
+ *     인증 자체가 실패함을 명확히 구분.
+ *   - 정확히 하나의 out: 라벨로 keyring put 보장 — 키 reference count leak 방지.
+ *
+ * 호출 컨텍스트: qpair 스레드. 비블로킹.
+ *
+ * 호출 체인:
+ *   nvmf_auth_send_exec → [이 함수] → set_state(SUCCESS1) → request_complete
+ *   실패 분기 → nvmf_auth_request_fail1
+ */
 static void
 nvmf_auth_reply_exec(struct spdk_nvmf_request *req, struct spdk_nvmf_dhchap_reply *msg)
 {
 	struct spdk_nvmf_qpair *qpair = req->qpair;
+	/* [한국어] 요청 → qpair 역참조. */
 	struct spdk_nvmf_ctrlr *ctrlr = qpair->ctrlr;
+	/* [한국어] qpair 가 속한 컨트롤러 — subsys/hostnqn 체이닝의 시작점. */
 	struct spdk_nvmf_qpair_auth *auth = qpair->auth;
+	/* [한국어] 인증 컨텍스트 — digest/dhgroup/cval/seqnum/dhkey 모두 보존됨. */
 	uint8_t response[NVMF_AUTH_DIGEST_MAX_SIZE];
+	/* [한국어] 컨트롤러가 자체 계산한 기대 응답 R_h — 호스트가 보낸 msg->rval과 비교용.
+	 * stack 버퍼: 최대 64B (SHA-512). 함수 종료 시 자동 회수 — 임시 비밀로 메모리 잔존 최소화. */
 	uint8_t dhsec[NVMF_AUTH_DH_KEY_MAX_SIZE];
+	/* [한국어] DH shared secret — dhgroup != NULL 일 때만 채워짐. 최대 1024B (ffdhe8192).
+	 * stack 보관 — 함수 종료 시 자동 회수, ephemeral DH 의 forward secrecy 의 한 축. */
 	struct spdk_key *key = NULL, *ckey = NULL;
+	/* [한국어] keyring 에서 가져온 PSK 핸들. NULL 초기화로 out: 에서 안전하게 put. */
 	size_t dhseclen = 0;
+	/* [한국어] dhsec 의 실제 길이. 0=DH 사용 안함 → calculate 에 NULL 전달. */
 	uint8_t hl;
+	/* [한국어] hash length — digest 에 따라 32/48/64. msg->hl 검증 및 HMAC/memcmp 길이로 사용. */
 	int rc;
+	/* [한국어] 임시 반환값. */
 
 	if (auth->state != NVMF_QPAIR_AUTH_REPLY) {
+		/* [한국어] 상태가 REPLY 가 아닌데 REPLY 메시지 도착 — 프로토콜 위반. */
 		AUTH_ERRLOG(qpair, "invalid state=%s\n", nvmf_auth_get_state_name(auth->state));
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_INCORRECT_PROTOCOL_MESSAGE);
 		goto out;
 	}
 	if (req->length < sizeof(*msg)) {
+		/* [한국어] 헤더만큼도 못 채운 경우 — 와이어 트렁케이션. */
 		AUTH_ERRLOG(qpair, "invalid message length=%"PRIu32"\n", req->length);
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_INCORRECT_PAYLOAD);
 		goto out;
 	}
 
 	hl = spdk_nvme_dhchap_get_digest_length(auth->digest);
+	/* [한국어] 협상된 digest 의 길이 추출 — SHA-256→32, SHA-384→48, SHA-512→64. */
 	if (hl == 0 || msg->hl != hl) {
+		/* [한국어] hl=0 이면 잘못된 digest id (방어적). msg->hl 이 협상값과 다르면 호스트 오작동. */
 		AUTH_ERRLOG(qpair, "hash length mismatch: %u != %u\n", msg->hl, hl);
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_INCORRECT_PAYLOAD);
 		goto out;
 	}
 	if ((msg->dhvlen % 4) != 0) {
+		/* [한국어] DH value 길이는 4B 정렬 필수 — NVMe TP4022 와이어 alignment 규칙. */
 		AUTH_ERRLOG(qpair, "dhvlen=%u is not multiple of 4\n", msg->dhvlen);
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_INCORRECT_PAYLOAD);
 		goto out;
 	}
 	if (req->length != sizeof(*msg) + 2 * hl + msg->dhvlen) {
+		/* [한국어] 정확한 페이로드 길이: 헤더 + R_h(hl) + C_h(hl) + DH pubkey(dhvlen).
+		 * 2*hl: msg->rval 영역에 [host 응답 R_h | host challenge C_h] 2개 hash 가 연이어. */
 		AUTH_ERRLOG(qpair, "invalid message length: %"PRIu32" != %zu\n",
 			    req->length, sizeof(*msg) + 2 * hl);
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_INCORRECT_PAYLOAD);
 		goto out;
 	}
 	if (msg->t_id != auth->tid) {
+		/* [한국어] 트랜잭션 ID 불일치 — 다른 세션과 혼동/replay 가능성. */
 		AUTH_ERRLOG(qpair, "transaction id mismatch: %u != %u\n", msg->t_id, auth->tid);
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_INCORRECT_PAYLOAD);
 		goto out;
 	}
 	if (msg->cvalid != 0 && msg->cvalid != 1) {
+		/* [한국어] cvalid 는 boolean — 0/1 외 값 거부 (방어적 검증, 향후 spec 확장 대비). */
 		AUTH_ERRLOG(qpair, "unexpected cvalid=%d\n", msg->cvalid);
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_INCORRECT_PAYLOAD);
 		goto out;
 	}
 	if (msg->cvalid && msg->seqnum == 0) {
+		/* [한국어] 상호 인증 요청(cvalid=1) 시 seqnum=0 금지 — TP4022 §3.4 명시.
+		 * seqnum=0 은 "이전 세션 재사용" 의미라 freshness 보장 불가. */
 		AUTH_ERRLOG(qpair, "unexpected seqnum=0 with cvalid=1\n");
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_INCORRECT_PAYLOAD);
 		goto out;
 	}
 
 	key = nvmf_subsystem_get_dhchap_key(ctrlr->subsys, ctrlr->hostnqn, NVMF_AUTH_KEY_HOST);
+	/* [한국어] keyring 에서 host PSK lookup — subsys + hostnqn 으로 식별.
+	 * RPC `nvmf_subsystem_add_host` 에서 등록한 키. reference count 증가 — out: 에서 put. */
 	if (key == NULL) {
+		/* [한국어] 호스트 키가 등록되어 있지 않음 — 인증 자체 불가. */
 		AUTH_ERRLOG(qpair, "couldn't get DH-HMAC-CHAP key\n");
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_FAILED);
 		goto out;
 	}
 
 	if (auth->dhgroup != SPDK_NVMF_DHCHAP_DHGROUP_NULL) {
+		/* [한국어] DH 사용 시: 호스트 pubkey 받아 secret 도출. */
 		AUTH_LOGDUMP("host pubkey:", &msg->rval[2 * hl], msg->dhvlen);
+		/* [한국어] msg->rval 레이아웃: [R_h | C_h | host_pubkey]. 2*hl 오프셋부터 pubkey. */
 		dhseclen = sizeof(dhsec);
+		/* [한국어] 입출력 인자: 입력=버퍼 크기, 출력=실제 secret 길이. */
 		rc = spdk_nvme_dhchap_dhkey_derive_secret(auth->dhkey, &msg->rval[2 * hl],
 				msg->dhvlen, dhsec, &dhseclen);
+		/* [한국어] DH secret 도출 — OpenSSL EVP_PKEY_derive(ctrlr_priv, host_pub) 호출.
+		 * 이 secret 이 forward secrecy 의 핵심 — ephemeral 이므로 세션 종료 시 폐기. */
 		if (rc != 0) {
+			/* [한국어] 호스트 pubkey 가 잘못된 그룹 또는 invalid point — 거부. */
 			AUTH_ERRLOG(qpair, "couldn't derive DH secret\n");
 			nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_FAILED);
 			goto out;
 		}
 
 		AUTH_LOGDUMP("dh secret:", dhsec, dhseclen);
+		/* [한국어] 디버그 빌드에서만 dump — 운영 빌드는 차단됨. */
 	}
 
 	assert(hl <= sizeof(response) && hl <= sizeof(auth->cval));
+	/* [한국어] 컴파일타임/런타임 buffer overflow 방어 — hl<=64B 보장. */
 	rc = spdk_nvme_dhchap_calculate(key, (enum spdk_nvmf_dhchap_hash)auth->digest,
 					"HostHost", auth->seqnum, auth->tid, 0,
 					ctrlr->hostnqn, ctrlr->subsys->subnqn,
 					dhseclen > 0 ? dhsec : NULL, dhseclen,
 					auth->cval, response);
+	/* [한국어] 호스트가 보내야 할 R_h 의 기대값 계산 — 와이어 spec §3.4:
+	 *   R_h = HMAC(K_h, "HostHost" || seqnum || tid || 0 || hostnqn || subnqn || dhsec || C_t)
+	 * 인자: key(K_h), digest, label("HostHost"), seqnum, tid, scc=0,
+	 *       host nqn, subsys nqn, dh secret(없으면 NULL), challenge nonce(C_t),
+	 *       출력: response[].
+	 * label="HostHost"는 호스트가 자신을 인증하는 응답임을 식별 — controller 응답 R_c 에선 "Controller". */
 	if (rc != 0) {
+		/* [한국어] HMAC 계산 자체 실패 — OpenSSL 또는 메모리 오류. AUTH_FAILED 로 통일. */
 		AUTH_ERRLOG(qpair, "failed to calculate challenge response: %s\n",
 			    spdk_strerror(-rc));
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_FAILED);
@@ -956,6 +1147,8 @@ nvmf_auth_reply_exec(struct spdk_nvmf_request *req, struct spdk_nvmf_dhchap_repl
 	}
 
 	if (memcmp(msg->rval, response, hl) != 0) {
+		/* [한국어] 호스트 R_h vs 컨트롤러 기대 R_h 비교 — 일치하지 않으면 PSK 불일치/사칭.
+		 * memcmp 는 timing-safe 가 아니지만 challenge 가 매번 random 이므로 실용 영향 미미. */
 		AUTH_ERRLOG(qpair, "challenge response mismatch\n");
 		AUTH_LOGDUMP("response:", msg->rval, hl);
 		AUTH_LOGDUMP("expected:", response, hl);
@@ -964,9 +1157,13 @@ nvmf_auth_reply_exec(struct spdk_nvmf_request *req, struct spdk_nvmf_dhchap_repl
 	}
 
 	if (msg->cvalid) {
+		/* [한국어] 호스트가 상호 인증 요청 — 컨트롤러도 자기 신원을 증명해야 함. */
 		ckey = nvmf_subsystem_get_dhchap_key(ctrlr->subsys, ctrlr->hostnqn,
 						     NVMF_AUTH_KEY_CTRLR);
+		/* [한국어] 컨트롤러 key 별도 lookup — 일반적으로 host key 와 별개로 운영자가 지정.
+		 * 양방향 인증 시 동일 키를 양쪽에서 알면 컨트롤러 사칭 위험. */
 		if (ckey == NULL) {
+			/* [한국어] 컨트롤러 key 미등록 — 상호 인증 불가. AUTH_FAILED 로 종료. */
 			AUTH_ERRLOG(qpair, "missing DH-HMAC-CHAP ctrlr key\n");
 			nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_FAILED);
 			goto out;
@@ -976,16 +1173,28 @@ nvmf_auth_reply_exec(struct spdk_nvmf_request *req, struct spdk_nvmf_dhchap_repl
 						ctrlr->subsys->subnqn, ctrlr->hostnqn,
 						dhseclen > 0 ? dhsec : NULL, dhseclen,
 						&msg->rval[hl], auth->cval);
+		/* [한국어] R_c = HMAC(K_c, "Controller" || msg->seqnum || tid || 0 ||
+		 *                    subnqn || hostnqn || dhsec || C_h)
+		 * 차이점:
+		 *   - key: ckey (controller PSK).
+		 *   - label: "Controller".
+		 *   - seqnum: 호스트가 보낸 msg->seqnum (controller seqnum 아님).
+		 *   - nqn 순서 reverse: subnqn first.
+		 *   - challenge: C_h (msg->rval[hl..2*hl]) — 호스트가 컨트롤러에 던진 nonce.
+		 *   - 출력: auth->cval — success1 송신 시 그대로 사용. */
 		if (rc != 0) {
+			/* [한국어] HMAC 계산 실패 — 위와 동일 처리. */
 			AUTH_ERRLOG(qpair, "failed to calculate ctrlr challenge response: %s\n",
 				    spdk_strerror(-rc));
 			nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_FAILED);
 			goto out;
 		}
 		auth->cvalid = true;
+		/* [한국어] success1 빌드 시 cval 을 rval 로 송신하도록 표시. */
 	}
 
 	if (nvmf_auth_rearm_poller(qpair)) {
+		/* [한국어] 다음 단계(SUCCESS1) 메시지 timeout 재시작 실패 — 인프라 에러. */
 		nvmf_auth_request_complete(req, SPDK_NVME_SCT_GENERIC,
 					   SPDK_NVME_SC_INTERNAL_DEVICE_ERROR, 1);
 		nvmf_auth_disconnect_qpair(qpair);
@@ -993,155 +1202,325 @@ nvmf_auth_reply_exec(struct spdk_nvmf_request *req, struct spdk_nvmf_dhchap_repl
 	}
 
 	nvmf_auth_set_state(qpair, NVMF_QPAIR_AUTH_SUCCESS1);
+	/* [한국어] 호스트 인증 통과 — SUCCESS1 메시지 송신 대기 상태로 전이. */
 	nvmf_auth_request_complete(req, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, 0);
+	/* [한국어] AuthSend(REPLY) 자체 NVMe layer success — 호스트가 다음 AuthRecv 를 보낸다. */
 out:
 	spdk_keyring_put_key(ckey);
+	/* [한국어] keyring reference count 감소 — NULL safe. 모든 분기 단일 종착점. */
 	spdk_keyring_put_key(key);
+	/* [한국어] host key 도 동일하게 정리. 두 put 모두 NULL safe 라 항상 호출 가능. */
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_success2_exec - 양방향 인증 마지막 5단계 (SUCCESS2) 처리.
+ *
+ * @req: 호스트의 AuthSend(SUCCESS2) — controller R_c 검증 통과를 호스트가 통지.
+ * @msg: 페이로드 — struct spdk_nvmf_dhchap_success2 (헤더 + tid 만).
+ *
+ * 호스트는 success1 에서 받은 R_c 를 자기 측에서 같은 키/입력으로 재계산해 비교.
+ * 일치하면 컨트롤러 인증 성공으로 보고 SUCCESS2 송신 → 본 함수가 받아 qpair=ENABLED.
+ * 불일치라면 호스트는 AUTH_failure2 를 보냄 → nvmf_auth_failure2_exec 처리.
+ *
+ * 동작 흐름 (NVMe TP4022 §3.5):
+ *   1) 상태/길이/tid 정합성 검증.
+ *   2) qpair 상태 → ENABLED (정상 NVMe I/O 처리 시작).
+ *   3) 인증 SM → COMPLETED.
+ *   4) timeout poller / dhkey ephemeral 자원 정리.
+ *
+ * 호출 컨텍스트: qpair 스레드.
+ *
+ * 호출 체인:
+ *   nvmf_auth_send_exec → [이 함수] → nvmf_qpair_set_state(ENABLED) + cleanup
+ */
 static void
 nvmf_auth_success2_exec(struct spdk_nvmf_request *req, struct spdk_nvmf_dhchap_success2 *msg)
 {
 	struct spdk_nvmf_qpair *qpair = req->qpair;
+	/* [한국어] 요청 → qpair 역참조. */
 	struct spdk_nvmf_qpair_auth *auth = qpair->auth;
+	/* [한국어] 인증 컨텍스트 — 정리 대상. */
 
 	if (auth->state != NVMF_QPAIR_AUTH_SUCCESS2) {
+		/* [한국어] 양방향 인증 흐름이 아닌데 SUCCESS2 도착 — 프로토콜 위반. */
 		AUTH_ERRLOG(qpair, "invalid state=%s\n", nvmf_auth_get_state_name(auth->state));
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_INCORRECT_PROTOCOL_MESSAGE);
 		return;
 	}
 	if (req->length != sizeof(*msg)) {
+		/* [한국어] success2 는 고정 길이 — 헤더만 있고 가변 영역 없음. */
 		AUTH_ERRLOG(qpair, "invalid message length=%"PRIu32"\n", req->length);
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_INCORRECT_PAYLOAD);
 		return;
 	}
 	if (msg->t_id != auth->tid) {
+		/* [한국어] tid 불일치 — 다른 세션 메시지 혼입. */
 		AUTH_ERRLOG(qpair, "transaction id mismatch: %u != %u\n", msg->t_id, auth->tid);
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_INCORRECT_PAYLOAD);
 		return;
 	}
 
 	AUTH_DEBUGLOG(qpair, "controller authentication successful\n");
+	/* [한국어] 양방향 인증 완료 — 컨트롤러 신원도 호스트에 의해 검증됨. */
 	nvmf_qpair_set_state(qpair, SPDK_NVMF_QPAIR_ENABLED);
+	/* [한국어] qpair 활성화 — 이후 일반 NVMe I/O 명령 처리 가능. */
 	nvmf_auth_set_state(qpair, NVMF_QPAIR_AUTH_COMPLETED);
+	/* [한국어] 인증 SM 도 COMPLETED 로 전이. */
 	nvmf_auth_qpair_cleanup(auth);
+	/* [한국어] timeout poller unregister + ephemeral DH key free — 더 이상 필요 없음. */
 	nvmf_auth_request_complete(req, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, 0);
+	/* [한국어] AuthSend(SUCCESS2) NVMe layer success 응답. */
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_failure2_exec - 호스트 측 컨트롤러 검증 실패 통지 (AUTH_failure2) 처리.
+ *
+ * @req: 호스트가 보낸 AuthSend(FAILURE2).
+ * @msg: 페이로드 — struct spdk_nvmf_auth_failure (rc, rce 필드 포함).
+ *
+ * 호스트가 success1 에서 받은 R_c 를 검증한 결과 불일치 → 컨트롤러 사칭 의심 →
+ * AUTH_failure2 메시지로 통지. 컨트롤러는 이를 받아 qpair=ERROR 로 전이 (sub-handler 정리는
+ * disconnect 경로에서).
+ *
+ * 동작:
+ *   1) 상태가 SUCCESS2 인지 확인 — 그 외에서 failure2 받으면 프로토콜 위반.
+ *   2) 길이/tid 검증.
+ *   3) rc/rce 로깅 (디버그) + 상태 ERROR.
+ *   4) 응답 자체는 NVMe layer success — disconnect 는 다른 경로에서 트리거.
+ *
+ * 호출 컨텍스트: qpair 스레드.
+ *
+ * 호출 체인:
+ *   nvmf_auth_send_exec → [이 함수] → set_state(ERROR)
+ */
 static void
 nvmf_auth_failure2_exec(struct spdk_nvmf_request *req, struct spdk_nvmf_auth_failure *msg)
 {
 	struct spdk_nvmf_qpair *qpair = req->qpair;
+	/* [한국어] 요청 → qpair 역참조. */
 	struct spdk_nvmf_qpair_auth *auth = qpair->auth;
+	/* [한국어] 인증 컨텍스트. */
 
 	/* AUTH_failure2 is only expected when we're waiting for the success2 message */
 	if (auth->state != NVMF_QPAIR_AUTH_SUCCESS2) {
+		/* [한국어] 영문 주석대로 — failure2 는 SUCCESS2 대기 중에만 의미. */
 		AUTH_ERRLOG(qpair, "invalid state=%s\n", nvmf_auth_get_state_name(auth->state));
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_INCORRECT_PROTOCOL_MESSAGE);
 		return;
 	}
 	if (req->length != sizeof(*msg)) {
+		/* [한국어] failure 메시지 고정 길이. */
 		AUTH_ERRLOG(qpair, "invalid message length=%"PRIu32"\n", req->length);
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_INCORRECT_PAYLOAD);
 		return;
 	}
 	if (msg->t_id != auth->tid) {
+		/* [한국어] tid 검증. */
 		AUTH_ERRLOG(qpair, "transaction id mismatch: %u != %u\n", msg->t_id, auth->tid);
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_INCORRECT_PAYLOAD);
 		return;
 	}
 
 	AUTH_ERRLOG(qpair, "ctrlr authentication failed: rc=%d, rce=%d\n", msg->rc, msg->rce);
+	/* [한국어] rc=Reason Code(ALL=0), rce=Reason Code Extension(detail). 운영자 진단 단서. */
 	nvmf_auth_set_state(qpair, NVMF_QPAIR_AUTH_ERROR);
+	/* [한국어] ERROR 상태 — 더 이상 인증 메시지 처리 안함. 후속 disconnect 는 transport 레벨에서. */
 	nvmf_auth_request_complete(req, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, 0);
+	/* [한국어] AuthSend(FAILURE2) 자체는 호스트의 보고이므로 NVMe layer success 응답. */
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_send_exec - AuthSend (fctype=0x05) 명령의 페이로드 디스패치.
+ *
+ * @req: AuthSend 요청.
+ *
+ * 동작:
+ *   1) 공통 fabric command 필드(secp/spsp0/spsp1/tl) 검증.
+ *   2) 페이로드의 첫 4B 공통 헤더 획득.
+ *   3) (auth_type, auth_id) 조합으로 sub-handler 분기:
+ *      COMMON × NEGOTIATE     → nvmf_auth_negotiate_exec
+ *      COMMON × FAILURE2      → nvmf_auth_failure2_exec
+ *      DHCHAP × REPLY         → nvmf_auth_reply_exec
+ *      DHCHAP × SUCCESS2      → nvmf_auth_success2_exec
+ *      기타 조합              → INCORRECT_PROTOCOL_MESSAGE 로 fail1.
+ *
+ * 호출 컨텍스트: qpair 스레드.
+ *
+ * 호출 체인:
+ *   nvmf_auth_request_exec → [이 함수] → 각 sub-handler.
+ */
 static void
 nvmf_auth_send_exec(struct spdk_nvmf_request *req)
 {
 	struct spdk_nvmf_qpair *qpair = req->qpair;
+	/* [한국어] 요청 → qpair. 로그 prefix 및 컨텍스트 검색용. */
 	struct spdk_nvmf_fabric_auth_send_cmd *cmd = &req->cmd->auth_send_cmd;
+	/* [한국어] union nvmf_h2c_msg 의 AuthSend command 뷰 — secp/spsp0/spsp1/tl 필드 접근. */
 	struct nvmf_auth_common_header *header;
+	/* [한국어] 페이로드 첫 4B 캐스팅 대상 — auth_type/auth_id 디스패치 키. */
 	int rc;
+	/* [한국어] check_command 반환값. */
 
 	rc = nvmf_auth_check_command(req, cmd->secp, cmd->spsp0, cmd->spsp1, cmd->tl);
+	/* [한국어] secp/spsp/tl 검증 — 와이어 프로토콜 일관성. */
 	if (rc != 0) {
+		/* [한국어] 검증 실패 — INVALID_FIELD 로 NVMe layer 거부. fail1 패턴 미사용
+		 * (이 단계는 AUTH 페이로드에 진입하기 전이라 application failure 가 아닌 명령 거부). */
 		nvmf_auth_request_complete(req, SPDK_NVME_SCT_GENERIC,
 					   SPDK_NVME_SC_INVALID_FIELD, 1);
 		return;
 	}
 
 	header = nvmf_auth_get_message(req, sizeof(*header));
+	/* [한국어] 페이로드 시작 4B 가져오기 — 단일 IOV + 길이 충분 시 포인터 반환. */
 	if (header == NULL) {
+		/* [한국어] 페이로드 부족/scatter — 진입할 sub-handler 결정 불가. */
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_INCORRECT_PAYLOAD);
 		return;
 	}
 
 	switch (header->auth_type) {
 	case SPDK_NVMF_AUTH_TYPE_COMMON_MESSAGE:
+		/* [한국어] COMMON family — NEGOTIATE/FAILURE 등 protocol-agnostic 메시지. */
 		switch (header->auth_id) {
 		case SPDK_NVMF_AUTH_ID_NEGOTIATE:
+			/* [한국어] 1단계 — digest/dhgroup 협상 시작. */
 			nvmf_auth_negotiate_exec(req, (void *)header);
 			break;
 		case SPDK_NVMF_AUTH_ID_FAILURE2:
+			/* [한국어] 호스트가 컨트롤러 인증 실패 통지 (양방향 인증 4단계). */
 			nvmf_auth_failure2_exec(req, (void *)header);
 			break;
 		default:
+			/* [한국어] COMMON 패밀리에 속하지 않는 알 수 없는 auth_id — 거부. */
 			AUTH_ERRLOG(qpair, "unexpected auth_id=%u\n", header->auth_id);
 			nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_INCORRECT_PROTOCOL_MESSAGE);
 			break;
 		}
 		break;
 	case SPDK_NVMF_AUTH_TYPE_DHCHAP:
+		/* [한국어] DHCHAP family — challenge-response 본 프로토콜. */
 		switch (header->auth_id) {
 		case SPDK_NVMF_AUTH_ID_DHCHAP_REPLY:
+			/* [한국어] 3단계 — 호스트 응답 R_h 검증. */
 			nvmf_auth_reply_exec(req, (void *)header);
 			break;
 		case SPDK_NVMF_AUTH_ID_DHCHAP_SUCCESS2:
+			/* [한국어] 5단계 — 양방향 인증 최종 confirm. */
 			nvmf_auth_success2_exec(req, (void *)header);
 			break;
 		default:
+			/* [한국어] DHCHAP 가족이지만 알 수 없는 sub-id — 거부.
+			 * 참고: CHALLENGE/SUCCESS1 은 host→ctrl 송신 대상이 아님 (ctrl→host 만). */
 			AUTH_ERRLOG(qpair, "unexpected auth_id=%u\n", header->auth_id);
 			nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_INCORRECT_PROTOCOL_MESSAGE);
 			break;
 		}
 		break;
 	default:
+		/* [한국어] auth_type 자체가 미정의 — 향후 확장(예: DH-EC 기반 새 가족). */
 		AUTH_ERRLOG(qpair, "unexpected auth_type=%u\n", header->auth_type);
 		nvmf_auth_request_fail1(req, SPDK_NVMF_AUTH_INCORRECT_PROTOCOL_MESSAGE);
 		break;
 	}
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_recv_complete - AuthRecv 응답 길이 설정 + NVMe completion.
+ *
+ * @req:    AuthRecv 요청.
+ * @length: 페이로드에 채워 넣은 실제 길이 (challenge/success/failure 메시지 크기).
+ *
+ * AuthRecv 는 호스트가 컨트롤러로부터 메시지를 가져가는 명령 — req->iov 에 페이로드를 빌드해
+ * 두고 req->length 를 정확한 송신 길이로 갱신해야 트랜스포트가 그 길이만 호스트로 보낸다.
+ *
+ * 호출 컨텍스트: qpair 스레드.
+ *
+ * 호출 체인:
+ *   recv_challenge / recv_success1 / recv_failure1 → [이 함수] → request_complete.
+ */
 static void
 nvmf_auth_recv_complete(struct spdk_nvmf_request *req, uint32_t length)
 {
 	assert(req->cmd->nvmf_cmd.fctype == SPDK_NVMF_FABRIC_COMMAND_AUTHENTICATION_RECV);
+	/* [한국어] 디버그 단언: 이 함수는 오직 AuthRecv 명령에 대해서만 호출. */
 	req->length = length;
+	/* [한국어] 트랜스포트가 이 length 만큼 SGL 데이터를 호스트로 송신하도록 갱신. */
 	nvmf_auth_request_complete(req, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, 0);
+	/* [한국어] NVMe layer success — 페이로드와 함께 호스트로 전달됨. */
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_recv_failure1_done - FAILURE1 메시지 송신 후 100ms 지연이 끝나면 호출되는 poller.
+ *
+ * @ctx: qpair 포인터.
+ * @return: SPDK_POLLER_BUSY.
+ *
+ * 인증 실패 후 즉시 disconnect 하지 않고 100ms 지연을 둔다 — 어느 단계에서 실패했는지를
+ * 응답시간으로 추론하는 timing side-channel 공격을 완화. 이 poller 가 발화하면 진짜로
+ * qpair 종료를 트리거.
+ *
+ * 호출 컨텍스트: qpair 스레드의 poller dispatcher.
+ *
+ * 호출 체인:
+ *   spdk_thread timer wheel → [이 함수] → nvmf_auth_disconnect_qpair → transport teardown.
+ */
 static int
 nvmf_auth_recv_failure1_done(void *ctx)
 {
 	struct spdk_nvmf_qpair *qpair = ctx;
+	/* [한국어] poller register 시 전달한 qpair 포인터 복원. */
 	struct spdk_nvmf_qpair_auth *auth = qpair->auth;
+	/* [한국어] 인증 컨텍스트 — poller 자기자신 unregister 용. */
 
 	spdk_poller_unregister(&auth->poller);
+	/* [한국어] one-shot 동작 — 재발화 방지. */
 	nvmf_auth_disconnect_qpair(qpair);
+	/* [한국어] qpair 종료 — ERROR 상태 표시 + transport 비동기 disconnect. */
 
 	return SPDK_POLLER_BUSY;
+	/* [한국어] poller idle 비율 통계용. */
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_recv_failure1 - AuthRecv 응답으로 AUTH_failure1 메시지 빌드 + 100ms 지연 disconnect 예약.
+ *
+ * @req:         AuthRecv 요청 (응답 버퍼 보유).
+ * @fail_reason: rce 필드에 들어갈 reason code.
+ *
+ * 동작:
+ *   1) 응답 페이로드에 AUTH_failure1 메시지 작성 (auth_type=COMMON, auth_id=FAILURE1, rc, rce).
+ *   2) 상태 → FAILURE1.
+ *   3) recv_complete 로 NVMe layer 응답 (응답 페이로드 호스트로 송신).
+ *   4) 기존 poller(KATO timeout) unregister 후 100ms 지연 poller 등록 →
+ *      nvmf_auth_recv_failure1_done 발화 시 disconnect.
+ *
+ * 호출 컨텍스트: qpair 스레드.
+ *
+ * 호출 체인:
+ *   nvmf_auth_recv_exec (FAILURE1 상태 또는 default) → [이 함수].
+ */
 static void
 nvmf_auth_recv_failure1(struct spdk_nvmf_request *req, int fail_reason)
 {
 	struct spdk_nvmf_qpair *qpair = req->qpair;
+	/* [한국어] 요청 → qpair. */
 	struct spdk_nvmf_qpair_auth *auth = qpair->auth;
+	/* [한국어] tid 보유 컨텍스트. */
 	struct spdk_nvmf_auth_failure *failure;
+	/* [한국어] 응답 페이로드 빌드 대상. */
 
 	failure = nvmf_auth_get_message(req, sizeof(*failure));
+	/* [한국어] req->iov 가 응답을 담을 단일 IOV이며 충분한 크기인지 확인. */
 	if (failure == NULL) {
+		/* [한국어] 응답 버퍼 부족 — failure 메시지를 못 보냄. NVMe layer 거부 + 즉시 disconnect.
+		 * 100ms 지연 없이 끊어도 무방 — failure 메시지를 송신하지 못한 fatal 케이스. */
 		nvmf_auth_request_complete(req, SPDK_NVME_SCT_GENERIC,
 					   SPDK_NVME_SC_INVALID_FIELD, 1);
 		nvmf_auth_disconnect_qpair(qpair);
@@ -1149,207 +1528,422 @@ nvmf_auth_recv_failure1(struct spdk_nvmf_request *req, int fail_reason)
 	}
 
 	failure->auth_type = SPDK_NVMF_AUTH_TYPE_COMMON_MESSAGE;
+	/* [한국어] COMMON 패밀리. */
 	failure->auth_id = SPDK_NVMF_AUTH_ID_FAILURE1;
+	/* [한국어] FAILURE1 sub-id (0xF0). */
 	failure->t_id = auth->tid;
+	/* [한국어] 협상 단계에서 호스트가 정한 tid 그대로 echo. */
 	failure->rc = SPDK_NVMF_AUTH_FAILURE;
+	/* [한국어] reason code: 1=Authentication Failure (실패의 일반 카테고리). */
 	failure->rce = fail_reason;
+	/* [한국어] reason code extension — INCORRECT_PAYLOAD/SCC_MISMATCH 등 세부. */
 
 	nvmf_auth_set_state(qpair, NVMF_QPAIR_AUTH_FAILURE1);
+	/* [한국어] 명시적으로 FAILURE1 상태 — 이미 fail1 호출자 측에서 set 했지만 중복 안전. */
 	nvmf_auth_recv_complete(req, sizeof(*failure));
+	/* [한국어] 호스트에 failure 메시지 송신 — 호스트는 이를 받아 자기 측에서 인증 실패 처리. */
 
 	spdk_poller_unregister(&auth->poller);
+	/* [한국어] 기존 KATO timeout poller 해제 — 곧 100ms 지연 poller 로 교체. */
 	auth->poller = SPDK_POLLER_REGISTER(nvmf_auth_recv_failure1_done, qpair,
 					    NVMF_AUTH_FAILURE1_DELAY_US);
+	/* [한국어] 100ms 후 disconnect 트리거 poller 등록 — timing side-channel 완화 핵심. */
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_get_seqnum - DH-HMAC-CHAP sequence number 채번 (subsys 단위 카운터).
+ *
+ * @qpair: 채번 대상 qpair (subsys 식별용).
+ * @return: 0=성공, -EIO=RAND_bytes 실패.
+ *
+ * 동작:
+ *   1) subsys 단위 카운터 subsys->auth_seqnum 보호용 mutex lock.
+ *   2) auth_seqnum=0 이면(첫 호출) RAND_bytes 로 random 시드값 채움 — 1부터 시작 안 하기 위해.
+ *   3) ++auth_seqnum — 0이 되면(wrap) 1로 강제 (seqnum=0 은 의미상 reserved).
+ *   4) 결과를 qpair 단위 auth->seqnum 에 저장 → challenge 메시지에 첨부.
+ *
+ * 동기화: 같은 subsys 의 여러 qpair 가 카운터 공유 — pthread_mutex 필수.
+ *   각 qpair 는 자기 reactor 스레드에서 동작하므로 cross-thread 경합 가능.
+ *
+ * 보안: seqnum 시드 random 화로 challenge replay 방지 강화.
+ *   spec(§3.4): seqnum != 0 이어야 cvalid=1 가능.
+ *
+ * 호출 컨텍스트: qpair 스레드. mutex 락 짧게만 잡음.
+ *
+ * 호출 체인:
+ *   nvmf_auth_recv_challenge → [이 함수].
+ */
 static int
 nvmf_auth_get_seqnum(struct spdk_nvmf_qpair *qpair)
 {
 	struct spdk_nvmf_subsystem *subsys = qpair->ctrlr->subsys;
+	/* [한국어] qpair → ctrlr → subsys 체이닝. 카운터는 subsys 단위. */
 	struct spdk_nvmf_qpair_auth *auth = qpair->auth;
+	/* [한국어] qpair 단위 인증 컨텍스트. */
 	int rc;
+	/* [한국어] RAND_bytes 반환값 — OpenSSL 관례상 1=성공, 0/-1=실패. */
 
 	pthread_mutex_lock(&subsys->mutex);
+	/* [한국어] subsys 단위 카운터 보호. 같은 subsys 의 다른 qpair 가 동시 채번 가능. */
 	if (subsys->auth_seqnum == 0) {
+		/* [한국어] 첫 호출 — random 시드 주입.
+		 * auth_seqnum 을 1 부터 단순 증가시키면 카운터 값 자체가 정보(서버 시작 후 몇 번째 인증인지)
+		 * 노출 → random 시작점으로 정보 누설 차단. */
 		rc = RAND_bytes((void *)&subsys->auth_seqnum, sizeof(subsys->auth_seqnum));
 		if (rc != 1) {
+			/* [한국어] OpenSSL CSPRNG 고갈/오류 — 거의 발생하지 않음 (initialize 실패시 등). */
 			pthread_mutex_unlock(&subsys->mutex);
 			return -EIO;
 		}
 	}
 	if (++subsys->auth_seqnum == 0) {
+		/* [한국어] 32-bit overflow wrap → 0 — spec 상 0 금지이므로 1 로 보정.
+		 * 이론적 빈도: 4G 회 인증 후. 실용적으로 발생 가능성 매우 낮음. */
 		subsys->auth_seqnum = 1;
 
 	}
 	auth->seqnum = subsys->auth_seqnum;
+	/* [한국어] qpair 단위 보존 — challenge 메시지 + reply 검증의 HMAC 입력. */
 	pthread_mutex_unlock(&subsys->mutex);
+	/* [한국어] mutex 해제 — 다른 qpair 채번 허용. */
 
 	return 0;
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_recv_challenge - DH-HMAC-CHAP 2단계 (CHALLENGE) 메시지 빌드 + 송신.
+ *
+ * @req: AuthRecv 요청 (응답 페이로드 버퍼 보유).
+ * @return: 0=성공, SPDK_NVMF_AUTH_FAILED/INCORRECT_PAYLOAD=호출자가 fail1 처리.
+ *
+ * 동작 흐름 (NVMe TP4022 §3.3):
+ *   1) hash length 산출.
+ *   2) dhgroup != NULL 이면 ephemeral DH 키페어 생성 + 컨트롤러 pubkey 추출.
+ *   3) 응답 버퍼 크기 검증 (header + hl + dhvlen).
+ *   4) seqnum 채번.
+ *   5) C_t (challenge nonce) random 생성 (RAND_bytes) → auth->cval 보존.
+ *   6) timeout poller 재무장.
+ *   7) 응답 페이로드에 challenge 메시지 빌드 (auth_type=DHCHAP, auth_id=CHALLENGE, ...).
+ *   8) 상태 → REPLY (호스트 응답 대기).
+ *
+ * 호출 컨텍스트: qpair 스레드.
+ *
+ * 호출 체인:
+ *   nvmf_auth_recv_exec(state=CHALLENGE) → [이 함수] → recv_complete.
+ */
 static int
 nvmf_auth_recv_challenge(struct spdk_nvmf_request *req)
 {
 	struct spdk_nvmf_qpair *qpair = req->qpair;
+	/* [한국어] 요청 → qpair. */
 	struct spdk_nvmf_qpair_auth *auth = qpair->auth;
+	/* [한국어] 인증 컨텍스트 — digest/dhgroup 결과 보유. */
 	struct spdk_nvmf_dhchap_challenge *challenge;
+	/* [한국어] 응답 페이로드 빌드 대상. */
 	uint8_t hl, dhv[NVMF_AUTH_DH_KEY_MAX_SIZE];
+	/* [한국어] hl=hash length, dhv[]=컨트롤러 DH pubkey 임시 버퍼 (1024B 최대). */
 	size_t dhvlen = 0;
+	/* [한국어] 실제 pubkey 길이. dhgroup=NULL 시 0 유지. */
 	int rc;
+	/* [한국어] 임시 반환값. */
 
 	hl = spdk_nvme_dhchap_get_digest_length(auth->digest);
+	/* [한국어] 협상된 digest → 32/48/64. */
 	assert(hl > 0 && hl <= sizeof(auth->cval));
+	/* [한국어] auth->cval 버퍼 overflow 방지 정합성. */
 
 	if (auth->dhgroup != SPDK_NVMF_DHCHAP_DHGROUP_NULL) {
+		/* [한국어] DH 사용 시: ephemeral 키페어 생성. */
 		auth->dhkey = spdk_nvme_dhchap_generate_dhkey(auth->dhgroup);
+		/* [한국어] OpenSSL EVP_PKEY_keygen 으로 ffdhe2048~8192 그룹 키페어 생성.
+		 * 이 키는 forward secrecy 의 핵심 — 인증 종료 시 즉시 폐기. */
 		if (auth->dhkey == NULL) {
+			/* [한국어] 메모리/OpenSSL 오류 — 인증 실패. */
 			AUTH_ERRLOG(qpair, "failed to generate DH key\n");
 			return SPDK_NVMF_AUTH_FAILED;
 		}
 
 		dhvlen = sizeof(dhv);
+		/* [한국어] 입력=버퍼 한도, 출력=실제 길이. */
 		rc = spdk_nvme_dhchap_dhkey_get_pubkey(auth->dhkey, dhv, &dhvlen);
+		/* [한국어] DH pubkey 직렬화 — challenge 메시지에 포함시켜 호스트로 송신. */
 		if (rc != 0) {
+			/* [한국어] 직렬화 실패 — 거의 발생 불가 (방어적). */
 			AUTH_ERRLOG(qpair, "failed to get DH public key\n");
 			return SPDK_NVMF_AUTH_FAILED;
 		}
 
 		AUTH_LOGDUMP("ctrlr pubkey:", dhv, dhvlen);
+		/* [한국어] 디버그 빌드에서 dump — 운영 빌드는 nvmf_auth 컴포넌트 비활성. */
 	}
 
 	challenge = nvmf_auth_get_message(req, sizeof(*challenge) + hl + dhvlen);
+	/* [한국어] 응답 SGL 이 [헤더 + C_t(hl) + DH pubkey(dhvlen)] 모두 담을 수 있는지 검증. */
 	if (challenge == NULL) {
+		/* [한국어] 호스트가 al 을 너무 작게 잡음 — INCORRECT_PAYLOAD. */
 		AUTH_ERRLOG(qpair, "invalid message length: %"PRIu32"\n", req->length);
 		return SPDK_NVMF_AUTH_INCORRECT_PAYLOAD;
 	}
 	rc = nvmf_auth_get_seqnum(qpair);
+	/* [한국어] subsys 단위 카운터에서 새 seqnum 채번 → auth->seqnum 보존. */
 	if (rc != 0) {
 		return SPDK_NVMF_AUTH_FAILED;
 	}
 	rc = RAND_bytes(auth->cval, hl);
+	/* [한국어] C_t (challenge nonce) — hl 바이트 random.
+	 * 이후 reply 검증 시 HMAC 입력으로 다시 사용. challenge 마다 new random 으로 replay 방지. */
 	if (rc != 1) {
+		/* [한국어] OpenSSL CSPRNG 오류 — 인증 실패. */
 		return SPDK_NVMF_AUTH_FAILED;
 	}
 	if (nvmf_auth_rearm_poller(qpair)) {
+		/* [한국어] timeout poller 재무장 실패 — 인프라 오류로 즉시 disconnect. */
 		nvmf_auth_request_complete(req, SPDK_NVME_SCT_GENERIC,
 					   SPDK_NVME_SC_INTERNAL_DEVICE_ERROR, 1);
 		nvmf_auth_disconnect_qpair(qpair);
 		return 0;
+		/* [한국어] 0 반환 — 호출자가 fail1 추가 처리하지 않도록 (이미 disconnect 진행). */
 	}
 
 	memcpy(challenge->cval, auth->cval, hl);
+	/* [한국어] 응답 페이로드 cval 영역에 C_t 복사. */
 	memcpy(&challenge->cval[hl], dhv, dhvlen);
+	/* [한국어] cval 뒤이어 컨트롤러 pubkey — 와이어 레이아웃 [C_t | pubkey]. */
 	challenge->auth_type = SPDK_NVMF_AUTH_TYPE_DHCHAP;
+	/* [한국어] DHCHAP 패밀리. */
 	challenge->auth_id = SPDK_NVMF_AUTH_ID_DHCHAP_CHALLENGE;
+	/* [한국어] CHALLENGE sub-id (0x01). */
 	challenge->t_id = auth->tid;
+	/* [한국어] negotiate 단계 tid echo. */
 	challenge->hl = hl;
+	/* [한국어] hash length 명시 — 호스트가 동일 hl 로 응답 빌드. */
 	challenge->hash_id = (uint8_t)auth->digest;
+	/* [한국어] 협상된 digest id 통지. */
 	challenge->dhg_id = (uint8_t)auth->dhgroup;
+	/* [한국어] 협상된 dhgroup id 통지. */
 	challenge->dhvlen = dhvlen;
+	/* [한국어] DH pubkey 길이 (NULL 그룹이면 0). */
 	challenge->seqnum = auth->seqnum;
+	/* [한국어] 컨트롤러 측 채번 seqnum — reply HMAC 입력 일부. */
 
 	nvmf_auth_set_state(qpair, NVMF_QPAIR_AUTH_REPLY);
+	/* [한국어] 호스트 응답 R_h 대기 상태로 전이. */
 	nvmf_auth_recv_complete(req, sizeof(*challenge) + hl + dhvlen);
+	/* [한국어] AuthRecv 응답 송신 — challenge 메시지 + DH pubkey 전체 길이. */
 
 	return 0;
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_recv_success1 - DH-HMAC-CHAP 4단계 (SUCCESS1) 메시지 빌드 + 송신.
+ *
+ * @req: AuthRecv 요청.
+ * @return: 0=성공, SPDK_NVMF_AUTH_INCORRECT_PAYLOAD=버퍼 부족.
+ *
+ * 호스트 인증 통과 후 호스트에 통지. cvalid=1 이면 컨트롤러 응답 R_c 도 함께 송신
+ * → 양방향 인증 진입 (SUCCESS2 대기). 아니면 즉시 qpair=ENABLED.
+ *
+ * 동작 흐름 (NVMe TP4022 §3.5):
+ *   1) 응답 페이로드 크기 검증 (header + cvalid*hl).
+ *   2) success 메시지 헤더 채우기 (auth_type=DHCHAP, auth_id=SUCCESS1, hl, rvalid 초기 0).
+ *   3) cvalid=0 (단방향): qpair → ENABLED, 인증 SM → COMPLETED, 자원 정리.
+ *   4) cvalid=1 (양방향): poller 재무장, R_c (auth->cval) 를 success->rval 에 복사,
+ *      rvalid=1 표시, 상태 → SUCCESS2.
+ *
+ * 호출 컨텍스트: qpair 스레드.
+ *
+ * 호출 체인:
+ *   nvmf_auth_recv_exec(state=SUCCESS1) → [이 함수] → recv_complete.
+ */
 static int
 nvmf_auth_recv_success1(struct spdk_nvmf_request *req)
 {
 	struct spdk_nvmf_qpair *qpair = req->qpair;
+	/* [한국어] 요청 → qpair. */
 	struct spdk_nvmf_qpair_auth *auth = qpair->auth;
+	/* [한국어] cvalid/cval/digest 보유. */
 	struct spdk_nvmf_dhchap_success1 *success;
+	/* [한국어] 응답 페이로드 빌드 대상. */
 	uint8_t hl;
+	/* [한국어] hash length — rval 길이로 사용. */
 
 	hl = spdk_nvme_dhchap_get_digest_length(auth->digest);
+	/* [한국어] 협상된 digest → 32/48/64. */
 	success = nvmf_auth_get_message(req, sizeof(*success) + auth->cvalid * hl);
+	/* [한국어] 버퍼 크기 검증: cvalid=0 이면 헤더만, cvalid=1 이면 R_c(hl) 추가.
+	 * cvalid 가 bool→정수로 산술에 사용된 idiom. */
 	if (success == NULL) {
+		/* [한국어] 호스트의 al 부족. */
 		AUTH_ERRLOG(qpair, "invalid message length: %"PRIu32"\n", req->length);
 		return SPDK_NVMF_AUTH_INCORRECT_PAYLOAD;
 	}
 
 	AUTH_DEBUGLOG(qpair, "host authentication successful\n");
+	/* [한국어] 호스트 인증 성공 — 디버그 로그. */
 	success->auth_type = SPDK_NVMF_AUTH_TYPE_DHCHAP;
+	/* [한국어] DHCHAP 패밀리. */
 	success->auth_id = SPDK_NVMF_AUTH_ID_DHCHAP_SUCCESS1;
+	/* [한국어] SUCCESS1 sub-id (0x03). */
 	success->t_id = auth->tid;
+	/* [한국어] tid echo. */
 	/* Kernel initiator always expects hl to be set, regardless of rvalid */
 	success->hl = hl;
+	/* [한국어] 영문 주석대로: Linux kernel initiator 호환성 — rvalid 무관 항상 hl 채움.
+	 * 일부 구현은 rvalid=0 시 hl=0 으로 처리하지만 kernel initiator 는 hl 을 항상 기대. */
 	success->rvalid = 0;
+	/* [한국어] 초기값 0 — cvalid=1 분기에서만 1 로 갱신. */
 
 	if (!auth->cvalid) {
 		/* Host didn't request to authenticate us, we're done */
+		/* [한국어] 단방향 인증 완료 — 호스트만 인증되고 컨트롤러 인증은 요청 안함. */
 		nvmf_qpair_set_state(qpair, SPDK_NVMF_QPAIR_ENABLED);
+		/* [한국어] qpair 활성화 — 일반 NVMe I/O 처리 가능. */
 		nvmf_auth_set_state(qpair, NVMF_QPAIR_AUTH_COMPLETED);
+		/* [한국어] 인증 SM 완료. */
 		nvmf_auth_qpair_cleanup(auth);
+		/* [한국어] poller / DH ephemeral 키 정리 — 더 이상 필요 없음. */
 	} else {
+		/* [한국어] 양방향 인증 — controller R_c 송신 + SUCCESS2 응답 대기. */
 		if (nvmf_auth_rearm_poller(qpair)) {
+			/* [한국어] poller 재무장 실패 — 인프라 오류. */
 			nvmf_auth_request_complete(req, SPDK_NVME_SCT_GENERIC,
 						   SPDK_NVME_SC_INTERNAL_DEVICE_ERROR, 1);
 			nvmf_auth_disconnect_qpair(qpair);
 			return 0;
 		}
 		AUTH_DEBUGLOG(qpair, "cvalid=1, starting controller authentication\n");
+		/* [한국어] 양방향 인증 시작 알림 로그. */
 		nvmf_auth_set_state(qpair, NVMF_QPAIR_AUTH_SUCCESS2);
+		/* [한국어] SUCCESS2 메시지(또는 FAILURE2) 대기 상태로 전이. */
 		memcpy(success->rval, auth->cval, hl);
+		/* [한국어] reply 단계에서 미리 계산한 R_c (auth->cval) 를 응답 페이로드에 복사. */
 		success->rvalid = 1;
+		/* [한국어] R_c 가 페이로드에 있다고 표시. */
 	}
 
 	nvmf_auth_recv_complete(req, sizeof(*success) + auth->cvalid * hl);
+	/* [한국어] 응답 송신 — 단방향이면 헤더만, 양방향이면 R_c 까지. */
 	return 0;
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_recv_exec - AuthRecv (fctype=0x06) 명령 처리 진입점.
+ *
+ * @req: AuthRecv 요청.
+ *
+ * 동작:
+ *   1) 공통 명령 필드 검증.
+ *   2) 응답 SGL 영역 0 으로 초기화 (스택 메모리 누설 방지).
+ *   3) 현재 인증 상태에 따라 분기:
+ *      CHALLENGE → recv_challenge (challenge 메시지 빌드/송신).
+ *      SUCCESS1  → recv_success1 (호스트 인증 성공 통지).
+ *      FAILURE1  → recv_failure1 (실패 메시지 + 100ms 후 disconnect).
+ *      그 외     → recv_failure1 (INCORRECT_PROTOCOL_MESSAGE).
+ *   4) 빌드 단계 실패 시 fail1 메시지로 fallback.
+ *
+ * 호출 컨텍스트: qpair 스레드.
+ *
+ * 호출 체인:
+ *   nvmf_auth_request_exec → [이 함수] → recv_challenge / recv_success1 / recv_failure1.
+ */
 static void
 nvmf_auth_recv_exec(struct spdk_nvmf_request *req)
 {
 	struct spdk_nvmf_qpair *qpair = req->qpair;
+	/* [한국어] 요청 → qpair. */
 	struct spdk_nvmf_qpair_auth *auth = qpair->auth;
+	/* [한국어] 현재 인증 상태 검색. */
 	struct spdk_nvmf_fabric_auth_recv_cmd *cmd = &req->cmd->auth_recv_cmd;
+	/* [한국어] AuthRecv command — al(allocation length) 필드 보유. */
 	int rc;
+	/* [한국어] 임시 반환값. */
 
 	rc = nvmf_auth_check_command(req, cmd->secp, cmd->spsp0, cmd->spsp1, cmd->al);
+	/* [한국어] secp/spsp/al 검증. */
 	if (rc != 0) {
+		/* [한국어] 명령 형식 자체 위반 — INVALID_FIELD 거부. */
 		nvmf_auth_request_complete(req, SPDK_NVME_SCT_GENERIC,
 					   SPDK_NVME_SC_INVALID_FIELD, 1);
 		return;
 	}
 
 	spdk_iov_memset(req->iov, req->iovcnt, 0);
+	/* [한국어] 응답 SGL 0 초기화 — 빌드 누락된 영역에 stack/heap 잔재가 leak 되지 않도록.
+	 * 보안 핵심: 호스트로 송신될 버퍼이므로 패딩/예약 영역도 0 보장. */
 	switch (auth->state) {
 	case NVMF_QPAIR_AUTH_CHALLENGE:
+		/* [한국어] negotiate 완료 — challenge 메시지 빌드. */
 		rc = nvmf_auth_recv_challenge(req);
 		if (rc != 0) {
+			/* [한국어] 빌드 실패 — fail1 메시지로 대체 송신. */
 			nvmf_auth_recv_failure1(req, rc);
 		}
 		break;
 	case NVMF_QPAIR_AUTH_SUCCESS1:
+		/* [한국어] reply 검증 통과 — success1 메시지 빌드. */
 		rc = nvmf_auth_recv_success1(req);
 		if (rc != 0) {
 			nvmf_auth_recv_failure1(req, rc);
 		}
 		break;
 	case NVMF_QPAIR_AUTH_FAILURE1:
+		/* [한국어] 이전 단계에서 fail1 호출됨 — 실제 failure 메시지를 이제 송신. */
 		nvmf_auth_recv_failure1(req, auth->fail_reason);
 		break;
 	default:
+		/* [한국어] AuthRecv 가 와선 안 되는 상태 (NEGOTIATE/REPLY/SUCCESS2/COMPLETED/ERROR).
+		 * 호스트가 잘못된 시점에 AuthRecv 보낸 경우 — 프로토콜 위반 처리. */
 		nvmf_auth_recv_failure1(req, SPDK_NVMF_AUTH_INCORRECT_PROTOCOL_MESSAGE);
 		break;
 	}
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_check_state - qpair 상태가 인증 명령을 받을 수 있는 상황인지 확인.
+ *
+ * @qpair: 요청을 받은 qpair.
+ * @req:   AuthSend/Recv 요청.
+ * @return: true=계속 진행, false=호출자가 즉시 반환 (응답 이미 송신됨).
+ *
+ * qpair 상태별 처리:
+ *   AUTHENTICATING: 첫 인증 진행 중 — 그대로 진행.
+ *   ENABLED:        이미 활성화된 qpair 가 인증 받음 → 재인증(re-authentication) 시작.
+ *                   기존 auth 컨텍스트 없거나 COMPLETED 라면 재초기화.
+ *                   재인증 중 timeout 은 fatal 아님 (timeout_poller 참조).
+ *   그 외:          잘못된 시점 — COMMAND_SEQUENCE_ERROR 거부.
+ *
+ * 재인증 의의: 호스트가 키 rotation, 정책 갱신, 의심 사건 발생 시 명시적으로 재협상.
+ *
+ * 호출 컨텍스트: qpair 스레드.
+ *
+ * 호출 체인:
+ *   nvmf_auth_request_exec → [이 함수] (실패 시 응답 직접 송신).
+ */
 static bool
 nvmf_auth_check_state(struct spdk_nvmf_qpair *qpair, struct spdk_nvmf_request *req)
 {
 	struct spdk_nvmf_qpair_auth *auth = qpair->auth;
+	/* [한국어] 현재 인증 컨텍스트 — NULL 일 수 있음(재인증 첫 진입 등). */
 	int rc;
+	/* [한국어] init 호출 결과. */
 
 	switch (qpair->state) {
 	case SPDK_NVMF_QPAIR_AUTHENTICATING:
+		/* [한국어] CONNECT 직후 atr=1/ascr=1 이라 인증 강제 — 정상 진행. */
 		break;
 	case SPDK_NVMF_QPAIR_ENABLED:
+		/* [한국어] 이미 활성화된 qpair — 재인증 시나리오. */
 		if (auth == NULL || auth->state == NVMF_QPAIR_AUTH_COMPLETED) {
+			/* [한국어] 인증 컨텍스트 없거나 이전 인증이 완료 상태 — 새 인증 세션 시작.
+			 * COMPLETED 인 경우 nvmf_qpair_auth_init 이 NEGOTIATE 로 재설정. */
 			rc = nvmf_qpair_auth_init(qpair);
 			if (rc != 0) {
+				/* [한국어] 인증 컨텍스트 할당 실패 — 인프라 에러 응답. */
 				nvmf_auth_request_complete(req, SPDK_NVME_SCT_GENERIC,
 							   SPDK_NVME_SC_INTERNAL_DEVICE_ERROR, 0);
 				return false;
@@ -1357,33 +1951,63 @@ nvmf_auth_check_state(struct spdk_nvmf_qpair *qpair, struct spdk_nvmf_request *r
 		}
 		break;
 	default:
+		/* [한국어] DEACTIVATING/ERROR/UNINITIALIZED 등 — 인증 명령 처리 불가.
+		 * COMMAND_SEQUENCE_ERROR (NVMe spec): 부적절한 시점에 명령 도착. */
 		nvmf_auth_request_complete(req, SPDK_NVME_SCT_GENERIC,
 					   SPDK_NVME_SC_COMMAND_SEQUENCE_ERROR, 0);
 		return false;
 	}
 
 	return true;
+	/* [한국어] 호출자가 fctype 분기 로 진행. */
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_request_exec - 외부 진입점. AuthSend/AuthRecv fabric 명령 디스패치.
+ *
+ * @req: fabric 명령 (opcode=0x7F, fctype=0x05/0x06).
+ * @return: SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS — 응답은 후속 비동기 callback 으로.
+ *
+ * NVMe-oF 컨트롤러 측 명령 디스패치(ctrlr.c)에서 fabric command 분기 시 호출.
+ *
+ * 동작:
+ *   1) qpair 상태 검증 — 부적절하면 즉시 응답 후 반환.
+ *   2) opcode=FABRIC 단언 (방어적).
+ *   3) fctype 별로 send/recv sub-handler 호출.
+ *
+ * 호출 컨텍스트: qpair 소유 스레드(폴 그룹 reactor).
+ *
+ * 호출 체인:
+ *   ctrlr.c::nvmf_request_exec (fabric 분기) → [이 함수] →
+ *     nvmf_auth_send_exec / nvmf_auth_recv_exec → 각 sub-handler.
+ */
 int
 nvmf_auth_request_exec(struct spdk_nvmf_request *req)
 {
 	struct spdk_nvmf_qpair *qpair = req->qpair;
+	/* [한국어] 요청 → qpair. */
 	union nvmf_h2c_msg *cmd = req->cmd;
+	/* [한국어] host-to-controller 메시지 union — opcode/fctype 검사용. */
 
 	if (!nvmf_auth_check_state(qpair, req)) {
+		/* [한국어] 상태 부적절 — 응답 이미 송신됨. 분기 종료. */
 		goto out;
 	}
 
 	assert(cmd->nvmf_cmd.opcode == SPDK_NVME_OPC_FABRIC);
+	/* [한국어] fabric 명령(0x7F)이 맞는지 단언 — 디스패처 contract 위반 검출. */
 	switch (cmd->nvmf_cmd.fctype) {
 	case SPDK_NVMF_FABRIC_COMMAND_AUTHENTICATION_SEND:
+		/* [한국어] fctype=0x05 — host→ctrl 메시지 송신 (NEGOTIATE/REPLY/SUCCESS2/FAILURE2). */
 		nvmf_auth_send_exec(req);
 		break;
 	case SPDK_NVMF_FABRIC_COMMAND_AUTHENTICATION_RECV:
+		/* [한국어] fctype=0x06 — host 가 ctrl 의 메시지 가져가기 (CHALLENGE/SUCCESS1/FAILURE1). */
 		nvmf_auth_recv_exec(req);
 		break;
 	default:
+		/* [한국어] 호출 contract 위반: AUTH 핸들러는 0x05/0x06 만 처리해야 함. */
 		assert(0 && "invalid fctype");
 		nvmf_auth_request_complete(req, SPDK_NVME_SCT_GENERIC,
 					   SPDK_NVME_SC_INTERNAL_DEVICE_ERROR, 0);
@@ -1391,27 +2015,63 @@ nvmf_auth_request_exec(struct spdk_nvmf_request *req)
 	}
 out:
 	return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
+	/* [한국어] 비동기 — sub-handler 가 nvmf_auth_request_complete 로 응답을 비동기 송신.
+	 * 호출자(nvmf_request_exec)는 이 반환값으로 "응답을 직접 처리하지 말 것"을 인식. */
 }
 
+/*
+ * [한국어]
+ * nvmf_qpair_auth_init - qpair 의 인증 컨텍스트 초기화 (생성 또는 재설정).
+ *
+ * @qpair: 인증 시작할 qpair.
+ * @return: 0=성공, -ENOMEM/기타 errno=실패.
+ *
+ * 두 가지 호출 시나리오:
+ *   1) 첫 인증: qpair 상태가 ACTIVATING → AUTHENTICATING 전이 시 ctrlr.c 에서 호출.
+ *      → calloc 으로 새 컨텍스트 할당.
+ *   2) 재인증: ENABLED 상태에서 호스트가 다시 AuthSend 보냄 → check_state 에서 호출.
+ *      → 기존 컨텍스트 재사용, NEGOTIATE 로 재설정.
+ *
+ * 동작:
+ *   1) auth 가 NULL 이면 calloc — 모든 필드 0/NULL 초기화.
+ *   2) digest=-1 (미협상 표시).
+ *   3) 상태 → NEGOTIATE.
+ *   4) timeout poller 등록 (KATO 또는 120초).
+ *
+ * 호출 컨텍스트: qpair 스레드.
+ *
+ * 호출 체인:
+ *   ctrlr.c qpair activation / nvmf_auth_check_state → [이 함수].
+ */
 int
 nvmf_qpair_auth_init(struct spdk_nvmf_qpair *qpair)
 {
 	struct spdk_nvmf_qpair_auth *auth = qpair->auth;
+	/* [한국어] 기존 컨텍스트 — 첫 호출이면 NULL. */
 	int rc;
+	/* [한국어] poller 등록 결과. */
 
 	if (auth == NULL) {
+		/* [한국어] 처음 — 새 컨텍스트 할당. */
 		auth = calloc(1, sizeof(*qpair->auth));
+		/* [한국어] calloc 으로 0 초기화 — state=NEGOTIATE(0), 모든 포인터 NULL, cval[]=0. */
 		if (auth == NULL) {
+			/* [한국어] 메모리 부족. */
 			return -ENOMEM;
 		}
 	}
 
 	auth->digest = -1;
+	/* [한국어] -1 = 미협상 표시 (negotiate_exec 가 1..3 으로 갱신). */
 	qpair->auth = auth;
+	/* [한국어] qpair 슬롯에 부착 — 재인증 시 이미 같은 포인터일 수 있음. */
 	nvmf_auth_set_state(qpair, NVMF_QPAIR_AUTH_NEGOTIATE);
+	/* [한국어] 재인증 시 COMPLETED→NEGOTIATE 명시 전이. 첫 호출은 0→0 no-op. */
 
 	rc = nvmf_auth_rearm_poller(qpair);
+	/* [한국어] timeout poller 등록 — 첫 NEGOTIATE 메시지 KATO 내 도착 강제. */
 	if (rc != 0) {
+		/* [한국어] poller 등록 실패 — 컨텍스트 free 후 에러 반환. */
 		AUTH_ERRLOG(qpair, "failed to arm timeout poller: %s\n", spdk_strerror(-rc));
 		nvmf_qpair_auth_destroy(qpair);
 		return rc;
@@ -1420,40 +2080,107 @@ nvmf_qpair_auth_init(struct spdk_nvmf_qpair *qpair)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * nvmf_qpair_auth_destroy - qpair 종료 시 인증 컨텍스트 완전 해제.
+ *
+ * @qpair: 종료 대상.
+ *
+ * idempotent — auth 가 NULL 이면 no-op. cleanup(poller/dhkey) 후 struct 자체 free.
+ *
+ * 호출 컨텍스트: qpair 스레드 종료 직전.
+ *
+ * 호출 체인:
+ *   transport disconnect callback / nvmf_qpair_auth_init 실패 → [이 함수].
+ */
 void
 nvmf_qpair_auth_destroy(struct spdk_nvmf_qpair *qpair)
 {
 	struct spdk_nvmf_qpair_auth *auth = qpair->auth;
+	/* [한국어] 기존 컨텍스트 — 미할당이면 NULL. */
 
 	if (auth != NULL) {
+		/* [한국어] 컨텍스트 존재 — 자원 정리 후 free. */
 		nvmf_auth_qpair_cleanup(auth);
+		/* [한국어] poller unregister + dhkey ephemeral free. */
 		free(qpair->auth);
+		/* [한국어] struct 자체 free — calloc 짝. */
 		qpair->auth = NULL;
+		/* [한국어] dangling pointer 방지 — 이후 init 호출 시 NULL 비교로 신규 할당. */
 	}
 }
 
+/*
+ * [한국어]
+ * nvmf_qpair_auth_dump - RPC 진단용으로 인증 상태를 JSON 출력.
+ *
+ * @qpair: 검사할 qpair.
+ * @w:     spdk_json_write_ctx — RPC 응답 빌더.
+ *
+ * RPC `nvmf_get_qpairs` / `nvmf_subsystem_get_qpairs` 등에서 호출.
+ * auth 미할당이면 "auth" 객체 자체를 생략 (호스트별 미인증 qpair 표시 회피).
+ *
+ * 출력 스키마:
+ *   "auth": {
+ *     "state":   "negotiate"|"challenge"|"reply"|"success1"|"success2"|"failure1"|"completed"|"error",
+ *     "digest":  "sha256"|"sha384"|"sha512"|"unknown",
+ *     "dhgroup": "null"|"ffdhe2048"|...|"ffdhe8192"|"unknown"
+ *   }
+ *
+ * 호출 컨텍스트: RPC 스레드 (qpair 단일 스레드 가정).
+ *
+ * 호출 체인:
+ *   subsystem RPC handler → [이 함수].
+ */
 void
 nvmf_qpair_auth_dump(struct spdk_nvmf_qpair *qpair, struct spdk_json_write_ctx *w)
 {
 	struct spdk_nvmf_qpair_auth *auth = qpair->auth;
+	/* [한국어] 인증 컨텍스트 — NULL 가능. */
 	const char *digest, *dhgroup;
+	/* [한국어] enum→문자열 변환 결과. NULL 가능 — 미협상 시. */
 
 	if (auth == NULL) {
+		/* [한국어] 인증 비활성 qpair — JSON 에 "auth" 키 자체 생략. */
 		return;
 	}
 
 	spdk_json_write_named_object_begin(w, "auth");
+	/* [한국어] "auth": { ... 시작. */
 	spdk_json_write_named_string(w, "state", nvmf_auth_get_state_name(auth->state));
+	/* [한국어] "state": "<state name>". */
 	digest = spdk_nvme_dhchap_get_digest_name(auth->digest);
+	/* [한국어] digest enum→문자열. -1(미협상) 시 NULL 반환. */
 	spdk_json_write_named_string(w, "digest", digest ? digest : "unknown");
+	/* [한국어] NULL fallback "unknown". */
 	dhgroup = spdk_nvme_dhchap_get_dhgroup_name(auth->dhgroup);
+	/* [한국어] dhgroup enum→문자열. */
 	spdk_json_write_named_string(w, "dhgroup", dhgroup ? dhgroup : "unknown");
+	/* [한국어] NULL fallback. */
 	spdk_json_write_object_end(w);
+	/* [한국어] } 종료. */
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_is_supported - 본 빌드에서 인증 기능을 지원하는지 확인.
+ *
+ * @return: true (항상).
+ *
+ * 본 파일은 OpenSSL 의존(libcrypto)으로만 컴파일 — 빌드된 시점에 항상 true.
+ * stub 구현(빌드 옵션 OFF)은 별도 파일(auth_stub.c 또는 inline)에서 false 반환.
+ *
+ * 호출 컨텍스트: 모든 컨텍스트.
+ *
+ * 호출 체인:
+ *   ctrlr.c::nvmf_qpair_handle_connect → [이 함수] (atr/ascr 강제 검증 시).
+ */
 bool
 nvmf_auth_is_supported(void)
 {
 	return true;
+	/* [한국어] OpenSSL 가용 시 항상 true. */
 }
 SPDK_LOG_REGISTER_COMPONENT(nvmf_auth)
+/* [한국어] "nvmf_auth" 로그 컴포넌트 등록 — AUTH_DEBUGLOG/AUTH_LOGDUMP 활성화 키.
+ * SPDK CLI: --logflag=nvmf_auth 로 토글. 빌드 시 .gnu.linkonce.spdk_log_register 섹션에 자동 등록. */

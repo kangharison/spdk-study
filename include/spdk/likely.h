@@ -66,7 +66,7 @@ extern "C" {                     /* [한국어] C++ 네임맹글링 억제 — C
                                   *   - 반환값: expr의 원래 값 (부작용 없음 — 런타임 비교/연산 없음)
                                   *   - 두 번째 인수 0은 "cond가 거짓(0)일 가능성이 크다"는 의미
                                   *   - 괄호 감싸기 `(cond)`는 매크로 치환 시 연산자 우선순위 오류 방지
-                                  *   사용 예: if (spdk_unlikely(rc != 0)) { /\* 에러 처리 \*/ }
+                                  *   사용 예: if (spdk_unlikely(rc != 0)) { ...에러 처리... }
                                   *   효과: 정상 경로(rc == 0)가 fall-through로 배치되어 분기 예측·명령어
                                   *         프리페치에 유리. unlikely 분기는 함수 끝으로 밀려나 cold 영역으로 이동 */
 
@@ -77,7 +77,7 @@ extern "C" {                     /* [한국어] C++ 네임맹글링 억제 — C
                                   *     확실히 0 또는 1로 정규화한다. __builtin_expect는 long 두 개를 받는데,
                                   *     cond가 31/63비트 값을 가지면 1과 직접 비교할 때 모호해질 수 있어
                                   *     !!로 명시적 bool 캐스팅을 건 것이다.
-                                  *   사용 예: if (spdk_likely(io->status == SUCCESS)) { /\* fast path \*/ }
+                                  *   사용 예: if (spdk_likely(io->status == SUCCESS)) { ...fast path... }
                                   *   효과: hot path가 straight-line으로 배치되어 CPU 프론트엔드 stall 최소화 */
 
 #ifdef __cplusplus               /* [한국어] C++ 가드 종료 — extern "C" 블록 닫기 */
