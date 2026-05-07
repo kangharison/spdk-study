@@ -2,80 +2,421 @@
  * Copyright (c) 2024 Intel Corporation
  */
 
-#include "spdk/nvme.h"
-#include "spdk/json.h"
-#include "spdk/log.h"
-#include "spdk/stdinc.h"
-#include "spdk/string.h"
-#include "spdk/thread.h"
-#include "spdk/util.h"
-#include "spdk_internal/nvme.h"
+/*
+ * [한국어 설명] NVMe-oF 타깃(컨트롤러) 측 DH-HMAC-CHAP 인증 구현 (auth.c)
+ *
+ * === 파일의 역할 ===
+ * 이 파일은 NVMe-oF target(서버/컨트롤러) 측의 in-band 인증 프로토콜을 구현한다.
+ * 호스트(initiator)가 CONNECT 후 또는 Re-authentication을 요구할 때, Authentication Send
+ * (fabric command opcode=0x7F, fctype=0x05)와 Authentication Receive(fctype=0x06) 두 가지
+ * Fabric command를 통해 4단계 challenge-response 핸드셰이크를 수행한다 — NVMe TP4022
+ * (DH-HMAC-CHAP) 스펙에 정의된 negotiate → challenge → reply → success1 → success2 흐름.
+ * 호스트 측 대응 구현은 lib/nvme/nvme_auth.c에 있다(8상태 머신).
+ *
+ * 핵심 가치:
+ *   1) **PSK 기밀성 보장**: 사전 공유키(PSK)를 그대로 와이어로 보내지 않고, HMAC을 통해
+ *      challenge-response로만 노출 — 도청해도 원 키 복원 불가.
+ *   2) **Diffie-Hellman forward secrecy**: dhgroup이 NULL이 아니면 ephemeral DH 키페어로
+ *      세션 secret을 도출 → 장기 키가 유출되어도 과거 세션 비밀성 유지(전향 안전성).
+ *   3) **상호 인증 옵션**: 호스트의 reply 메시지에 cvalid=1이 있으면 컨트롤러도 자기 신원을
+ *      증명해야 함 — 양방향 인증으로 컨트롤러 사칭 차단.
+ *   4) **알고리즘 협상**: SHA-256/384/512 + ffdhe2048~8192(RFC 7919)의 정책-허용 조합 중
+ *      가장 강한 것 선택.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * NVMe-oF 컨트롤러 측 명령 처리 디스패치에서 호출되는 인증 sub-handler:
+ *
+ *   transport rx(RDMA/TCP) → request 파싱 → ctrlr.c 의 nvmf_request_exec
+ *     → fabric command 분기:
+ *        ├─ CONNECT(fctype=0x01) → ctrlr.c
+ *        ├─ PROPERTY_SET/GET(0x00/0x04) → ctrlr.c
+ *        └─ AUTH_SEND/RECV(0x05/0x06) → **이 파일의 nvmf_auth_request_exec**
+ *
+ * qpair 상태 전이와의 결합:
+ *   ACTIVATING(connect 직후) →
+ *     atr=1 또는 ascr=1 이면 → AUTHENTICATING (인증 강제)
+ *     이외는 → ENABLED (인증 생략)
+ *
+ * 실행 컨텍스트: qpair를 소유한 SPDK 스레드(폴 그룹의 한 reactor 스레드) 단일 스레드.
+ * spdk_poller(timeout poller)와 SPDK 비동기 callback 패턴을 따른다 — 어떤 함수도 블로킹
+ * I/O를 하지 않고, 응답 메시지는 nvmf_auth_request_complete로 비동기 완료시킨다.
+ *
+ * === 타 모듈과의 연결 ===
+ * - **nvmf_internal.h**: 타깃 자료구조(spdk_nvmf_qpair, _ctrlr, _subsystem, _request, _tgt) 정의.
+ *   특히 qpair->auth(=struct spdk_nvmf_qpair_auth*) 슬롯에 이 파일의 상태를 저장.
+ * - **spdk/nvme.h + spdk_internal/nvme.h**: DH-HMAC-CHAP 헬퍼 4종 호출 진입점
+ *   (spdk_nvme_dhchap_get_digest_length / generate_dhkey / dhkey_get_pubkey /
+ *   dhkey_derive_secret / calculate). 호스트와 컨트롤러가 동일 헬퍼를 사용 → 와이어 호환.
+ * - **lib/nvme/nvme_auth.c**: 호스트 측 대응 — 동일 메시지 포맷을 송수신.
+ * - **subsystem.c**: nvmf_subsystem_get_dhchap_key()를 통해 spdk_keyring에 등록된
+ *   호스트키/컨트롤러키를 가져온다(NVMF_AUTH_KEY_HOST/_CTRLR).
+ * - **OpenSSL libcrypto**: RAND_bytes()로 challenge nonce(C_t)와 seqnum 시드 생성. 내부적으로
+ *   spdk_nvme_dhchap_*는 EVP_MAC(HMAC) / EVP_PKEY(DH) API를 사용.
+ * - **spdk/keyring**: 사용자/RPC가 등록한 PSK key handle을 키링에서 lookup.
+ * - **transport_tcp.c**(별도): TLS 1.3 PSK identity 구성과 RFC 5705 EXPORTER key derivation은
+ *   TCP 트랜스포트 측에서 처리하며 본 파일은 in-band DH-HMAC-CHAP만 담당.
+ *
+ * 데이터 흐름 (한 세션):
+ *   host → AuthSend(NEGOTIATE) → 컨트롤러: nvmf_auth_negotiate_exec (algo/dhgroup 협상)
+ *   host ← AuthRecv(CHALLENGE)  ← 컨트롤러: nvmf_auth_recv_challenge (C_t + ctrlr pubkey)
+ *   host → AuthSend(REPLY)      → 컨트롤러: nvmf_auth_reply_exec (HMAC 검증, 상호인증 시 C_h 수신)
+ *   host ← AuthRecv(SUCCESS1)   ← 컨트롤러: nvmf_auth_recv_success1 (호스트 인증 OK, 옵션 R_c)
+ *   host → AuthSend(SUCCESS2)   → 컨트롤러: nvmf_auth_success2_exec (양방향 완료, ENABLED)
+ *
+ * 실패 분기:
+ *   임의 단계 검증 실패 → FAILURE1 상태로 전이 → 호스트가 AuthRecv 시도하면
+ *   AUTH_failure1 메시지로 응답 → 100ms 지연 후 qpair disconnect (timing-side-channel 방지).
+ *
+ * === 주요 함수/구조체 요약 ===
+ *   - **nvmf_auth_request_exec()**: 외부 진입점. AuthSend/AuthRecv fctype 분기 + qpair 상태 검증.
+ *   - **nvmf_auth_send_exec()**: AuthSend 페이로드 분기 — auth_type/auth_id로 negotiate/reply/
+ *     success2/failure2 sub-handler 디스패치.
+ *   - **nvmf_auth_recv_exec()**: AuthRecv — auth.state에 따라 challenge/success1/failure1 빌드.
+ *   - **nvmf_auth_negotiate_exec()**: digest(SHA-256/384/512)와 dhgroup(NULL/ffdhe2048~8192) 협상.
+ *     서버는 자신이 허용하는 셋과 호스트 제안을 교집합한 뒤 가장 강한 것을 선택.
+ *   - **nvmf_auth_recv_challenge()**: 16~64B 랜덤 C_t 생성 + dhgroup이 NULL이 아니면 ephemeral
+ *     DH 키페어 생성 후 컨트롤러 pubkey를 challenge 메시지에 첨부.
+ *   - **nvmf_auth_reply_exec()**: 호스트의 R_h = HMAC(K_h, ...) 검증. cvalid=1이면 컨트롤러
+ *     역방향 응답 R_c = HMAC(K_c, C_h ...)을 미리 계산해 cval에 보존(success1에서 송신).
+ *   - **nvmf_auth_recv_success1()**: 호스트 인증 성공 통지. cvalid이면 컨트롤러 응답 R_c 송신
+ *     (양방향 인증 진행), 아니면 즉시 ENABLED 전이.
+ *   - **nvmf_auth_success2_exec()**: 양방향 인증 최종 confirm. qpair → ENABLED.
+ *   - **nvmf_auth_recv_failure1()**: AUTH_failure1 메시지 송신 + 100ms 지연 후 disconnect.
+ *   - **nvmf_auth_timeout_poller()**: KATO(기본 120초) 내 다음 단계 미수신 시 disconnect.
+ *   - **nvmf_qpair_auth_init/destroy/dump()**: qpair lifecycle 결합 — 인증 컨텍스트 생성/해제/상태 출력.
+ *
+ *   - **struct spdk_nvmf_qpair_auth**: 단일 qpair의 인증 세션 상태 컨테이너
+ *     (state/poller/tid/digest/dhgroup/cval/seqnum/dhkey/cvalid).
+ *   - **struct nvmf_auth_common_header**: 모든 in-band 인증 메시지의 공통 4B 헤더
+ *     (auth_type, auth_id, t_id) — auth_type/auth_id로 sub-handler를 디스패치.
+ *
+ * === Wire 프로토콜 매핑 (NVMe TP4022 §3.2~3.5) ===
+ *   - Fabric Command opcode = SPDK_NVME_OPC_FABRIC (0x7F)
+ *   - fctype: AUTH_SEND=0x05, AUTH_RECV=0x06
+ *   - secp(Security Protocol) = 0xE9 (NVMe-oF Authentication, IEEE assigned)
+ *   - spsp0=1, spsp1=1 (in-band auth)
+ *   - tl(AuthSend)/al(AuthRecv): payload length
+ *
+ *   메시지 헤더(4B) 공통:
+ *     auth_type (1B):  0x00=COMMON, 0x01=DH-HMAC-CHAP
+ *     auth_id   (1B):  COMMON{0x00=NEGOTIATE, 0xF0=FAILURE1, 0xF1=FAILURE2},
+ *                      DHCHAP{0x01=CHALLENGE, 0x02=REPLY, 0x03=SUCCESS1, 0x04=SUCCESS2}
+ *     reserved  (2B)
+ *     t_id      (2B):  transaction id (NEGOTIATE에서 host 결정 → 이후 모든 메시지 동일)
+ *
+ *   4단계 시퀀스(상호 인증 OFF):
+ *     [Host]                          [Controller]
+ *       NEGOTIATE   (AuthSend) ─────────►
+ *                            ◄─────── CHALLENGE  (AuthRecv 응답)
+ *       REPLY       (AuthSend) ─────────►   ← 여기서 HMAC 검증
+ *                            ◄─────── SUCCESS1  (AuthRecv 응답)
+ *
+ *   상호 인증 ON(reply.cvalid=1) 추가 라운드:
+ *       SUCCESS1에 R_c 포함 ─────────► host 검증
+ *       SUCCESS2    (AuthSend) ────────►   ← 양방향 완료
+ *
+ * === 보안 주의사항 ===
+ *   - challenge nonce(C_t)와 seqnum은 OpenSSL RAND_bytes() (CSPRNG) 사용.
+ *   - HMAC 비교(memcmp)는 timing-safe가 아니지만 challenge가 랜덤이므로 실용적 영향 미미
+ *     (호스트는 매번 다른 challenge에 대한 응답을 보내야 함).
+ *   - FAILURE1 후 100ms 강제 지연으로 사이드채널 leakage 완화.
+ *   - dhsec/response 등 일시 비밀은 stack에 두며 함수 종료 시 frame이 회수됨(추가
+ *     spdk_memset_s zeroize는 호스트 측 nvme_auth.c에서 적용 — 본 파일은 미적용).
+ */
 
-#include <openssl/rand.h>
+#include "spdk/nvme.h"           /* [한국어] NVMe 공개 API: spdk_nvme_dhchap_* 헬퍼 진입 (digest_length/generate_dhkey/derive_secret/calculate). */
+#include "spdk/json.h"           /* [한국어] JSON writer: nvmf_qpair_auth_dump()가 RPC 진단용 상태 출력에 사용. */
+#include "spdk/log.h"            /* [한국어] SPDK 로그 매크로(SPDK_ERRLOG/_DEBUGLOG/_LOGDUMP) — 인증 단계별 디버깅. */
+#include "spdk/stdinc.h"         /* [한국어] 표준 C 헤더 통합(string.h, stdint.h, stdbool.h, stdlib.h, assert.h 등) — SPDK 빌드 호환 래퍼. */
+#include "spdk/string.h"         /* [한국어] spdk_strerror() — errno → 사람이 읽을 수 있는 문자열. */
+#include "spdk/thread.h"         /* [한국어] spdk_poller_register/_unregister API — KATO 타임아웃 poller, FAILURE1 지연 poller에 사용. */
+#include "spdk/util.h"           /* [한국어] SPDK_BIT(n), SPDK_COUNTOF() 등 비트/배열 유틸 — dhchap_digests/dhgroups 마스크 검사. */
+#include "spdk_internal/nvme.h"  /* [한국어] DH-HMAC-CHAP 내부 API: spdk_nvme_dhchap_dhkey 자료형 + ephemeral DH 키페어 관리 함수. */
 
-#include "nvmf_internal.h"
+#include <openssl/rand.h>        /* [한국어] OpenSSL CSPRNG — RAND_bytes()로 challenge nonce(C_t)와 seqnum 초기 시드 생성. */
 
+#include "nvmf_internal.h"       /* [한국어] NVMe-oF 타깃 내부 자료구조: spdk_nvmf_qpair / _ctrlr / _subsystem / _request / _tgt + qpair 상태 머신 enum + key lookup API. */
+
+/* [한국어] 인증 단계 간 timeout (마이크로초) - keep-alive timer(KATO)가 0이면 이 기본값 사용.
+ * 120초는 NVMe-oF 1.1 권고 — 호스트가 적절한 시간 안에 다음 단계를 보내지 않으면 인증 실패.
+ * 너무 짧으면 정상 클라이언트 스파이크에서 실패, 너무 길면 좀비 세션 누수. */
 #define NVMF_AUTH_DEFAULT_KATO_US	(120ull * 1000 * 1000)
+/* [한국어] FAILURE1 메시지 송신 후 disconnect까지의 강제 지연 (100ms).
+ * 사이드채널 timing 공격 완화 — 인증 실패 즉시 끊으면 어떤 단계에서 실패했는지가
+ * 응답시간으로 누설될 수 있어, 의도적으로 일정 지연을 둔다. */
 #define NVMF_AUTH_FAILURE1_DELAY_US	(100ull * 1000)
+/* [한국어] HMAC digest 최대 길이 (64B) - SHA-512 출력 크기에 맞춤.
+ * spdk_nvmf_qpair_auth.cval[]과 stack 버퍼 response[]/auth->cval에 사용.
+ * SHA-256(32B) / SHA-384(48B) / SHA-512(64B) 모두 수용. */
 #define NVMF_AUTH_DIGEST_MAX_SIZE	64
+/* [한국어] DH 공개키/secret 최대 길이 (1024B = 8192비트 = ffdhe8192 그룹의 최대 modulus 크기).
+ * dhv[]/dhsec[] stack 버퍼 사이즈로 사용 — 가장 큰 RFC 7919 그룹(8192비트)도 수용. */
 #define NVMF_AUTH_DH_KEY_MAX_SIZE	1024
 
+/* [한국어] 인증 에러 로그 매크로 — qpair → subsys/host/qid 식별 prefix 자동 부여.
+ * subnqn(서브시스템 NVMe Qualified Name), hostnqn(호스트 식별자), qid(queue id) 3종 키.
+ * 멀티 호스트 멀티 서브시스템 환경에서 어느 세션의 실패인지 즉시 추적 가능. */
 #define AUTH_ERRLOG(q, fmt, ...) \
 	SPDK_ERRLOG("[%s:%s:%u] " fmt, (q)->ctrlr->subsys->subnqn, (q)->ctrlr->hostnqn, \
 		    (q)->qid, ## __VA_ARGS__)
+/* [한국어] 인증 디버그 로그 — "nvmf_auth" 컴포넌트 활성화 시에만 출력.
+ * SPDK_LOG_REGISTER_COMPONENT(nvmf_auth)와 짝. SPDK CLI: --logflag=nvmf_auth. */
 #define AUTH_DEBUGLOG(q, fmt, ...) \
 	SPDK_DEBUGLOG(nvmf_auth, "[%s:%s:%u] " fmt, \
 		      (q)->ctrlr->subsys->subnqn, (q)->ctrlr->hostnqn, (q)->qid, ## __VA_ARGS__)
+/* [한국어] 바이너리 데이터 hex dump — challenge/response/dhsec/pubkey 디버깅에 사용.
+ * 운영 빌드에선 "nvmf_auth" 로그 컴포넌트가 꺼져 있어 비활성. 시크릿 노출 방지 차원. */
 #define AUTH_LOGDUMP(msg, buf, len) \
 	SPDK_LOGDUMP(nvmf_auth, msg, buf, len)
 
+/*
+ * [한국어] 컨트롤러 측 단일 qpair의 인증 진행 단계 enum.
+ *
+ * 호스트 측(nvme_auth.c)의 8상태 머신과 대칭 — 호스트가 "AWAIT_*"로 응답을 기다리는 동안
+ * 컨트롤러는 그 메시지를 "*_EXEC"하기 위해 해당 상태에 머문다. 상태 전이는 nvmf_auth_set_state()
+ * 단일 진입점으로만 일어난다.
+ *
+ * 정상 흐름:
+ *   NEGOTIATE → CHALLENGE → REPLY → SUCCESS1
+ *     상호인증 OFF: → COMPLETED (qpair=ENABLED)
+ *     상호인증 ON:  → SUCCESS2 → COMPLETED
+ *
+ * 실패 흐름:
+ *   임의 단계 → FAILURE1 → (FAILURE1 메시지 송신 후 100ms 지연) → ERROR + disconnect
+ */
 enum nvmf_qpair_auth_state {
 	NVMF_QPAIR_AUTH_NEGOTIATE,
+	/* [한국어] 초기 상태. 호스트가 첫 AuthSend(NEGOTIATE)를 보낼 때까지 대기.
+	 * 진입자: nvmf_qpair_auth_init() — qpair 인증 컨텍스트 생성 시 자동 진입.
+	 * 다음 상태: NEGOTIATE 메시지 정상 처리 후 CHALLENGE. */
+
 	NVMF_QPAIR_AUTH_CHALLENGE,
+	/* [한국어] NEGOTIATE 완료. 호스트의 AuthRecv(CHALLENGE) 요청을 기다림.
+	 * 진입자: nvmf_auth_negotiate_exec() — digest/dhgroup 협상 성공 시.
+	 * 다음 상태: nvmf_auth_recv_challenge()가 challenge 메시지 빌드 후 REPLY. */
+
 	NVMF_QPAIR_AUTH_REPLY,
+	/* [한국어] CHALLENGE 송신 완료. 호스트의 AuthSend(REPLY)로 R_h를 받기 대기.
+	 * 진입자: nvmf_auth_recv_challenge() — challenge 응답 송신 후.
+	 * 다음 상태: nvmf_auth_reply_exec()가 HMAC 검증 통과 시 SUCCESS1. */
+
 	NVMF_QPAIR_AUTH_SUCCESS1,
+	/* [한국어] REPLY 검증 완료. 호스트의 AuthRecv(SUCCESS1) 요청을 기다림.
+	 * 진입자: nvmf_auth_reply_exec() — 호스트 응답 HMAC 일치 시.
+	 * 다음 상태:
+	 *   - cvalid=0(상호인증 OFF) → COMPLETED + qpair=ENABLED
+	 *   - cvalid=1(상호인증 ON)  → SUCCESS2 (R_c 송신 후 호스트 응답 대기) */
+
 	NVMF_QPAIR_AUTH_SUCCESS2,
+	/* [한국어] SUCCESS1 송신(R_c 포함) 완료. 호스트의 AuthSend(SUCCESS2)를 기다림.
+	 * 진입자: nvmf_auth_recv_success1() — cvalid=1일 때.
+	 * 다음 상태: nvmf_auth_success2_exec()가 양방향 완료 → COMPLETED + qpair=ENABLED.
+	 *           또는 호스트가 AUTH_failure2를 보내면 ERROR로 전이. */
+
 	NVMF_QPAIR_AUTH_FAILURE1,
+	/* [한국어] 임의 단계에서 검증 실패 → 호스트가 다음 AuthRecv를 보내면 AUTH_failure1로 응답.
+	 * 진입자: nvmf_auth_request_fail1() — 모든 invalid 메시지/HMAC 불일치/키 부재 등.
+	 * 다음 상태: nvmf_auth_recv_failure1()이 실패 메시지 송신 + 100ms 지연 poller 등록 →
+	 *           timeout 발화 시 disconnect로 ERROR 전이. */
+
 	NVMF_QPAIR_AUTH_COMPLETED,
+	/* [한국어] 인증 정상 완료. qpair는 SPDK_NVMF_QPAIR_ENABLED로 전이됨.
+	 * 이후 일반 NVMe I/O 명령 처리 가능. Re-authentication 시 다시 NEGOTIATE로 복귀. */
+
 	NVMF_QPAIR_AUTH_ERROR,
+	/* [한국어] 비가역적 에러 — qpair disconnect 진행 중 또는 disconnect 완료.
+	 * 진입자: nvmf_auth_disconnect_qpair() / failure2 수신 등.
+	 * 이 상태에서는 더 이상 어떤 메시지도 처리하지 않음. */
 };
 
+/*
+ * [한국어] 단일 qpair에 종속된 DH-HMAC-CHAP 인증 세션 컨텍스트.
+ *
+ * 수명주기:
+ *   생성: nvmf_qpair_auth_init() — qpair 상태가 ACTIVATING이고 인증이 필요한 경우 또는
+ *         재인증 트리거 시 calloc.
+ *   소멸: nvmf_qpair_auth_destroy() — qpair 종료 시. nvmf_auth_qpair_cleanup()는 진행
+ *         중인 poller/dhkey만 해제(컨텍스트 자체는 보존).
+ *
+ * 동기화: qpair는 단일 SPDK 스레드에 affinity 고정 — 본 구조체에는 락이 필요 없음.
+ *   예외: subsys->auth_seqnum 갱신만 subsys->mutex로 보호(다른 qpair와 공유).
+ */
 struct spdk_nvmf_qpair_auth {
 	enum nvmf_qpair_auth_state	state;
+	/* [한국어] 현재 인증 단계. 위 enum 정의 참조.
+	 * 설정자: nvmf_auth_set_state() 단일 함수 — 디버그 로그와 함께 변경.
+	 * 읽는 자: 모든 *_exec / *_recv_* 함수가 진입 시 검증.
+	 * 값 범위: NVMF_QPAIR_AUTH_NEGOTIATE..ERROR (8값).
+	 * 동기화: qpair 단일 스레드 고정이므로 락 불필요. */
+
 	struct spdk_poller		*poller;
+	/* [한국어] KATO timeout poller 핸들 — 다음 단계 메시지를 일정 시간 내 받지 못하면 disconnect.
+	 * 또한 FAILURE1 응답 후 disconnect까지 100ms 지연 poller로도 재사용(unregister 후 재등록).
+	 * 설정자: nvmf_auth_rearm_poller()(인증 진행 중) / nvmf_auth_recv_failure1()(실패 시).
+	 * 읽는 자: nvmf_auth_qpair_cleanup() / nvmf_auth_timeout_poller() 자체 콜백.
+	 * 값 범위: 유효한 spdk_poller* 또는 NULL(미등록).
+	 * 동기화: qpair 스레드 단일 — poller도 같은 스레드에서 발화. */
+
 	int				fail_reason;
+	/* [한국어] FAILURE1 메시지의 reason code 보관 — AUTH_failure1.rce 필드로 호스트에 전달.
+	 * SPDK_NVMF_AUTH_FAILED / INCORRECT_PAYLOAD / INCORRECT_PROTOCOL_MESSAGE / SCC_MISMATCH /
+	 * HASH_UNUSABLE / DHGROUP_UNUSABLE / PROTOCOL_UNUSABLE 등 (NVMe TP4022 §3.6).
+	 * 설정자: nvmf_auth_request_fail1() — 검증 실패 발견 시 즉시 기록.
+	 * 읽는 자: nvmf_auth_recv_failure1()이 호스트의 AuthRecv 요청 시 응답에 포함.
+	 * 값 범위: enum spdk_nvmf_auth_failure_reason. */
+
 	uint16_t			tid;
+	/* [한국어] 트랜잭션 ID — 호스트가 NEGOTIATE에서 결정 → 모든 이후 메시지 동일 값 검증.
+	 * 한 인증 세션을 식별하는 nonce 역할. 세션 간섭/리플레이 방지의 약한 방어.
+	 * 설정자: nvmf_auth_negotiate_exec() — 호스트가 보낸 msg->t_id 그대로 저장.
+	 * 읽는 자: 모든 응답 메시지 빌드 시(challenge/success1/failure1) + REPLY/SUCCESS2 검증 시.
+	 * 값 범위: 0..65535 (호스트가 정한 값). */
+
 	int				digest;
+	/* [한국어] 협상된 HMAC digest 알고리즘 ID — SHA-256(0x01)/SHA-384(0x02)/SHA-512(0x03).
+	 * enum spdk_nvmf_dhchap_hash 값. -1은 미협상(init 직후) 상태.
+	 * 설정자: nvmf_auth_negotiate_exec() — 정책 허용 셋과 호스트 제안의 교집합에서 가장 강한 것.
+	 * 읽는 자: spdk_nvme_dhchap_get_digest_length()로 hl(hash length) 도출.
+	 *         spdk_nvme_dhchap_calculate()의 hash 인자.
+	 * 값 범위: -1 또는 1..3 (SPDK_NVMF_DHCHAP_HASH_SHA256..512). */
+
 	int				dhgroup;
+	/* [한국어] 협상된 DH 그룹 — NULL(0)/ffdhe2048(1)/ffdhe3072(2)/ffdhe4096(3)/ffdhe6144(4)/ffdhe8192(5).
+	 * NULL이면 PSK만 사용(무결성), 그 외는 ephemeral DH로 forward secrecy.
+	 * 설정자: nvmf_auth_negotiate_exec() — 위와 동일 정책 선택.
+	 * 읽는 자: nvmf_auth_recv_challenge()(키페어 생성 여부), nvmf_auth_reply_exec()(secret 도출 여부).
+	 * 값 범위: -1 또는 0..5 (RFC 7919 그룹 enum). */
+
 	uint8_t				cval[NVMF_AUTH_DIGEST_MAX_SIZE];
+	/* [한국어] 양방향 인증용 슬롯 — 두 가지 용도로 재사용:
+	 *   1) CHALLENGE 단계: 컨트롤러가 호스트에게 보낸 nonce C_t (RAND_bytes로 생성)를 보존.
+	 *      reply 검증 시 HMAC 입력으로 다시 사용.
+	 *   2) REPLY 단계(cvalid=1): 호스트가 보낸 C_h에 대한 컨트롤러 응답 R_c를 미리 계산해서 보관.
+	 *      success1 송신 시 그대로 rval 필드에 복사.
+	 * 설정자: RAND_bytes (1번 용도) / spdk_nvme_dhchap_calculate (2번 용도).
+	 * 읽는 자: spdk_nvme_dhchap_calculate (1번) / memcpy(success->rval, ...) (2번).
+	 * 값 범위: 16..64B 임의 바이트. 보안: 평문 nonce/응답 — log dump도 디버그 빌드에서만. */
+
 	uint32_t			seqnum;
+	/* [한국어] DH-HMAC-CHAP sequence number — 컨트롤러가 호스트에게 보내는 challenge의 일련번호.
+	 * 0이면 호스트가 cvalid=1로 상호인증 요청 시 reject (NVMe TP4022 §3.4 — seqnum=0 + cvalid=1 금지).
+	 * 설정자: nvmf_auth_get_seqnum() — subsys 단위 카운터에서 채번 (0 wrap → 1 강제).
+	 * 읽는 자: challenge.seqnum 필드로 호스트에 전달, reply 검증 시 HMAC 입력에 포함.
+	 * 값 범위: 1..0xFFFFFFFF (절대 0이 아님).
+	 * 동기화: subsys->mutex 보호 (여러 qpair가 같은 카운터 공유). */
+
 	struct spdk_nvme_dhchap_dhkey	*dhkey;
+	/* [한국어] Ephemeral DH 키페어 핸들 — dhgroup이 NULL이 아닐 때만 생성.
+	 * 컨트롤러 측 private + public key를 OpenSSL EVP_PKEY로 보유.
+	 * 호스트 pubkey와 결합하여 secret 도출에 사용. forward secrecy의 근거.
+	 * 설정자: nvmf_auth_recv_challenge() — spdk_nvme_dhchap_generate_dhkey()로 그룹별 생성.
+	 * 읽는 자: spdk_nvme_dhchap_dhkey_get_pubkey()(challenge에 첨부), _derive_secret()(reply 검증).
+	 * 값 범위: 유효 포인터(dhgroup!=NULL) 또는 NULL.
+	 * 보안: 인증 종료/실패 시 nvmf_auth_qpair_cleanup()이 즉시 free → ephemeral 보장. */
+
 	bool				cvalid;
+	/* [한국어] 호스트가 reply에서 cvalid=1로 상호인증을 요청했는지 여부.
+	 * 설정자: nvmf_auth_reply_exec() — msg->cvalid==1이고 ctrlr key로 R_c 계산 성공 시 true.
+	 * 읽는 자: nvmf_auth_recv_success1() — true면 success 메시지에 R_c(cval) 첨부 + SUCCESS2 진입,
+	 *         false면 즉시 ENABLED.
+	 * 값 범위: true/false. */
 };
 
+/*
+ * [한국어] 모든 in-band 인증 메시지의 공통 4B 헤더 (NVMe TP4022 §3.2).
+ *
+ * 이 헤더만 보면 어느 sub-handler로 디스패치할지 결정 가능 — auth_send_exec / auth_recv가
+ * 페이로드 시작 4바이트로 캐스팅하여 type 분기.
+ *
+ * 와이어 포맷 (host 바이트 순서, NVMe-oF는 little-endian):
+ *   offset 0: auth_type (1B)
+ *   offset 1: auth_id   (1B)
+ *   offset 2: reserved  (2B)
+ *   offset 4: t_id      (2B)
+ */
 struct nvmf_auth_common_header {
 	uint8_t		auth_type;
+	/* [한국어] 메시지 패밀리 — 0x00=COMMON, 0x01=DH-HMAC-CHAP.
+	 * 설정자: 호스트가 채워서 송신 (NEGOTIATE/FAILURE2=COMMON, REPLY/SUCCESS2=DHCHAP).
+	 * 읽는 자: nvmf_auth_send_exec()의 outer switch.
+	 * 값 범위: SPDK_NVMF_AUTH_TYPE_COMMON_MESSAGE(0) / SPDK_NVMF_AUTH_TYPE_DHCHAP(1). */
+
 	uint8_t		auth_id;
+	/* [한국어] 메시지 종류 — auth_type과 함께 sub-handler 결정.
+	 * COMMON: NEGOTIATE(0x00) / FAILURE1(0xF0) / FAILURE2(0xF1)
+	 * DHCHAP: CHALLENGE(0x01) / REPLY(0x02) / SUCCESS1(0x03) / SUCCESS2(0x04)
+	 * 설정자: 호스트(또는 컨트롤러 응답).
+	 * 읽는 자: nvmf_auth_send_exec()의 inner switch. */
+
 	uint8_t		reserved0[2];
+	/* [한국어] 예약 영역 (2B) — 0으로 채워야 하지만 본 코드에선 검증하지 않음(완화 정책). */
+
 	uint16_t	t_id;
+	/* [한국어] 트랜잭션 ID — 한 인증 세션을 식별. NEGOTIATE에서 호스트가 결정 → 이후 모든 메시지 동일.
+	 * 설정자: 호스트(NEGOTIATE에서 임의 값) / 컨트롤러 응답은 호스트가 보낸 값 echo.
+	 * 읽는 자: spdk_nvmf_qpair_auth.tid에 보존 후 모든 후속 메시지에서 일치 검증.
+	 * 값 범위: 0..65535 (LE 인코딩). */
 };
 
+/*
+ * [한국어]
+ * nvmf_auth_request_complete - AuthSend/AuthRecv 명령에 대한 NVMe completion 빌드 + 송신.
+ *
+ * @req: 처리 중인 fabric AuthSend/Recv 요청. req->rsp가 호스트에 보낼 CQE의 backing.
+ * @sct: Status Code Type (SPDK_NVME_SCT_GENERIC / SPECIFIC / FABRIC).
+ * @sc:  Status Code (SUCCESS / INVALID_FIELD / COMMAND_SEQUENCE_ERROR / INTERNAL_DEVICE_ERROR 등).
+ * @dnr: Do Not Retry — 1이면 호스트가 자동 재시도하지 않도록 지시.
+ *
+ * 인증 sub-handler의 모든 정상/에러 경로 종단에서 호출되는 단일 응답 진입점.
+ * NVMe-oF transport(TCP/RDMA)가 이 CQE를 호스트로 전송한다.
+ *
+ * 주의: AUTH_failure1 같은 application-level 실패는 이 함수의 sct/sc로 보내지 않고,
+ *      "이 명령 자체는 성공(GENERIC/SUCCESS)"으로 응답한 뒤 다음 AuthRecv가 들어오면
+ *      그때 AUTH_failure1 메시지를 페이로드로 돌려준다 (nvmf_auth_request_fail1 참조).
+ *      → NVMe-oF 인증 프로토콜은 application 메시지와 NVMe CQE 레이어를 분리해 다룸.
+ *
+ * 호출 컨텍스트: qpair 소유 SPDK 스레드. 비블로킹.
+ *
+ * 호출 체인:
+ *   negotiate/reply/success2/recv_*_exec → [이 함수] → spdk_nvmf_request_complete →
+ *     transport tx (RDMA/TCP)
+ */
 static void
 nvmf_auth_request_complete(struct spdk_nvmf_request *req, int sct, int sc, int dnr)
 {
 	struct spdk_nvme_cpl *response = &req->rsp->nvme_cpl;
+	/* [한국어] 응답 CQE 포인터 획득 — req->rsp는 transport가 미리 할당한 응답 버퍼. */
 
 	response->status.sct = sct;
+	/* [한국어] Status Code Type 비트 (3비트) — Generic/Command-Specific/Media/Path/Vendor/Fabric. */
 	response->status.sc = sc;
+	/* [한국어] Status Code 비트 (8비트) — sct에 따라 의미 결정 (Generic이면 SUCCESS=0/INVALID_FIELD 등). */
 	response->status.dnr = dnr;
+	/* [한국어] Do Not Retry 비트 — 호스트가 transparent retry를 시도하지 않도록 지시.
+	 * 인증 단계 에러는 대개 dnr=1 (재시도해도 동일 결과). */
 
 	spdk_nvmf_request_complete(req);
+	/* [한국어] 트랜스포트별 completion 콜백 호출 → CQE를 호스트로 송신.
+	 * RDMA: send WR enqueue. TCP: capsule response 전송. 비동기 복귀. */
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_get_state_name - 인증 상태 enum을 디버그용 문자열로 변환.
+ *
+ * @state: 변환할 상태 값.
+ * @return: 정적 문자열 포인터(영원히 유효, 호출자가 free하지 않음).
+ *
+ * 단순 lookup. AUTH_DEBUGLOG / nvmf_qpair_auth_dump (RPC)에서 호출.
+ *
+ * 호출 컨텍스트: 모든 컨텍스트에서 호출 가능(stateless, 락 불필요).
+ */
 static const char *
 nvmf_auth_get_state_name(enum nvmf_qpair_auth_state state)
 {
 	static const char *state_names[] = {
+		/* [한국어] designated initializer로 enum 인덱스에 직접 매핑 — 새 상태 추가 시
+		 * 컴파일러가 갭을 NULL로 채우므로 누락 디버그 용이. */
 		[NVMF_QPAIR_AUTH_NEGOTIATE] = "negotiate",
 		[NVMF_QPAIR_AUTH_CHALLENGE] = "challenge",
 		[NVMF_QPAIR_AUTH_REPLY] = "reply",
@@ -87,100 +428,285 @@ nvmf_auth_get_state_name(enum nvmf_qpair_auth_state state)
 	};
 
 	return state_names[state];
+	/* [한국어] 경계 검사 없음 — 호출자가 enum 범위 보장 책임. */
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_set_state - 인증 상태를 변경하고 디버그 로그 출력.
+ *
+ * @qpair: 상태 변경 대상 qpair.
+ * @state: 새 상태.
+ *
+ * 모든 상태 전이의 단일 진입점 — 직접 auth->state = X 대입 금지.
+ * 디버그 로그 일관성 + 향후 상태 전이 hooks(검증/통계) 확장 지점.
+ *
+ * 동일 상태로의 전이는 no-op (로그 스팸 방지).
+ *
+ * 호출 컨텍스트: qpair 소유 스레드. 락 불필요(qpair 단일 스레드 affinity).
+ *
+ * 호출 체인:
+ *   nvmf_auth_*_exec / nvmf_auth_recv_* / nvmf_qpair_auth_init → [이 함수]
+ */
 static void
 nvmf_auth_set_state(struct spdk_nvmf_qpair *qpair, enum nvmf_qpair_auth_state state)
 {
 	struct spdk_nvmf_qpair_auth *auth = qpair->auth;
+	/* [한국어] qpair에 부착된 인증 컨텍스트 획득 — 호출 시점엔 항상 유효해야 함. */
 
 	if (auth->state == state) {
+		/* [한국어] 같은 상태로 변경하는 것은 no-op — 로그 노이즈 절감. */
 		return;
 	}
 
 	AUTH_DEBUGLOG(qpair, "auth state: %s\n", nvmf_auth_get_state_name(state));
+	/* [한국어] 새 상태 이름을 디버그 로그에 출력 — 인증 흐름 추적 핵심 단서. */
 	auth->state = state;
+	/* [한국어] 실제 상태 갱신. 이 라인 이후 다른 sub-handler가 새 상태에서 동작. */
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_disconnect_qpair - 인증 실패/종료 시 qpair를 ERROR 상태로 표시하고 disconnect.
+ *
+ * @qpair: 종료할 qpair.
+ *
+ * 비가역적 종결 — 호출 후 더 이상 인증 메시지를 처리하지 않는다.
+ * spdk_nvmf_qpair_disconnect는 비동기 — 실제 transport 자원 해제는 나중에 진행.
+ *
+ * 호출 컨텍스트: qpair 소유 스레드.
+ *
+ * 호출 체인:
+ *   timeout_poller / failure2_exec / 페이로드 검증 실패 등 → [이 함수] →
+ *   spdk_nvmf_qpair_disconnect → transport 정리 + nvmf_qpair_auth_destroy
+ */
 static void
 nvmf_auth_disconnect_qpair(struct spdk_nvmf_qpair *qpair)
 {
 	nvmf_auth_set_state(qpair, NVMF_QPAIR_AUTH_ERROR);
+	/* [한국어] 명시적으로 ERROR 상태 표시 — 이후 들어오는 메시지가 reuse하지 못하게 가드. */
 	spdk_nvmf_qpair_disconnect(qpair);
+	/* [한국어] qpair 종료 비동기 트리거 — transport별 graceful shutdown 후 callback 등록. */
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_request_fail1 - 검증 실패를 FAILURE1 상태로 표시하고 현 명령은 success로 응답.
+ *
+ * @req:    실패가 발견된 AuthSend/Recv 요청.
+ * @reason: SPDK_NVMF_AUTH_FAILED / INCORRECT_PAYLOAD / INCORRECT_PROTOCOL_MESSAGE 등.
+ *
+ * NVMe-oF 인증 프로토콜의 핵심 분리 패턴:
+ *   - "이 NVMe 명령 자체"는 GENERIC/SUCCESS로 정상 응답한다.
+ *   - "application 레벨 인증 실패"는 다음 호스트의 AuthRecv 시 AUTH_failure1 메시지로 통지.
+ *   → 이렇게 하는 이유: NVMe CQE는 호스트가 일반 NVMe 처리하지만, AUTH 실패 정보는
+ *     application(인증 SM)가 받아야 함.
+ *
+ * 호출 후 흐름:
+ *   FAILURE1 상태 → 호스트가 다음 AuthRecv 보냄 → nvmf_auth_recv_failure1()이 메시지 빌드 →
+ *   100ms 지연 후 disconnect (timing side-channel 완화).
+ *
+ * 호출 컨텍스트: qpair 소유 스레드.
+ *
+ * 호출 체인:
+ *   negotiate/reply/success2/failure2_exec — 거의 모든 검증 실패 분기 → [이 함수] →
+ *   nvmf_auth_request_complete (NVMe layer success)
+ *   이후 host AuthRecv → nvmf_auth_recv_failure1
+ */
 static void
 nvmf_auth_request_fail1(struct spdk_nvmf_request *req, int reason)
 {
 	struct spdk_nvmf_qpair *qpair = req->qpair;
+	/* [한국어] 요청 → 소유 qpair 역참조. */
 	struct spdk_nvmf_qpair_auth *auth = qpair->auth;
+	/* [한국어] 인증 컨텍스트 획득. */
 
 	nvmf_auth_set_state(qpair, NVMF_QPAIR_AUTH_FAILURE1);
+	/* [한국어] 상태를 FAILURE1로 전이 — 다음 AuthRecv가 failure 메시지를 빌드하도록 지시. */
 	auth->fail_reason = reason;
+	/* [한국어] 실패 사유 보존 — recv_failure1이 그대로 메시지의 rce 필드로 송신. */
 
 	/* The command itself is completed successfully, but a subsequent AUTHENTICATION_RECV
 	 * command will be completed with an AUTH_failure1 message
 	 */
+	/* [한국어] NVMe-oF 와이어 contract: AuthSend 자체는 항상 NVMe 레벨 success로 응답.
+	 * 실제 application 인증 실패는 다음 AuthRecv의 페이로드(AUTH_failure1)로 통지. */
 	nvmf_auth_request_complete(req, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, 0);
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_digest_allowed - 정책상 이 digest를 허용하는지 검사.
+ *
+ * @qpair:  검사할 qpair (target까지 chain).
+ * @digest: 검사할 hash id (1=SHA-256, 2=SHA-384, 3=SHA-512).
+ * @return: true=허용, false=금지.
+ *
+ * spdk_nvmf_tgt.dhchap_digests는 비트마스크(SPDK_BIT(id) OR'ed) — RPC로 운영자가 설정.
+ * 기본값은 모두 활성. 특정 digest 비활성 시 협상에서 자동 제외.
+ *
+ * 호출 컨텍스트: qpair 스레드. 비블로킹.
+ *
+ * 호출 체인: nvmf_auth_negotiate_exec 내부 루프.
+ */
 static bool
 nvmf_auth_digest_allowed(struct spdk_nvmf_qpair *qpair, uint8_t digest)
 {
 	struct spdk_nvmf_tgt *tgt = qpair->group->tgt;
+	/* [한국어] qpair → poll group → 소유 target. target 단위로 정책 마스크 보유. */
 
 	return tgt->dhchap_digests & SPDK_BIT(digest);
+	/* [한국어] 비트마스크 검사 — SPDK_BIT(n) = (1 << n). 비트 셋이면 허용. */
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_dhgroup_allowed - 정책상 이 DH 그룹을 허용하는지 검사.
+ *
+ * @qpair:   검사 대상.
+ * @dhgroup: DH 그룹 id (0=NULL, 1=ffdhe2048, 2=3072, 3=4096, 4=6144, 5=8192).
+ * @return:  true=허용.
+ *
+ * tgt->dhchap_dhgroups 비트마스크 — RPC로 운영자가 ffdhe2048 미만/이상을 토글 가능.
+ * NULL 그룹은 PSK-only 모드 — 약한 그룹이지만 호환성/저비용 환경에서 사용.
+ *
+ * 호출 체인: nvmf_auth_negotiate_exec 내부 루프.
+ */
 static bool
 nvmf_auth_dhgroup_allowed(struct spdk_nvmf_qpair *qpair, uint8_t dhgroup)
 {
 	struct spdk_nvmf_tgt *tgt = qpair->group->tgt;
+	/* [한국어] target 정책 위치까지 동일 chain. */
 
 	return tgt->dhchap_dhgroups & SPDK_BIT(dhgroup);
+	/* [한국어] 비트 검사. */
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_qpair_cleanup - 인증 진행 중 자원(타임아웃 poller, ephemeral DH 키페어) 해제.
+ *
+ * @auth: 정리할 인증 컨텍스트 (struct 자체는 free하지 않음).
+ *
+ * 정상 완료(COMPLETED 진입), 재인증 시작, FAILURE/disconnect 진로 모든 곳에서 호출되는
+ * idempotent cleanup 헬퍼:
+ *   - poller: 더 이상 timeout 발화하지 않도록 unregister.
+ *   - dhkey:  ephemeral 키페어 즉시 free → forward secrecy 보장 (private key가 메모리에
+ *     남아있으면 나중에 코어덤프 등으로 secret 노출 가능).
+ *
+ * 주의: struct spdk_nvmf_qpair_auth 자체는 nvmf_qpair_auth_destroy()가 free.
+ *       이 함수만 호출하면 컨텍스트 재사용 가능 (재인증 등).
+ *
+ * 호출 컨텍스트: qpair 소유 스레드.
+ *
+ * 호출 체인:
+ *   timeout_poller / success2_exec / recv_success1 / nvmf_qpair_auth_destroy → [이 함수]
+ */
 static void
 nvmf_auth_qpair_cleanup(struct spdk_nvmf_qpair_auth *auth)
 {
 	spdk_poller_unregister(&auth->poller);
+	/* [한국어] poller 등록 해제 — &auth->poller로 더블 포인터 전달, NULL로 자동 클리어.
+	 * 같은 함수가 두 번 호출되어도 안전(NULL이면 no-op). */
 	spdk_nvme_dhchap_dhkey_free(&auth->dhkey);
+	/* [한국어] DH ephemeral 키페어 free + auth->dhkey=NULL 자동 클리어.
+	 * 내부적으로 OpenSSL EVP_PKEY_free 호출 → BIGNUM 메모리도 zeroize.
+	 * 보안 핵심: 인증 종료 후 private key를 즉시 폐기해야 forward secrecy 성립. */
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_timeout_poller - 인증 단계 간 timeout 발화 시 호출되는 spdk_poller 콜백.
+ *
+ * @ctx: SPDK_POLLER_REGISTER 등록 시 전달한 qpair 포인터.
+ * @return: SPDK_POLLER_BUSY — 일이 있었음을 표시 (poller 통계용).
+ *
+ * 동작:
+ *   - 호스트가 KATO(또는 기본 120초) 시간 안에 다음 인증 메시지를 보내지 않으면 발화.
+ *   - qpair 상태에 따라 분기:
+ *     1) ENABLED: re-authentication 도중 timeout — 기존 세션이 유효하므로 fatal 아님.
+ *        그냥 인증 SM만 COMPLETED로 표시하고 cleanup → 호스트가 다시 시도 가능.
+ *     2) AUTHENTICATING: 첫 인증 도중 timeout — qpair 자체를 disconnect (연결 종료).
+ *
+ * 호출 컨텍스트: qpair 소유 SPDK 스레드의 poller 디스패치 시점. 단일 스레드, 재진입 없음.
+ *
+ * 호출 체인:
+ *   spdk_thread poller dispatcher → [이 함수] → set_state + cleanup 또는 disconnect
+ */
 static int
 nvmf_auth_timeout_poller(void *ctx)
 {
 	struct spdk_nvmf_qpair *qpair = ctx;
+	/* [한국어] poller 등록 시 전달한 qpair 포인터 복원. */
 	struct spdk_nvmf_qpair_auth *auth = qpair->auth;
+	/* [한국어] 인증 컨텍스트 — qpair 종료 직전이라도 destroy 전에는 유효. */
 
 	AUTH_ERRLOG(qpair, "authentication timed out\n");
+	/* [한국어] 인증 timeout 에러 로그 — subsys/host/qid prefix 자동 포함. */
 	spdk_poller_unregister(&auth->poller);
+	/* [한국어] one-shot 처리 후 자기 자신 등록 해제 — 두 번 발화 방지. */
 
 	if (qpair->state == SPDK_NVMF_QPAIR_ENABLED) {
 		/* Reauthentication timeout isn't considered to be a fatal failure */
+		/* [한국어] qpair는 이미 ENABLED — 기존 세션 활성 중 재인증 시도 timeout.
+		 * 기존 인증이 유효하므로 disconnect 없이 인증 SM만 종료. */
 		nvmf_auth_set_state(qpair, NVMF_QPAIR_AUTH_COMPLETED);
+		/* [한국어] 인증 SM을 COMPLETED로 복귀 — 다음 사용자/호스트 트리거 시 재시작 가능. */
 		nvmf_auth_qpair_cleanup(auth);
+		/* [한국어] poller(이미 unregister됨, NULL no-op)와 dhkey만 정리. */
 	} else {
+		/* [한국어] AUTHENTICATING 상태 — 첫 connect 인증 도중 timeout.
+		 * 세션을 활성화하지 못했으므로 qpair 종료(연결 끊기). */
 		nvmf_auth_disconnect_qpair(qpair);
 	}
 
 	return SPDK_POLLER_BUSY;
+	/* [한국어] poller 통계상 "유효 작업 수행" 표시. spdk_thread는 이를 idle 비율 계산에 사용. */
 }
 
+/*
+ * [한국어]
+ * nvmf_auth_rearm_poller - timeout poller를 (재)등록 — 다음 단계 시간 제한 시작.
+ *
+ * @qpair: poller를 부착할 qpair.
+ * @return: 0=성공, -ENOMEM=poller 객체 할당 실패.
+ *
+ * 인증 진행 중 한 단계가 끝나고 다음 호스트 메시지를 기다리기 시작할 때마다 호출.
+ * 기존 poller 있으면 unregister 후 새로 등록 — KATO 카운터를 리셋하는 효과.
+ *
+ * 타임아웃 산출:
+ *   - ctrlr->feat.keep_alive_timer.bits.kato가 호스트가 SET FEATURES로 알린 값 (ms 단위).
+ *   - 0이면(미설정) NVMF_AUTH_DEFAULT_KATO_US (120초) 기본값.
+ *
+ * 호출 컨텍스트: qpair 스레드.
+ *
+ * 호출 체인:
+ *   negotiate_exec / reply_exec / recv_challenge / recv_success1 / nvmf_qpair_auth_init →
+ *   [이 함수] → SPDK_POLLER_REGISTER → spdk_thread 내부 timer wheel
+ */
 static int
 nvmf_auth_rearm_poller(struct spdk_nvmf_qpair *qpair)
 {
 	struct spdk_nvmf_ctrlr *ctrlr = qpair->ctrlr;
+	/* [한국어] qpair가 속한 컨트롤러 — KATO feature는 ctrlr 단위 설정. */
 	struct spdk_nvmf_qpair_auth *auth = qpair->auth;
+	/* [한국어] 인증 컨텍스트. */
 	uint64_t timeout;
+	/* [한국어] 마이크로초 단위 타임아웃. */
 
 	timeout = ctrlr->feat.keep_alive_timer.bits.kato > 0 ?
 		  ctrlr->feat.keep_alive_timer.bits.kato * 1000 :
 		  NVMF_AUTH_DEFAULT_KATO_US;
+	/* [한국어] 호스트가 KATO 설정했으면 그 값(ms)을 us로 변환 (×1000), 아니면 기본 120초.
+	 * KATO는 일반 keep-alive timer 재사용 — 호스트는 이미 keep-alive 의미로 알고 있음. */
 
 	spdk_poller_unregister(&auth->poller);
+	/* [한국어] 기존 poller 해제 — 이전 단계 타임아웃이 남아 있을 수 있음. */
 	auth->poller = SPDK_POLLER_REGISTER(nvmf_auth_timeout_poller, qpair, timeout);
+	/* [한국어] 새 poller 등록 — timeout us 후 nvmf_auth_timeout_poller 1회 발화.
+	 * spdk_thread는 timer wheel로 효율적으로 관리. qpair 스레드에서만 호출됨. */
 	if (auth->poller == NULL) {
+		/* [한국어] poller 객체 메모리 할당 실패 — 호출자가 INTERNAL_ERROR 응답하도록 -ENOMEM 반환. */
 		return -ENOMEM;
 	}
 

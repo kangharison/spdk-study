@@ -535,87 +535,161 @@ nvme_zns_zone_mgmt_send(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 
 /*
  * [한국어]
- * spdk_nvme_zns_close_zone - Zone Close (action=0x01).
+ * spdk_nvme_zns_close_zone - Zone Close (Zone Mgmt Send, action=0x01) public API.
  *
- * @ns/qpair/slba/select_all/cb_fn/cb_arg: 표준 zone send 인자.
- * @return: 0 성공, 음수 에러.
+ * @ns: 대상 ZNS namespace 핸들.
+ * @qpair: 명령 제출 qpair (호출 스레드와 owner thread 일치해야 함).
+ * @slba: 닫을 zone의 zslba(Zone Start LBA). select_all=true 면 무시됨.
+ * @select_all: true 시 namespace 내 모든 IMP_OPEN/EXP_OPEN zone에 일괄 적용 (CDW13[8]=1).
+ * @cb_fn: 완료 콜백 (CQE 도착 후 process_completions 컨텍스트에서 호출).
+ * @cb_arg: 콜백 컨텍스트 인자 — SPDK가 그대로 cb_fn 첫 인자로 전달.
+ * @return: 0 성공(요청이 SQ에 큐잉됨), -ENOMEM 등 동기 에러.
  *
- * Zone State 전이: IMP_OPEN/EXP_OPEN → CLOSED. write resource 해제 (open count↓),
- * 그러나 zone에 기록된 데이터/wp 위치는 보존. 다시 write/append하면 IMP_OPEN으로 복귀.
+ * Zone State Machine 전이: IMP_OPEN(Implicitly Open) / EXP_OPEN(Explicitly Open) → CLOSED.
+ * 디바이스 내부의 write resource (open count) 가 1 감소하므로 MOR 한도가 차서 새 zone을
+ * 열 수 없을 때 호스트가 자발적으로 호출. zone 데이터/wp 위치는 보존되어 이후 write
+ * /append 시 IMP_OPEN 으로 자동 복귀. 즉 Reset 과 달리 데이터 파괴 없는 자원 회수.
+ *
+ * 실행 컨텍스트: qpair 소유 SPDK thread. 다른 thread에서 부르면 lockless 가정 위반.
+ *
+ * 호출 체인:
+ *   사용자/bdev_zone → [spdk_nvme_zns_close_zone]
+ *     → nvme_zns_zone_mgmt_send (이 파일 static helper)
+ *     → nvme_qpair_submit_request → 트랜스포트 vtable → CQE → cb_fn
  */
 int
 spdk_nvme_zns_close_zone(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair, uint64_t slba,
 			 bool select_all, spdk_nvme_cmd_cb cb_fn, void *cb_arg)
 {
+	/* [한국어] static helper에 action=SPDK_NVME_ZONE_CLOSE(0x01) 만 주입하여 SQE 빌드/제출 위임.
+	 * helper가 opcode 0x79(ZSEND), CDW10/11(SLBA), CDW13[7:0]=action, CDW13[8]=select_all 채움. */
 	return nvme_zns_zone_mgmt_send(ns, qpair, slba, select_all, SPDK_NVME_ZONE_CLOSE,
 				       cb_fn, cb_arg);
 }
 
 /*
  * [한국어]
- * spdk_nvme_zns_finish_zone - Zone Finish (action=0x02).
+ * spdk_nvme_zns_finish_zone - Zone Finish (Zone Mgmt Send, action=0x02) public API.
  *
- * @return: 0 성공, 음수 에러.
+ * @ns: 대상 ZNS namespace.
+ * @qpair: 제출 qpair.
+ * @slba: 마감할 zone의 zslba. select_all=true 면 의미 없음.
+ * @select_all: true 시 namespace 내 모든 비-FULL zone 일괄 적용.
+ * @cb_fn / cb_arg: 완료 콜백/컨텍스트.
+ * @return: 0 성공, -ENOMEM 등 동기 에러.
  *
- * Zone State 전이: 임의 상태 → FULL. wp를 zone 끝(zslba+zsze)으로 강제 이동시켜
- * 더 이상 write 받지 않게 만듬. 사전 종료가 필요한 호스트 정책에 사용.
+ * Zone State Machine 전이: EMPTY/IMP_OPEN/EXP_OPEN/CLOSED → FULL. 디바이스가 wp 를
+ * zone 끝(zslba + zsze)까지 강제 이동시켜 이후 write/append 를 NVMe 상태 전이 오류로
+ * 거부하게 만든다. zone에 남은 미사용 LBA 가 있어도 더는 채우지 않고 종결할 때 사용
+ * (예: 호스트 측 GC 또는 데이터 무결성 정책으로 partial zone 닫기).
+ *
+ * 실행 컨텍스트: qpair 소유 thread. 비동기 명령이며 완료까지 zone 상태는 변경되지 않음.
+ *
+ * 호출 체인:
+ *   사용자/bdev_zone → [spdk_nvme_zns_finish_zone]
+ *     → nvme_zns_zone_mgmt_send → nvme_qpair_submit_request → CQE → cb_fn
  */
 int
 spdk_nvme_zns_finish_zone(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair, uint64_t slba,
 			  bool select_all, spdk_nvme_cmd_cb cb_fn, void *cb_arg)
 {
+	/* [한국어] action=SPDK_NVME_ZONE_FINISH(0x02). helper가 opcode 0x79 + CDW13 빌드 후 제출. */
 	return nvme_zns_zone_mgmt_send(ns, qpair, slba, select_all, SPDK_NVME_ZONE_FINISH,
 				       cb_fn, cb_arg);
 }
 
 /*
  * [한국어]
- * spdk_nvme_zns_open_zone - Zone Open (action=0x03), Explicit Open.
+ * spdk_nvme_zns_open_zone - Zone Open (Zone Mgmt Send, action=0x03) — Explicit Open.
  *
- * @return: 0 성공, 음수 에러.
+ * @ns: 대상 ZNS namespace.
+ * @qpair: 제출 qpair.
+ * @slba: 열 zone의 zslba. select_all=true 면 무시.
+ * @select_all: true 시 EMPTY/CLOSED 상태 zone 모두 일괄 EXP_OPEN.
+ * @cb_fn / cb_arg: 완료 콜백/컨텍스트.
+ * @return: 0 성공, -ENOMEM 등 동기 에러.
  *
- * Zone State 전이: EMPTY/CLOSED → EXP_OPEN. 명시적으로 write resource(open count) 1
- * 차지. 사용자가 곧 write할 zone을 미리 알리는 hint — 펌웨어가 buffer 미리 할당.
+ * Zone State Machine 전이: EMPTY/CLOSED → EXP_OPEN(Explicitly Opened). 일반 write/append
+ * 가 트리거하는 자동 IMP_OPEN(Implicitly Opened) 과 달리, 호스트가 명시적으로 open
+ * resource(MOR 카운터)를 차지하는 명령. 펌웨어가 미리 buffer/메타데이터 슬롯을 할당해
+ * 첫 write latency 를 줄이려는 hint. 만약 MOR 한도가 가득 찬 상태에서 호출하면
+ * 컨트롤러가 Too Many Open Zones 상태 코드를 CQE 로 회신.
+ *
+ * 실행 컨텍스트: qpair 소유 thread. 명령은 비동기.
+ *
+ * 호출 체인:
+ *   사용자/bdev_zone → [spdk_nvme_zns_open_zone]
+ *     → nvme_zns_zone_mgmt_send → nvme_qpair_submit_request → CQE → cb_fn
  */
 int
 spdk_nvme_zns_open_zone(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair, uint64_t slba,
 			bool select_all, spdk_nvme_cmd_cb cb_fn, void *cb_arg)
 {
+	/* [한국어] action=SPDK_NVME_ZONE_OPEN(0x03). helper가 SQE 빌드 후 SQ에 enqueue. */
 	return nvme_zns_zone_mgmt_send(ns, qpair, slba, select_all, SPDK_NVME_ZONE_OPEN,
 				       cb_fn, cb_arg);
 }
 
 /*
  * [한국어]
- * spdk_nvme_zns_reset_zone - Zone Reset (action=0x04).
+ * spdk_nvme_zns_reset_zone - Zone Reset (Zone Mgmt Send, action=0x04) public API.
  *
- * @return: 0 성공, 음수 에러.
+ * @ns: 대상 ZNS namespace.
+ * @qpair: 제출 qpair.
+ * @slba: 리셋할 zone의 zslba. select_all=true 면 무시.
+ * @select_all: true 시 namespace 내 모든 non-OFFLINE/non-READ_ONLY zone 일괄 RESET
+ *              (zone 전체 초기화 — 종종 ZNS 디바이스 재포맷 직전 사용).
+ * @cb_fn / cb_arg: 완료 콜백/컨텍스트.
+ * @return: 0 성공, -ENOMEM 등 동기 에러.
  *
- * Zone State 전이: 임의 상태 → EMPTY. wp를 zslba로 reset, 데이터는 erase된 것으로 간주
- * (이후 read 시 invalid LBA 또는 zero, namespace 정책에 따름). select_all=true 가 자주 쓰임.
+ * Zone State Machine 전이: 임의 상태(IMP_OPEN/EXP_OPEN/CLOSED/FULL) → EMPTY. wp를
+ * zslba로 되돌리고 zone 내용을 erase 된 것으로 간주(NLBAS 의 unmapped read 정책에
+ * 따라 이후 read는 zero/invalid LBA error). 데이터 파괴 명령 — 호스트 측 GC 또는
+ * 사용자 명시 reset 정책에서 사용.
+ *
+ * 실행 컨텍스트: qpair 소유 thread. 비동기 명령. RESET ALL (select_all=true) 은 내부
+ * 적으로 디바이스가 다수 zone 의 wp/메타를 일괄 갱신하므로 latency 가 single-zone
+ * 보다 클 수 있음.
+ *
+ * 호출 체인:
+ *   사용자/bdev_zone → [spdk_nvme_zns_reset_zone]
+ *     → nvme_zns_zone_mgmt_send → nvme_qpair_submit_request → CQE → cb_fn
  */
 int
 spdk_nvme_zns_reset_zone(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair, uint64_t slba,
 			 bool select_all, spdk_nvme_cmd_cb cb_fn, void *cb_arg)
 {
+	/* [한국어] action=SPDK_NVME_ZONE_RESET(0x04). helper가 SQE 빌드/제출. */
 	return nvme_zns_zone_mgmt_send(ns, qpair, slba, select_all, SPDK_NVME_ZONE_RESET,
 				       cb_fn, cb_arg);
 }
 
 /*
  * [한국어]
- * spdk_nvme_zns_offline_zone - Zone Offline (action=0x05).
+ * spdk_nvme_zns_offline_zone - Zone Offline (Zone Mgmt Send, action=0x05) public API.
  *
- * @return: 0 성공, 음수 에러.
+ * @ns: 대상 ZNS namespace.
+ * @qpair: 제출 qpair.
+ * @slba: offline 처리할 zone의 zslba. select_all=true 면 무시.
+ * @select_all: true 시 모든 READ_ONLY zone 일괄 OFFLINE (희귀 사용 — 디바이스 폐기 직전).
+ * @cb_fn / cb_arg: 완료 콜백/컨텍스트.
+ * @return: 0 성공, -ENOMEM 등 동기 에러.
  *
- * Zone State 전이: READ_ONLY → OFFLINE. 디바이스가 미디어 결함을 감지해 READ_ONLY로
- * 강등된 zone을 사용자가 영구 폐기 처리할 때 사용. OFFLINE zone은 더 이상 어떤 명령도
- * 수락하지 않음.
+ * Zone State Machine 전이: READ_ONLY → OFFLINE. 디바이스가 미디어 마모/결함을 감지해
+ * 자체적으로 READ_ONLY 로 강등시킨 zone(데이터 read 만 가능)을 사용자가 명시적으로
+ * 폐기 처리할 때 사용. OFFLINE zone 은 어떤 read/write 도 수락하지 않으며 zone count
+ * 에는 잡혀 있어 namespace 의 사용 가능 LBA 가 영구 감소. 디바이스 수명/내구성 관리
+ * 용 호스트 측 정책 명령 (일반 IO 경로에서는 거의 등장하지 않음).
+ *
+ * 호출 체인:
+ *   사용자/bdev_zone → [spdk_nvme_zns_offline_zone]
+ *     → nvme_zns_zone_mgmt_send → nvme_qpair_submit_request → CQE → cb_fn
  */
 int
 spdk_nvme_zns_offline_zone(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair, uint64_t slba,
 			   bool select_all, spdk_nvme_cmd_cb cb_fn, void *cb_arg)
 {
+	/* [한국어] action=SPDK_NVME_ZONE_OFFLINE(0x05). helper가 opcode 0x79 SQE 빌드 후 제출. */
 	return nvme_zns_zone_mgmt_send(ns, qpair, slba, select_all, SPDK_NVME_ZONE_OFFLINE,
 				       cb_fn, cb_arg);
 }

@@ -9,7 +9,7 @@
  */
 
 /*
- * [한국어 설명] bdev 공개 사용자 API (bdev.h) — 2551 라인
+ * [한국어 설명] bdev 공개 사용자 API (bdev.h) — 4194 라인 (전 공개 API 주석 완료)
  *
  * === 파일의 역할 ===
  * SPDK의 "블록 디바이스 추상화 레이어(bdev)" **사용자/애플리케이션 API**.
@@ -23,21 +23,32 @@
  * bdev 모듈 작성자 API는 별도 파일 `spdk/bdev_module.h`에 있다. 이 파일은
  * "bdev을 쓰는 쪽" 전용.
  *
- * 주요 내용 (라인 기준 대략적):
- *   - 이벤트 타입·콜백 (line 41~): REMOVE/RESIZE/MEDIA_MANAGEMENT
- *   - enum spdk_bdev_io_type (line 103): READ/WRITE/UNMAP/FLUSH/RESET/COMPARE/…
- *   - enum spdk_bdev_qos_rate_limit_type (line 147): IOPS/BANDWIDTH 리밋
- *   - struct spdk_bdev_io_stat (line 175): per-bdev 통계
- *   - 초기화/종료 API (spdk_bdev_initialize/finish)
- *   - 열기/닫기 API (spdk_bdev_open_ext/close, claim)
- *   - 속성 질의 (get_block_size, get_num_blocks, UUID, NUMA 등)
- *   - ★ I/O 제출 API (line 1237~): read/readv/readv_blocks_with_md/_ext,
+ * 주요 내용:
+ *   - 이벤트 타입·콜백: REMOVE/RESIZE/MEDIA_MANAGEMENT
+ *   - enum spdk_bdev_io_type (23종): READ/WRITE/UNMAP/FLUSH/RESET/COMPARE/SEEK_DATA/HOLE/COPY/...
+ *   - enum spdk_bdev_qos_rate_limit_type: RW IOPS/BPS, R BPS, W BPS (4종)
+ *   - struct spdk_bdev_opts: 전역 옵션 (pool_size, cache_size, iobuf 캐시)
+ *   - struct spdk_bdev_io_stat: per-bdev 통계 (RW/UNMAP/COPY 카운터·지연·에러)
+ *   - struct spdk_bdev_enable_histogram_opts: 히스토그램 세밀 옵션 (granularity, min/max_nsec, io_type 필터)
+ *   - struct spdk_bdev_ext_io_opts: _ext API 옵션 (memory_domain, accel_sequence, NVMe cdw12·13)
+ *   - struct spdk_bdev_open_opts/_async_opts: 열기 옵션 (hide_metadata, timeout_ms)
+ *   - 초기화/종료: spdk_bdev_initialize/finish
+ *   - 열기/닫기: spdk_bdev_open_ext / _v2 / _async / close
+ *   - 속성 질의: get_block_size, get_num_blocks, UUID, NUMA, optimal_io_boundary, dif_*, max_copy
+ *   - QoS: get_qos_rpc_type, get/set_qos_rate_limits
+ *   - QD 모니터링: get_qd, get/set_qd_sampling_period, get_io_time, get_weighted_io_time
+ *   - ★ I/O 제출 API (43+종): read/readv/readv_blocks_with_md/_ext,
  *     write/writev/writev_blocks_with_md/_ext, write_zeroes, write_uncorrectable,
- *     unmap, flush, reset, compare, compare_and_write, abort, copy,
- *     zone 관리/append, nvme admin/io passthru
- *   - 완료·상태 설정 (spdk_bdev_io_complete, _set_nvme_status, _set_scsi_status)
- *   - I/O 대기 큐 (spdk_bdev_queue_io_wait)
- *   - 히스토그램, QoS, 채널 iteration 유틸
+ *     unmap, flush, reset, nvme_nssr, abort, compare/comparev/comparev_and_writev,
+ *     zcopy_start/end, copy_blocks, seek_data/seek_hole,
+ *     nvme_admin/io/io_md/iov_md_passthru
+ *   - 완료 처리: free_io, get_nvme_status/fused/scsi/aio_status, get_iovec/md_buf/cb_arg, get_seek_offset
+ *   - I/O 대기 큐: io_wait_entry, queue_io_wait (NOMEM 재시도 패턴)
+ *   - 히스토그램: histogram_enable / _ext / _opts_init / _get / channel_get_histogram
+ *   - 통계: get_io_stat (단일 채널 동기), get_device_stat (모든 채널 비동기 집계)
+ *   - 채널 순회: for_each_channel + continue (sync/async 패턴 모두 지원)
+ *   - 메모리 도메인: get_memory_domains (RDMA/GPU 호환성 확인)
+ *   - 미디어 이벤트: get_media_events (Open Channel SSD bad block 등)
  *
  * === 전체 아키텍처에서의 위치 ===
  * 호출 흐름:
@@ -75,11 +86,20 @@
  *   - spdk_bdev_get_io_channel: 스레드별 I/O 채널 획득
  *   - spdk_bdev_read_blocks / write_blocks / unmap / flush / reset: 핵심 I/O API
  *   - readv_blocks_with_md / _ext: scatter-gather + 메타 + 확장 옵션 경로
- *   - spdk_bdev_io_complete: 모듈 → bdev 코어 완료 통지
+ *   - spdk_bdev_seek_data / seek_hole: 스파스 영역 탐색 (POSIX SEEK_DATA/HOLE 등가)
+ *   - spdk_bdev_histogram_enable_ext / channel_get_histogram: per-IO-type latency 분포 측정
+ *   - spdk_bdev_for_each_channel + continue: per-channel 비동기 작업 패턴
  *   - spdk_bdev_io_timeout_cb 등: timeout/통계/히스토그램 관측
  *
- * 본 주석은 상단 블록 + 초기 enum/typedef/상수와 개방 매핑 기능군 주석을
- * 제공한다. 각 read/write 변종 43개 + 통계/히스토그램/zone API는 후속 세션.
+ * 핵심 인사이트:
+ *   - DIF/PI: NVMe Base Spec 5.27 (Type1/2/3, PIF=16/32/64B variants), GUARD/APPTAG/REFTAG의
+ *     세 검사 항목이 PRINFO/PRCHK 비트로 SQE에 매핑. desc 시점 vs bdev 시점 getter 분리는
+ *     hide_metadata 옵션 지원 때문 (상위 계층이 PI를 보지 않도록 마스킹).
+ *   - seek_data/seek_hole: thin-provisioned bdev(lvol)의 cluster 할당 비트맵 또는 NVMe DSM
+ *     정보를 활용하여 빈 영역 skip — rsync-style 스파스 복사의 핵심 프리미티브.
+ *   - histogram: bdev 단위 enable이지만 누적은 채널별. histogram_get은 모든 채널 메시지
+ *     집계(비동기), channel_get_histogram은 단일 채널 직접 조회. opts.granularity로 메모리·
+ *     CPU 비용 vs 해상도 trade-off, io_type 필터로 READ/WRITE 분리 분석 가능.
  */
 
 #ifndef SPDK_BDEV_H_             /* [한국어] include 가드 */
@@ -267,18 +287,42 @@ enum spdk_bdev_io_type {
 /**
  * Structure with optional enable histogram parameters
  */
+/*
+ * [한국어] struct spdk_bdev_enable_histogram_opts - 히스토그램 활성화 확장 옵션
+ *
+ * spdk_bdev_histogram_enable_ext()에 전달되어 히스토그램의 측정 범위·해상도·
+ * 대상 I/O 타입을 세밀하게 제어. 기본 enable() API는 이 구조체 없이 호출되며,
+ * 측정 범위·해상도는 SPDK 기본값을 따름.
+ *
+ * ABI 호환성: size 필드 우선 — 호출자가 sizeof 결과를 기록 → SPDK는 모르는
+ * 신규 필드를 기본값으로 무시 (구형 호출자도 계속 동작).
+ */
 struct spdk_bdev_enable_histogram_opts {
 	/** Size of this structure in bytes */
 	size_t size;
+	                                  /* [한국어] 호출자가 알고 있는 구조체 크기. spdk_bdev_enable_histogram_opts_init이 자동 설정 */
 
 	/** Min value in nanoseconds to track in histogram */
 	uint64_t min_nsec;
+	                                  /* [한국어] 히스토그램 최소 측정 지연(ns) — 이 값 미만은 첫 버킷에 합산
+	                                   *  - 0: SPDK 기본 (최저 버킷 = 1 tick)
+	                                   *  - 작은 값(예: 100ns): 매우 빠른 NVMe 장치의 미세 분포까지 추적 */
 	/** Max value in nanoseconds to track in histogram */
 	uint64_t max_nsec;
+	                                  /* [한국어] 히스토그램 최대 측정 지연(ns) — 이 값 초과는 마지막 버킷에 합산
+	                                   *  - 0: SPDK 기본 (충분히 큰 상한)
+	                                   *  - tail latency(예: 1초)까지 분포가 필요한 경우 명시 */
 	uint8_t io_type;
+	                                  /* [한국어] 측정 대상 I/O 타입 (enum spdk_bdev_io_type 값을 8bit로 압축)
+	                                   *  - SPDK_BDEV_IO_TYPE_INVALID(0): 모든 타입 측정 (기본)
+	                                   *  - 특정 타입 지정 시 그 타입의 latency만 누적 → READ/WRITE 분리 분석 */
 	uint8_t granularity;
+	                                  /* [한국어] 히스토그램 버킷 해상도 (bucket_shift) — 2^granularity ns 단위 버킷
+	                                   *  - 작을수록 세밀, 클수록 메모리·CPU 절감
+	                                   *  - 0: SPDK 기본 (대략 64 버킷/decade) */
 } __attribute__((packed));
 SPDK_STATIC_ASSERT(sizeof(struct spdk_bdev_enable_histogram_opts) == 26, "Incorrect size");
+                                  /* [한국어] 26B 고정 — packed로 패딩 제거. 필드 추가는 끝에 (ABI 호환) */
 
 /** bdev QoS rate limit type */
 /*
@@ -368,13 +412,30 @@ struct spdk_bdev_io_stat {
                                   /* [한국어] deep copy 효율 — io_error 뒤에 멤버 추가 금지 */
 };
 
+/*
+ * [한국어] struct spdk_bdev_opts - bdev 서브시스템 전역 튜닝 옵션
+ *
+ * spdk_bdev_set_opts()로 초기화 전 미리 적용 (initialize 후 변경 시 일부 필드 무시).
+ * RPC bdev_set_options 또는 JSON config에서 값 주입.
+ * ABI 호환성: opts_size 필드로 호출자 인지 크기 전달.
+ */
 struct spdk_bdev_opts {
 	uint32_t bdev_io_pool_size;
+	                                  /* [한국어] 전역 spdk_bdev_io 풀 크기 (요소 수)
+	                                   *  - 풀 고갈 시 제출 API가 -ENOMEM 반환
+	                                   *  - 권장값: 동시 in-flight 최대 + 마진 (기본 65536) */
 	uint32_t bdev_io_cache_size;
+	                                  /* [한국어] 채널당(thread별) bdev_io 캐시 크기
+	                                   *  - 전역 풀 → 채널 캐시 → 채널 큐 의 2단계 lockless allocation
+	                                   *  - 캐시 hit 시 락 없이 빠른 할당 (기본 256) */
 	bool bdev_auto_examine;
+	                                  /* [한국어] 새 bdev 등록 시 모든 모듈의 examine_config/examine_disk 자동 호출 여부
+	                                   *  - true(기본): vbdev이 leaf 위에 자동 적층 (lvol/raid 등 자동 발견)
+	                                   *  - false: 수동 spdk_bdev_examine 호출만 허용 (단위 테스트/특수 시나리오) */
 
 	/* Hole at bytes 9-15. */
 	uint8_t reserved9[7];
+	                                  /* [한국어] 정렬·예약 패딩 — 향후 bool 추가 여지 */
 
 	/**
 	 * The size of spdk_bdev_opts according to the caller of this library is used for ABI
@@ -383,61 +444,103 @@ struct spdk_bdev_opts {
 	 * New added fields should be put at the end of the struct.
 	 */
 	size_t opts_size;
+	                                  /* [한국어] ABI 호환: 호출자가 알고 있는 구조체 크기 — spdk_bdev_get_opts에 sizeof로 전달 */
 
 	/* Size of the per-thread iobuf caches */
 	uint32_t iobuf_small_cache_size;
+	                                  /* [한국어] iobuf 풀 "작은 버퍼"(<=8KB) 채널별 캐시 크기 */
 	uint32_t iobuf_large_cache_size;
+	                                  /* [한국어] iobuf 풀 "큰 버퍼"(<=64KB) 채널별 캐시 크기
+	                                   *  - 작은/큰 풀 분리 — 작은 I/O 대량/큰 I/O 산발 등 워크로드별 튜닝 */
 } __attribute__((packed));
 SPDK_STATIC_ASSERT(sizeof(struct spdk_bdev_opts) == 32, "Incorrect size");
+                                  /* [한국어] 32B 고정 — 필드 추가 시 끝부분에만, opts_size로 ABI 분기 */
 
 /**
  * Union for controller attributes field, to list whether bdev supports fdp etc.
  * By convention we match the NVMe definition, allowing other bdevs to use this feature
  */
+/*
+ * [한국어] union spdk_bdev_nvme_ctratt - NVMe Controller Attributes 비트맵
+ *
+ * NVMe 1.4+ Identify Controller 응답의 CTRATT 필드(384B 오프셋)를 그대로 미러링.
+ * NVMe가 아닌 bdev이라도 같은 비트 의미로 기능 노출 가능 (예: malloc bdev이 fdps=1 설정).
+ * spdk_bdev_get_nvme_ctratt(bdev)로 조회.
+ */
 union spdk_bdev_nvme_ctratt {
 	uint32_t raw;
+	                                  /* [한국어] 32비트 원본 — CTRATT 그대로 */
 
 	struct {
 		uint32_t reserved	: 19;
+	                                  /* [한국어] reserved 비트 (현재 NVMe 스펙에서 미정의) */
 		/* Supports flexible data placement */
 		uint32_t fdps		: 1;
+	                                  /* [한국어] FDP(Flexible Data Placement) 지원 여부 — NVMe TP4146
+	                                   *  - 1이면 사용자가 cdw12.dtype=2(placement) + cdw13.dspec(handle)로 placement 힌트 전달 가능
+	                                   *  - 모듈/장치가 hot/cold 데이터 분리·GC 비용 절감 */
 		uint32_t reserved2	: 12;
+	                                  /* [한국어] 향후 확장용 reserved */
 	} bits;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_bdev_nvme_ctratt) == 4, "Incorrect size");
+                                  /* [한국어] 4B 고정 (NVMe DWORD) */
 
 /**
  * Union for command dword 12, which by convention matches the NVMe command dword 12 definition.
  * This is used to pass NVMe specific fields to bdevs, that reports support for them as indicated
  * by \ref spdk_bdev_get_nvme_ctratt
  */
+/*
+ * [한국어] union spdk_bdev_nvme_cdw12 - NVMe SQE Command DWORD 12 미러
+ *
+ * spdk_bdev_ext_io_opts.nvme_cdw12로 전달 → bdev_nvme 모듈이 그대로 SQE 빌드.
+ * 비트 정의는 NVMe Base Spec 의 Write/Read 커맨드 cdw12와 일치.
+ */
 union spdk_bdev_nvme_cdw12 {
 	uint32_t raw;
+	                                  /* [한국어] 32비트 원본 — 사용자가 NVMe 스펙대로 직접 비트 조립 */
 
 	struct {
 		uint32_t reserved	: 20;
+	                                  /* [한국어] reserved (NLB 등 코어 필드는 bdev 코어가 채움) */
 		/* Directive type */
 		uint32_t dtype		: 4;
+	                                  /* [한국어] Directive Type — Write 명령에서 지시자(directive) 종류
+	                                   *  - 1: Streams Directive
+	                                   *  - 2: Data Placement Directive (FDP)
+	                                   *  - cdw13.dspec와 짝으로 동작 */
 		uint32_t reserved2	: 8;
+	                                  /* [한국어] reserved (PRINFO/FUA/LR 등 NVMe 코어 비트는 bdev 코어가 관리) */
 	} write;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_bdev_nvme_cdw12) == 4, "Incorrect size");
+                                  /* [한국어] 4B (NVMe DWORD) */
 
 /**
  * Union for command dword 13, which by convention matches the NVMe command dword 13 definition.
  * This is used to pass NVMe specific fields to bdevs, that reports support for them as indicated
  * by \ref spdk_bdev_get_nvme_ctratt
  */
+/*
+ * [한국어] union spdk_bdev_nvme_cdw13 - NVMe SQE Command DWORD 13 미러
+ */
 union spdk_bdev_nvme_cdw13 {
 	uint32_t raw;
+	                                  /* [한국어] 32비트 원본 */
 
 	struct {
 		uint32_t reserved	: 16;
+	                                  /* [한국어] reserved */
 		/* Directive specific */
 		uint32_t dspec		: 16;
+	                                  /* [한국어] Directive Specific (cdw12.dtype과 짝)
+	                                   *  - dtype=1(Streams): Stream Identifier
+	                                   *  - dtype=2(FDP): Placement Handle (Reclaim Unit Handle Identifier) */
 	} write;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_bdev_nvme_cdw13) == 4, "Incorrect size");
+                                  /* [한국어] 4B (NVMe DWORD) */
 
 /**
  * Structure with optional IO request parameters
@@ -509,20 +612,60 @@ SPDK_STATIC_ASSERT(sizeof(struct spdk_bdev_ext_io_opts) == 52, "Incorrect size")
  * \param opts_size sizeof(*opts)
  */
 void spdk_bdev_get_opts(struct spdk_bdev_opts *opts, size_t opts_size);
+/*
+ * [한국어]
+ * spdk_bdev_get_opts - 현재 bdev 서브시스템 전역 옵션 조회
+ *
+ * @opts: 출력 — 호출자가 미리 할당한 spdk_bdev_opts에 현재값 복사
+ * @opts_size: sizeof(*opts) — ABI 호환성 위해 호출자 인지 크기 전달
+ *
+ * 사용 패턴:
+ *   struct spdk_bdev_opts opts;
+ *   spdk_bdev_get_opts(&opts, sizeof(opts));   // 현재값 로드
+ *   opts.bdev_io_pool_size = 131072;            // 일부만 수정
+ *   spdk_bdev_set_opts(&opts);                  // 적용
+ *
+ * spdk_bdev_initialize 전에 호출해야 의미 있음 (이후엔 일부 필드만 동적 변경 가능).
+ */
 
 int spdk_bdev_set_opts(struct spdk_bdev_opts *opts);
+/*
+ * [한국어]
+ * spdk_bdev_set_opts - bdev 서브시스템 전역 옵션 설정
+ *
+ * @opts: 적용할 옵션. opts->opts_size로 호출자 인지 크기 검증
+ * @return: 0 성공, -EINVAL 잘못된 값(예: pool_size < cache_size)
+ *
+ * 호출 시점: 반드시 spdk_bdev_initialize() **이전**에 호출.
+ * 일부 필드(pool_size 등)는 init 후 변경 시 무시 — 풀이 이미 할당된 상태이므로.
+ * 사용처: app 시작 단계의 RPC bdev_set_options 또는 JSON config "bdev_set_options" 메서드.
+ */
 
 typedef void (*spdk_bdev_wait_for_examine_cb)(void *arg);
+                                  /* [한국어] examine 완료 통지 콜백 (spdk_bdev_wait_for_examine 등록)
+                                   *  - 모든 모듈의 examine_disk가 완료되면 호출 (1회성)
+                                   *  - vbdev 자동 적층 완료 후 첫 I/O 가능 시점 식별에 사용 */
 
+/*
+ * [한국어] enum spdk_bdev_reset_stat_mode - 통계 조회 후 리셋 정책
+ *
+ * spdk_bdev_get_io_stat / get_device_stat 호출 시 통계 조회 후 어떤 카운터를 0으로
+ * 되돌릴지 결정. 주기적으로 통계를 샘플링할 때 누적/주기 모드 선택.
+ */
 enum spdk_bdev_reset_stat_mode {
 	/** Reset all stats */
 	SPDK_BDEV_RESET_STAT_ALL,
+	                                  /* [한국어] 모든 통계 초기화 — 매 호출마다 직전 호출 이후 델타로 동작 */
 	/** Reset only max and min stats */
 	SPDK_BDEV_RESET_STAT_MAXMIN,
+	                                  /* [한국어] max/min 지연만 리셋 (누적 카운터·합계는 유지)
+	                                   *  - 윈도우별 최악·최저 latency 추적용 */
 	/** Reset i/o error stats */
 	SPDK_BDEV_RESET_STAT_ERROR,
+	                                  /* [한국어] 에러 카운터만 리셋 (정상 카운터·지연은 유지) */
 	/** Do not reset stats at all */
 	SPDK_BDEV_RESET_STAT_NONE,
+	                                  /* [한국어] 리셋 없음 — 누적값 그대로 조회 (모니터링 시스템에서 차이 계산) */
 };
 
 /**
@@ -536,6 +679,22 @@ enum spdk_bdev_reset_stat_mode {
  * \return 0 if function was registered, suitable errno value otherwise
  */
 int spdk_bdev_wait_for_examine(spdk_bdev_wait_for_examine_cb cb_fn, void *cb_arg);
+/*
+ * [한국어]
+ * spdk_bdev_wait_for_examine - 모든 bdev examine 완료 시점 통지 등록
+ *
+ * @cb_fn: 모든 모듈의 examine_disk 체인이 완료되면 호출 (1회성)
+ * @cb_arg: 콜백 컨텍스트
+ * @return: 0 등록 성공, 음수 errno 실패
+ *
+ * 동기:
+ *   - bdev 등록 시 examine 체인이 비동기로 vbdev을 적층 (NVMe → lvol_store → lvol_blob)
+ *   - 사용자가 lvol을 open하기 위해선 examine이 끝나야 함
+ *   - 이 함수가 그 "안정 상태(quiescent)" 시점을 알려줌
+ *
+ * 재호출 필요: 콜백은 1회만 호출 → 후속 examine 라운드 감지하려면 다시 등록.
+ * 사용처: RPC bdev_wait_for_examine, app 부팅 시퀀스에서 명시적 동기화.
+ */
 
 /**
  * Examine a block device explicitly
@@ -546,6 +705,17 @@ int spdk_bdev_wait_for_examine(spdk_bdev_wait_for_examine_cb cb_fn, void *cb_arg
  * \return 0 if block device was examined successfully, suitable errno value otherwise
  */
 int spdk_bdev_examine(const char *name);
+/*
+ * [한국어]
+ * spdk_bdev_examine - 특정 bdev에 대해 명시적 examine 트리거
+ *
+ * @name: bdev 본이름 또는 별칭
+ * @return: 0 성공, 음수 errno (-ENODEV 해당 bdev 없음)
+ *
+ * 동기: bdev_auto_examine=false 환경에서 사용자가 vbdev 적층을 수동 제어할 때 사용.
+ * 동작: 모든 모듈의 examine_config + examine_disk 콜백을 이 bdev에 대해 호출.
+ * 제약: SPDK app thread에서만 호출 가능 (모듈 examine 콜백이 단일 스레드 가정).
+ */
 
 /**
  * Block device initialization callback.
@@ -554,6 +724,10 @@ int spdk_bdev_examine(const char *name);
  * \param rc 0 if block device initialized successfully or negative errno if it failed.
  */
 typedef void (*spdk_bdev_init_cb)(void *cb_arg, int rc);
+                                  /* [한국어] spdk_bdev_initialize 완료 콜백
+                                   *  - @rc==0: 모든 모듈 init 성공
+                                   *  - @rc<0: 일부 모듈 init 실패 (errno) — 애플리케이션은 spdk_app_stop 등으로 중단 결정
+                                   *  - 호출 스레드: app thread (initialize 호출 스레드와 동일) */
 
 /**
  * Block device finish callback.
@@ -561,8 +735,13 @@ typedef void (*spdk_bdev_init_cb)(void *cb_arg, int rc);
  * \param cb_arg Callback argument.
  */
 typedef void (*spdk_bdev_fini_cb)(void *cb_arg);
+                                  /* [한국어] spdk_bdev_finish 완료 콜백 — 모든 모듈 fini 후 호출 (rc 없음) */
 typedef void (*spdk_bdev_get_device_stat_cb)(struct spdk_bdev *bdev,
 		struct spdk_bdev_io_stat *stat, void *cb_arg, int rc);
+                                  /* [한국어] spdk_bdev_get_device_stat 비동기 완료 콜백
+                                   *  - @stat: 모든 채널을 합산한 통계 (호출자가 할당, get_device_stat에 전달한 그대로)
+                                   *  - @rc: 0 성공, 음수 errno (drain 도중 실패 등)
+                                   *  - 실행 컨텍스트: get_device_stat 호출 스레드 */
 
 /**
  * Block device channel IO timeout callback
@@ -571,6 +750,9 @@ typedef void (*spdk_bdev_get_device_stat_cb)(struct spdk_bdev *bdev,
  * \param bdev_io The IO cause the timeout
  */
 typedef void (*spdk_bdev_io_timeout_cb)(void *cb_arg, struct spdk_bdev_io *bdev_io);
+                                  /* [한국어] I/O 타임아웃 콜백 (spdk_bdev_set_timeout 등록)
+                                   *  - @bdev_io: 타임아웃 발생한 in-flight I/O — abort/reset/log 등을 호출자가 결정
+                                   *  - 호출 스레드: bdev_io를 제출한 채널 스레드 (poller가 검사 후 발견) */
 
 /**
  * Initialize block device modules.
@@ -621,6 +803,17 @@ void spdk_bdev_finish(spdk_bdev_fini_cb cb_fn, void *cb_arg);
  * \param w pointer to a JSON write context where the configuration will be written.
  */
 void spdk_bdev_subsystem_config_json(struct spdk_json_write_ctx *w);
+/*
+ * [한국어]
+ * spdk_bdev_subsystem_config_json - bdev 서브시스템 전체 설정을 JSON 출력
+ *
+ * @w: spdk_json_write_ctx (이미 array context 시작 상태)
+ * 동작:
+ *   - bdev_set_options 메서드 출력 (전역 옵션)
+ *   - 각 등록 모듈의 config_json 콜백 호출 → 모듈별 RPC 메서드 시퀀스 작성
+ *   - 결과: app 재시작 시 그대로 재현 가능한 RPC 메서드 배열
+ * 사용처: spdk_app_save_config, "spdk_app_get_config" 응답.
+ */
 
 /**
  * Get block device module name.
@@ -629,6 +822,11 @@ void spdk_bdev_subsystem_config_json(struct spdk_json_write_ctx *w);
  * \return Name of bdev module as a null-terminated string.
  */
 const char *spdk_bdev_get_module_name(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_module_name - bdev이 속한 모듈 이름 반환 ("nvme", "malloc", "lvol", "raid" 등)
+ * RPC bdev_get_bdevs 응답의 "driver_specific" 키 분기에 사용.
+ */
 
 /**
  * Get block device by the block device name.
@@ -907,6 +1105,17 @@ void spdk_bdev_close(struct spdk_bdev_desc *desc);
  *	    ID is unknown.
  */
 int32_t spdk_bdev_get_numa_id(struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_numa_id - bdev이 부착된 NUMA 노드 ID 반환
+ *
+ * @return: NUMA 노드 번호 (≥0), 또는 SPDK_ENV_NODE_ID_ANY(=-1) 미지정/모름
+ *
+ * 사용처:
+ *   - 같은 NUMA 노드의 reactor에 채널을 배치하면 메모리 latency 최소화
+ *   - DPDK hugepage memory도 가능하면 같은 노드에서 할당 (NUMA-local DMA)
+ *   - PCIe 카드는 특정 socket의 RC에 연결 → cross-socket 트래픽 회피
+ */
 
 /**
  * Callback function for spdk_for_each_bdev() and spdk_for_each_bdev_leaf().
@@ -915,6 +1124,8 @@ int32_t spdk_bdev_get_numa_id(struct spdk_bdev *bdev);
  * \param bdev Block device the callback handles.
  */
 typedef int (*spdk_for_each_bdev_fn)(void *ctx, struct spdk_bdev *bdev);
+                                  /* [한국어] spdk_for_each_bdev*() 콜백
+                                   *  - @return: 0 정상 (다음 bdev 진행), 음수 errno (순회 즉시 중단 + 같은 값 반환) */
 
 /**
  * Call the provided callback function for every registered block device.
@@ -930,6 +1141,15 @@ typedef int (*spdk_for_each_bdev_fn)(void *ctx, struct spdk_bdev *bdev);
  * callback returned otherwise.
  */
 int spdk_for_each_bdev(void *ctx, spdk_for_each_bdev_fn fn);
+/*
+ * [한국어]
+ * spdk_for_each_bdev - 모든 등록 bdev에 대해 fn 호출
+ *
+ * 안전성: 내부에서 각 bdev에 대해 임시 desc를 open/close 처리 → 콜백 실행 중
+ * unregister 진행되지 않도록 reference 보호.
+ * fn이 음수 반환 시 즉시 중단하고 같은 값 반환.
+ * spdk_bdev_first/next 보다 권장 — race-free.
+ */
 
 /**
  * Call the provided callback function for every block device without virtual
@@ -945,6 +1165,11 @@ int spdk_for_each_bdev(void *ctx, spdk_for_each_bdev_fn fn);
  * callback returned otherwise.
  */
 int spdk_for_each_bdev_leaf(void *ctx, spdk_for_each_bdev_fn fn);
+/*
+ * [한국어]
+ * spdk_for_each_bdev_leaf - leaf bdev (claim 없는 최상위)만 순회
+ * 사용처: 사용자에게 "이 위에 vbdev를 더 쌓을 수 있는 bdev 후보" 목록 제공.
+ */
 
 /**
  * Call the provided callback function on block devices with provided names.
@@ -962,6 +1187,14 @@ int spdk_for_each_bdev_leaf(void *ctx, spdk_for_each_bdev_fn fn);
  */
 int spdk_for_each_bdev_by_name(void *ctx, spdk_for_each_bdev_fn fn, const char **names,
 			       size_t count);
+/*
+ * [한국어]
+ * spdk_for_each_bdev_by_name - 이름 배열로 지정된 bdev들에 대해서만 fn 호출
+ *
+ * @names: bdev 이름(또는 별칭) 배열, count개. 모두 존재해야 정상 완료
+ * @return: -ENODEV 하나라도 없으면, 또는 fn이 음수 반환 시 그 값
+ * 사용처: RPC bdev_get_iostat이 일부 bdev만 선택해 통계 조회.
+ */
 
 /**
  * Get the bdev associated with a bdev descriptor.
@@ -970,6 +1203,13 @@ int spdk_for_each_bdev_by_name(void *ctx, spdk_for_each_bdev_fn fn, const char *
  * \return bdev associated with the descriptor
  */
 struct spdk_bdev *spdk_bdev_desc_get_bdev(struct spdk_bdev_desc *desc);
+/*
+ * [한국어]
+ * spdk_bdev_desc_get_bdev - desc → bdev 포인터 변환
+ *
+ * 안전성: desc가 valid한 동안 반환 bdev 포인터도 valid (desc가 reference 보유).
+ * 사용처: open 후 bdev 속성 조회 시 (get_block_size 등은 bdev 인자 요구).
+ */
 
 /**
  * Get logical block size, specific to a bdev descriptor.
@@ -978,6 +1218,13 @@ struct spdk_bdev *spdk_bdev_desc_get_bdev(struct spdk_bdev_desc *desc);
  * \return Size of logical block for this bdev in bytes.
  */
 uint32_t spdk_bdev_desc_get_block_size(struct spdk_bdev_desc *desc);
+/*
+ * [한국어]
+ * spdk_bdev_desc_get_block_size - desc 시점의 논리 블록 크기 (바이트)
+ *
+ * 일반 bdev에서는 spdk_bdev_get_block_size와 동일 결과.
+ * 단, hide_metadata=true로 open된 desc에서는 PI 미포함 외부 표시 블록 크기로 보정.
+ */
 
 /**
  * Get metadata size, specific to a bdev descriptor.
@@ -986,6 +1233,13 @@ uint32_t spdk_bdev_desc_get_block_size(struct spdk_bdev_desc *desc);
  * \return Size of metadata for this bdev in bytes.
  */
 uint32_t spdk_bdev_desc_get_md_size(struct spdk_bdev_desc *desc);
+/*
+ * [한국어]
+ * spdk_bdev_desc_get_md_size - desc 시점의 메타데이터 크기
+ *
+ * hide_metadata=true면 0 반환 (사용자에게 메타 노출 안 함).
+ * 그 외에는 spdk_bdev_get_md_size와 동일.
+ */
 
 /**
  * Query whether metadata is interleaved with block data or separated
@@ -998,6 +1252,14 @@ uint32_t spdk_bdev_desc_get_md_size(struct spdk_bdev_desc *desc);
  * if metadata is separated with block data.
  */
 bool spdk_bdev_desc_is_md_interleaved(struct spdk_bdev_desc *desc);
+/*
+ * [한국어]
+ * spdk_bdev_desc_is_md_interleaved - 인터리브 메타데이터 모드 여부 (desc 시점)
+ *
+ * NVMe 스펙 (Identify NS의 FLBAS.MS=0): true=extended LBA (블록 + PI 한 덩어리),
+ *                                      false=별도 메타 버퍼 (DPS·MSET=1).
+ * hide_metadata=true로 열린 desc에서는 항상 false 반환.
+ */
 
 /**
  * Query whether metadata is interleaved with block data or separated
@@ -1010,6 +1272,12 @@ bool spdk_bdev_desc_is_md_interleaved(struct spdk_bdev_desc *desc);
  * otherwise.
  */
 bool spdk_bdev_desc_is_md_separate(struct spdk_bdev_desc *desc);
+/*
+ * [한국어]
+ * spdk_bdev_desc_is_md_separate - 분리 메타 버퍼 모드 여부 (desc 시점)
+ *
+ * is_md_interleaved의 보수 — true이면 read/write_blocks_with_md API로 별도 md 버퍼 전달.
+ */
 
 /**
  * Get DIF type, specific to a bdev descriptor.
@@ -1018,6 +1286,19 @@ bool spdk_bdev_desc_is_md_separate(struct spdk_bdev_desc *desc);
  * \return DIF type of the block device.
  */
 enum spdk_dif_type spdk_bdev_desc_get_dif_type(struct spdk_bdev_desc *desc);
+/*
+ * [한국어]
+ * spdk_bdev_desc_get_dif_type - desc의 T10 DIF/PI 타입 (NVMe 스펙: NS Identify DPS.PIT)
+ *
+ * 반환값:
+ *   SPDK_DIF_DISABLE(0): PI 미사용
+ *   SPDK_DIF_TYPE1: GUARD + APPTAG + REFTAG(LBA 시작값)
+ *   SPDK_DIF_TYPE2: GUARD + APPTAG + REFTAG(EILBRT 사용자 지정)
+ *   SPDK_DIF_TYPE3: GUARD + APPTAG (REFTAG 없음, 자유 매핑)
+ *
+ * NVMe Base Spec 8.3 / SCSI SBC-3 5.2 (Protection Information).
+ * hide_metadata=true desc에서는 항상 SPDK_DIF_DISABLE.
+ */
 
 /**
  * Get DIF protection information format of the block device, specific to
@@ -1029,6 +1310,15 @@ enum spdk_dif_type spdk_bdev_desc_get_dif_type(struct spdk_bdev_desc *desc);
  * \return DIF protection information format of the block device.
  */
 enum spdk_dif_pi_format spdk_bdev_desc_get_dif_pi_format(struct spdk_bdev_desc *desc);
+/*
+ * [한국어]
+ * spdk_bdev_desc_get_dif_pi_format - PI 포맷 (16B / 32B / 64B Variant)
+ *
+ * NVMe 2.0+의 확장 PI: PIF=0 (16-bit GUARD + 16-bit APPTAG + 32-bit REFTAG),
+ *                     PIF=1 (32-bit), PIF=2 (64-bit CRC, NVMe Storage Tag 포함).
+ * NVM Express Base Spec 5.27.2.1.4 / 5.27.2.1.5.
+ * DIF_DISABLE인 bdev에서는 호출 무의미 (반환값 미정).
+ */
 
 /**
  * Check whether DIF is set in the first 8/16 bytes or the last 8/16 bytes of metadata,
@@ -1041,6 +1331,16 @@ enum spdk_dif_pi_format spdk_bdev_desc_get_dif_pi_format(struct spdk_bdev_desc *
  * if DIF is set in the last 8/16 bytes of metadata.
  */
 bool spdk_bdev_desc_is_dif_head_of_md(struct spdk_bdev_desc *desc);
+/*
+ * [한국어]
+ * spdk_bdev_desc_is_dif_head_of_md - PI 위치(메타 앞쪽 vs 뒤쪽)
+ *
+ * NVMe NS Identify의 DPS.PIP(Protection Information Position):
+ *   true(=DPS.PIP=1): 메타 첫 8/16/32B에 PI (앞부분)
+ *   false(=DPS.PIP=0): 메타 마지막 8/16/32B에 PI (뒷부분, 기본)
+ *
+ * spdk_dif 라이브러리가 PI 검사·삽입 시 이 위치를 따라 오프셋 결정.
+ */
 
 /**
  * Check whether the DIF check type is enabled, specific to a bdev descriptor.
@@ -1051,6 +1351,18 @@ bool spdk_bdev_desc_is_dif_head_of_md(struct spdk_bdev_desc *desc);
  */
 bool spdk_bdev_desc_is_dif_check_enabled(struct spdk_bdev_desc *desc,
 		enum spdk_dif_check_type check_type);
+/*
+ * [한국어]
+ * spdk_bdev_desc_is_dif_check_enabled - 특정 DIF 검사 항목 활성 여부 (desc 시점)
+ *
+ * @check_type:
+ *   SPDK_DIF_CHECK_TYPE_REFTAG: REFTAG = LBA(또는 EILBRT) 매칭
+ *   SPDK_DIF_CHECK_TYPE_APPTAG: APPTAG (사용자 정의) 매칭
+ *   SPDK_DIF_CHECK_TYPE_GUARD: GUARD = CRC-16/CRC-32/CRC-64 of data
+ *
+ * NVMe Read/Write의 PRINFO 비트와 매핑 — 비활성화된 검사는 SQE에서 PRACT/PRCHK 클리어.
+ * 사용처: NVMe-oF 타겟이 호스트 PRCHK 비트와 bdev 정책을 정렬할 때.
+ */
 
 /**
  * Set a time limit for the timeout IO of the bdev and timeout callback.
@@ -1110,6 +1422,11 @@ bool spdk_bdev_io_type_supported(struct spdk_bdev *bdev, enum spdk_bdev_io_type 
  * \return Name of the IO type as a null-terminated string.
  */
 const char *spdk_bdev_get_io_type_name(enum spdk_bdev_io_type io_type);
+/*
+ * [한국어]
+ * spdk_bdev_get_io_type_name - enum 값 → 사람이 읽는 이름 ("read", "write", "unmap"...)
+ * RPC bdev_enable_histogram io_type 인자 파싱과 짝으로 사용.
+ */
 
 /**
  * Return the io_type based on the io_type_string.
@@ -1119,6 +1436,13 @@ const char *spdk_bdev_get_io_type_name(enum spdk_bdev_io_type io_type);
  * This will map to enum spdk_bdev_io_type.
  */
 int spdk_bdev_get_io_type(const char *io_type_string);
+/*
+ * [한국어]
+ * spdk_bdev_get_io_type - 문자열 → enum spdk_bdev_io_type 변환 (역함수)
+ *
+ * @return: 매칭 enum 값, 또는 SPDK_BDEV_IO_TYPE_INVALID(0) — 알 수 없는 문자열
+ * RPC bdev_enable_histogram에서 사용자가 "io_type":"read"를 보낼 때 enum으로 매핑.
+ */
 
 /**
  * Output driver-specific information to a JSON stream.
@@ -1132,6 +1456,15 @@ int spdk_bdev_get_io_type(const char *io_type_string);
  * \return 0 on success, negated errno on failure.
  */
 int spdk_bdev_dump_info_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w);
+/*
+ * [한국어]
+ * spdk_bdev_dump_info_json - 모듈별 추가 정보를 JSON object로 직렬화
+ *
+ * 동작: bdev->fn_table->dump_info_json(ctx, w) 콜백 위임 → 모듈이 자체 키/값 작성
+ * 예: NVMe bdev → {"trid": {...}, "ns_data": {...}, "ctrlr_data": {...}}
+ *     Malloc bdev → {} (특화 정보 없음)
+ * 사용처: RPC bdev_get_bdevs 응답의 "driver_specific" 필드.
+ */
 
 /**
  * Get block device name.
@@ -1184,6 +1517,14 @@ uint32_t spdk_bdev_get_block_size(const struct spdk_bdev *bdev);
  * \return The write unit size in logical blocks.
  */
 uint32_t spdk_bdev_get_write_unit_size(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_write_unit_size - 최소 쓰기 단위 (블록 단위, 최소 1)
+ *
+ * NVMe: Identify NS의 NPWG(Namespace Preferred Write Granularity).
+ * write num_blocks는 이 값의 배수여야 함 (위반 시 -EINVAL 또는 split 발생).
+ * ZNS의 경우 write_unit_size는 write granularity로 사용 가능.
+ */
 
 /**
  * Get size of block device in logical blocks.
@@ -1285,6 +1626,15 @@ size_t spdk_bdev_get_buf_align(const struct spdk_bdev *bdev);
  *         no optimal boundary is reported.
  */
 uint32_t spdk_bdev_get_optimal_io_boundary(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_optimal_io_boundary - 최적 I/O 경계 (블록 단위, 0=없음)
+ *
+ * NVMe: Identify NS의 NOIOB(Namespace Optimal I/O Boundary).
+ * 이 경계를 가로지르는 I/O는 두 개의 내부 명령으로 분할되어 latency 증가 가능.
+ * bdev 코어가 자동 split: I/O가 boundary를 넘으면 [start, boundary)와 [boundary, end)로 분리.
+ * 사용자는 align/size를 boundary에 맞추면 split 없이 단일 명령으로 처리.
+ */
 
 /**
  * Query whether block device has an enabled write cache.
@@ -1315,6 +1665,18 @@ bool spdk_bdev_has_write_cache(const struct spdk_bdev *bdev);
  * application runs.
  */
 const struct spdk_uuid *spdk_bdev_get_uuid(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_uuid - bdev의 UUID(128-bit) 포인터 반환
+ *
+ * 모든 bdev은 UUID를 가짐 — 단, 영구성 보장 없음:
+ *   - NVMe: NGUID/EUI64 → UUID 변환 (장치 영구)
+ *   - lvol: blob UUID (블롭스토어 영구)
+ *   - malloc: 매 등록마다 새로 생성 (휘발)
+ *
+ * 사용처: 이름이 변할 수 있는 환경에서 bdev 식별 (config 영속화).
+ * 반환 포인터는 bdev 수명 동안 유효 (변경되지 않음).
+ */
 
 /**
  * Get block device atomic compare and write unit.
@@ -1323,6 +1685,15 @@ const struct spdk_uuid *spdk_bdev_get_uuid(const struct spdk_bdev *bdev);
  * \return Atomic compare and write unit for this bdev in blocks.
  */
 uint16_t spdk_bdev_get_acwu(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_acwu - Atomic Compare-and-Write Unit (블록 단위)
+ *
+ * NVMe: Identify NS의 NACWU(Namespace Atomic Compare and Write Unit) +1.
+ * 이 크기 이내의 COMPARE+WRITE fused 명령은 장치가 원자성 보장.
+ * 분산 합의(consensus) 알고리즘이 lock 없이 update 가능한 최대 단위.
+ * 0이면 보장 없음 (소프트웨어 락 필요).
+ */
 
 /**
  * Get block device metadata size.
@@ -1331,6 +1702,14 @@ uint16_t spdk_bdev_get_acwu(const struct spdk_bdev *bdev);
  * \return Size of metadata for this bdev in bytes.
  */
 uint32_t spdk_bdev_get_md_size(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_md_size - 메타데이터 바이트/블록
+ *
+ * 0이면 메타 없음. 일반적으로 8B(PI Type 1/2/3) 또는 16B(extended PI).
+ * NVMe NS Identify의 LBADS와 함께 사용 (LBA Format).
+ * is_md_interleaved=true면 block_size에 이 값이 포함, false면 별도 버퍼 필요.
+ */
 
 /**
  * Query whether metadata is interleaved with block data or separated
@@ -1343,6 +1722,16 @@ uint32_t spdk_bdev_get_md_size(const struct spdk_bdev *bdev);
  * if metadata is separated with block data.
  */
 bool spdk_bdev_is_md_interleaved(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_is_md_interleaved - 인터리브(extended LBA) 모드 여부
+ *
+ * NVMe Identify NS의 FLBAS.MS=1 (Metadata Settings: extended).
+ * true: 블록과 PI가 한 버퍼에 순차 저장 (예: 4096B + 64B PI = 4160B 단위)
+ * false: 분리 (read_blocks_with_md API로 별도 md 버퍼 전달)
+ *
+ * 호스트 메모리 사용량과 PI 검증 경로(데이터 복사 vs 분리 가능)에 영향.
+ */
 
 /**
  * Query whether metadata is interleaved with block data or separated
@@ -1355,6 +1744,10 @@ bool spdk_bdev_is_md_interleaved(const struct spdk_bdev *bdev);
  * otherwise.
  */
 bool spdk_bdev_is_md_separate(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_is_md_separate - 분리 메타 모드 여부 (is_md_interleaved의 보수)
+ */
 
 /**
  * Checks if bdev supports zoned namespace semantics.
@@ -1383,6 +1776,16 @@ bool spdk_bdev_is_zoned(const struct spdk_bdev *bdev);
  * \return Size of data block for this bdev in bytes.
  */
 uint32_t spdk_bdev_get_data_block_size(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_data_block_size - 메타 제외 순수 데이터 블록 크기
+ *
+ * 계산:
+ *   - 메타 없음 또는 분리(separate): block_size 그대로 (예: 4096B)
+ *   - 인터리브: block_size - md_size (예: 4160 - 64 = 4096B)
+ *
+ * 사용자 데이터 영역 크기 계산용 — 파일시스템/blobstore가 실제 페이로드 크기로 사용.
+ */
 
 /**
  * Get block device physical block size.
@@ -1391,6 +1794,14 @@ uint32_t spdk_bdev_get_data_block_size(const struct spdk_bdev *bdev);
  * \return Size of physical block size for this bdev in bytes.
  */
 uint32_t spdk_bdev_get_physical_block_size(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_physical_block_size - 물리 블록 크기 (PMA, atomic write 단위)
+ *
+ * NVMe: Identify NS의 NPDG(Namespace Preferred Deallocate Granularity)/NPWA 등을 종합.
+ * 일반: 4096B SSD가 logical=512B로 표시되더라도 physical=4096B.
+ * 정렬되지 않은 쓰기는 read-modify-write를 유발 → 성능·내구성 저하.
+ */
 
 /**
  * Get block device preferred write alignment.
@@ -1399,6 +1810,13 @@ uint32_t spdk_bdev_get_physical_block_size(const struct spdk_bdev *bdev);
  * \return preferred write alignment for this bdev in blocks. Value 0 means there is no preferred write alignment.
  */
 uint32_t spdk_bdev_get_preferred_write_alignment(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_preferred_write_alignment - 권장 쓰기 정렬 (블록 단위, 0=없음)
+ *
+ * NVMe: Identify NS의 NPWA(Namespace Preferred Write Alignment).
+ * 이 값의 배수 LBA로 시작하는 쓰기가 RMW 없이 처리.
+ */
 
 /**
  * Get block device preferred write granularity.
@@ -1407,6 +1825,13 @@ uint32_t spdk_bdev_get_preferred_write_alignment(const struct spdk_bdev *bdev);
  * \return preferred write granularity for this bdev in blocks. Value 0 means there is no preferred write granularity.
  */
 uint32_t spdk_bdev_get_preferred_write_granularity(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_preferred_write_granularity - 권장 쓰기 단위 (블록 단위, 0=없음)
+ *
+ * NVMe: Identify NS의 NPWG. 이 값 배수 길이의 쓰기가 최적.
+ * 예: NPWG=8(=4KB at 512B blocks)일 때 4KB 단위 쓰기가 권장.
+ */
 
 /**
  * Get block device optimal write size.
@@ -1415,6 +1840,13 @@ uint32_t spdk_bdev_get_preferred_write_granularity(const struct spdk_bdev *bdev)
  * \return preferred write size for this bdev in blocks. Value 0 means there is no preferred write size.
  */
 uint32_t spdk_bdev_get_optimal_write_size(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_optimal_write_size - 최적 쓰기 크기 (블록 단위, 0=없음)
+ *
+ * NVMe: Identify NS의 NOWS(Namespace Optimal Write Size).
+ * 이 크기로 쓰면 write amplification 최소화 (NAND erase block 정합).
+ */
 
 /**
  * Get block device preferred unmap alignment.
@@ -1423,6 +1855,12 @@ uint32_t spdk_bdev_get_optimal_write_size(const struct spdk_bdev *bdev);
  * \return preferred unmap alignment for this bdev in blocks. Value 0 means there is no preferred unmap alignment.
  */
 uint32_t spdk_bdev_get_preferred_unmap_alignment(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_preferred_unmap_alignment - 권장 UNMAP/Deallocate 정렬 (블록 단위)
+ * NVMe Identify NS의 NPDA(Namespace Preferred Deallocate Alignment).
+ * 정렬된 UNMAP만 실제 NAND erase로 변환됨 (미정렬은 mark only).
+ */
 
 /**
  * Get block device preferred unmap granularity.
@@ -1431,6 +1869,12 @@ uint32_t spdk_bdev_get_preferred_unmap_alignment(const struct spdk_bdev *bdev);
  * \return preferred unmap granularity for this bdev in blocks. Value 0 means there is no preferred unmap granularity.
  */
 uint32_t spdk_bdev_get_preferred_unmap_granularity(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_preferred_unmap_granularity - 권장 UNMAP 길이 단위 (블록 단위)
+ * NVMe Identify NS의 NPDG(Namespace Preferred Deallocate Granularity).
+ * 이 단위 배수의 UNMAP만 실제 GC trigger.
+ */
 
 /**
  * Get DIF type of the block device.
@@ -1439,6 +1883,14 @@ uint32_t spdk_bdev_get_preferred_unmap_granularity(const struct spdk_bdev *bdev)
  * \return DIF type of the block device.
  */
 enum spdk_dif_type spdk_bdev_get_dif_type(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_dif_type - bdev의 PI Type (NVMe NS Identify DPS.PIT)
+ *
+ * SPDK_DIF_DISABLE / TYPE1 / TYPE2 / TYPE3.
+ * desc 기반(spdk_bdev_desc_get_dif_type)이 호출자에 권장 — hide_metadata 지원.
+ * NVMe Base Spec 5.27.2.1.4 (PI Field Position and Format).
+ */
 
 /**
  * Get DIF protection information format of the block device.
@@ -1449,6 +1901,16 @@ enum spdk_dif_type spdk_bdev_get_dif_type(const struct spdk_bdev *bdev);
  * \return DIF protection information format of the block device.
  */
 enum spdk_dif_pi_format spdk_bdev_get_dif_pi_format(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_dif_pi_format - PI 포맷 (NVMe NS Identify DPS.PIF)
+ *
+ * 16B(PIF=0): GUARD16 + APPTAG16 + REFTAG32
+ * 32B(PIF=1): GUARD16 + APPTAG16 + STORAGETAG48 + REFTAG48 (NVMe 2.0)
+ * 64B(PIF=2): GUARD64 + APPTAG16 + REFTAG48 (CRC64-NVMe, ZNS·DSM)
+ *
+ * 미사용 시(DISABLE) 호출은 의미 없음 (반환값 불정).
+ */
 
 /**
  * Check whether DIF is set in the first 8/16 bytes or the last 8/16 bytes of metadata.
@@ -1460,6 +1922,16 @@ enum spdk_dif_pi_format spdk_bdev_get_dif_pi_format(const struct spdk_bdev *bdev
  * if DIF is set in the last 8/16 bytes of metadata.
  */
 bool spdk_bdev_is_dif_head_of_md(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_is_dif_head_of_md - PI 위치 (메타 영역 head vs tail)
+ *
+ * NVMe DPS.PIP(Protection Information Position):
+ *   true(=PIP=1): 메타 앞쪽에 PI
+ *   false(=PIP=0): 메타 뒤쪽에 PI (기본)
+ *
+ * spdk_dif_ctx 빌드 시 PI 오프셋 결정에 사용.
+ */
 
 /**
  * Check whether the DIF check type is enabled.
@@ -1470,6 +1942,18 @@ bool spdk_bdev_is_dif_head_of_md(const struct spdk_bdev *bdev);
  */
 bool spdk_bdev_is_dif_check_enabled(const struct spdk_bdev *bdev,
 				    enum spdk_dif_check_type check_type);
+/*
+ * [한국어]
+ * spdk_bdev_is_dif_check_enabled - 특정 PI 검사 종류 활성화 여부
+ *
+ * @check_type:
+ *   SPDK_DIF_CHECK_TYPE_GUARD: CRC 검증
+ *   SPDK_DIF_CHECK_TYPE_APPTAG: 사용자 정의 태그 검증
+ *   SPDK_DIF_CHECK_TYPE_REFTAG: 참조 태그(LBA 기반) 검증
+ *
+ * NVMe SQE의 PRINFO/PRCHK 비트와 매핑. Type 3는 REFTAG 검사 자동 비활성.
+ * 사용처: bdev 모듈이 자기 dif_ctx 초기화 시 어떤 검사 항목을 켤지 결정.
+ */
 
 /**
  * Get block device max copy size.
@@ -1478,6 +1962,14 @@ bool spdk_bdev_is_dif_check_enabled(const struct spdk_bdev *bdev,
  * \return Max copy size for this bdev in blocks. 0 means unlimited.
  */
 uint32_t spdk_bdev_get_max_copy(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_max_copy - 단일 COPY 명령의 최대 블록 수 (0=제한 없음)
+ *
+ * NVMe Simple Copy Command(MSSRL: Maximum Source Range Length).
+ * spdk_bdev_copy_blocks가 num_blocks > max_copy인 요청을 자동 split.
+ * 0이면 split 없이 원-샷 전송 (장치가 무제한 지원).
+ */
 
 /**
  * Get the most recently measured queue depth from a bdev.
@@ -1515,6 +2007,13 @@ spdk_bdev_get_qd(const struct spdk_bdev *bdev);
  */
 uint64_t
 spdk_bdev_get_qd_sampling_period(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_qd_sampling_period - QD 샘플링 주기(틱 단위) 조회
+ *
+ * 0이면 샘플링 비활성. 활성 상태에서만 spdk_bdev_get_qd 결과가 의미 있음.
+ * 사용처: RPC bdev_get_iostat에서 측정 주기 보고.
+ */
 
 /**
  * Enable or disable queue depth sampling for this bdev.
@@ -1528,6 +2027,16 @@ spdk_bdev_get_qd_sampling_period(const struct spdk_bdev *bdev);
  * to zero, polling will be disabled.
  */
 void spdk_bdev_set_qd_sampling_period(struct spdk_bdev *bdev, uint64_t period);
+/*
+ * [한국어]
+ * spdk_bdev_set_qd_sampling_period - QD 샘플링 활성화/비활성/주기 변경
+ *
+ * @period: 0=비활성, >0=마이크로초(또는 tick) 단위 샘플링 주기
+ *
+ * 동작: poller가 등록되어 주기마다 모든 채널의 outstanding 카운트를 합산해 measured_queue_depth 갱신.
+ * 부가 효과: 샘플 시점마다 io_time / weighted_io_time도 누적.
+ * 비용: 샘플링 주기마다 모든 채널 메시지 → 짧은 주기는 CPU 비용 증가.
+ */
 
 /**
  * Get the time spent processing IO for this device.
@@ -1545,6 +2054,14 @@ void spdk_bdev_set_qd_sampling_period(struct spdk_bdev *bdev, uint64_t period);
  * \return The io time for this device in microseconds.
  */
 uint64_t spdk_bdev_get_io_time(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_io_time - 누적 I/O 처리 시간(마이크로초)
+ *
+ * 정의: 샘플링 시점에 measured_qd>0이면 sampling_period만큼 가산.
+ * 디스크 사용률 = (io_time_2 - io_time_1) / elapsed_time (Linux iostat의 %util과 동일 의미).
+ * iostat-style 계산: 호출자가 두 시점에 호출하여 차이 계산 + 자체 elapsed 측정.
+ */
 
 /**
  * Get the weighted IO processing time for this bdev.
@@ -1562,6 +2079,14 @@ uint64_t spdk_bdev_get_io_time(const struct spdk_bdev *bdev);
  * \return The weighted io time for this device in microseconds.
  */
 uint64_t spdk_bdev_get_weighted_io_time(const struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_weighted_io_time - 가중 I/O 시간 (마이크로초 × measured_qd)
+ *
+ * 정의: 매 샘플마다 sampling_period × measured_qd 가산.
+ * 평균 QD = (weighted_io_time_2 - weighted_io_time_1) / elapsed_time.
+ * Linux iostat의 aveq(uint avqu-sz) 계산과 동등 — 시간 가중 평균 큐 길이 도출.
+ */
 
 /**
  * Obtain an I/O channel for the block device opened by the specified
@@ -1665,6 +2190,29 @@ void *spdk_bdev_get_module_ctx(struct spdk_bdev_desc *desc);
 int spdk_bdev_seek_data(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 			uint64_t offset_blocks,
 			spdk_bdev_io_completion_cb cb, void *cb_arg);
+/*
+ * [한국어]
+ * spdk_bdev_seek_data - ★ thin-provisioned 영역에서 다음 "데이터 있는" LBA 탐색 ★
+ *
+ * @desc: open된 descriptor
+ * @ch: I/O 채널 (같은 스레드)
+ * @offset_blocks: 탐색 시작 LBA
+ * @cb: 완료 콜백 — 결과는 spdk_bdev_io_get_seek_offset(bdev_io)로 조회
+ * @cb_arg: 콜백 컨텍스트
+ * @return: 0 제출 성공 (cb 호출 보장) / -EINVAL 범위 위반 / -ENOMEM 풀 고갈 /
+ *          -ENOTSUP 모듈 미지원 (sparse 미지원 bdev: malloc, raid 등)
+ *
+ * 의미: POSIX의 lseek(SEEK_DATA)와 동일 — offset_blocks 이후 첫 번째 할당된 데이터 위치 반환.
+ *       모두 hole이면 UINT64_MAX 반환 (get_seek_offset 결과).
+ *
+ * NVMe Dataset Management(DSM) 정보 또는 lvol blob의 cluster 할당 비트맵 활용.
+ * 사용처: rsync-style 스파스 복사, dm-thin migration, blob walker.
+ *
+ * 호출 체인:
+ *   사용자 → spdk_bdev_seek_data → bdev_io_submit(SEEK_DATA) →
+ *   모듈 submit_request → 결과를 bdev_io.u.bdev.offset_blocks에 저장 →
+ *   완료 cb 내부 spdk_bdev_io_get_seek_offset로 회수 → spdk_bdev_free_io
+ */
 
 /**
  * Submit a hole seek request to the bdev on the given channel.
@@ -1688,6 +2236,26 @@ int spdk_bdev_seek_data(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 int spdk_bdev_seek_hole(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 			uint64_t offset_blocks,
 			spdk_bdev_io_completion_cb cb, void *cb_arg);
+/*
+ * [한국어]
+ * spdk_bdev_seek_hole - ★ thin-provisioned 영역에서 다음 "데이터 없는(hole)" LBA 탐색 ★
+ *
+ * lseek(SEEK_HOLE) 등가 — offset_blocks 이후 첫 번째 미할당(unmapped) 영역 시작 LBA 반환.
+ * hole이 없으면 (= 끝까지 모두 할당) num_blocks 반환 (POSIX 관례: EOF 직전).
+ * 결과 회수: 완료 cb 내부 spdk_bdev_io_get_seek_offset(bdev_io).
+ *
+ * seek_data와 짝으로 사용:
+ *   uint64_t off = 0;
+ *   while (off < num_blocks) {
+ *       off = seek_data(off);   // 다음 데이터 시작
+ *       end = seek_hole(off);   // 그 데이터 영역의 끝
+ *       copy(off..end);
+ *       off = end;
+ *   }
+ * → 데이터가 없는 영역은 자동 skip → 스파스 효율 복사.
+ *
+ * @return 추가: -ENOTSUP — 모듈/장치가 sparse를 지원하지 않음.
+ */
 
 /**
  * Submit a read request to the bdev on the given channel.
@@ -3110,6 +3678,19 @@ int spdk_bdev_queue_io_wait(struct spdk_bdev *bdev, struct spdk_io_channel *ch,
  */
 void spdk_bdev_get_io_stat(struct spdk_bdev *bdev, struct spdk_io_channel *ch,
 			   struct spdk_bdev_io_stat *stat, enum spdk_bdev_reset_stat_mode reset_mode);
+/*
+ * [한국어]
+ * spdk_bdev_get_io_stat - 단일 채널의 통계 동기 조회 + 선택적 리셋
+ *
+ * @bdev: 대상 bdev
+ * @ch: I/O 채널 (현재 스레드 소유)
+ * @stat: OUT — 호출자가 할당, 채널 통계가 복사됨
+ * @reset_mode: 조회 후 카운터 리셋 정책 (enum spdk_bdev_reset_stat_mode 참조)
+ *
+ * 호출 컨텍스트: 채널 소유 스레드에서 호출 (thread affinity).
+ * 동기 동작: 메시지 없이 직접 채널 통계 읽음 → 완료 콜백 없이 즉시 반환.
+ * 디바이스 전체 통계는 spdk_bdev_get_device_stat(비동기) 사용.
+ */
 
 
 /**
@@ -3124,6 +3705,22 @@ void spdk_bdev_get_io_stat(struct spdk_bdev *bdev, struct spdk_io_channel *ch,
  */
 void spdk_bdev_get_device_stat(struct spdk_bdev *bdev, struct spdk_bdev_io_stat *stat,
 			       enum spdk_bdev_reset_stat_mode reset_mode, spdk_bdev_get_device_stat_cb cb, void *cb_arg);
+/*
+ * [한국어]
+ * spdk_bdev_get_device_stat - ★ 모든 채널 통계 비동기 집계 ★
+ *
+ * 동작:
+ *   1) for_each_channel 패턴으로 모든 채널 순회
+ *   2) 각 채널에서 get_io_stat 호출 후 결과 stat에 누적
+ *   3) reset_mode에 따라 채널 통계 리셋 (또는 유지)
+ *   4) 모든 채널 완료 후 호출 스레드에서 cb(bdev, stat, cb_arg, rc) 호출
+ *
+ * @stat: 호출자가 할당, 함수 반환 시점에는 아직 미완성. 콜백 진입 시 완성.
+ *        콜백 종료까지 stat 메모리 유지 필수 (bdev 코어가 비동기 채움).
+ *
+ * 호출 컨텍스트: 임의 스레드 (단, cb는 호출 스레드에서 실행).
+ * 사용처: RPC bdev_get_iostat — JSON 응답 빌드.
+ */
 
 /**
  * Get the status of bdev_io as an NVMe status code and command specific
@@ -3245,10 +3842,25 @@ void *spdk_bdev_io_get_md_buf(struct spdk_bdev_io *bdev_io);
  * \return Callback argument of bdev_io.
  */
 void *spdk_bdev_io_get_cb_arg(struct spdk_bdev_io *bdev_io);
+/*
+ * [한국어]
+ * spdk_bdev_io_get_cb_arg - bdev_io의 사용자 cb_arg 반환
+ *
+ * 주요 용도: spdk_bdev_abort가 in-flight I/O를 식별할 때 cb_arg를 키로 사용 →
+ *           특정 abort 대상 I/O의 cb_arg를 찾을 때.
+ * 일반 데이터 경로에서는 사용 불필요 (완료 cb의 cb_arg 인자가 직접 전달됨).
+ */
 
 typedef void (*spdk_bdev_histogram_status_cb)(void *cb_arg, int status);
+                                  /* [한국어] 히스토그램 enable/disable 완료 콜백
+                                   *  - @status: 0 성공, 음수 errno (모든 채널 적용 도중 실패)
+                                   *  - 호출 컨텍스트: enable/disable 호출 스레드 */
 typedef void (*spdk_bdev_histogram_data_cb)(void *cb_arg, int status,
 		struct spdk_histogram_data *histogram);
+                                  /* [한국어] 히스토그램 조회 완료 콜백 (get / channel_get)
+                                   *  - @histogram: 집계된 결과 (호출자가 미리 할당, 또는 채널의 임시 객체)
+                                   *  - 채널별 호출 시(@histogram)은 cb 실행 동안만 valid — cb 후 참조 금지
+                                   *  - @status: 0 성공, 음수 errno */
 
 /**
  * Get the result of a previous seek function.
@@ -3260,6 +3872,18 @@ typedef void (*spdk_bdev_histogram_data_cb)(void *cb_arg, int status,
  * \return data/hole offset in blocks or UINT64_MAX if not found
  */
 uint64_t spdk_bdev_io_get_seek_offset(const struct spdk_bdev_io *bdev_io);
+/*
+ * [한국어]
+ * spdk_bdev_io_get_seek_offset - seek_data/seek_hole 완료 결과 회수
+ *
+ * 사용 시점: 완료 cb 내부에서 호출하여 LBA 결과 취득.
+ * @return:
+ *   - seek_data 성공: 다음 데이터 시작 LBA
+ *   - seek_hole 성공: 다음 hole 시작 LBA
+ *   - 더 이상 매칭 없음: UINT64_MAX (POSIX SEEK_DATA의 ENXIO 등가)
+ *
+ * bdev_io는 SEEK_DATA / SEEK_HOLE 타입이어야 함 — 다른 I/O에 호출하면 의미 없는 값 반환.
+ */
 
 /**
  * Enable or disable collecting histogram data on a bdev.
@@ -3295,6 +3919,24 @@ void spdk_bdev_histogram_enable(struct spdk_bdev *bdev, spdk_bdev_histogram_stat
  */
 void spdk_bdev_histogram_enable_ext(struct spdk_bdev *bdev, spdk_bdev_histogram_status_cb cb_fn,
 				    void *cb_arg, bool enable, struct spdk_bdev_enable_histogram_opts *opts);
+/*
+ * [한국어]
+ * spdk_bdev_histogram_enable_ext - 확장 옵션 기반 히스토그램 enable/disable
+ *
+ * @bdev: 대상 bdev
+ * @cb_fn: 모든 채널에 enable/disable 적용 후 호출 (비동기)
+ * @cb_arg: 콜백 컨텍스트
+ * @enable: true=수집 시작, false=중단 (기존 데이터 유지)
+ * @opts: 측정 범위·해상도·io_type 필터. NULL이면 기본값 (전 I/O 타입, 표준 해상도)
+ *
+ * 동작:
+ *   1) bdev의 모든 채널을 spdk_bdev_for_each_channel 패턴으로 순회
+ *   2) 각 채널에서 enable=true면 spdk_histogram_data_alloc(granularity), false면 free
+ *   3) min/max_nsec 범위로 첫/마지막 버킷 fold 동작 결정
+ *   4) 모든 채널 완료 후 cb_fn(status=0) 호출
+ *
+ * io_type=특정값이면 그 타입 I/O 완료 시에만 latency 누적 → 타입별 분포 분리 분석.
+ */
 
 /**
  * Initialize bdev enable histogram options structure.
@@ -3304,6 +3946,26 @@ void spdk_bdev_histogram_enable_ext(struct spdk_bdev *bdev, spdk_bdev_histogram_
  */
 void
 spdk_bdev_enable_histogram_opts_init(struct spdk_bdev_enable_histogram_opts *opts, size_t size);
+/*
+ * [한국어]
+ * spdk_bdev_enable_histogram_opts_init - histogram_opts를 기본값으로 초기화
+ *
+ * @opts: 호출자가 스택/힙에 할당한 구조체
+ * @size: sizeof(struct spdk_bdev_enable_histogram_opts) 또는 호출자 인지 크기
+ *
+ * 기본값:
+ *   io_type = 0 (모든 타입 측정)
+ *   granularity = 0 (기본 해상도)
+ *   min_nsec = 0, max_nsec = 0 (기본 범위)
+ *   size = @size
+ *
+ * 권장 사용 패턴:
+ *   struct spdk_bdev_enable_histogram_opts opts;
+ *   spdk_bdev_enable_histogram_opts_init(&opts, sizeof(opts));
+ *   opts.io_type = SPDK_BDEV_IO_TYPE_READ;
+ *   opts.granularity = 6;  // 64ns 버킷
+ *   spdk_bdev_histogram_enable_ext(bdev, cb, ctx, true, &opts);
+ */
 
 /**
  * Get aggregated histogram data from a bdev. Callback provides merged histogram
@@ -3337,6 +3999,22 @@ void spdk_bdev_histogram_get(struct spdk_bdev *bdev, struct spdk_histogram_data 
  */
 void spdk_bdev_channel_get_histogram(struct spdk_io_channel *ch, spdk_bdev_histogram_data_cb cb_fn,
 				     void *cb_arg);
+/*
+ * [한국어]
+ * spdk_bdev_channel_get_histogram - ★ 단일 채널의 히스토그램만 조회 ★
+ *
+ * @ch: 대상 I/O 채널
+ * @cb_fn: cb_fn(cb_arg, status, histogram) — histogram은 cb 동안만 valid
+ * @cb_arg: 콜백 컨텍스트
+ *
+ * spdk_bdev_histogram_get(전체 집계)와의 차이:
+ *   - 이 함수는 단일 채널의 버킷만 반환 → 채널별(reactor별) 분포 분석
+ *   - 메시지 합산 단계 없음 → 빠른 조회
+ *   - histogram 객체는 채널이 보유한 임시 객체 → cb 종료 후 즉시 무효 (참조 금지)
+ *
+ * 호출 컨텍스트: 채널 소유 스레드에서 직접 호출해야 함 (thread affinity).
+ * 사용처: 특정 reactor의 NUMA-locality 효과 측정, per-CPU latency 분포 디버깅.
+ */
 
 /**
  * Retrieves media events.  Can only be called from the context of
@@ -3351,6 +4029,18 @@ void spdk_bdev_channel_get_histogram(struct spdk_io_channel *ch, spdk_bdev_histo
  */
 size_t spdk_bdev_get_media_events(struct spdk_bdev_desc *bdev_desc,
 				  struct spdk_bdev_media_event *events, size_t max_events);
+/*
+ * [한국어]
+ * spdk_bdev_get_media_events - 미디어 관리 이벤트 큐에서 이벤트 회수
+ *
+ * 호출 컨텍스트: SPDK_BDEV_EVENT_MEDIA_MANAGEMENT 이벤트 콜백 내부에서만 호출 가능
+ * @events: 호출자가 할당한 이벤트 배열 (offset/num_blocks 정보)
+ * @max_events: 배열 크기
+ * @return: 실제 채워진 이벤트 수 (≤max_events). 추가 이벤트가 더 있으면 다음 호출로 회수
+ *
+ * 사용처: Open Channel SSD 등 raw 미디어를 노출하는 장치에서 bad block 알림,
+ *         host-managed FTL이 GC를 위해 영향 영역 추적.
+ */
 
 /**
  * Get SPDK memory domains used by the given bdev. If bdev reports that it uses memory domains
@@ -3370,6 +4060,23 @@ size_t spdk_bdev_get_media_events(struct spdk_bdev_desc *bdev_desc,
  */
 int spdk_bdev_get_memory_domains(struct spdk_bdev *bdev, struct spdk_memory_domain **domains,
 				 int array_size);
+/*
+ * [한국어]
+ * spdk_bdev_get_memory_domains - bdev이 지원하는 모든 메모리 도메인 열거
+ *
+ * @bdev: 대상 bdev (vbdev이면 하위 모든 bdev의 도메인 합집합)
+ * @domains: 결과 배열 (NULL 가능 — 개수만 조회)
+ * @array_size: 배열 크기
+ * @return: 실제 도메인 수. array_size보다 크면 호출자가 배열 키워 재호출
+ *
+ * 두 단계 호출 패턴:
+ *   int n = spdk_bdev_get_memory_domains(bdev, NULL, 0);   // 개수 먼저
+ *   struct spdk_memory_domain **arr = calloc(n, ...);
+ *   spdk_bdev_get_memory_domains(bdev, arr, n);            // 본 조회
+ *
+ * 사용처: NVMe-oF 타겟이 RDMA 호스트 메모리 도메인 호환성 확인 — 호환되는 도메인이면
+ *         memory_domain 옵션으로 zero-copy I/O 가능, 아니면 bounce buffer 경유.
+ */
 
 /**
  * \brief SPDK bdev channel iterator.
@@ -3377,6 +4084,8 @@ int spdk_bdev_get_memory_domains(struct spdk_bdev *bdev, struct spdk_memory_doma
  * This is a virtual representation of a bdev channel iterator.
  */
 struct spdk_bdev_channel_iter;
+                                  /* [한국어] opaque — spdk_bdev_for_each_channel 순회 상태 (내부에서 동적 할당)
+                                   *  - 사용자는 fn 콜백의 인자로만 받아 spdk_bdev_for_each_channel_continue에 전달 */
 
 /**
  * Called on the appropriate thread for each channel associated with the given bdev.
@@ -3388,6 +4097,12 @@ struct spdk_bdev_channel_iter;
  */
 typedef void (*spdk_bdev_for_each_channel_msg)(struct spdk_bdev_channel_iter *i,
 		struct spdk_bdev *bdev, struct spdk_io_channel *ch, void *ctx);
+                                  /* [한국어] for_each_channel의 per-channel 콜백
+                                   *  - @i: iterator (continue에 전달 필요)
+                                   *  - @bdev: 대상 bdev
+                                   *  - @ch: 현재 채널 (해당 채널 소유 스레드에서 호출됨)
+                                   *  - @ctx: for_each_channel 호출 시 전달한 공유 컨텍스트
+                                   *  - 콜백 내에서 동기/비동기 작업 후 반드시 spdk_bdev_for_each_channel_continue(i, status) 호출 */
 
 /**
  * spdk_bdev_for_each_channel() function's final callback with the given bdev.
@@ -3397,6 +4112,9 @@ typedef void (*spdk_bdev_for_each_channel_msg)(struct spdk_bdev_channel_iter *i,
  * \param status 0 if it completed successfully, or negative errno if it failed.
  */
 typedef void (*spdk_bdev_for_each_channel_done)(struct spdk_bdev *bdev, void *ctx, int status);
+                                  /* [한국어] for_each_channel 최종 완료 콜백
+                                   *  - @status: 모든 채널 정상 0, 또는 어느 fn이 비0 status로 continue 호출 시 그 값
+                                   *  - 호출 스레드: for_each_channel을 처음 호출한 스레드 (스레드 메시지 경유) */
 
 /**
  * Helper function to iterate the next channel for spdk_bdev_for_each_channel().
@@ -3457,6 +4175,15 @@ void spdk_bdev_for_each_channel(struct spdk_bdev *bdev, spdk_bdev_for_each_chann
  * \return controller attributes for the bdev.
  */
 union spdk_bdev_nvme_ctratt spdk_bdev_get_nvme_ctratt(struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_nvme_ctratt - bdev의 컨트롤러 어트리뷰트 비트맵 조회
+ *
+ * 반환: union spdk_bdev_nvme_ctratt — bits.fdps 등 검사 가능
+ * 사용처: 사용자가 _ext API로 cdw12.dtype=2(FDP) 전달 전 fdps 비트 확인.
+ *
+ * 비-NVMe bdev이라도 모듈이 같은 의미로 노출 가능 (spdk_bdev_register 시 설정).
+ */
 
 /**
  * Get NVMe namespace ID for a given bdev (only for NVMe bdevs).
@@ -3466,6 +4193,19 @@ union spdk_bdev_nvme_ctratt spdk_bdev_get_nvme_ctratt(struct spdk_bdev *bdev);
  * \return Namespace ID or 0 if it's not available.
  */
 uint32_t spdk_bdev_get_nvme_nsid(struct spdk_bdev *bdev);
+/*
+ * [한국어]
+ * spdk_bdev_get_nvme_nsid - NVMe bdev의 Namespace ID 조회
+ *
+ * @return: NSID (1..N), 또는 0 — NVMe bdev이 아니거나 NSID 미노출
+ *
+ * 사용처:
+ *   - NVMe-oF 타겟이 호스트로 보낼 NSID 매핑 빌드
+ *   - RPC bdev_nvme_get_controllers 응답에서 namespace 식별
+ *   - admin passthru에서 NSID 인자 자동 주입
+ *
+ * 일반 bdev API는 LBA 기반이므로 NSID 직접 사용 거의 없음 — passthru 경로 한정.
+ */
 
 #ifdef __cplusplus
 }
