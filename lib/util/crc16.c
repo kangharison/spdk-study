@@ -3,38 +3,114 @@
  *   All rights reserved.
  */
 
+/*
+ * [한국어 설명] T10 DIF/PI용 CRC-16 계산기 (crc16.c)
+ *
+ * === 파일의 역할 ===
+ * SCSI T10 DIF(Data Integrity Field) / NVMe E2E PI(Protection Information)에서 정의한
+ * CRC-16 알고리즘을 구현한다. 다항식 0x8BB7 (T10-DIF, x^16 + x^15 + x^11 + x^9 + x^8 +
+ * x^7 + x^5 + x^4 + x^2 + x + 1, 비반전)을 사용하며, 각 데이터 블록(보통 512B 또는 4096B)
+ * 끝에 8바이트 PI 영역의 첫 2바이트 "Guard" 필드로 들어간다. 빌드 시 SPDK_CONFIG_ISAL이
+ * 정의되어 있으면 ISA-L의 SIMD 가속 루틴을 직접 호출하고, 그렇지 않으면 16×256 = 4096
+ * 엔트리 슬라이싱 기법(slice-by-16) 룩업 테이블을 사용한 소프트웨어 폴백을 사용한다.
+ * "copy" 변형은 src에서 dst로 데이터를 복사하면서 동시에 CRC를 계산해 메모리 대역폭을 절약.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * SPDK util 라이브러리 → CRC-16 백엔드.
+ * 호출 체인:
+ *   사용자(예: lib/nvme의 PRACT/PRCHK 처리, lib/util/dif.c, bdev_nvme의 전송 검증)
+ *     → spdk_crc16_t10dif / spdk_crc16_t10dif_copy (이 파일의 공개 API)
+ *     → ISA-L: crc16_t10dif() / crc16_t10dif_copy() (PCLMULQDQ SIMD 가속)
+ *     → 폴백: crc16_table_t10dif → crc_update_fast (slice-by-16 LUT)
+ * 실행 컨텍스트: 호스트 유저스페이스. 보통 NVMe submit/completion 처리 중 reactor
+ * 스레드에서 동기 호출. lib/util/dif.c는 이 함수들을 SGL 순회 콜백으로 호출.
+ *
+ * === 타 모듈과의 연결 ===
+ * - 의존: spdk/crc16.h(공개 API), spdk/config.h(SPDK_CONFIG_ISAL),
+ *         (조건부) isa-l/include/crc.h.
+ * - 의존하는 자: lib/util/dif.c(가장 큰 사용자), lib/nvme/*(PRACT 처리), lib/bdev/*
+ *   (DIF/DIX 변환 시), 그 외 NVMe-oF target에서 PI 검증 시.
+ * - 데이터 흐름: 호출자가 데이터 버퍼와 이전 CRC(보통 0)를 전달 → 한 블록의 데이터를
+ *   바이트/16바이트 단위로 처리하며 CRC 누적 → 16비트 결과 반환 → 호출자가 PI 영역에 기록.
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - spdk_crc16_t10dif      : T10 DIF CRC-16 계산. ISA-L 또는 폴백 경로 위임.
+ * - spdk_crc16_t10dif_copy : memcpy + CRC를 동시에 수행(폴백은 memcpy 후 CRC).
+ * - crc_table_fast[16][256]: slice-by-16 룩업 테이블. 0번 행은 단일 바이트 CRC,
+ *   1..15번 행은 다음 바이트들에 대한 사전 변환 결과.
+ * - crc_update_fast        : 16바이트 청크는 16개 룩업 결과를 XOR로 합산, 잔여는 1바이트 단위.
+ * - crc16_table_t10dif     : 폴백 진입점, init_crc로 시작해 crc_update_fast 호출.
+ *
+ * === T10 DIF CRC 알고리즘 핵심 ===
+ *   - 다항식: 0x8BB7 (반전 안 함)
+ *   - 초기값: 일반적으로 0
+ *   - reflect_in / reflect_out: false (T10 DIF는 비반전)
+ *   - 출력 XOR: 0
+ * 슬라이스-바이-16 기법은 한 라운드에서 16바이트를 동시에 처리하여 메모리 대역폭에
+ * 가까운 처리량을 낸다. 16개의 256엔트리 LUT 룩업 결과를 XOR해 새로운 16비트 CRC 산출.
+ */
+
 #include "spdk/crc16.h"
+/* [한국어] 공개 API(spdk_crc16_t10dif/spdk_crc16_t10dif_copy) 선언. */
 #include "spdk/config.h"
+/* [한국어] SPDK_CONFIG_ISAL 등 빌드 컨피그 매크로. */
 
 /*
  * Use Intelligent Storage Acceleration Library for line speed CRC
  */
 
 #ifdef SPDK_CONFIG_ISAL
+/* [한국어] ISA-L 사용 가능 빌드: PCLMULQDQ 등 하드웨어 가속으로 line speed 성능. */
 #include "isa-l/include/crc.h"
+/* [한국어] ISA-L의 crc16_t10dif/copy 선언 가져오기. */
 
+/*
+ * [한국어]
+ * spdk_crc16_t10dif - ISA-L 가속 경로의 T10 DIF CRC-16 산출.
+ *
+ * @init_crc: 이전 CRC 값(블록 시작은 보통 0).
+ * @buf:      데이터 버퍼.
+ * @len:      바이트 길이.
+ * @return:   누적 갱신된 16비트 CRC.
+ */
 uint16_t
 spdk_crc16_t10dif(uint16_t init_crc, const void *buf, size_t len)
 {
 	return (crc16_t10dif(init_crc, buf, len));
+	/* [한국어] ISA-L 함수에 그대로 위임. PCLMULQDQ SIMD로 매우 빠름. */
 }
 
+/*
+ * [한국어]
+ * spdk_crc16_t10dif_copy - 데이터를 src→dst로 복사하면서 동시에 CRC-16 산출.
+ * 메모리 한 번 읽기로 복사+CRC를 모두 수행 → 대역폭 절감.
+ */
 uint16_t
 spdk_crc16_t10dif_copy(uint16_t init_crc, uint8_t *dst, uint8_t *src,
 		       size_t len)
 {
 	return (crc16_t10dif_copy(init_crc, dst, src, len));
+	/* [한국어] ISA-L의 copy+crc 융합 루틴에 위임. */
 }
 
 #else
 /*
  * Use table-driven (somewhat faster) CRC
  */
+/* [한국어] ISA-L 미사용 빌드: 4KiB 테이블 기반 슬라이스-바이-16 폴백. */
 
 /*
  * Static tables used for the table_driven implementation.
  */
 
+/* [한국어] crc_table_fast[k][b]: 16바이트 슬라이싱 기법용 사전 계산 테이블.
+ * 의미: 한 16바이트 입력 청크 c[0..15]에 대해 새 CRC =
+ *   crc_table_fast[15][b0] ^ crc_table_fast[14][b1] ^ ... ^ crc_table_fast[0][b15]
+ *   (b0, b1은 현재 CRC와 입력 바이트의 XOR/이동에 따른 인덱스).
+ * 0번 행은 단일 바이트 슬라이드용 표(전통적인 byte-wise 표).
+ * 설정자: 컴파일 시점에 빌드 도구(또는 손으로) 미리 계산한 상수.
+ * 읽는 자: crc_update_fast.
+ * 동기화: const 정적이므로 멀티스레드 read-only 안전. */
 static const uint16_t crc_table_fast[16][256] = {
 	{
 		0x0000u, 0x8BB7u, 0x9CD9u, 0x176Eu, 0xB205u, 0x39B2u, 0x2EDCu, 0xA56Bu,
@@ -582,14 +658,37 @@ static const uint16_t crc_table_fast[16][256] = {
 	}
 };
 
+/*
+ * [한국어]
+ * crc_update_fast - slice-by-16 기법으로 buf 길이만큼 CRC를 누적 갱신.
+ *
+ * @crc:       이전 CRC.
+ * @data:      입력 버퍼.
+ * @data_len:  바이트 길이.
+ * @return:    갱신된 16비트 CRC.
+ *
+ * 알고리즘:
+ *  1) 16바이트 정렬 영역(d_last16까지)을 한 번에 16바이트씩 처리.
+ *     각 라운드: 16개의 LUT 룩업 결과를 XOR로 합산 → 새 CRC.
+ *     첫 두 바이트(d[0], d[1])는 현재 CRC의 상위/하위 바이트와 XOR 후 룩업.
+ *     나머지 14바이트는 직접 인덱스로 룩업(이미 CRC 영향이 사전 계산되어 있음).
+ *  2) 잔여(< 16바이트)는 1바이트 단위 전통 LUT 룩업: crc = (crc << 8) ^ table[hi(crc) ^ d].
+ *
+ * 호출 체인: spdk_crc16_t10dif/copy → crc16_table_t10dif → [crc_update_fast].
+ * 실행 컨텍스트: 동기 순수 함수. 어떤 스레드에서도 안전.
+ */
 static inline uint16_t
 crc_update_fast(uint16_t crc, const void *data, size_t data_len)
 {
 	const unsigned char *d = (const unsigned char *)data;
+	/* [한국어] 입력 바이트 포인터(읽기 전용 의미로 unsigned char *). */
 	const unsigned char *d_end = d + data_len;
+	/* [한국어] 입력 끝 직후 위치(end iterator 패턴). */
 	const unsigned char *d_last16 = d + (data_len & ~0x0F);
+	/* [한국어] 16바이트 정렬 끝 위치 = 시작 + (len 라운드 다운 16). 잔여는 이후 처리. */
 
 	for (; d < d_last16 ; d += 16) {
+		/* [한국어] 16바이트 청크를 한 번에 처리하는 메인 루프. */
 		crc = crc_table_fast[15][d[0] ^ (uint8_t)(crc >> 8)] ^
 		      crc_table_fast[14][d[1] ^ (uint8_t)(crc >> 0)] ^
 		      crc_table_fast[13][d[2]] ^
@@ -606,35 +705,68 @@ crc_update_fast(uint16_t crc, const void *data, size_t data_len)
 		      crc_table_fast[2][d[13]] ^
 		      crc_table_fast[1][d[14]] ^
 		      crc_table_fast[0][d[15]];
+		/* [한국어] 16개 룩업의 XOR 합. 처음 두 바이트만 현재 CRC의 영향(>>8, & 0xFF)을 받고
+		 * 나머지는 사전 계산된 슬라이스 표에 의해 직접 인덱싱 가능 - 핵심 트릭. */
 	}
 	for (; d < d_end ; d++) {
+		/* [한국어] 잔여 바이트(<16)는 1바이트 단위 처리. */
 		crc = (crc << 8) ^ crc_table_fast[0][((uint8_t)(crc >> 8) ^ *d)];
+		/* [한국어] 전통적인 byte-wise CRC 갱신: hi(crc) XOR data를 인덱스로 LUT 룩업,
+		 * 그 결과와 (crc << 8)을 XOR. */
 	}
 	return crc & 0xffff;
+	/* [한국어] uint16_t 범위 보장(상위 비트 클리어). */
 }
 
+/*
+ * [한국어]
+ * crc16_table_t10dif - 폴백 경로의 T10 DIF CRC-16 시작 함수.
+ *
+ * @init_crc: 시작 CRC.
+ * @buf, len: 입력.
+ * @return: 누적 CRC.
+ */
 static inline uint16_t
 crc16_table_t10dif(uint16_t init_crc, const void *buf, size_t len)
 {
 	uint16_t crc;
+	/* [한국어] 누적 CRC 변수. */
 	const uint8_t *data = (const uint8_t *)buf;
+	/* [한국어] 캐스팅을 통한 바이트 단위 접근. */
 
 	crc = init_crc;
+	/* [한국어] 호출자 제공 초기값(보통 0)으로 시작. */
 	crc = crc_update_fast(crc, data, len);
+	/* [한국어] 슬라이스-바이-16 핵심 루프 호출. */
 	return crc;
 }
 
+/*
+ * [한국어]
+ * spdk_crc16_t10dif - 폴백 빌드의 공개 API. 표 기반으로 CRC-16 산출.
+ */
 uint16_t
 spdk_crc16_t10dif(uint16_t init_crc, const void *buf, size_t len)
 {
 	return (crc16_table_t10dif(init_crc, buf, len));
+	/* [한국어] 내부 헬퍼에 위임. */
 }
 
+/*
+ * [한국어]
+ * spdk_crc16_t10dif_copy - 폴백 빌드의 공개 API. 복사 후 CRC 산출(분리).
+ *
+ * 주: ISA-L 빌드는 한 번 읽기로 copy+crc를 융합하지만, 폴백은 단순 memcpy + 별도 CRC.
+ */
 uint16_t
 spdk_crc16_t10dif_copy(uint16_t init_crc, uint8_t *dst, uint8_t *src, size_t len)
 {
 	memcpy(dst, src, len);
+	/* [한국어] src→dst 단순 복사. */
 	return (crc16_table_t10dif(init_crc, src, len));
+	/* [한국어] 복사된 데이터(=src)에 대해 CRC 계산. dst 대신 src를 읽는 이유는 캐시상 동등하고
+	 * src는 보통 이미 hot cache 상태이기 때문. */
 }
 
 #endif
+/* [한국어] SPDK_CONFIG_ISAL 분기 끝. */
