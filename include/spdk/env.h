@@ -477,14 +477,19 @@ void spdk_env_fini(void);
  */
 /*
  * [한국어]
- * spdk_dma_malloc - DMA 안전 버퍼 할당 (NUMA 자동) - spdk_malloc(size, align, unused, ANY, DMA) 의 별칭
+ * spdk_dma_malloc - DMA 안전 버퍼 할당 (NUMA 자동, spdk_malloc 의 편의 래퍼)
  *
- * @param size/align/unused: spdk_malloc 과 동일 의미.
- * @return: hugepage 가상주소 또는 NULL.
+ * @param size: 바이트 수.
+ * @param align: 정렬 (0=캐시라인 자동, 2의 거듭제곱).
+ * @param unused: NULL 이어야 함. legacy IOVA out-param 슬롯.
+ * @return: hugepage 기반 가상주소 또는 NULL.
  *
- * SPDK 초창기 API 로, 신코드는 spdk_malloc + flags 권장. 동작 의미는 동일하다.
+ * 의미: spdk_malloc(size, align, unused, SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA) 와 동일.
+ * 역사: SPDK 초창기 API 로 신코드는 spdk_malloc + flags 사용 권장. 다만 광범위한 out-of-tree
+ *   사용자 코드 호환을 위해 유지.
+ * 반환된 버퍼는 spdk_vtophys 로 IOVA 변환 가능 — NVMe SQE PRP/SGL 에 그대로 사용.
  *
- * 호출 체인: 사용자 → spdk_dma_malloc → spdk_malloc(... , SPDK_MALLOC_DMA)
+ * 호출 체인: 사용자/드라이버 → spdk_dma_malloc → spdk_malloc(... , ANY, DMA)
  */
 void *spdk_dma_malloc(size_t size, size_t align, uint64_t *unused);
 
@@ -503,11 +508,19 @@ void *spdk_dma_malloc(size_t size, size_t align, uint64_t *unused);
  */
 /*
  * [한국어]
- * spdk_dma_malloc_socket - DMA 안전 버퍼 + NUMA 노드 명시
+ * spdk_dma_malloc_socket - DMA 안전 버퍼 + 명시 NUMA 노드 할당
  *
- * @param numa_id: 할당할 NUMA 노드. NVMe 디바이스가 붙은 노드와 일치시키는 것이 성능 최적.
+ * @param size: 바이트 수.
+ * @param align: 정렬.
+ * @param unused: NULL 필수.
+ * @param numa_id: 할당할 NUMA 노드 (또는 SPDK_ENV_NUMA_ID_ANY).
+ * @return: hugepage 가상주소 또는 NULL.
  *
- * 호출 체인: 사용자/NVMe init → spdk_dma_malloc_socket → spdk_malloc(... , numa_id, DMA)
+ * 의미: spdk_malloc(... , numa_id, SPDK_MALLOC_DMA). NUMA-local I/O 최적화 — NVMe 디바이스가
+ *   numa_id 노드에 붙어있다면 같은 노드에 버퍼를 잡아 cross-NUMA 메모리 트래픽을 회피.
+ * 사용처: NVMe req PRP 버퍼, RDMA NIC 의 send/recv 버퍼.
+ *
+ * 호출 체인: NVMe attach_cb → spdk_dma_malloc_socket(... , dev_numa_id, ...) → spdk_malloc
  */
 void *spdk_dma_malloc_socket(size_t size, size_t align, uint64_t *unused, int numa_id);
 
@@ -525,9 +538,18 @@ void *spdk_dma_malloc_socket(size_t size, size_t align, uint64_t *unused, int nu
  */
 /*
  * [한국어]
- * spdk_dma_zmalloc - DMA 안전 + 0초기화 버퍼 (NUMA ANY)
- * @return: 0 으로 채워진 hugepage 메모리.
- * 호출 체인: 사용자/드라이버 init → spdk_dma_zmalloc → spdk_zmalloc(...,ANY, DMA)
+ * spdk_dma_zmalloc - DMA 안전 + 0 초기화 버퍼 (NUMA ANY)
+ *
+ * @param size: 바이트 수.
+ * @param align: 정렬 (0=캐시라인, 그 외 2^n).
+ * @param unused: NULL 이어야 함 (legacy IOVA out-param 슬롯).
+ * @return: 0 으로 채워진 hugepage 메모리 포인터 또는 NULL.
+ *
+ * 의미적으로 spdk_zmalloc(size, align, unused, SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA) 와 동일.
+ * 가장 흔히 사용되는 SPDK DMA 할당 API — NVMe Identify 응답, log page 페이로드, NVMe Admin queue 등
+ * "init 시 한 번 잡고 lifetime 동안 유지" 하는 0-init 버퍼에 사용된다.
+ *
+ * 호출 체인: NVMe init / 사용자 → spdk_dma_zmalloc → spdk_zmalloc(... , ANY, DMA)
  */
 void *spdk_dma_zmalloc(size_t size, size_t align, uint64_t *unused);
 
@@ -547,8 +569,18 @@ void *spdk_dma_zmalloc(size_t size, size_t align, uint64_t *unused);
  */
 /*
  * [한국어]
- * spdk_dma_zmalloc_socket - spdk_dma_zmalloc + NUMA 노드 명시
- * 호출 체인: 사용자 → spdk_dma_zmalloc_socket → spdk_zmalloc(... , numa_id, DMA)
+ * spdk_dma_zmalloc_socket - DMA 안전 + 0 초기화 버퍼 + NUMA 노드 명시
+ *
+ * @param size: 바이트 수.
+ * @param align: 정렬.
+ * @param unused: NULL 필수.
+ * @param numa_id: 할당할 NUMA 노드 (또는 SPDK_ENV_NUMA_ID_ANY).
+ * @return: 0 으로 채워진 hugepage 메모리 포인터 또는 NULL.
+ *
+ * spdk_zmalloc(... , numa_id, SPDK_MALLOC_DMA) 와 동일. 디바이스가 붙은 NUMA 노드와 같은 곳에
+ * 버퍼를 잡아 cross-NUMA DMA 대역폭 손실을 회피하는 패턴 (spdk_pci_device_get_numa_id 와 짝).
+ *
+ * 호출 체인: NVMe attach_cb → spdk_dma_zmalloc_socket(... , dev_numa_id, ...) → spdk_zmalloc
  */
 void *spdk_dma_zmalloc_socket(size_t size, size_t align, uint64_t *unused, int numa_id);
 
@@ -567,9 +599,20 @@ void *spdk_dma_zmalloc_socket(size_t size, size_t align, uint64_t *unused, int n
  */
 /*
  * [한국어]
- * spdk_dma_realloc - DMA 버퍼 크기 변경 (spdk_realloc 의 DMA 버전)
- * 주의: in-flight DMA 가 없는 상태여야 함 — IOVA 가 바뀌면 NVMe 가 잘못된 주소를 DMA 함.
- * 호출 체인: 사용자 → spdk_dma_realloc → spdk_realloc
+ * spdk_dma_realloc - DMA 안전 버퍼 크기 변경 (spdk_realloc 의 DMA 버전)
+ *
+ * @param buf: spdk_dma_*malloc 으로 받은 기존 버퍼 (NULL = 신규 할당).
+ * @param size: 새 크기 (0 = free).
+ * @param align: 새 정렬.
+ * @param unused: NULL 필수.
+ * @return: 새 (혹은 같은) hugepage 가상주소. 옛 buf 는 무효일 수 있음.
+ *
+ * 위험: in-flight DMA 가 진행 중인 버퍼에 호출 금지. realloc 이 새 영역으로 옮기면 IOVA 가 바뀌고,
+ *   NVMe 컨트롤러는 옛 IOVA 로 DMA 를 계속하다가 잘못된 메모리에 쓰기/읽기 → 데이터 손상.
+ *   반드시 spdk_nvme_qpair_process_completions / spdk_bdev_io 완료를 보장한 뒤 호출.
+ * 사용처: 동적 크기 버퍼 (사용자가 size 를 늘리면서 데이터 유지 필요) — 드물지만 사용자 코드용.
+ *
+ * 호출 체인: 사용자 코드 → spdk_dma_realloc → spdk_realloc → rte_realloc_socket
  */
 void *spdk_dma_realloc(void *buf, size_t size, size_t align, uint64_t *unused);
 
@@ -581,8 +624,16 @@ void *spdk_dma_realloc(void *buf, size_t size, size_t align, uint64_t *unused);
  */
 /*
  * [한국어]
- * spdk_dma_free - spdk_dma_*malloc 으로 받은 버퍼 해제 (사실상 spdk_free 와 동일)
- * "performance path 에서 호출되지 않음" 명시 — cleanup 단계에서만 사용 권장.
+ * spdk_dma_free - spdk_dma_*malloc 으로 받은 버퍼 해제 (spdk_free 와 동일)
+ *
+ * @param buf: 해제할 버퍼 (NULL 허용 — no-op).
+ *
+ * 의미: spdk_free 의 별칭 (역사적 이유로 분리 유지). 일반 free() 와 절대 섞으면 안 됨.
+ * 위험: in-flight DMA 가 진행 중인 버퍼에 호출 금지 — 완료 콜백 도착 후 해제.
+ * 헤더 docstring 의 "never made from the performance path" 는 hugepage free 가 메타데이터 정리
+ *   비용이 들어 핫패스에 부적합함을 알림 — 빈번한 alloc/free 는 mempool 로 대체.
+ *
+ * 호출 체인: NVMe shutdown / 사용자 cleanup → spdk_dma_free → spdk_free → rte_free
  */
 void spdk_dma_free(void *buf);
 
@@ -795,8 +846,16 @@ struct spdk_mempool *spdk_mempool_create_ctor(const char *name, size_t count,
  */
 /*
  * [한국어]
- * spdk_mempool_get_name - 풀의 이름 문자열 조회 (디버깅/RPC 표시용)
- * 반환된 포인터는 풀 lifetime 동안 유효. 호출자가 free 하지 말 것.
+ * spdk_mempool_get_name - 풀의 이름 문자열 조회
+ *
+ * @param mp: 대상 풀.
+ * @return: spdk_mempool_create 시 사용한 이름 문자열 포인터. 풀 lifetime 동안 유효.
+ *
+ * 주의: 호출자가 free 하면 안 됨 (내부 정적/풀 내부 버퍼). 풀이 free 되면 dangling pointer 가
+ *   되므로 사용 전후로 풀의 lifetime 을 보장해야 한다.
+ * 사용처: 디버그 로깅, RPC 통계 응답의 풀 식별자.
+ *
+ * 호출 체인: RPC/디버그 코드 → spdk_mempool_get_name → rte_mempool->name
  */
 char *spdk_mempool_get_name(struct spdk_mempool *mp);
 
@@ -846,8 +905,18 @@ void *spdk_mempool_get(struct spdk_mempool *mp);
  * [한국어]
  * spdk_mempool_get_bulk - count 개 객체를 한 번에 꺼냄 (atomic 횟수 절감)
  *
- * @return: 0 = 모두 받음, 음수 = 부족 (이 경우 ele_arr 는 미정, 호출자가 fallback 필요).
- * 사용처: NVMe-oF target 처럼 한 요청에 여러 객체 필요 시.
+ * @param mp: 대상 풀.
+ * @param ele_arr: count 개 포인터를 받을 호출자 배열.
+ * @param count: 요청 개수.
+ * @return: 0 = 모두 받음, 음수 errno = 부족 (이 경우 ele_arr 는 부분적이거나 미정의 상태,
+ *          호출자는 받은 0 개 가정하고 fallback 처리 필요 — 즉 atomic all-or-nothing 의미).
+ *
+ * 동작: 코어 캐시에서 우선 빼고, 부족하면 글로벌 ring 에서 보충 시도. 한 번의 atomic CAS 로 N 개
+ *   가져오므로 spdk_mempool_get 을 N 번 호출하는 것보다 효율적.
+ * 사용처: NVMe-oF target 의 RDMA WR 묶음 처리, 한 bdev_io 가 여러 child IO 를 동시에 띄울 때.
+ * 컨텍스트: SPDK thread 권장 (코어 캐시 사용).
+ *
+ * 호출 체인: NVMe-oF / bdev split → spdk_mempool_get_bulk → rte_mempool_get_bulk
  */
 int spdk_mempool_get_bulk(struct spdk_mempool *mp, void **ele_arr, size_t count);
 
@@ -875,7 +944,17 @@ void spdk_mempool_put(struct spdk_mempool *mp, void *ele);
  */
 /*
  * [한국어]
- * spdk_mempool_put_bulk - 여러 객체 일괄 반환 (atomic 절감)
+ * spdk_mempool_put_bulk - 여러 객체를 한 번에 풀에 반환 (atomic 횟수 절감)
+ *
+ * @param mp: 대상 풀.
+ * @param ele_arr: 반환할 객체 포인터 배열.
+ * @param count: 반환 개수.
+ *
+ * 동작: 코어 캐시에 우선 채우고, 캐시가 가득 차면 절반을 글로벌 ring 으로 flush. 1번 atomic CAS 로 N 개.
+ * 사용처: NVMe-oF target 의 RDMA WR 묶음 완료, bdev split child 완료 시 일괄 free.
+ * 컨텍스트: SPDK thread 권장.
+ *
+ * 호출 체인: 완료 콜백/배치 free → spdk_mempool_put_bulk → rte_mempool_put_bulk
  */
 void spdk_mempool_put_bulk(struct spdk_mempool *mp, void **ele_arr, size_t count);
 
@@ -888,10 +967,17 @@ void spdk_mempool_put_bulk(struct spdk_mempool *mp, void **ele_arr, size_t count
  */
 /*
  * [한국어]
- * spdk_mempool_count - 현재 풀 내에 "사용 가능한" 객체 수 (in-pool count)
+ * spdk_mempool_count - 현재 풀 안에 "사용 가능한"(in-pool) 객체 수 조회
  *
- * 주의: 코어 캐시 / 글로벌 ring 합계의 근사값 — 멀티스레드 환경에서 정확히 일치 보장 X.
- * 모니터링/디버깅 용도. 핫패스 분기 조건으로 사용하지 말 것.
+ * @param pool: 대상 풀.
+ * @return: 모든 lcore 캐시 + 글로벌 ring 의 잔여 객체 수 합산 (근사값).
+ *
+ * 정확성: 멀티 lcore 환경에서 다른 코어가 동시에 get/put 중이면 결과는 즉시 stale 가능 — 정확한
+ *   "in-use 객체 수" = create 시 count - 이 함수 반환값 도 race-prone.
+ * 사용처: 모니터링, RPC bdev_get_iostat 의 pool 통계, 디버깅. 핫패스 분기 조건으로는 사용 X
+ *   (실패는 spdk_mempool_get 이 NULL 반환할 때 처리).
+ *
+ * 호출 체인: RPC stats → spdk_mempool_count → rte_mempool_avail_count
  */
 size_t spdk_mempool_count(const struct spdk_mempool *pool);
 
@@ -906,10 +992,21 @@ size_t spdk_mempool_count(const struct spdk_mempool *pool);
  */
 /*
  * [한국어]
- * spdk_mempool_obj_iter - 풀의 모든 객체에 obj_cb 호출 (in-use, in-pool 무관)
+ * spdk_mempool_obj_iter - 풀의 모든 객체에 obj_cb 호출 (in-use/in-pool 무관 전체 순회)
  *
- * 사용처: 디버깅, 통계, 외부 매핑 등록(예: RDMA MR 등록을 풀 전체 객체에 일괄 적용).
- * 컨텍스트: 핫패스 금지 — O(N) 비용.
+ * @param mp: 대상 풀.
+ * @param obj_cb: 각 객체에 호출될 콜백 (spdk_mempool_obj_cb_t 시그니처).
+ * @param obj_cb_arg: 콜백에 전달되는 opaque 컨텍스트.
+ * @return: 순회된 객체 수.
+ *
+ * 동작: 풀 내부의 메모리 chunk 들을 ele_size 단위로 슬라이스하여 obj_cb 를 N 번 호출.
+ *   in-use(현재 다른 코드가 들고 있는) 객체도 포함되므로 콜백은 객체의 일관성을 가정하면 안 됨
+ *   (사용 중일 수 있음 → read-only 메타정보 출력 정도가 안전).
+ * 사용처: 디버깅 dump, 통계, 외부 DMA 매핑 (RDMA MR 등록을 풀 전체 객체에 일괄 적용 — 이때는
+ *   풀이 아직 in-use 0 인 init 직후가 안전).
+ * 컨텍스트: 핫패스 금지 (O(N) 비용). init / cleanup / RPC 핸들러 등 cold path.
+ *
+ * 호출 체인: RDMA MR init / RPC stats → spdk_mempool_obj_iter → rte_mempool_obj_iter
  */
 uint32_t spdk_mempool_obj_iter(struct spdk_mempool *mp, spdk_mempool_obj_cb_t obj_cb,
 			       void *obj_cb_arg);
@@ -925,10 +1022,21 @@ uint32_t spdk_mempool_obj_iter(struct spdk_mempool *mp, spdk_mempool_obj_cb_t ob
  */
 /*
  * [한국어]
- * spdk_mempool_mem_iter - 풀의 각 chunk(연속 IOVA 영역) 에 콜백
+ * spdk_mempool_mem_iter - 풀의 각 메모리 chunk(연속 IOVA 영역) 단위로 콜백 호출
  *
- * 사용처: NVMe-oF RDMA target 이 RDMA MR(memory region) 을 풀 chunk 단위로 등록.
- * 풀이 여러 hugepage 에 흩어져 있을 수 있어 chunk 단위 처리가 필요.
+ * @param mp: 대상 풀.
+ * @param mem_cb: 각 chunk 에 호출될 콜백 (spdk_mempool_mem_cb_t).
+ * @param mem_cb_arg: 콜백 컨텍스트.
+ * @return: 순회된 chunk 수.
+ *
+ * 동작: 풀의 백킹 메모리는 IOVA-연속 hugepage 가 부족하면 여러 chunk 로 분할 저장됨. 이 함수는 각
+ *   chunk 의 (addr, iova, len) 을 콜백에 전달.
+ * 사용처: NVMe-oF RDMA target 이 풀 메모리를 RDMA MR(memory region) 로 등록할 때 — MR 은 IOVA-
+ *   연속 영역 단위로만 가능하므로 chunk 단위로 ibv_reg_mr 호출. obj 단위(spdk_mempool_obj_iter)
+ *   보다 효율적 (한 chunk = 수많은 obj).
+ * 컨텍스트: init / RDMA poll group 생성 시. 핫패스 금지.
+ *
+ * 호출 체인: NVMe-oF RDMA init → spdk_mempool_mem_iter → rte_mempool_mem_iter → ibv_reg_mr
  */
 uint32_t spdk_mempool_mem_iter(struct spdk_mempool *mp, spdk_mempool_mem_cb_t mem_cb,
 			       void *mem_cb_arg);
@@ -942,7 +1050,17 @@ uint32_t spdk_mempool_mem_iter(struct spdk_mempool *mp, spdk_mempool_mem_cb_t me
  */
 /*
  * [한국어]
- * spdk_mempool_lookup - 이름으로 풀 검색 (multi-process 또는 모듈 간 공유)
+ * spdk_mempool_lookup - 이름으로 등록된 mempool 검색
+ *
+ * @param name: spdk_mempool_create 시 사용된 고유 이름.
+ * @return: 매칭된 풀 핸들, 없으면 NULL.
+ *
+ * 동작: 글로벌 mempool 리스트(DPDK rte_mempool 의 글로벌 TAILQ)에서 strcmp 매칭.
+ * 사용처:
+ *   - Multi-process: secondary 가 primary 가 만든 풀에 attach (객체 데이터는 hugepage 공유).
+ *   - 모듈 간 공유: bdev_io 풀처럼 한 라이브러리가 만든 풀을 다른 모듈이 lookup 으로 접근.
+ *
+ * 호출 체인: secondary init / 모듈 lookup → spdk_mempool_lookup → rte_mempool_lookup
  */
 struct spdk_mempool *spdk_mempool_lookup(const char *name);
 
@@ -953,8 +1071,18 @@ struct spdk_mempool *spdk_mempool_lookup(const char *name);
  */
 /*
  * [한국어]
- * spdk_env_get_core_count - SPDK 가 보유한 lcore 개수 (= core_mask 의 bit 수)
- * 사용처: reactor 개수 결정, mempool cache 총량 추정.
+ * spdk_env_get_core_count - SPDK 가 사용할 lcore 의 개수 조회
+ *
+ * @return: spdk_env_opts.core_mask 또는 lcore_map 에 set 된 lcore 비트 수와 동일.
+ *          spdk_env_init 이 한 번 결정한 뒤로 변하지 않음.
+ *
+ * 사용처:
+ *   - reactor 개수 결정 (lib/thread): 정확히 이 수만큼 reactor 스레드 생성.
+ *   - mempool cache size 추정 (총 캐시 메모리 = cache_size * 코어수).
+ *   - bdev_io 풀 크기 산정 (코어당 N 개 가정).
+ * 컨텍스트: 어디서나 호출 가능 (init 후).
+ *
+ * 호출 체인: reactor init / bdev init → spdk_env_get_core_count → 내부 lcore 비트맵 popcount
  */
 uint32_t spdk_env_get_core_count(void);
 
@@ -984,9 +1112,16 @@ uint32_t spdk_env_get_current_core(void);
  */
 /*
  * [한국어]
- * spdk_env_get_main_core - 메인 코어(앱 부팅 lcore) 의 ID
+ * spdk_env_get_main_core - 메인(main) lcore ID 조회
  *
- * spdk_env_opts.main_core 또는 자동 선택값. 보통 RPC/관리 작업이 이 코어에서 처리.
+ * @return: spdk_env_opts.main_core 가 지정한 값 또는 미지정시 자동 선택된 lcore (보통 core_mask 의
+ *          가장 낮은 비트). spdk_env_init 이후 불변.
+ *
+ * 의미: "main lcore" = DPDK 가 rte_eal_init 후 가장 먼저 진입하는 lcore. SPDK 는 보통 이 코어에서
+ *   초기화 작업(메모리 풀 생성, RPC 서버 부팅)을 수행하고 다른 reactor 들에 I/O 분배.
+ * 사용처: spdk_thread_get_app_thread() 가 일반적으로 이 코어에 매핑됨, RPC 핸들러 라우팅 기준.
+ *
+ * 호출 체인: app init / RPC dispatcher → spdk_env_get_main_core → 내부 변수
  */
 uint32_t spdk_env_get_main_core(void);
 
@@ -997,8 +1132,14 @@ uint32_t spdk_env_get_main_core(void);
  */
 /*
  * [한국어]
- * spdk_env_get_first_core - core_mask 에서 가장 낮은 bit 의 코어 ID
- * SPDK_ENV_FOREACH_CORE 매크로의 시작점.
+ * spdk_env_get_first_core - core_mask 에서 가장 낮은 비트의 lcore ID 조회
+ *
+ * @return: 가장 낮은 lcore 인덱스. core_mask 가 비어있으면 SPDK_ENV_LCORE_ID_ANY (UINT32_MAX).
+ *
+ * 동작: env_dpdk 가 보관한 lcore 비트맵에서 첫 set bit 의 위치 반환.
+ * 사용처: SPDK_ENV_FOREACH_CORE 매크로의 시작점, 디폴트 reactor 코어 결정 (main_core 가 -1 일 때).
+ *
+ * 호출 체인: SPDK_ENV_FOREACH_CORE / 사용자 → spdk_env_get_first_core → 비트맵 ffs
  */
 uint32_t spdk_env_get_first_core(void);
 
@@ -1009,7 +1150,15 @@ uint32_t spdk_env_get_first_core(void);
  */
 /*
  * [한국어]
- * spdk_env_get_last_core - core_mask 에서 가장 높은 bit 의 코어 ID
+ * spdk_env_get_last_core - core_mask 에서 가장 높은 비트의 lcore ID 조회
+ *
+ * @return: 가장 높은 lcore 인덱스 (SPDK_ENV_FOREACH_CORE 의 종료 비교에는 사용 X — next 가
+ *          UINT32_MAX 반환으로 종료 처리). core_mask 비어있으면 SPDK_ENV_LCORE_ID_ANY.
+ *
+ * 사용처: 코어 범위 사전 할당 (예: lcore 인덱스 기반 배열 크기 = last_core + 1), 마지막 코어에만
+ *   특별 역할 부여.
+ *
+ * 호출 체인: 사용자/모듈 init → spdk_env_get_last_core → 비트맵 fls
  */
 uint32_t spdk_env_get_last_core(void);
 
@@ -1059,7 +1208,21 @@ int32_t spdk_env_get_numa_id(uint32_t core);
  *
  * \return the ID of the first NUMA node
  */
-/* [한국어] spdk_env_get_first_numa_id - 시스템의 가장 낮은 NUMA 노드 ID. FOREACH 시작점. */
+/*
+ * [한국어]
+ * spdk_env_get_first_numa_id - 시스템의 가장 낮은 NUMA 노드 ID 조회
+ *
+ * @return: 시스템이 보유한 NUMA 노드 중 가장 낮은 ID (보통 0). NUMA 노드 정보가 없으면 -1.
+ *
+ * 동작: env_dpdk 가 부팅 시 sysfs(/sys/devices/system/node/) 또는 hwloc 으로 토폴로지를 스캔하여
+ *       만들어둔 내부 비트맵에서 첫 set bit 의 인덱스를 반환. SPDK_ENV_FOREACH_NUMA_ID 매크로의
+ *       시작점으로 사용된다.
+ * 컨텍스트: 어디서나 호출 가능. read-only 조회로 동기화 불필요.
+ * caller: 시스템 토폴로지 순회가 필요한 모든 모듈 (예: bdev_io 풀 NUMA 별 생성, RPC 통계).
+ * callee: env_dpdk 내부 NUMA 비트맵 lookup.
+ *
+ * 호출 체인: SPDK_ENV_FOREACH_NUMA_ID 매크로 / 사용자 코드 → spdk_env_get_first_numa_id
+ */
 int32_t spdk_env_get_first_numa_id(void);
 
 /**
@@ -1067,7 +1230,19 @@ int32_t spdk_env_get_first_numa_id(void);
  *
  * \return the ID of the last NUMA node
  */
-/* [한국어] spdk_env_get_last_numa_id - 가장 높은 NUMA 노드 ID. */
+/*
+ * [한국어]
+ * spdk_env_get_last_numa_id - 시스템의 가장 높은 NUMA 노드 ID 조회
+ *
+ * @return: NUMA 노드 비트맵의 마지막 set bit 인덱스. 단일 NUMA 시스템은 0.
+ *
+ * 동작: env_dpdk 의 내부 NUMA 비트맵에서 마지막 set bit 의 인덱스를 반환. SPDK_ENV_FOREACH_NUMA_ID
+ *       매크로의 종료 비교에는 사용되지 않고 (next 가 INT32_MAX 반환으로 끝남), 노드 개수 산정이나
+ *       마지막 노드 특별 처리 (예: 마지막 노드에만 RPC 콜백 부착) 시 사용한다.
+ * 컨텍스트: 어디서나 호출 가능. read-only.
+ *
+ * 호출 체인: 사용자 코드 → spdk_env_get_last_numa_id
+ */
 int32_t spdk_env_get_last_numa_id(void);
 
 /**
@@ -1184,8 +1359,15 @@ int spdk_env_thread_launch_pinned(uint32_t core, thread_start_fn fn, void *arg);
  */
 /*
  * [한국어]
- * spdk_env_thread_wait_all - 모든 launch_pinned 스레드의 join
- * 종료 단계에서 메인 스레드가 호출. 각 스레드의 fn 이 return 할 때까지 블록.
+ * spdk_env_thread_wait_all - launch_pinned 로 생성된 모든 lcore 스레드의 종료 대기 (join)
+ *
+ * 동작: DPDK rte_eal_mp_wait_lcore 호출 — 모든 lcore 의 thread_start_fn 이 return 할 때까지
+ *   메인 스레드를 블록. lcore 스레드가 무한 polling 루프인 경우 외부 종료 신호로 루프를 빠져나오게
+ *   먼저 만들어야 한다 (그렇지 않으면 영원히 대기).
+ * 컨텍스트: 메인 스레드 종료 단계에서 1회.
+ * caller: spdk_app_stop → spdk_app_fini → spdk_env_thread_wait_all → spdk_env_fini.
+ *
+ * 호출 체인: main → spdk_env_thread_wait_all → rte_eal_mp_wait_lcore
  */
 void spdk_env_thread_wait_all(void);
 
@@ -1196,11 +1378,22 @@ void spdk_env_thread_wait_all(void);
  */
 /*
  * [한국어]
- * spdk_process_is_primary - 현재 프로세스가 DPDK primary 인지 (vs secondary)
+ * spdk_process_is_primary - 현재 프로세스가 DPDK primary 인지 secondary 인지 조회
  *
- * Multi-process 모델: primary 가 hugepage 를 처음 만들고, secondary 는 attach 만 함.
- * memzone_reserve / mempool_create 는 primary 만 가능, secondary 는 lookup 만.
- * 사용처: bdev/모듈이 init 시 primary/secondary 구분 분기.
+ * @return: true = primary (= 최초로 EAL init 한 프로세스), false = secondary (= 같은 shm_id 로 attach).
+ *
+ * Multi-process 모델 (DPDK):
+ *   - Primary: hugepage 를 처음 mmap 하고 memzone/mempool 의 메타데이터를 만든다. secondary 들이
+ *     붙기 전에 모든 자원을 미리 생성해두는 패턴.
+ *   - Secondary: 같은 hugepage segment 를 attach 하여 primary 가 만든 자원을 lookup-only 로 사용.
+ *     memzone_reserve / mempool_create 같은 "생성" API 는 호출 불가 (errno=ENOTSUP).
+ *
+ * 사용처:
+ *   - bdev/모듈이 init 시 분기: primary 는 풀 생성, secondary 는 lookup.
+ *   - vhost target 의 primary, vhost-user client 의 secondary 패턴.
+ * 컨텍스트: 어디서나. 결과는 init 후 불변.
+ *
+ * 호출 체인: 모듈 init → spdk_process_is_primary → rte_eal_process_type == RTE_PROC_PRIMARY
  */
 bool spdk_process_is_primary(void);
 
@@ -1211,10 +1404,17 @@ bool spdk_process_is_primary(void);
  */
 /*
  * [한국어]
- * spdk_get_ticks - 단조 증가 카운터 (DPDK rte_get_tsc_cycles, 사실상 rdtsc)
+ * spdk_get_ticks - 단조 증가 타임스탬프 카운터 (TSC 기반)
  *
- * 사용처: poller 의 deadline, latency 측정. spdk_get_ticks_hz 와 함께 ns/us 환산.
- * 컨텍스트: 어디서나 호출 가능 (시스템콜 없는 사용자 명령어).
+ * @return: 64-bit monotonic tick 카운터. 단위는 spdk_get_ticks_hz() 의 Hz 로 ns/us 환산.
+ *
+ * 동작: DPDK rte_get_tsc_cycles → 내부적으로 x86 의 RDTSC 인스트럭션 (또는 ARM CNTVCT_EL0).
+ *   시스템콜 없음 — 매우 빠르게 (수 사이클) ns-급 해상도 시간 측정 가능.
+ *   주의: TSC 가 invariant 아니면 (구형 CPU, 일부 VM) 값이 코어/주파수 변경 따라 흔들릴 수 있음 —
+ *   현대 서버 CPU 는 invariant TSC 보장 (CPUID.80000007h:EDX[8]).
+ * 사용처: poller deadline 계산, I/O latency 측정, statistic histogram (lib/util/histogram).
+ *
+ * 호출 체인: poller / latency stats → spdk_get_ticks → RDTSC
  */
 uint64_t spdk_get_ticks(void);
 
@@ -1225,9 +1425,19 @@ uint64_t spdk_get_ticks(void);
  */
 /*
  * [한국어]
- * spdk_get_ticks_hz - 1초당 spdk_get_ticks 증가량 (TSC 주파수, Hz)
+ * spdk_get_ticks_hz - spdk_get_ticks() 의 초당 증가량 (TSC 주파수, Hz)
  *
- * 일반적으로 CPU base clock 에 대응. ns 환산: ns = ticks * 1e9 / hz.
+ * @return: tick rate (Hz). 예: 3.0 GHz CPU 면 3000000000 근사값.
+ *
+ * 동작: DPDK 가 init 시점에 CPUID 또는 calibration 으로 측정해둔 값을 반환. invariant TSC 면
+ *   런타임 내내 변하지 않음.
+ * 환산:
+ *   - ns = ticks * 1e9 / hz
+ *   - us = ticks * 1e6 / hz
+ *   - sec = ticks / hz
+ * 사용처: spdk_get_ticks 결과를 사람이 읽을 수 있는 단위로 변환, poller period 설정.
+ *
+ * 호출 체인: latency 계산 / poller 등록 → spdk_get_ticks_hz → DPDK 캐시값
  */
 uint64_t spdk_get_ticks_hz(void);
 
@@ -1238,10 +1448,21 @@ uint64_t spdk_get_ticks_hz(void);
  */
 /*
  * [한국어]
- * spdk_delay_us - busy-wait 으로 us 마이크로초 대기
+ * spdk_delay_us - busy-wait 으로 지정 마이크로초만큼 대기
  *
- * sleep() 가 아닌 busy-wait — reactor 모델에서 잠들면 polling 멈추므로 절대 X.
- * 사용처: NVMe reset 시퀀스의 spec 명시 대기 등 짧은 폴 대기.
+ * @param us: 대기 시간 (마이크로초).
+ *
+ * 동작: spdk_get_ticks 를 폴링하며 us * hz / 1e6 만큼 경과할 때까지 busy-loop.
+ *   usleep / nanosleep 같은 sleep 시스템 콜이 아닌 이유: reactor 가 잠들면 다른 poller 가 정지하고
+ *   polled-mode I/O latency 가 깨진다. busy-wait 은 CPU 를 100% 점유하지만 reactor 의 polling
+ *   순환은 유지된다.
+ * 사용처:
+ *   - NVMe reset 시퀀스의 spec 명시 대기 (예: CC.EN 토글 후 CSTS.RDY bit 폴링 사이의 짧은 지연).
+ *   - 디바이스 power state 전환 후 settle 시간.
+ *   - 단위 테스트의 결정적 타이밍.
+ * 주의: 긴 us 값(>1ms)은 비효율 — poller deadline 기반 비동기 패턴으로 대체 권장.
+ *
+ * 호출 체인: NVMe reset / power mgmt → spdk_delay_us → spdk_get_ticks 폴링 루프
  */
 void spdk_delay_us(unsigned int us);
 
@@ -1250,10 +1471,17 @@ void spdk_delay_us(unsigned int us);
  */
 /*
  * [한국어]
- * spdk_pause - x86 PAUSE 인스트럭션 (스핀 락 hint, hyperthread 양보)
+ * spdk_pause - 짧은 spin 대기를 위한 CPU 힌트 (x86 PAUSE 인스트럭션 등)
  *
- * 짧은 spin loop 에서 SMT 형제에게 자원 양보 + 분기 예측 패널티 회피용.
- * NVMe CQE polling 의 inner loop 에서 자주 사용.
+ * 동작:
+ *   - x86: PAUSE (REP NOP) — SMT 형제 코어에 파이프라인 자원 양보 + memory ordering 위반 회피로
+ *     분기 예측 패널티 절감. 약 5~140 사이클 idle.
+ *   - ARM: YIELD 인스트럭션 (유사 의미).
+ *   - 그 외: no-op.
+ * 사용처: NVMe CQE polling 의 tight inner loop, atomic CAS 의 spin retry 사이, ring contention 시.
+ *   목적은 "내가 잠시 진전할 게 없으니 SMT 형제 코어가 progress 하도록 양보" + "memory snoop 트래픽 절감".
+ *
+ * 호출 체인: NVMe poller / spin lock → spdk_pause → rte_pause (PAUSE/YIELD)
  */
 void spdk_pause(void);
 
@@ -1307,7 +1535,18 @@ struct spdk_ring *spdk_ring_create(enum spdk_ring_type type, size_t count, int n
  */
 /*
  * [한국어]
- * spdk_ring_free - ring 해제. 비어있어야 안전 (in-flight 메시지 손실 방지).
+ * spdk_ring_free - lockless ring 해제 (DPDK rte_ring 래퍼 free)
+ *
+ * @param ring: spdk_ring_create 가 반환한 핸들. NULL 호출 금지.
+ *
+ * 안전 조건: ring 이 비어있어야 함 — 안에 남아있는 객체 포인터들은 free 되지 않고 손실된다.
+ *   spdk_thread 의 메시지 큐라면 모든 send_msg 완료 + dequeue 0 인 상태에서만 호출.
+ * 동작: 내부 메타데이터(producer/consumer 인덱스, lcore 캐시 정보) 및 백킹 메모리 해제.
+ * 컨텍스트: cleanup 단계 — 메인 스레드에서 1회. 핫패스 금지.
+ * caller: spdk_thread 해체 시퀀스, reactor cleanup.
+ * callee: rte_ring_free.
+ *
+ * 호출 체인: spdk_thread_destroy → spdk_ring_free → rte_ring_free
  */
 void spdk_ring_free(struct spdk_ring *ring);
 
@@ -1320,8 +1559,18 @@ void spdk_ring_free(struct spdk_ring *ring);
  */
 /*
  * [한국어]
- * spdk_ring_count - 현재 ring 에 들어있는 엔트리 수 (근사값, MP/MC 일 때).
- * 분기 조건이 아닌 모니터링 용도.
+ * spdk_ring_count - 현재 ring 에 enqueued 된 객체 수 (근사값)
+ *
+ * @param ring: 대상 ring.
+ * @return: producer_tail - consumer_head 의 unsigned 차이 (atomic read 한 스냅샷).
+ *
+ * 정확성: SP_SC ring 은 정확, MP_SC/MP_MC 는 다른 lcore 가 동시에 enqueue/dequeue 하면 즉시
+ *   stale 해질 수 있어 "근사값" 으로만 신뢰. 따라서 핫패스의 분기 조건 (예: ring 비어있으면 skip)
+ *   으로 사용하면 안 됨 — 실제 비어있음 확인은 spdk_ring_dequeue 의 반환값 0 으로 판정.
+ * 사용처: 모니터링, RPC 통계, 백프레셔 추정 (정확도 요구가 낮은 영역).
+ * 컨텍스트: 어디서나. 그러나 결과는 항상 race-prone 임을 인지.
+ *
+ * 호출 체인: RPC/stats 코드 → spdk_ring_count → rte_ring_count
  */
 size_t spdk_ring_count(struct spdk_ring *ring);
 
@@ -1374,11 +1623,22 @@ size_t spdk_ring_dequeue(struct spdk_ring *ring, void **objs, size_t count);
  */
 /*
  * [한국어]
- * spdk_iommu_is_enabled - 현재 SPDK 가 IOMMU(VFIO) 사용 중인지 보고
+ * spdk_iommu_is_enabled - 현재 SPDK 프로세스가 IOMMU(VFIO) 모드로 동작 중인지 조회
  *
- * IOMMU 활성 시: vtophys 가 IOVA(VA 직접) 반환, NVMe 가 직접 가상주소 DMA. 안전.
- * IOMMU 미활성 시: vtophys 가 실제 물리주소 반환 (CAP_SYS_ADMIN 또는 noiommu 모드 필요).
- * 사용처: 드라이버가 unsafe-mode 경고 출력, 또는 DMA 매핑 전략 선택.
+ * @return: true = IOMMU(VFIO container) 활성, false = no-IOMMU (uio_pci_generic / vfio noiommu).
+ *
+ * IOMMU 활성:
+ *   - spdk_vtophys 가 IOVA(보통 가상주소 = IOVA) 반환. NVMe 는 가상주소를 IOVA 로 그대로 DMA.
+ *   - VFIO container 가 IOVA→PA 변환을 처리 → 안전 (다른 메모리에 접근 불가).
+ *   - 일반 사용자도 권한 부여만 받으면 사용 가능 (root 불필요).
+ *   - iova_mode = "va" 가 디폴트 결정.
+ * IOMMU 미활성:
+ *   - vtophys 가 실제 PA 반환 (Linux /proc/self/pagemap 으로 PA 조회 필요 → CAP_SYS_ADMIN 또는 root).
+ *   - 디바이스가 임의 PA 에 DMA 가능 → 보안 취약 (rogue NIC 이 커널 메모리 손상 가능).
+ *   - iova_mode = "pa".
+ * 사용처: 드라이버가 unsafe-mode 경고 출력, 외부 DMA 등록(RDMA MR) 전략 분기, 보안 정책 결정.
+ *
+ * 호출 체인: NVMe init / RDMA init / RPC stats → spdk_iommu_is_enabled → 내부 플래그
  */
 bool spdk_iommu_is_enabled(void);
 
@@ -1593,9 +1853,20 @@ __attribute__((constructor)) static void _spdk_pci_driver_register_##name(void) 
  *
  * \return PCI driver.
  */
-/* [한국어] spdk_pci_vmd_get_driver - VMD(Volume Management Device) 드라이버 핸들 조회.
- * VMD = Intel CPU 의 PCIe 가상화 컨트롤러 (RAID 카드 같은 자식 NVMe 들을 하나의 PCI 디바이스로 노출).
- * spdk_pci_enumerate 의 driver 인자로 전달하여 VMD 디바이스만 enumerate 한다. */
+/*
+ * [한국어]
+ * spdk_pci_vmd_get_driver - VMD(Volume Management Device) PCI 드라이버 핸들 조회
+ *
+ * @return: lib/vmd 가 register 한 spdk_pci_driver 포인터.
+ *
+ * VMD = Intel CPU 가 보유한 PCIe 가상화 컨트롤러로, 아래에 달린 자식 NVMe 들을 단일 PCI 디바이스
+ *   처럼 호스트에 노출. 핫플러그/관리 일원화의 이점이 있으나 SPDK 가 자식 NVMe 에 접근하려면
+ *   VMD 드라이버로 한 번 enumerate 한 뒤 그 자식들을 다시 NVMe 드라이버로 enumerate 해야 한다.
+ *
+ * 사용처: spdk_pci_enumerate(spdk_pci_vmd_get_driver(), ...) — VMD 디바이스만 attach.
+ *
+ * 호출 체인: NVMe init (VMD 옵션 활성) → spdk_pci_vmd_get_driver → spdk_pci_enumerate
+ */
 struct spdk_pci_driver *spdk_pci_vmd_get_driver(void);
 
 /**
@@ -1603,7 +1874,19 @@ struct spdk_pci_driver *spdk_pci_vmd_get_driver(void);
  *
  * \return PCI driver.
  */
-/* [한국어] I/OAT (Intel I/O Acceleration Technology) DMA 엔진 드라이버 핸들. CPU 메모리 복사 오프로드. */
+/*
+ * [한국어]
+ * spdk_pci_ioat_get_driver - I/OAT(Intel I/O Acceleration Technology) DMA 엔진 PCI 드라이버 핸들
+ *
+ * @return: lib/ioat 가 register 한 spdk_pci_driver 포인터.
+ *
+ * I/OAT = Intel Xeon CPU 의 내장 DMA 엔진 (Crystal Beach). CPU 코어를 사용하지 않고 메모리-메모리
+ *   복사를 오프로드 — bdev_copy, blob CoW, NVMe-oF target 의 데이터 복사 경로 가속에 사용.
+ *
+ * 사용처: spdk_pci_enumerate(spdk_pci_ioat_get_driver(), ...) — I/OAT 채널 attach.
+ *
+ * 호출 체인: copy accelerator init → spdk_pci_ioat_get_driver → spdk_pci_enumerate
+ */
 struct spdk_pci_driver *spdk_pci_ioat_get_driver(void);
 
 /**
@@ -1611,7 +1894,20 @@ struct spdk_pci_driver *spdk_pci_ioat_get_driver(void);
  *
  * \return PCI driver.
  */
-/* [한국어] IDXD (Intel Data Streaming Accelerator) 드라이버 핸들. 차세대 DSA — copy/CRC/compress 가속. */
+/*
+ * [한국어]
+ * spdk_pci_idxd_get_driver - IDXD(Intel Data Streaming Accelerator, "DSA") PCI 드라이버 핸들
+ *
+ * @return: lib/idxd 가 register 한 spdk_pci_driver 포인터.
+ *
+ * IDXD = Intel Xeon Sapphire Rapids 이후의 차세대 가속기. I/OAT 의 후속으로 memcpy/CRC/compress/
+ *   fill/compare 를 SVA(Shared Virtual Addressing) 기반으로 오프로드. 사용자 공간에서 ENQCMD(S)
+ *   인스트럭션으로 work submission descriptor 를 디바이스에 직접 푸시.
+ *
+ * 사용처: bdev/blob 의 dataintegrity(CRC), copy 가속, NVMe-oF crc32 계산 등에 활용.
+ *
+ * 호출 체인: accel module init → spdk_pci_idxd_get_driver → spdk_pci_enumerate
+ */
 struct spdk_pci_driver *spdk_pci_idxd_get_driver(void);
 
 /**
@@ -1619,7 +1915,19 @@ struct spdk_pci_driver *spdk_pci_idxd_get_driver(void);
  *
  * \return PCI driver.
  */
-/* [한국어] AMD AE4DMA (Engine for DMA) 드라이버 핸들. AMD의 DSA 동등 가속기. */
+/*
+ * [한국어]
+ * spdk_pci_ae4dma_get_driver - AMD AE4DMA(AMD Engine for DMA) PCI 드라이버 핸들
+ *
+ * @return: lib/ae4dma 가 register 한 spdk_pci_driver 포인터.
+ *
+ * AE4DMA = AMD EPYC 세대의 DMA/가속 엔진. Intel IDXD/I/OAT 와 유사한 메모리-메모리 복사 오프로드
+ *   기능 제공. SPDK accel framework 가 플랫폼에 따라 IDXD 또는 AE4DMA 를 선택 사용.
+ *
+ * 사용처: AMD 플랫폼에서 copy/CRC 가속.
+ *
+ * 호출 체인: accel module init (AMD) → spdk_pci_ae4dma_get_driver → spdk_pci_enumerate
+ */
 struct spdk_pci_driver *spdk_pci_ae4dma_get_driver(void);
 
 /**
@@ -1627,13 +1935,38 @@ struct spdk_pci_driver *spdk_pci_ae4dma_get_driver(void);
  *
  * \return PCI driver.
  */
-/* [한국어] Virtio PCI (virtio-blk/scsi) 드라이버 핸들. QEMU/KVM 게스트의 가상 디바이스 attach 용. */
+/*
+ * [한국어]
+ * spdk_pci_virtio_get_driver - Virtio PCI 드라이버 핸들 (virtio-blk/scsi)
+ *
+ * @return: lib/virtio 가 register 한 spdk_pci_driver 포인터.
+ *
+ * Virtio = QEMU/KVM 가상화 환경의 paravirtual 디바이스 표준. SPDK 가 게스트 VM 안에서 동작할 때
+ *   호스트가 제공한 virtio-blk/virtio-scsi 디바이스를 polled-mode 로 attach 하기 위함.
+ *   bdev_virtio 백엔드 모듈의 기반.
+ *
+ * 사용처: VM 안에서 SPDK 가 실행되며 virtio-blk 를 bdev 로 노출하는 시나리오.
+ *
+ * 호출 체인: bdev_virtio init → spdk_pci_virtio_get_driver → spdk_pci_enumerate
+ */
 struct spdk_pci_driver *spdk_pci_virtio_get_driver(void);
 
 /**
  * Get PCI driver by name (e.g. "nvme", "vmd", "ioat").
  */
-/* [한국어] 이름 문자열로 등록된 드라이버 검색 — RPC 등 동적 환경에서 사용. */
+/*
+ * [한국어]
+ * spdk_pci_get_driver - 이름 문자열로 등록된 PCI 드라이버 검색
+ *
+ * @param name: spdk_pci_driver_register 시 사용한 이름 ("nvme", "vmd", "ioat", "idxd", "virtio" 등).
+ * @return: 매칭된 드라이버 포인터, 없으면 NULL.
+ *
+ * 동작: 글로벌 드라이버 TAILQ 를 선형 검색하여 strcmp 매칭.
+ * 사용처: RPC 핸들러가 사용자 인자(문자열)로 드라이버를 동적 선택할 때.
+ *   하드코딩된 spdk_pci_nvme_get_driver() 와 달리 런타임 lookup.
+ *
+ * 호출 체인: RPC handler → spdk_pci_get_driver(name) → 드라이버 TAILQ 검색
+ */
 struct spdk_pci_driver *spdk_pci_get_driver(const char *name);
 
 /**
@@ -1641,8 +1974,21 @@ struct spdk_pci_driver *spdk_pci_get_driver(const char *name);
  *
  * \return PCI driver.
  */
-/* [한국어] NVMe PCI 드라이버 핸들 — SPDK 의 가장 핵심. lib/nvme 가 등록한 ID 테이블 (Intel/Samsung 등
- * NVMe vendor 들 + class match) 을 가짐. spdk_nvme_probe 가 이 드라이버로 enumerate 호출. */
+/*
+ * [한국어]
+ * spdk_pci_nvme_get_driver - NVMe PCI 드라이버 핸들 (SPDK 의 가장 핵심 드라이버)
+ *
+ * @return: lib/nvme 가 register 한 spdk_pci_driver 포인터.
+ *
+ * NVMe 드라이버: lib/nvme 가 부팅 시 NVMe vendor/class (PCI class 0x010802 = NVM Express)
+ *   ID 테이블을 가지고 spdk_pci_driver_register 호출. spdk_nvme_probe 는 이 핸들로
+ *   spdk_pci_enumerate 를 호출하여 모든 NVMe SSD 를 attach 한다.
+ * NEED_MAPPING 플래그가 설정되어 있어 enumerate 단계에서 자동으로 BAR0(controller register) 매핑.
+ *
+ * 사용처: spdk_nvme_probe / spdk_nvme_connect / RPC nvme_attach_controller 등.
+ *
+ * 호출 체인: spdk_nvme_probe → spdk_pci_nvme_get_driver → spdk_pci_enumerate
+ */
 struct spdk_pci_driver *spdk_pci_nvme_get_driver(void);
 
 /**
@@ -1751,7 +2097,18 @@ int spdk_pci_device_map_bar(struct spdk_pci_device *dev, uint32_t bar,
  */
 /*
  * [한국어]
- * spdk_pci_device_unmap_bar - BAR 매핑 해제. detach 시 자동 호출되므로 사용자가 직접 부르는 경우는 드뭄.
+ * spdk_pci_device_unmap_bar - PCI BAR 매핑 해제 (map_bar 의 짝)
+ *
+ * @param dev: PCI 디바이스.
+ * @param bar: BAR 번호.
+ * @param mapped_addr: map_bar 가 반환했던 가상주소.
+ * @return: 0 성공.
+ *
+ * 동작: dev->unmap_bar 호출 — env_dpdk 면 munmap + VFIO region 해제.
+ * 호출 시점: spdk_pci_device_detach 가 attached BAR 들을 자동 unmap 하므로 사용자가 직접 부를 일은
+ *   거의 없다. 단, BAR 를 일시적으로 unmap 했다가 다시 map 하는 특수 시나리오에서 명시 호출.
+ *
+ * 호출 체인: spdk_pci_device_detach → spdk_pci_device_unmap_bar → dev->unmap_bar (munmap)
  */
 int spdk_pci_device_unmap_bar(struct spdk_pci_device *dev, uint32_t bar,
 			      void *mapped_addr);
@@ -1780,7 +2137,18 @@ int spdk_pci_device_enable_interrupt(struct spdk_pci_device *dev);
  *
  * \return 0 on success, negative value on error.
  */
-/* [한국어] spdk_pci_device_disable_interrupt - 인터럽트 비활성. enable 의 짝. */
+/*
+ * [한국어]
+ * spdk_pci_device_disable_interrupt - PCI 인터럽트 비활성 (enable 의 짝, 실험적)
+ *
+ * @param dev: PCI 디바이스.
+ * @return: 0 성공, 음수 errno 실패.
+ *
+ * 동작: VFIO_DEVICE_SET_IRQS 로 INTx/MSI 비활성. 등록된 eventfd 도 자동 close.
+ * 사용처: polled-mode 로 복귀하거나 디바이스 종료 직전. 핫패스에서는 호출 X.
+ *
+ * 호출 체인: NVMe shutdown / mode 전환 → spdk_pci_device_disable_interrupt → VFIO_DEVICE_SET_IRQS
+ */
 int spdk_pci_device_disable_interrupt(struct spdk_pci_device *dev);
 
 /**
@@ -1828,7 +2196,19 @@ int spdk_pci_device_enable_interrupts(struct spdk_pci_device *dev, uint32_t efd_
  *
  * \return 0 on success, negative value on error.
  */
-/* [한국어] spdk_pci_device_disable_interrupts - 다중 MSI-X 비활성 + efd close. enable 짝. */
+/*
+ * [한국어]
+ * spdk_pci_device_disable_interrupts - MSI-X 다중 벡터 비활성 (enable_interrupts 의 짝)
+ *
+ * @param dev: PCI 디바이스.
+ * @return: 0 성공, 음수 errno 실패.
+ *
+ * 동작: VFIO_DEVICE_SET_IRQS (count=0) 호출 → 모든 efd close 및 IRQ 라우팅 해제.
+ *   enable_interrupts 가 생성한 efd 들이 자동 정리되므로 호출자가 따로 close 할 필요 X.
+ * 사용처: NVMe qpair 들의 일괄 종료, interrupt-mode → polled-mode 전환.
+ *
+ * 호출 체인: NVMe controller shutdown → spdk_pci_device_disable_interrupts → VFIO_DEVICE_SET_IRQS
+ */
 int spdk_pci_device_disable_interrupts(struct spdk_pci_device *dev);
 
 /**
@@ -1842,9 +2222,17 @@ int spdk_pci_device_disable_interrupts(struct spdk_pci_device *dev);
  */
 /*
  * [한국어]
- * spdk_pci_device_get_interrupt_efd_by_index - 특정 MSI-X 벡터의 efd 조회
+ * spdk_pci_device_get_interrupt_efd_by_index - 특정 MSI-X 벡터 인덱스의 eventfd 조회
  *
- * NVMe qpair N 의 인터럽트 = index N 의 efd → reactor 의 epoll 셋에 등록.
+ * @param dev: PCI 디바이스.
+ * @param index: MSI-X 벡터 인덱스 (spdk_pci_device_enable_interrupts 의 efd_count 범위 내).
+ * @return: 해당 인덱스 eventfd (>= 0) 또는 음수 errno.
+ *
+ * 동작: VFIO 가 enable 시 생성해둔 efd 배열에서 index 번째 fd 반환.
+ * 사용처: NVMe qpair N 의 인터럽트 신호를 받기 위해 index=N 의 efd 를 reactor 의 epoll set 에
+ *   등록 → IRQ 발생 시 epoll 이 깨어나 해당 qpair 의 CQ 를 폴링. polled-mode 의 보완형 idle 절전.
+ *
+ * 호출 체인: NVMe qpair init (interrupt-mode) → spdk_pci_device_get_interrupt_efd_by_index → epoll_ctl
  */
 int spdk_pci_device_get_interrupt_efd_by_index(struct spdk_pci_device *dev, uint32_t index);
 
@@ -1855,7 +2243,19 @@ int spdk_pci_device_get_interrupt_efd_by_index(struct spdk_pci_device *dev, uint
  *
  * \return PCI device domain.
  */
-/* [한국어] spdk_pci_device_get_domain - dev->addr.domain 조회 (PCI segment 번호). */
+/*
+ * [한국어]
+ * spdk_pci_device_get_domain - PCI 디바이스의 domain(segment) 번호 조회
+ *
+ * @param dev: attached PCI 디바이스 핸들.
+ * @return: 16/32-bit PCI domain. 일반 시스템은 0, NUMA 다수 도메인 서버에서 0..N.
+ *
+ * 동작: dev->addr.domain 단순 반환. struct 접근을 함수 호출로 감싸 ABI/구현 캡슐화.
+ * 사용처: 로깅("0000:5e:00.0"), BDF 비교, RPC 응답 직렬화.
+ * 컨텍스트: 어디서나. dev 가 valid 한 동안 안전.
+ *
+ * 호출 체인: 로깅/RPC 핸들러 → spdk_pci_device_get_domain → dev->addr.domain
+ */
 uint32_t spdk_pci_device_get_domain(struct spdk_pci_device *dev);
 
 /**
@@ -1865,7 +2265,18 @@ uint32_t spdk_pci_device_get_domain(struct spdk_pci_device *dev);
  *
  * \return PCI bus number.
  */
-/* [한국어] spdk_pci_device_get_bus - dev->addr.bus 조회. */
+/*
+ * [한국어]
+ * spdk_pci_device_get_bus - PCI bus 번호 조회
+ *
+ * @param dev: attached PCI 디바이스.
+ * @return: PCI bus 번호 0..255 (BDF 의 B).
+ *
+ * 동작: dev->addr.bus 반환. PCIe 토폴로지에서 root complex 직속 또는 bridge 하위 bus 번호.
+ * 사용처: BDF 비교, RPC 응답 직렬화, NUMA-local 디바이스 탐색.
+ *
+ * 호출 체인: 사용자/RPC → spdk_pci_device_get_bus → dev->addr.bus
+ */
 uint8_t spdk_pci_device_get_bus(struct spdk_pci_device *dev);
 
 /**
@@ -1875,7 +2286,18 @@ uint8_t spdk_pci_device_get_bus(struct spdk_pci_device *dev);
  *
  * \return PCI device number.
  */
-/* [한국어] spdk_pci_device_get_dev - dev->addr.dev 조회. */
+/*
+ * [한국어]
+ * spdk_pci_device_get_dev - PCI device 번호 조회 (BDF 의 D)
+ *
+ * @param dev: attached PCI 디바이스.
+ * @return: 0..31 (PCI spec: 5비트만 유효). 같은 bus 내 슬롯 식별자.
+ *
+ * 동작: dev->addr.dev 반환.
+ * 사용처: BDF 비교, RPC, 슬롯 단위 정책 (예: 슬롯별 다른 timeout).
+ *
+ * 호출 체인: 사용자/RPC → spdk_pci_device_get_dev → dev->addr.dev
+ */
 uint8_t spdk_pci_device_get_dev(struct spdk_pci_device *dev);
 
 /**
@@ -1885,7 +2307,19 @@ uint8_t spdk_pci_device_get_dev(struct spdk_pci_device *dev);
  *
  * \return PCI function number.
  */
-/* [한국어] spdk_pci_device_get_func - dev->addr.func 조회. */
+/*
+ * [한국어]
+ * spdk_pci_device_get_func - PCI function 번호 조회 (BDF 의 F)
+ *
+ * @param dev: attached PCI 디바이스.
+ * @return: 0..7 (PCI multi-function 디바이스의 function index).
+ *
+ * 동작: dev->addr.func 반환. SR-IOV 환경에서는 PF 가 func=0, VF 가 그 외 func.
+ *   같은 dev 의 다른 func 은 logical 디바이스로 별개 BDF 를 부여받는다.
+ * 사용처: SR-IOV VF 구분, multi-function NIC/NVMe 식별.
+ *
+ * 호출 체인: 사용자/RPC → spdk_pci_device_get_func → dev->addr.func
+ */
 uint8_t spdk_pci_device_get_func(struct spdk_pci_device *dev);
 
 /**
@@ -1895,7 +2329,20 @@ uint8_t spdk_pci_device_get_func(struct spdk_pci_device *dev);
  *
  * \return PCI address.
  */
-/* [한국어] spdk_pci_device_get_addr - 4튜플 BDF 통째로 반환 (값 복사). */
+/*
+ * [한국어]
+ * spdk_pci_device_get_addr - 4튜플 BDF 구조체 통째 반환 (값 복사)
+ *
+ * @param dev: attached PCI 디바이스.
+ * @return: { domain, bus, dev, func } 4필드를 값으로 복사한 spdk_pci_addr.
+ *
+ * 동작: dev->addr 를 값으로 반환. 호출자는 결과를 spdk_pci_addr_fmt 로 문자열화하거나
+ *   spdk_pci_addr_compare 로 다른 BDF 와 비교할 수 있다.
+ *   값 반환이라 dev 가 detach 되어도 호출자가 들고 있는 복사본은 유효.
+ * 사용처: RPC 응답, 로깅, allowed/blocked 리스트 검색.
+ *
+ * 호출 체인: NVMe driver/RPC → spdk_pci_device_get_addr → dev->addr (값 복사)
+ */
 struct spdk_pci_addr spdk_pci_device_get_addr(struct spdk_pci_device *dev);
 
 /**
@@ -1905,7 +2352,19 @@ struct spdk_pci_addr spdk_pci_device_get_addr(struct spdk_pci_device *dev);
  *
  * \return vendor ID.
  */
-/* [한국어] spdk_pci_device_get_vendor_id - dev->id.vendor_id 조회. */
+/*
+ * [한국어]
+ * spdk_pci_device_get_vendor_id - PCI vendor ID 조회 (드라이버 ID 매칭의 기본)
+ *
+ * @param dev: attached PCI 디바이스.
+ * @return: 16-bit vendor ID (예: 0x8086 = Intel, 0x144d = Samsung, 0x1b36 = Red Hat/QEMU virtio).
+ *
+ * 동작: dev->id.vendor_id 반환. PCI config space offset 0x00 의 첫 2바이트가 vendor ID 이며,
+ *   env_dpdk 가 attach 시점에 cfg_read16(0x00) 으로 채워둔다.
+ * 사용처: vendor-specific quirk 분기 (예: Samsung NVMe 특정 reset 시퀀스), 로깅, RPC.
+ *
+ * 호출 체인: NVMe quirk 분기 / RPC → spdk_pci_device_get_vendor_id → dev->id.vendor_id
+ */
 uint16_t spdk_pci_device_get_vendor_id(struct spdk_pci_device *dev);
 
 /**
@@ -1915,7 +2374,18 @@ uint16_t spdk_pci_device_get_vendor_id(struct spdk_pci_device *dev);
  *
  * \return device ID.
  */
-/* [한국어] spdk_pci_device_get_device_id - dev->id.device_id 조회. */
+/*
+ * [한국어]
+ * spdk_pci_device_get_device_id - vendor 내 device ID 조회 (제품/모델 식별)
+ *
+ * @param dev: attached PCI 디바이스.
+ * @return: 16-bit device ID. vendor 별로 의미가 다르며 같은 vendor 의 다른 모델 구분에 사용.
+ *
+ * 동작: dev->id.device_id 반환. PCI config space offset 0x02 의 2바이트.
+ * 사용처: 특정 모델만 적용되는 firmware bug workaround, RPC 의 디바이스 카탈로그.
+ *
+ * 호출 체인: NVMe quirk / RPC → spdk_pci_device_get_device_id → dev->id.device_id
+ */
 uint16_t spdk_pci_device_get_device_id(struct spdk_pci_device *dev);
 
 /**
@@ -1925,7 +2395,19 @@ uint16_t spdk_pci_device_get_device_id(struct spdk_pci_device *dev);
  *
  * \return subvendor ID.
  */
-/* [한국어] spdk_pci_device_get_subvendor_id - 서브시스템 vendor 조회. */
+/*
+ * [한국어]
+ * spdk_pci_device_get_subvendor_id - 서브시스템 vendor ID 조회 (보드/OEM 식별)
+ *
+ * @param dev: attached PCI 디바이스.
+ * @return: 16-bit subsystem vendor ID. 동일 칩셋이 여러 OEM(예: Dell, HP) 보드로 재포장될 때 구분.
+ *
+ * 동작: dev->id.subvendor_id 반환. PCI config space offset 0x2C 의 2바이트.
+ *   대부분 드라이버 매칭은 vendor/device 만 보고 sub* 는 ANY 로 두므로 식별 정보용.
+ * 사용처: OEM 별 quirk, 인벤토리/관리 정보.
+ *
+ * 호출 체인: 사용자/RPC → spdk_pci_device_get_subvendor_id → dev->id.subvendor_id
+ */
 uint16_t spdk_pci_device_get_subvendor_id(struct spdk_pci_device *dev);
 
 /**
@@ -1935,7 +2417,18 @@ uint16_t spdk_pci_device_get_subvendor_id(struct spdk_pci_device *dev);
  *
  * \return subdevice ID.
  */
-/* [한국어] spdk_pci_device_get_subdevice_id - 서브시스템 device 조회. */
+/*
+ * [한국어]
+ * spdk_pci_device_get_subdevice_id - 서브시스템 device ID 조회
+ *
+ * @param dev: attached PCI 디바이스.
+ * @return: 16-bit subsystem device ID. subvendor 별로 OEM 보드 모델 구분.
+ *
+ * 동작: dev->id.subdevice_id 반환. PCI config space offset 0x2E 의 2바이트.
+ * 사용처: 서브벤더가 같은 OEM 의 보드 모델별 firmware/quirk 분기.
+ *
+ * 호출 체인: 사용자/RPC → spdk_pci_device_get_subdevice_id → dev->id.subdevice_id
+ */
 uint16_t spdk_pci_device_get_subdevice_id(struct spdk_pci_device *dev);
 
 /**
@@ -1945,7 +2438,18 @@ uint16_t spdk_pci_device_get_subdevice_id(struct spdk_pci_device *dev);
  *
  * \return PCI ID.
  */
-/* [한국어] spdk_pci_device_get_id - 5튜플 ID 통째로 반환. */
+/*
+ * [한국어]
+ * spdk_pci_device_get_id - 5튜플 PCI ID 구조체 통째 반환 (값 복사)
+ *
+ * @param dev: attached PCI 디바이스.
+ * @return: { class_id, vendor_id, device_id, subvendor_id, subdevice_id } 값 복사본.
+ *
+ * 동작: dev->id 를 값으로 반환. 호출자는 결과로 ID 테이블 매칭이나 quirk 분기 작성 가능.
+ * 사용처: 한 함수 안에서 여러 ID 필드 동시 참조할 때 (각각 호출보다 1번 복사가 효율적).
+ *
+ * 호출 체인: NVMe driver/RPC → spdk_pci_device_get_id → dev->id (값 복사)
+ */
 struct spdk_pci_id spdk_pci_device_get_id(struct spdk_pci_device *dev);
 
 /**
@@ -1955,8 +2459,22 @@ struct spdk_pci_id spdk_pci_device_get_id(struct spdk_pci_device *dev);
  *
  * \return NUMA node index (>= 0).
  */
-/* [한국어] spdk_pci_device_get_numa_id - 디바이스가 붙은 NUMA 노드.
- * 사용처: NUMA-local 한 코어를 reactor 로 선택해 cross-NUMA DMA 대역폭 손실 회피. */
+/*
+ * [한국어]
+ * spdk_pci_device_get_numa_id - 디바이스가 물리적으로 연결된 NUMA 노드 조회
+ *
+ * @param dev: attached PCI 디바이스.
+ * @return: NUMA 노드 ID (>= 0) 또는 SPDK_ENV_NUMA_ID_ANY(=-1) — 정보 없음/단일 노드.
+ *
+ * 동작: dev->numa_id 반환 (env_dpdk 가 sysfs /sys/bus/pci/devices/.../numa_node 에서 읽어둠).
+ *   PCIe 디바이스는 특정 CPU socket 의 root complex 에 연결되어 있어 해당 socket 의 NUMA 노드와
+ *   짝지어진다. Cross-NUMA DMA 는 QPI/UPI 링크를 거치므로 대역폭 손실 + 지연이 발생.
+ * 사용처: NVMe qpair 를 처리할 reactor 를 디바이스와 같은 NUMA 의 lcore 에 배치 (NUMA-local I/O).
+ *   spdk_dma_zmalloc_socket(... , numa_id, ...) 의 numa_id 로도 전달되어 버퍼도 NUMA-local 화.
+ * 컨텍스트: init 단계 또는 RPC 응답. 핫패스에서는 attach 시 캐시해두고 매번 호출하지 않음이 일반적.
+ *
+ * 호출 체인: NVMe init → spdk_pci_device_get_numa_id → dev->numa_id → reactor cpumask 선택
+ */
 int spdk_pci_device_get_numa_id(struct spdk_pci_device *dev);
 
 /**
@@ -2012,7 +2530,20 @@ int spdk_pci_device_claim(struct spdk_pci_device *dev);
  *
  * \param dev PCI device to unclaim.
  */
-/* [한국어] spdk_pci_device_unclaim - claim 해제. lock 파일 close. */
+/*
+ * [한국어]
+ * spdk_pci_device_unclaim - spdk_pci_device_claim 으로 점유한 lock 해제
+ *
+ * @param dev: 점유 중인 PCI 디바이스.
+ *
+ * 동작: claim 시 잡아둔 lockfile fd 를 close → 커널이 F_SETLK 락을 자동 해제 → 다른 SPDK
+ *   프로세스가 같은 BDF 에 대해 claim 가능. dev->internal.claim_fd 는 -1 로 리셋.
+ * 자동 호출: spdk_pci_device_detach 가 attached 디바이스의 claim 을 자동 해제하므로 명시 호출은
+ *   "detach 없이 claim 만 해제하고 싶을 때" 에 한정 (드문 케이스).
+ * 컨텍스트: cleanup. 핫패스 호출 X.
+ *
+ * 호출 체인: NVMe cleanup / 사용자 → spdk_pci_device_unclaim → close(claim_fd)
+ */
 void spdk_pci_device_unclaim(struct spdk_pci_device *dev);
 
 /**
@@ -2118,7 +2649,25 @@ int spdk_pci_device_cfg_read(struct spdk_pci_device *dev, void *buf, uint32_t le
  *
  * \return 0 on success, -1 on failure.
  */
-/* [한국어] spdk_pci_device_cfg_write - cfg_read 의 짝. NVMe 컨트롤러 초기화 시 BME 활성 등에 사용. */
+/*
+ * [한국어]
+ * spdk_pci_device_cfg_write - PCI config space 가변 길이 쓰기 (cfg_read 의 짝)
+ *
+ * @param dev: attached PCI 디바이스.
+ * @param buf: 쓸 데이터의 소스 버퍼.
+ * @param len: 바이트 수.
+ * @param offset: config space 시작 오프셋.
+ * @return: 0 성공, -1 실패.
+ *
+ * 동작: dev->cfg_write 함수 포인터를 호출 — env_dpdk 면 VFIO 의 pwrite(VFIO_DEVICE_CFG region) 경유.
+ * 사용처:
+ *   - BME(Bus Master Enable) 활성: cfg_read16(0x04) | 0x4 → cfg_write16 — DMA 전제 조건.
+ *   - MSI-X capability 활성, PM state 변경, PCIe link retrain 등.
+ *   - NVMe controller reset 후 reconfiguration.
+ * 컨텍스트: init/reset 단계. 핫패스 호출 X.
+ *
+ * 호출 체인: NVMe init/reset → spdk_pci_device_cfg_write → dev->cfg_write (VFIO ioctl)
+ */
 int spdk_pci_device_cfg_write(struct spdk_pci_device *dev, void *buf, uint32_t len,
 			      uint32_t offset);
 
@@ -2131,7 +2680,21 @@ int spdk_pci_device_cfg_write(struct spdk_pci_device *dev, void *buf, uint32_t l
  *
  * \return 0 on success, -1 on failure.
  */
-/* [한국어] spdk_pci_device_cfg_read8 - 1바이트 편의 래퍼. 정렬 문제를 피하기 위한 타입 분리. */
+/*
+ * [한국어]
+ * spdk_pci_device_cfg_read8 - PCI config space 1바이트 읽기 편의 래퍼
+ *
+ * @param dev: PCI 디바이스.
+ * @param value: 1바이트 출력 버퍼.
+ * @param offset: config space 오프셋.
+ * @return: 0 성공, -1 실패.
+ *
+ * 동작: 내부적으로 cfg_read(dev, value, 1, offset). 1바이트 access 가 PCI 스펙상 항상 안전한
+ *   필드(예: Revision ID, Interrupt Line)에 사용. 정렬을 신경 쓰지 않아도 됨.
+ * 사용처: capability ID byte, programming interface byte 등 1바이트 필드 조회.
+ *
+ * 호출 체인: NVMe init → spdk_pci_device_cfg_read8 → cfg_read (1B)
+ */
 int spdk_pci_device_cfg_read8(struct spdk_pci_device *dev, uint8_t *value, uint32_t offset);
 
 /**
@@ -2143,7 +2706,20 @@ int spdk_pci_device_cfg_read8(struct spdk_pci_device *dev, uint8_t *value, uint3
  *
  * \return 0 on success, -1 on failure.
  */
-/* [한국어] spdk_pci_device_cfg_write8 - 1바이트 쓰기. */
+/*
+ * [한국어]
+ * spdk_pci_device_cfg_write8 - PCI config space 1바이트 쓰기
+ *
+ * @param dev: PCI 디바이스.
+ * @param value: 쓸 1바이트 값.
+ * @param offset: 시작 오프셋.
+ * @return: 0 성공, -1 실패.
+ *
+ * 동작: cfg_write(dev, &value, 1, offset). 보통 capability enable/disable 비트 토글에 사용.
+ * 사용처: Cache Line Size (offset 0x0C), Latency Timer 등 1바이트 단위 설정.
+ *
+ * 호출 체인: NVMe init → spdk_pci_device_cfg_write8 → cfg_write (1B)
+ */
 int spdk_pci_device_cfg_write8(struct spdk_pci_device *dev, uint8_t value, uint32_t offset);
 
 /**
@@ -2155,7 +2731,21 @@ int spdk_pci_device_cfg_write8(struct spdk_pci_device *dev, uint8_t value, uint3
  *
  * \return 0 on success, -1 on failure.
  */
-/* [한국어] spdk_pci_device_cfg_read16 - 2바이트 편의 래퍼. Command(0x04)/Status(0x06) 등에 사용. */
+/*
+ * [한국어]
+ * spdk_pci_device_cfg_read16 - PCI config space 2바이트 읽기 편의 래퍼
+ *
+ * @param dev: PCI 디바이스.
+ * @param value: 2바이트 출력 버퍼.
+ * @param offset: 시작 오프셋 (2바이트 정렬 권장).
+ * @return: 0 성공, -1 실패.
+ *
+ * 동작: cfg_read(dev, value, 2, offset).
+ * 사용처: Command(0x04)/Status(0x06), Vendor/Device/Subsystem ID 필드 등 2바이트 단위 표준 필드.
+ *   PCI 표준 헤더의 대부분 16-bit 필드는 이 함수로 읽는다.
+ *
+ * 호출 체인: NVMe init → spdk_pci_device_cfg_read16 → cfg_read (2B)
+ */
 int spdk_pci_device_cfg_read16(struct spdk_pci_device *dev, uint16_t *value, uint32_t offset);
 
 /**
@@ -2167,7 +2757,23 @@ int spdk_pci_device_cfg_read16(struct spdk_pci_device *dev, uint16_t *value, uin
  *
  * \return 0 on success, -1 on failure.
  */
-/* [한국어] spdk_pci_device_cfg_write16 - 2바이트 쓰기. BME 활성: read16(0x04) | 0x4 → write16. */
+/*
+ * [한국어]
+ * spdk_pci_device_cfg_write16 - PCI config space 2바이트 쓰기
+ *
+ * @param dev: PCI 디바이스.
+ * @param value: 쓸 2바이트 값.
+ * @param offset: 시작 오프셋.
+ * @return: 0 성공, -1 실패.
+ *
+ * 동작: cfg_write(dev, &value, 2, offset).
+ * 핵심 사용 예 — BME(Bus Master Enable) 활성:
+ *   uint16_t cmd; cfg_read16(dev, &cmd, 0x04); cmd |= 0x4; cfg_write16(dev, cmd, 0x04);
+ *   BME 비트가 1 이어야 디바이스가 호스트 메모리에 DMA 가능. NVMe 동작의 전제.
+ * 사용처: Command 레지스터, MSI-X capability message control 등 2바이트 단위 control.
+ *
+ * 호출 체인: NVMe init → spdk_pci_device_cfg_write16 → cfg_write (2B)
+ */
 int spdk_pci_device_cfg_write16(struct spdk_pci_device *dev, uint16_t value, uint32_t offset);
 
 /**
@@ -2179,7 +2785,21 @@ int spdk_pci_device_cfg_write16(struct spdk_pci_device *dev, uint16_t value, uin
  *
  * \return 0 on success, -1 on failure.
  */
-/* [한국어] spdk_pci_device_cfg_read32 - 4바이트 편의 래퍼. Vendor:Device(0x00) 4바이트 한번에 읽기 등. */
+/*
+ * [한국어]
+ * spdk_pci_device_cfg_read32 - PCI config space 4바이트 읽기 편의 래퍼
+ *
+ * @param dev: PCI 디바이스.
+ * @param value: 4바이트 출력 버퍼.
+ * @param offset: 시작 오프셋 (4바이트 정렬 권장).
+ * @return: 0 성공, -1 실패.
+ *
+ * 동작: cfg_read(dev, value, 4, offset). 4바이트 access 는 PCI/PCIe 표준에서 항상 안전한 atomic access.
+ * 사용처: Vendor:Device(0x00) 4B 동시 읽기, BAR 레지스터(0x10..0x24) 읽기, PCIe extended capability
+ *   header (offset 0x100~) 4바이트 단위 파싱 (next cap pointer + cap ID).
+ *
+ * 호출 체인: NVMe init / capability discovery → spdk_pci_device_cfg_read32 → cfg_read (4B)
+ */
 int spdk_pci_device_cfg_read32(struct spdk_pci_device *dev, uint32_t *value, uint32_t offset);
 
 /**
@@ -2191,7 +2811,21 @@ int spdk_pci_device_cfg_read32(struct spdk_pci_device *dev, uint32_t *value, uin
  *
  * \return 0 on success, -1 on failure.
  */
-/* [한국어] spdk_pci_device_cfg_write32 - 4바이트 쓰기. */
+/*
+ * [한국어]
+ * spdk_pci_device_cfg_write32 - PCI config space 4바이트 쓰기
+ *
+ * @param dev: PCI 디바이스.
+ * @param value: 쓸 4바이트 값.
+ * @param offset: 시작 오프셋.
+ * @return: 0 성공, -1 실패.
+ *
+ * 동작: cfg_write(dev, &value, 4, offset). 32-bit access 는 atomic 한 PCI 트랜잭션.
+ * 사용처: BAR base address 재프로그래밍 (보통 OS 가 함, SPDK 는 거의 안 함), AER status 클리어
+ *   (rw1c 비트에 1 을 써서 클리어), VFIO 디바이스 reset.
+ *
+ * 호출 체인: NVMe init/error handling → spdk_pci_device_cfg_write32 → cfg_write (4B)
+ */
 int spdk_pci_device_cfg_write32(struct spdk_pci_device *dev, uint32_t value, uint32_t offset);
 
 /**
@@ -2223,7 +2857,22 @@ bool spdk_pci_device_is_removed(struct spdk_pci_device *dev);
  *
  * \return 0 if a1 == a2, less than 0 if a1 < a2, greater than 0 if a1 > a2
  */
-/* [한국어] spdk_pci_addr_compare - BDF 두 개 lex 비교. allowed/blocked 리스트 검색에 사용. */
+/*
+ * [한국어]
+ * spdk_pci_addr_compare - 두 PCI BDF 주소의 사전식(lexicographic) 비교
+ *
+ * @param a1: 비교 대상 1.
+ * @param a2: 비교 대상 2.
+ * @return: 0 = 같음, <0 = a1 < a2, >0 = a1 > a2 (domain → bus → dev → func 순 비교).
+ *
+ * 사용처:
+ *   - allowed/blocked PCI 리스트 검색 (env_opts.pci_allowed[i] 와 enumerate 대상 BDF 비교).
+ *   - BDF 정렬 (RPC 응답에 정렬된 디바이스 리스트 반환).
+ *   - 디바이스 식별 (NVMe Probe 콜백이 특정 BDF 만 attach 하고 싶을 때).
+ * 컨텍스트: 어디서나. 순수 함수 (인자만 봄, 부수효과 없음).
+ *
+ * 호출 체인: env_dpdk 의 enum filter / 사용자 코드 → spdk_pci_addr_compare → 4필드 정수 비교
+ */
 int spdk_pci_addr_compare(const struct spdk_pci_addr *a1, const struct spdk_pci_addr *a2);
 
 /**
@@ -2288,7 +2937,18 @@ int spdk_pci_hook_device(struct spdk_pci_driver *drv, struct spdk_pci_device *de
  *
  * \param dev fully initialized PCI device struct
  */
-/* [한국어] spdk_pci_unhook_device - hook 해제. attached 상태 아닌 디바이스에만 호출 가능. */
+/*
+ * [한국어]
+ * spdk_pci_unhook_device - hook_device 의 짝, 커스텀 PCI 디바이스 등록 해제
+ *
+ * @param dev: spdk_pci_hook_device 로 등록된 디바이스 핸들.
+ *
+ * 사전 조건: dev 가 attached 상태가 아니어야 함 (attached 라면 먼저 detach 호출).
+ * 동작: 글로벌 PCI 디바이스 TAILQ 에서 dev 제거. dev 메모리 자체는 호출자가 해제해야 함.
+ * 사용처: vfio-user transport 종료, 단위 테스트 mock 디바이스 cleanup.
+ *
+ * 호출 체인: 테스트/transport cleanup → spdk_pci_unhook_device → TAILQ_REMOVE
+ */
 void spdk_pci_unhook_device(struct spdk_pci_device *dev);
 
 /**
@@ -2298,7 +2958,20 @@ void spdk_pci_unhook_device(struct spdk_pci_device *dev);
  *
  * \return string representing the type of the device
  */
-/* [한국어] spdk_pci_device_get_type - dev->type 문자열 조회 ("pci", "vfio-user" 등 provider 이름). */
+/*
+ * [한국어]
+ * spdk_pci_device_get_type - PCI 디바이스의 provider 타입 문자열 조회
+ *
+ * @param dev: PCI 디바이스 핸들.
+ * @return: dev->type 포인터 (예: "pci" = env_dpdk 기본, "vfio-user" = vfio-user transport).
+ *          NULL 반환 없음 — 항상 valid 문자열.
+ *
+ * 동작: dev->type 단순 반환. detach 시 어느 provider 의 detach_cb 를 호출할지 결정하는 키.
+ * 사용처: provider 별 로직 분기 (예: "vfio-user" 디바이스에는 BAR 매핑을 다르게 처리),
+ *   RPC 응답의 디바이스 타입 표시.
+ *
+ * 호출 체인: PCI provider lookup / RPC → spdk_pci_device_get_type → dev->type
+ */
 const char *spdk_pci_device_get_type(const struct spdk_pci_device *dev);
 
 /* [한국어] PCI device provider 추상화 — 같은 SPDK 안에서 여러 PCI 백엔드(env_dpdk, vfio-user 등)를
@@ -2338,8 +3011,21 @@ struct spdk_pci_device_provider {
  *
  * \param provider PCI device provider.
  */
-/* [한국어] spdk_pci_register_device_provider - provider 글로벌 리스트에 추가.
- * 보통 SPDK_PCI_REGISTER_DEVICE_PROVIDER 매크로를 통해 constructor 단계에서 자동 등록. */
+/*
+ * [한국어]
+ * spdk_pci_register_device_provider - PCI device provider 를 글로벌 리스트에 추가
+ *
+ * @param provider: name + attach_cb + detach_cb 가 채워진 spdk_pci_device_provider 포인터.
+ *                  메모리는 호출자가 lifetime 동안 유지해야 함 (포인터만 등록).
+ *
+ * 동작: provider 의 TAILQ_ENTRY 를 글로벌 provider 리스트에 추가. 등록 후에는 spdk_pci_device_attach
+ *   가 매칭되는 BDF 에 대해 이 provider 의 attach_cb 를 호출할 수 있게 된다.
+ * 자동 등록: 보통 SPDK_PCI_REGISTER_DEVICE_PROVIDER 매크로가 __attribute__((constructor)) 로
+ *   main 진입 전에 자동 등록 — 사용자가 명시 호출할 일은 거의 없다.
+ * 컨텍스트: init 단계 (constructor 또는 명시 init). 핫패스 호출 X.
+ *
+ * 호출 체인: __attribute__((constructor)) → spdk_pci_register_device_provider → 글로벌 TAILQ
+ */
 void spdk_pci_register_device_provider(struct spdk_pci_device_provider *provider);
 
 /* [한국어] PCI device provider 자동 등록 매크로 — main 진입 전 constructor 로 실행되어
@@ -2455,7 +3141,19 @@ struct spdk_mem_map *spdk_mem_map_alloc(uint64_t default_translation,
  *
  * \param pmap Memory map to free.
  */
-/* [한국어] spdk_mem_map_free - map 해제. **pmap 더블 포인터: free 후 NULL 로 자동 클리어. */
+/*
+ * [한국어]
+ * spdk_mem_map_free - spdk_mem_map_alloc 으로 생성한 mem_map 해제
+ *
+ * @param pmap: spdk_mem_map* 변수의 주소 (더블 포인터). 함수 종료 시 *pmap = NULL 로 자동 초기화되어
+ *              double-free 방지.
+ *
+ * 동작: map 의 radix tree 해제 + 글로벌 mem_map 리스트에서 제거. 등록 콜백은 호출되지 않음
+ *   (REGISTER 의 대칭으로 UNREGISTER 가 자동 발생하지는 않음 — map 자체가 사라지므로).
+ * 컨텍스트: cleanup 단계. 핫패스 호출 X.
+ *
+ * 호출 체인: 사용자/RDMA cleanup → spdk_mem_map_free → 내부 radix tree free + *pmap=NULL
+ */
 void spdk_mem_map_free(struct spdk_mem_map **pmap);
 
 /**
@@ -2493,7 +3191,21 @@ int spdk_mem_map_set_translation(struct spdk_mem_map *map, uint64_t vaddr, uint6
  *
  * \return 0 on success, negative errno on failure.
  */
-/* [한국어] spdk_mem_map_clear_translation - set_translation 의 짝. 영역을 default_translation 으로 되돌림. */
+/*
+ * [한국어]
+ * spdk_mem_map_clear_translation - 영역의 translation 값을 default 로 되돌림 (set 의 짝)
+ *
+ * @param map: 대상 mem_map.
+ * @param vaddr: 클리어 시작 주소 (2MB 정렬).
+ * @param size: 길이 (2MB 배수).
+ * @return: 0 성공, 음수 errno 실패.
+ *
+ * 동작: radix tree 의 해당 2MB 페이지 노드들을 default_translation 값으로 덮어쓰기. tree 노드 자체는
+ *   해제하지 않을 수 있어 메모리 절약보다는 lookup 결과 의미 변경이 목적.
+ * 사용처: spdk_mem_unregister 가 내부적으로 호출, 또는 외부 DMA 매핑 (RDMA MR) 캐시 무효화.
+ *
+ * 호출 체인: spdk_mem_unregister / 사용자 → spdk_mem_map_clear_translation → radix tree update
+ */
 int spdk_mem_map_clear_translation(struct spdk_mem_map *map, uint64_t vaddr, uint64_t size);
 
 /**
@@ -2699,7 +3411,18 @@ int spdk_pci_register_error_handler(spdk_pci_error_handler sighandler, void *ctx
  *
  * \param sighandler Signal bus handler of the PCI bus
  */
-/* [한국어] spdk_pci_unregister_error_handler - register 의 짝. 핸들러 함수 포인터로 매칭 제거. */
+/*
+ * [한국어]
+ * spdk_pci_unregister_error_handler - PCI bus 에러 시그널 핸들러 제거 (register 의 짝)
+ *
+ * @param sighandler: register 시 사용한 함수 포인터. 동일 포인터로 매칭하여 제거.
+ *
+ * 동작: SPDK 의 SIGBUS 핸들러 체인에서 sighandler 와 일치하는 엔트리를 unlink. ctx 도 함께 제거.
+ *   동일 sighandler 가 여러 ctx 로 등록되어 있으면 첫 매칭만 제거되는 점에 주의.
+ * 사용처: NVMe controller detach 시퀀스 — 옛 BAR vaddr 접근으로 SIGBUS 발생 가능 구간이 끝나면 해제.
+ *
+ * 호출 체인: NVMe controller cleanup → spdk_pci_unregister_error_handler → 내부 핸들러 체인 제거
+ */
 void spdk_pci_unregister_error_handler(spdk_pci_error_handler sighandler);
 
 /**

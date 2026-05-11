@@ -196,11 +196,17 @@ SPDK_RPC_REGISTER("bdev_null_create", rpc_bdev_null_create, SPDK_RPC_RUNTIME)
 /* [한국어] "bdev_null_create"를 RUNTIME 상태에서만 받아들이도록 등록. */
 
 struct rpc_delete_null {
-	/* [한국어] "bdev_null_delete" RPC 입력. 단일 필드 name. */
+	/* [한국어] "bdev_null_delete" RPC 입력 구조체. 단일 필드 name만 가진다.
+	 * 생성/소멸: rpc_bdev_null_delete()의 스택 변수로 매 요청마다 생성/소멸.
+	 * 사용 흐름: spdk_json_decode_object → bdev_null_delete → free_rpc_delete_null. */
 	char *name;
-	/* [한국어] 삭제할 bdev 이름.
-	 * 설정자: spdk_json_decode_string. 읽는 자: bdev_null_delete 호출.
-	 * 동기화: 핸들러 스택에서만 존재. */
+	/* [한국어] 삭제할 bdev의 이름 문자열(strdup 소유).
+	 * 설정자: spdk_json_decode_string (decoder 표를 통해 호출). JSON params의
+	 *         "name" 키 값을 strdup으로 복사해 채운다.
+	 * 읽는 자: bdev_null_delete()가 이름을 받아 spdk_bdev_unregister_by_name에 전달.
+	 * 값 범위: 유효한 bdev 이름(NUL 종단 문자열)이거나, 디코더 실패 시 NULL.
+	 *          빈 문자열은 unregister_by_name이 -ENODEV로 거절.
+	 * 동기화: 핸들러 호출 스택에서만 존재(요청별 독립). 다른 스레드와 공유 없음. */
 };
 
 /*
@@ -309,14 +315,25 @@ SPDK_RPC_REGISTER("bdev_null_delete", rpc_bdev_null_delete, SPDK_RPC_RUNTIME)
 /* [한국어] delete 메서드 등록. */
 
 struct rpc_bdev_null_resize {
-	/* [한국어] "bdev_null_resize" RPC 입력. 이름과 새 크기. */
+	/* [한국어] "bdev_null_resize" RPC 입력 구조체. 대상 이름과 새 크기 두 필드.
+	 * 생성/소멸: rpc_bdev_null_resize()의 스택 변수.
+	 * 사용 흐름: spdk_json_decode_object → bdev_null_resize → free_rpc_bdev_null_resize. */
 	char *name;
-	/* [한국어] 리사이즈 대상 bdev 이름.
-	 * 설정자: 디코더(strdup). 읽는 자: bdev_null_resize 호출. */
+	/* [한국어] 리사이즈 대상 bdev의 이름 문자열(strdup 소유).
+	 * 설정자: spdk_json_decode_string(decoder 표). 클라이언트 JSON의 "name"을 복사.
+	 * 읽는 자: bdev_null_resize()가 spdk_bdev_open_ext의 인자로 전달.
+	 * 값 범위: 유효한 null bdev 이름. 디코더 실패 시 NULL.
+	 *          다른 모듈의 bdev 이름이면 bdev_null_resize 내부에서 -EINVAL.
+	 * 동기화: 요청별 스택 변수 — 다른 RPC 핸들러와 공유 없음. */
 	uint64_t new_size;
-	/* [한국어] 새 크기 (MiB 단위, bdev_null_resize의 시그니처 기준).
-	 * 설정자: 디코더. 읽는 자: bdev_null_resize.
-	 * 값 범위: 현재 크기보다 크거나 같아야 함. 작으면 -EINVAL. */
+	/* [한국어] 새 디스크 크기 (단위: MiB; bdev_null_resize의 두 번째 인자 시그니처).
+	 * 설정자: spdk_json_decode_uint64(decoder 표).
+	 * 읽는 자: bdev_null_resize()가 내부에서 *1024*1024 후 blocklen으로 나눠
+	 *         새 blockcnt를 계산하고 spdk_bdev_notify_blockcnt_change에 전달.
+	 * 값 범위: 현재 디스크 크기(MiB) 이상이어야 함. 작으면 -EINVAL(축소 거부).
+	 *          0이면 디스크 용량 0 → 별도 검증 없이 거의 무의미 처리.
+	 *          uint64_t 표현 한도 내(블록 수 환산 시 오버플로 주의는 호출자 몫).
+	 * 동기화: 요청별 스택 변수. */
 };
 
 static const struct spdk_json_object_decoder rpc_bdev_null_resize_decoders[] = {

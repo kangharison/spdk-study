@@ -617,13 +617,13 @@ spdk_reactors_fini(void)
 	uint32_t i;                             /* [한국어] 순회 인덱스. */
 	struct spdk_reactor *reactor;           /* [한국어] 현재 처리 중 reactor. */
 
-	if (g_reactor_state == SPDK_REACTOR_STATE_UNINITIALIZED) {      /* [한국어] init 안 했거나 이미 fini 됨 — 안전한 no-op. */
+	if (g_reactor_state == SPDK_REACTOR_STATE_UNINITIALIZED) {      /* [한국어] init 안 했거나 이미 fini 됨 — 안전한 no-op (idempotent). */
 		return;
 	}
 
-	spdk_thread_lib_fini();                 /* [한국어] thread lib 의 콜백 등록 해제 — 이후 spdk_thread_create 호출 불가. */
+	spdk_thread_lib_fini();                 /* [한국어] thread lib 의 콜백 등록 해제 — 이후 spdk_thread_create 호출 불가. lw_thread 컨텍스트 크기 정보도 무효화. */
 
-	SPDK_ENV_FOREACH_CORE(i) {
+	SPDK_ENV_FOREACH_CORE(i) {              /* [한국어] 활성 코어만 — 비활성 슬롯은 reactor_construct 가 호출되지 않아 events ring 도 없음. */
 		reactor = spdk_reactor_get(i);
 		assert(reactor != NULL);
 		assert(reactor->thread_count == 0);     /* [한국어] 정상 종료라면 모든 lw_thread 가 destroy 되어 0이어야 함. */
@@ -631,18 +631,18 @@ spdk_reactors_fini(void)
 			spdk_ring_free(reactor->events);        /* [한국어] DPDK ring 해제 — ring 내부 미처리 이벤트는 mempool free 시 자동 회수. */
 		}
 
-		reactor_interrupt_fini(reactor);        /* [한국어] eventfd close + fd_group destroy. */
+		reactor_interrupt_fini(reactor);        /* [한국어] eventfd close + fd_group destroy. fgrp 가 NULL 이면 no-op. */
 
 		if (g_core_infos != NULL) {
-			free(g_core_infos[i].thread_infos);     /* [한국어] gather_metrics 가 calloc 한 thread_infos — 정상 종료 시엔 이미 NULL 일 가능성 높음. */
+			free(g_core_infos[i].thread_infos);     /* [한국어] gather_metrics 가 calloc 한 thread_infos — 정상 종료 시엔 이미 NULL 일 가능성 높음. free(NULL) 안전. */
 		}
 	}
 
-	spdk_mempool_free(g_spdk_event_mempool);        /* [한국어] event mempool 해제 — hugepage 영역 회수. */
+	spdk_mempool_free(g_spdk_event_mempool);        /* [한국어] event mempool 해제 — hugepage 영역 회수. 미반환 event 가 있어도 mempool 자체는 통째로 해제. */
 
-	free(g_reactors);                       /* [한국어] reactor 배열 해제 (posix_memalign 은 free 와 호환). */
-	g_reactors = NULL;                      /* [한국어] dangling 방지 — spdk_reactor_get 이 NULL 반환하도록. */
-	free(g_core_infos);
+	free(g_reactors);                       /* [한국어] reactor 배열 해제 (posix_memalign 는 free 와 호환 — glibc 보증). */
+	g_reactors = NULL;                      /* [한국어] dangling 방지 — 이후 spdk_reactor_get 이 NULL 반환. */
+	free(g_core_infos);                     /* [한국어] 스케줄러 메트릭 배열 해제. */
 	g_core_infos = NULL;
 }
 
@@ -794,10 +794,10 @@ _reactor_set_interrupt_mode(void *arg1, void *arg2)
 		/* Reactor is no longer in interrupt mode. Refresh the tsc_last to accurately
 		 * track reactor stats. */
 		target->tsc_last = spdk_get_ticks();            /* [한국어] interrupt 모드에서 멈춘 동안 누적된 시간을 idle/busy 로 잘못 잡지 않도록 reset. */
-		spdk_for_each_reactor(_reactor_set_notify_cpuset, target, NULL, _reactor_set_notify_cpuset_cpl); /* [한국어] 모든 reactor 의 notify 비트 clear (target.lcore 로 보낼 때 깨움 불필요). */
+		spdk_for_each_reactor(_reactor_set_notify_cpuset, target, NULL, _reactor_set_notify_cpuset_cpl); /* [한국어] 모든 reactor 의 notify 비트 clear (target.lcore 로 보낼 때 깨움 불필요). cpl 콜백에서 사용자 cb_fn 호출. */
 	} else {                                                /* [한국어] polling → interrupt: 펜딩 이벤트가 있을 수 있으므로 양쪽 fd 모두 깨움. */
 		uint64_t notify = 1;                            /* [한국어] eventfd 의 의미 없는 값 — 8B 카운터 증가만 되면 됨. */
-		int rc = 0;
+		int rc = 0;                                     /* [한국어] write(2) 의 반환값. */
 
 		/* Always trigger spdk_event and resched event in case of race condition */
 		rc = write(target->events_fd, &notify, sizeof(notify));         /* [한국어] events_fd 깨움 — interrupt 모드 진입 직후 펜딩 spdk_event 가 있으면 즉시 처리. */
@@ -915,23 +915,23 @@ struct spdk_event *
 spdk_event_allocate(uint32_t lcore, spdk_event_fn fn, void *arg1, void *arg2)
 {
 	struct spdk_event *event = NULL;                                /* [한국어] mempool 에서 받을 객체. */
-	struct spdk_reactor *reactor = spdk_reactor_get(lcore);         /* [한국어] 대상 코어 검증용. */
+	struct spdk_reactor *reactor = spdk_reactor_get(lcore);         /* [한국어] 대상 코어 검증용 — invalid 면 mempool 손실 방지 위해 미리 검사. */
 
-	if (!reactor) {                         /* [한국어] 잘못된 lcore — 디버그 abort. */
+	if (!reactor) {                         /* [한국어] 잘못된 lcore — 디버그 abort. 호출자 버그 (mask 외 코어 지정 등). */
 		assert(false);
 		return NULL;
 	}
 
-	event = spdk_mempool_get(g_spdk_event_mempool);                 /* [한국어] DPDK rte_mempool_get — per-core cache 우선. */
+	event = spdk_mempool_get(g_spdk_event_mempool);                 /* [한국어] DPDK rte_mempool_get — per-core cache 우선, miss 시 ring 에서. lockless. */
 	if (event == NULL) {                    /* [한국어] mempool 고갈 — 16383 개 모두 인플라이트 (이론상 불가). */
 		assert(false);
 		return NULL;
 	}
 
-	event->lcore = lcore;                   /* [한국어] 대상 코어 — event_queue_run_batch 의 reactor 와 일치 가정. */
-	event->fn = fn;                         /* [한국어] 실행할 함수. */
-	event->arg1 = arg1;                     /* [한국어] 첫 인자. */
-	event->arg2 = arg2;                     /* [한국어] 둘째 인자. */
+	event->lcore = lcore;                   /* [한국어] 대상 코어 — event_queue_run_batch 의 reactor 와 일치 가정. spdk_event_call 이 ring lookup 키로 사용. */
+	event->fn = fn;                         /* [한국어] 실행할 함수 — event_queue_run_batch 가 dequeue 후 호출. */
+	event->arg1 = arg1;                     /* [한국어] 첫 인자 (불투명 포인터). */
+	event->arg2 = arg2;                     /* [한국어] 둘째 인자 (불투명 포인터). */
 
 	return event;
 }
@@ -960,22 +960,22 @@ void
 spdk_event_call(struct spdk_event *event)
 {
 	int rc;                                 /* [한국어] 시스템 콜/ring API 반환값. */
-	struct spdk_reactor *reactor;           /* [한국어] 대상 reactor. */
-	struct spdk_reactor *local_reactor = NULL;      /* [한국어] 호출자 reactor (없을 수도 있음). */
+	struct spdk_reactor *reactor;           /* [한국어] 대상 reactor (event->lcore 가 가리킴). */
+	struct spdk_reactor *local_reactor = NULL;      /* [한국어] 호출자 reactor (DPDK 외 스레드 호출이면 NULL). */
 	uint32_t current_core = spdk_env_get_current_core();    /* [한국어] 호출 시점의 lcore (DPDK 외 스레드면 SPDK_ENV_LCORE_ID_ANY). */
 
-	reactor = spdk_reactor_get(event->lcore);
+	reactor = spdk_reactor_get(event->lcore);       /* [한국어] event->lcore 가 spdk_event_allocate 시 저장한 대상 코어. */
 
-	assert(reactor != NULL);
-	assert(reactor->events != NULL);
+	assert(reactor != NULL);                /* [한국어] allocate 단계에서 이미 검증됨 — 여기서 NULL 이면 race 또는 메모리 손상. */
+	assert(reactor->events != NULL);        /* [한국어] reactor_construct 가 ring 생성 — NULL 이면 초기화 오류. */
 
-	rc = spdk_ring_enqueue(reactor->events, (void **)&event, 1, NULL);      /* [한국어] DPDK rte_ring_enqueue — lockless MPSC. count 매개변수 NULL 이면 검사 없이 그냥 enqueue. */
+	rc = spdk_ring_enqueue(reactor->events, (void **)&event, 1, NULL);      /* [한국어] DPDK rte_ring_enqueue — lockless MPSC. count 매개변수 NULL 이면 검사 없이 그냥 enqueue. 1 개 push 시도. */
 	if (rc != 1) {
-		assert(false);                  /* [한국어] ring 가득참 — 65536 슬롯 가정 시 매우 비정상. */
+		assert(false);                  /* [한국어] ring 가득참 — 65536 슬롯 가정 시 매우 비정상. event 가 mempool 로 반환 안 되어 leak. */
 	}
 
 	if (current_core != SPDK_ENV_LCORE_ID_ANY) {            /* [한국어] reactor 컨텍스트 내부면 local_reactor 식별. */
-		local_reactor = spdk_reactor_get(current_core);
+		local_reactor = spdk_reactor_get(current_core); /* [한국어] 호출자가 어떤 reactor 였는지 — notify_cpuset 검사용. */
 	}
 
 	/* If spdk_event_call isn't called on a reactor, always send a notification.
@@ -1048,22 +1048,22 @@ event_queue_run_batch(void *arg)
 				return -errno;
 			}
 		}
-	} else {                                        /* [한국어] polling 모드: 단순 dequeue. */
-		count = spdk_ring_dequeue(reactor->events, events, SPDK_EVENT_BATCH_SIZE);
+	} else {                                        /* [한국어] polling 모드: 단순 dequeue (eventfd self-notify 불필요 — 다음 polling iter 가 곧 다시 호출). */
+		count = spdk_ring_dequeue(reactor->events, events, SPDK_EVENT_BATCH_SIZE);      /* [한국어] DPDK rte_ring_sc_dequeue_bulk — 최대 8개 한 번에 dequeue (lockless SC). */
 	}
 
-	if (count == 0) {                       /* [한국어] dequeue 0개 — 빠른 반환. */
+	if (count == 0) {                       /* [한국어] dequeue 0개 — ring 비어있음. 빠른 반환으로 hot-path 오버헤드 최소화. */
 		return 0;
 	}
 
-	for (i = 0; i < count; i++) {
-		struct spdk_event *event = events[i];
+	for (i = 0; i < count; i++) {                           /* [한국어] dequeue 한 만큼 (최대 8) 순회. */
+		struct spdk_event *event = events[i];           /* [한국어] dequeue 한 i 번째 이벤트 포인터. */
 
 		assert(event != NULL);                          /* [한국어] dequeue 가 NULL 을 채울 일은 없지만 방어적. */
 		assert(spdk_get_thread() == NULL);              /* [한국어] event 실행 시점에는 어떤 spdk_thread 도 활성이 아니어야 함 — thread 별 메시지는 spdk_thread_send_msg 의 영역. */
 		SPDK_DTRACE_PROBE3(event_exec, event->fn,
-				   event->arg1, event->arg2);   /* [한국어] USDT probe — 외부 트레이서가 이벤트 실행을 관측. */
-		event->fn(event->arg1, event->arg2);            /* [한국어] 콜백 실행 — 콜백 안에서 더 많은 spdk_event_call 가능. */
+				   event->arg1, event->arg2);   /* [한국어] USDT probe — 외부 트레이서가 이벤트 실행을 관측 (3개 인자: fn 포인터, arg1, arg2). */
+		event->fn(event->arg1, event->arg2);            /* [한국어] 콜백 실행 — 콜백 안에서 더 많은 spdk_event_call 가능 (재귀 enqueue OK). */
 	}
 
 	spdk_mempool_put_bulk(g_spdk_event_mempool, events, count);     /* [한국어] 처리 완료된 이벤트들을 mempool 로 bulk 반환 — per-core cache 효율. */
@@ -1217,14 +1217,14 @@ static void
 _threads_reschedule_thread(struct spdk_scheduler_thread_info *thread_info)
 {
 	struct spdk_lw_thread *lw_thread;       /* [한국어] thread 의 lw 컨텍스트. */
-	struct spdk_thread *thread;             /* [한국어] thread 핸들. */
+	struct spdk_thread *thread;             /* [한국어] thread 핸들 (id → object 복원). */
 
-	thread = spdk_thread_get_by_id(thread_info->thread_id);         /* [한국어] thread_id 는 안정적 64-bit ID. 핸들 복원. */
+	thread = spdk_thread_get_by_id(thread_info->thread_id);         /* [한국어] thread_id 는 안정적 64-bit ID. 핸들 복원. thread lib 가 id 테이블 관리. */
 	if (thread == NULL) {
 		/* Thread no longer exists. */
-		return;                                 /* [한국어] gather → balance 사이에 destroy 됐으면 무시. */
+		return;                                 /* [한국어] gather → balance 사이에 destroy 됐으면 무시 — race-safe. */
 	}
-	lw_thread = spdk_thread_get_ctx(thread);
+	lw_thread = spdk_thread_get_ctx(thread);        /* [한국어] thread → lw_thread 영역 포인터. */
 	assert(lw_thread != NULL);
 
 	lw_thread->lcore = thread_info->lcore;          /* [한국어] 원하는 새 lcore 표시 — 0 인덱스 부터 g_reactor_count 미만. */
@@ -1249,13 +1249,13 @@ _threads_reschedule(struct spdk_scheduler_core_info *cores_info)
 {
 	struct spdk_scheduler_core_info *core;          /* [한국어] 현재 순회 중 core_info. */
 	struct spdk_scheduler_thread_info *thread_info; /* [한국어] core 안의 j 번째 thread_info. */
-	uint32_t i, j;                                  /* [한국어] 외부/내부 인덱스. */
+	uint32_t i, j;                                  /* [한국어] 외부(코어) / 내부(thread) 인덱스. */
 
-	SPDK_ENV_FOREACH_CORE(i) {
+	SPDK_ENV_FOREACH_CORE(i) {                      /* [한국어] 활성 코어만 순회 — gather 가 thread_infos 채운 슬롯. */
 		core = &cores_info[i];
-		for (j = 0; j < core->threads_count; j++) {
+		for (j = 0; j < core->threads_count; j++) {     /* [한국어] 이 코어의 thread 수만큼 순회. */
 			thread_info = &core->thread_infos[j];
-			if (thread_info->lcore != i) {                  /* [한국어] balance 가 다른 코어로 옮기겠다고 결정한 경우. */
+			if (thread_info->lcore != i) {                  /* [한국어] balance 가 다른 코어로 옮기겠다고 결정한 경우 (현재 코어 i 와 다름). */
 				if (core->isolated || cores_info[thread_info->lcore].isolated) {        /* [한국어] src 또는 dst 가 isolated 면 정책 위반. */
 					SPDK_ERRLOG("A thread cannot be moved from an isolated core or \
 								moved to an isolated core. Skip rescheduling thread\n");
@@ -1275,14 +1275,23 @@ _threads_reschedule(struct spdk_scheduler_core_info *cores_info)
  * _reactors_scheduler_fini - scheduler 라운드 마무리 (Phase 4)
  *
  * balance 결정 적용 + g_scheduling_in_progress 플래그 해제. 다음 주기 진입 가능.
+ *
+ * Phase 3 (update_core_mode) 가 모든 코어의 interrupt/poll 모드 전환을 끝내고
+ * 자기 자신을 더 이상 dispatch 하지 않게 되었을 때 호출된다. 여기서 실제 thread
+ * 이동(_threads_reschedule)을 일괄 수행하고 다음 라운드를 위해 플래그를 해제.
+ *
+ * 실행 컨텍스트: 마지막 set_interrupt_mode 콜백이 호출된 코어 (스케줄링 reactor).
+ *
+ * 호출 체인:
+ *   _reactors_scheduler_update_core_mode (모든 코어 처리 완료 후) → [_reactors_scheduler_fini]
  */
 static void
 _reactors_scheduler_fini(void)
 {
 	/* Reschedule based on the balancing output */
-	_threads_reschedule(g_core_infos);              /* [한국어] balance 결과 적용. */
+	_threads_reschedule(g_core_infos);              /* [한국어] balance 결과 적용 — thread 마다 resched 플래그/lcore 마킹. 실제 이동은 각 reactor 의 다음 _reactor_run 라운드. */
 
-	g_scheduling_in_progress = false;               /* [한국어] 새 라운드 트리거 가능 상태로 복귀. */
+	g_scheduling_in_progress = false;               /* [한국어] 새 라운드 트리거 가능 상태로 복귀 — reactor_run 의 가드를 해제. */
 }
 
 /*
@@ -1296,29 +1305,38 @@ _reactors_scheduler_fini(void)
  * Phase 4 (_reactors_scheduler_fini) 진입.
  *
  * g_scheduler_core_number 는 chain 진행 상태 (다음 검사할 lcore).
+ *
+ * 실행 컨텍스트: 처음에는 scheduling reactor (balance 직후 직접 호출), 이후
+ * set_interrupt_mode 콜백으로 다시 scheduling reactor 에서 호출 (_event_call 로
+ * spdk_scheduler_get_scheduling_lcore 에 dispatch 됨).
+ *
+ * 호출 체인:
+ *   _reactors_scheduler_balance → [update_core_mode] → spdk_reactor_set_interrupt_mode
+ *      → ... → cb: [update_core_mode] → ... → _reactors_scheduler_fini
  */
 static void
 _reactors_scheduler_update_core_mode(void *ctx1, void *ctx2)
 {
-	struct spdk_reactor *reactor;
-	uint32_t i;
-	int rc = 0;
+	struct spdk_reactor *reactor;           /* [한국어] 현재 검사 중인 reactor. */
+	uint32_t i;                             /* [한국어] 코어 순회 인덱스. */
+	int rc = 0;                             /* [한국어] set_interrupt_mode 의 반환 코드 (0 = 비동기 시작 성공). */
 
-	for (i = g_scheduler_core_number; i < SPDK_ENV_LCORE_ID_ANY; i = spdk_env_get_next_core(i)) {   /* [한국어] 진행 인덱스부터 끝까지 순회. SPDK_ENV_LCORE_ID_ANY = UINT32_MAX. */
+	for (i = g_scheduler_core_number; i < SPDK_ENV_LCORE_ID_ANY; i = spdk_env_get_next_core(i)) {   /* [한국어] 진행 인덱스부터 끝까지 순회. SPDK_ENV_LCORE_ID_ANY = UINT32_MAX (sentinel) — spdk_env_get_next_core 가 끝에 도달 시 이 값 반환. */
 		reactor = spdk_reactor_get(i);
-		assert(reactor != NULL);
-		if (reactor->in_interrupt != g_core_infos[i].interrupt_mode) {  /* [한국어] balance 가 결정한 모드와 현재 모드가 다르면 전환 필요. */
+		assert(reactor != NULL);                                /* [한국어] FOREACH_CORE 범위 내 모든 reactor 는 valid. */
+		if (reactor->in_interrupt != g_core_infos[i].interrupt_mode) {  /* [한국어] balance 가 결정한 모드와 현재 모드가 다르면 전환 필요. 일치하면 다음 코어로. */
 			/* Switch next found reactor to new state */
 			rc = spdk_reactor_set_interrupt_mode(i, g_core_infos[i].interrupt_mode,
-							     _reactors_scheduler_update_core_mode, NULL);       /* [한국어] 비동기 모드 전환 시작 — 완료 후 자기 자신이 콜백으로 호출됨. */
+							     _reactors_scheduler_update_core_mode, NULL);       /* [한국어] 비동기 모드 전환 시작 — 완료 후 자기 자신이 콜백으로 호출됨 (chain 형태). cb 가 다시 이 함수를 호출하므로 무한 진행 보장. */
 			if (rc == 0) {
 				/* Set core to start with after callback completes */
-				g_scheduler_core_number = spdk_env_get_next_core(i);    /* [한국어] 다음 라운드는 i 의 다음 코어부터 — 진행 위치 저장. */
-				return;
+				g_scheduler_core_number = spdk_env_get_next_core(i);    /* [한국어] 다음 라운드는 i 의 다음 코어부터 — 진행 위치 저장 (콜백이 호출될 때 i 부터가 아닌 다음부터 검사). */
+				return;                                                 /* [한국어] 비동기 시작했으니 여기서 양보. 완료 콜백이 chain 이어감. */
 			}
+			/* [한국어] rc != 0: 전환 실패 (예: -EBUSY, -EPERM). 그냥 다음 코어로 진행 — best-effort. */
 		}
 	}
-	_reactors_scheduler_fini();             /* [한국어] 모든 코어 처리 완료 — Phase 4 로 진입. */
+	_reactors_scheduler_fini();             /* [한국어] 모든 코어 처리 완료 — Phase 4 로 진입 (thread reschedule + 플래그 해제). */
 }
 
 /*
@@ -1337,45 +1355,52 @@ _reactors_scheduler_update_core_mode(void *ctx1, void *ctx2)
 static void
 _reactors_scheduler_cancel(void *arg1, void *arg2)
 {
-	struct spdk_scheduler_core_info *core;
-	uint32_t i;
+	struct spdk_scheduler_core_info *core;  /* [한국어] 현재 코어의 메트릭 슬롯 포인터. */
+	uint32_t i;                             /* [한국어] 코어 순회 인덱스. */
 
-	SPDK_ENV_FOREACH_CORE(i) {
+	SPDK_ENV_FOREACH_CORE(i) {              /* [한국어] 활성 코어만 순회 — gather 가 thread_infos 를 할당했을 가능성이 있는 슬롯만. */
 		core = &g_core_infos[i];
-		core->threads_count = 0;        /* [한국어] gather 가 채운 카운터 무효화. */
-		free(core->thread_infos);       /* [한국어] gather 가 calloc 한 배열 해제. */
-		core->thread_infos = NULL;
+		core->threads_count = 0;        /* [한국어] gather 가 채운 카운터 무효화 — 다음 라운드에서 잔존 값 오용 방지. */
+		free(core->thread_infos);       /* [한국어] gather 가 calloc 한 배열 해제. NULL 이어도 free(NULL) 은 안전. */
+		core->thread_infos = NULL;      /* [한국어] dangling 방지 — 다음 gather 가 다시 calloc. */
 	}
 
-	g_scheduling_in_progress = false;       /* [한국어] 다음 라운드 가능. */
+	g_scheduling_in_progress = false;       /* [한국어] 다음 라운드 가능 — reactor_run 의 가드 해제. */
 }
 
 /*
  * [한국어]
  * _reactors_scheduler_balance - Phase 2: 부하분산 결정 호출
  *
- * @arg1, arg2: unused.
+ * @arg1, arg2: unused (spdk_event_fn 시그니처 호환).
  *
  * scheduling reactor 에서 실행. scheduler->balance() 플러그인 콜백을 호출해
  * g_core_infos 의 thread_info[*].lcore 가 새 배치 결과로 갱신되게 한다.
  * 그 후 Phase 3 (update_core_mode) 진입.
  *
- * 가드: 셧다운 중이거나 scheduler 가 NULL 이면 즉시 cancel.
+ * 가드: 셧다운 중이거나 scheduler 가 NULL 이면 즉시 cancel (Phase 4 의 cleanup
+ *  대신 _reactors_scheduler_cancel 로 단순화 — balance 결과가 없으므로).
+ *
+ * 실행 컨텍스트: scheduling reactor (gather_metrics chain 의 wrap-around 후).
+ *
+ * 호출 체인:
+ *   _reactors_scheduler_gather_metrics (마지막 코어) → _event_call(scheduling_lcore)
+ *      → [_reactors_scheduler_balance] → _reactors_scheduler_update_core_mode
  */
 static void
 _reactors_scheduler_balance(void *arg1, void *arg2)
 {
-	struct spdk_scheduler *scheduler = spdk_scheduler_get();
+	struct spdk_scheduler *scheduler = spdk_scheduler_get();        /* [한국어] 현재 활성 scheduler 스냅샷 — balance 직전에 spdk_scheduler_set(NULL) 됐을 수 있어 한 번만 읽음. */
 
-	if (g_reactor_state != SPDK_REACTOR_STATE_RUNNING || scheduler == NULL) {       /* [한국어] 셧다운 또는 비활성 — 안전하게 cancel. */
+	if (g_reactor_state != SPDK_REACTOR_STATE_RUNNING || scheduler == NULL) {       /* [한국어] 셧다운 또는 비활성 — 안전하게 cancel. gather 가 calloc 한 thread_infos 해제 + 진행 플래그 클리어. */
 		_reactors_scheduler_cancel(NULL, NULL);
 		return;
 	}
 
-	scheduler->balance(g_core_infos, g_reactor_count);      /* [한국어] 플러그인 콜백 — thread_info[*].lcore 변경 가능. */
+	scheduler->balance(g_core_infos, g_reactor_count);      /* [한국어] 플러그인 콜백 — thread_info[*].lcore 를 새 배치로 변경 가능. interrupt_mode 도 변경 가능. */
 
-	g_scheduler_core_number = spdk_env_get_first_core();    /* [한국어] update_core_mode 의 진행 인덱스 시작값. */
-	_reactors_scheduler_update_core_mode(NULL, NULL);       /* [한국어] Phase 3 진입. */
+	g_scheduler_core_number = spdk_env_get_first_core();    /* [한국어] update_core_mode 의 진행 인덱스 시작값 — 활성 코어 중 가장 작은 인덱스. */
+	_reactors_scheduler_update_core_mode(NULL, NULL);       /* [한국어] Phase 3 진입 — 첫 코어부터 interrupt 모드 전환 chain 시작. */
 }
 
 /* Phase 1 of thread scheduling is to gather metrics on the existing threads */
@@ -1563,9 +1588,9 @@ reactor_post_process_lw_thread(struct spdk_reactor *reactor, struct spdk_lw_thre
 static void
 reactor_interrupt_run(struct spdk_reactor *reactor)
 {
-	int block_timeout = -1; /* _EPOLL_WAIT_FOREVER */       /* [한국어] -1 = epoll_wait 무한 대기. eventfd 깨어남까지 CPU 0%. */
+	int block_timeout = -1; /* _EPOLL_WAIT_FOREVER */       /* [한국어] -1 = epoll_wait 무한 대기. eventfd 깨어남까지 CPU 0%. polling 모드와 달리 인터럽트 모드의 핵심: idle 코어가 사이클을 낭비하지 않음. */
 
-	spdk_fd_group_wait(reactor->fgrp, block_timeout);
+	spdk_fd_group_wait(reactor->fgrp, block_timeout);       /* [한국어] epoll_wait → 깨어남 시 등록 콜백 (event_queue_run_batch / reactor_schedule_thread_event / nested thread fd 들) 자동 실행. */
 }
 
 /*
@@ -1589,7 +1614,7 @@ reactor_interrupt_run(struct spdk_reactor *reactor)
 static void
 _reactor_run(struct spdk_reactor *reactor)
 {
-	struct spdk_thread	*thread;
+	struct spdk_thread	*thread;                /* [한국어] 현재 poll 대상 spdk_thread. */
 	struct spdk_lw_thread	*lw_thread, *tmp;       /* [한국어] _SAFE 순회 — post_process 가 리스트 수정 가능. */
 	uint64_t		now;                    /* [한국어] thread poll 후의 last TSC. */
 	int			rc;                     /* [한국어] thread_poll 반환값 (idle/busy/error). */
@@ -1659,17 +1684,17 @@ reactor_run(void *arg)
 	char			thread_name[32];        /* [한국어] "reactor_<lcore>" 버퍼. */
 	uint64_t		last_sched = 0;         /* [한국어] 마지막 스케줄링 트리거 TSC. */
 
-	SPDK_NOTICELOG("Reactor started on core %u\n", reactor->lcore);
+	SPDK_NOTICELOG("Reactor started on core %u\n", reactor->lcore); /* [한국어] reactor 시작 로그 — 모든 코어가 polling 시작했는지 확인. */
 
 	/* Rename the POSIX thread because the reactor is tied to the POSIX
 	 * thread in the SPDK event library.
 	 */
-	snprintf(thread_name, sizeof(thread_name), "reactor_%u", reactor->lcore);
-	_set_thread_name(thread_name);                          /* [한국어] top/htop 가시성. */
+	snprintf(thread_name, sizeof(thread_name), "reactor_%u", reactor->lcore);       /* [한국어] "reactor_<lcore>" 형식의 식별자 생성 — 16자 제한 내 (Linux comm). */
+	_set_thread_name(thread_name);                          /* [한국어] top/htop 가시성 — 디버깅 시 어느 코어가 멈췄는지 즉시 식별. */
 
-	reactor->trace_id = spdk_trace_register_owner(OWNER_TYPE_REACTOR, thread_name); /* [한국어] trace 시스템에 owner 등록. spdk_trace_record 의 owner_id 로 사용. */
+	reactor->trace_id = spdk_trace_register_owner(OWNER_TYPE_REACTOR, thread_name); /* [한국어] trace 시스템에 owner 등록. spdk_trace_record 의 owner_id 로 사용 — 외부 trace 분석 도구가 reactor 단위로 그룹화. */
 
-	reactor->tsc_last = spdk_get_ticks();                   /* [한국어] 첫 polling 시점 TSC — 이후 idle/busy 누적의 기준. */
+	reactor->tsc_last = spdk_get_ticks();                   /* [한국어] 첫 polling 시점 TSC — 이후 idle/busy 누적의 기준. spdk_get_ticks() = rdtsc 래퍼 (DPDK 사이클 카운터). */
 
 	while (1) {
 		/* Execute interrupt process fn if this reactor currently runs in interrupt state */
@@ -1701,40 +1726,40 @@ reactor_run(void *arg)
 		}
 	}
 
-	TAILQ_FOREACH(lw_thread, &reactor->threads, link) {
+	TAILQ_FOREACH(lw_thread, &reactor->threads, link) {     /* [한국어] reactor 의 모든 lw_thread 1차 순회 — 정상이면 모두 이미 EXITED 상태. */
 		thread = spdk_thread_get_from_ctx(lw_thread);
 		/* All threads should have already had spdk_thread_exit() called on them, except
 		 * for the app thread.
 		 */
-		if (spdk_thread_is_running(thread)) {                   /* [한국어] 아직 exit 호출 안 됐음. */
-			if (!spdk_thread_is_app_thread(thread)) {       /* [한국어] app thread 는 정상적으로 마지막까지 살아있을 수 있음. */
+		if (spdk_thread_is_running(thread)) {                   /* [한국어] 아직 exit 호출 안 됐음 — 비정상 상태. */
+			if (!spdk_thread_is_app_thread(thread)) {       /* [한국어] app thread 는 정상적으로 마지막까지 살아있을 수 있음 (app_start 의 메인 thread). */
 				SPDK_ERRLOG("spdk_thread_exit() was not called on thread '%s'\n",
 					    spdk_thread_get_name(thread));
 				SPDK_ERRLOG("This will result in a non-zero exit code in a future release.\n");
 			}
-			spdk_set_thread(thread);                        /* [한국어] thread 컨텍스트 set 후 exit 호출 (스스로 exit 처럼). */
-			spdk_thread_exit(thread);
+			spdk_set_thread(thread);                        /* [한국어] thread 컨텍스트 set 후 exit 호출 (스스로 exit 처럼). exit 콜백이 spdk_get_thread() 로 자기 식별 가능. */
+			spdk_thread_exit(thread);                       /* [한국어] thread lib 에 종료 시작 알림 — 메시지 큐 drain, 모든 poller unregister 등. 즉시 destroy 되지 않고 다음 poll 들에서 정리. */
 		}
 	}
 
-	while (!TAILQ_EMPTY(&reactor->threads)) {                       /* [한국어] 모든 thread 가 destroy 될 때까지 polling. */
-		TAILQ_FOREACH_SAFE(lw_thread, &reactor->threads, link, tmp) {
+	while (!TAILQ_EMPTY(&reactor->threads)) {                       /* [한국어] 모든 thread 가 destroy 될 때까지 polling 계속. exit 한 thread 들이 자기 cleanup 마치고 is_exited true 가 될 때까지. */
+		TAILQ_FOREACH_SAFE(lw_thread, &reactor->threads, link, tmp) {   /* [한국어] _SAFE: destroy 가 리스트에서 제거하므로 tmp 가 next 보존. */
 			thread = spdk_thread_get_from_ctx(lw_thread);
-			spdk_set_thread(thread);
+			spdk_set_thread(thread);                        /* [한국어] poll 호출 컨텍스트 설정. */
 			if (spdk_thread_is_exited(thread)) {            /* [한국어] exit 절차 끝났으면 destroy. */
-				_reactor_remove_lw_thread(reactor, lw_thread);
-				spdk_thread_destroy(thread);
+				_reactor_remove_lw_thread(reactor, lw_thread);  /* [한국어] reactor 의 thread 리스트에서 제거 + interrupt fgrp 분리. */
+				spdk_thread_destroy(thread);            /* [한국어] thread 의 마지막 자원 해제 — TAILQ_FOREACH_SAFE 의 tmp 가 다음 iter 보장. */
 			} else {
-				if (spdk_unlikely(reactor->in_interrupt)) {     /* [한국어] interrupt 모드면 fd_group_wait. */
+				if (spdk_unlikely(reactor->in_interrupt)) {     /* [한국어] interrupt 모드면 fd_group_wait — pending fd 처리. */
 					reactor_interrupt_run(reactor);
 				} else {
-					spdk_thread_poll(thread, 0, 0);         /* [한국어] polling 으로 thread 의 종료 메시지 처리 진행. */
+					spdk_thread_poll(thread, 0, 0);         /* [한국어] polling 으로 thread 의 종료 메시지 처리 진행 (max_msgs=0, now=0 — 자기가 측정). */
 				}
 			}
 		}
 	}
 
-	return 0;
+	return 0;                                                       /* [한국어] reactor pthread 종료 — spdk_env_thread_wait_all 이 join. */
 }
 
 /*
@@ -1807,9 +1832,9 @@ spdk_app_get_core_mask(void)
 void
 spdk_reactors_start(void)
 {
-	struct spdk_reactor *reactor;
-	uint32_t i, current_core;
-	int rc;
+	struct spdk_reactor *reactor;           /* [한국어] 순회 및 메인 reactor 임시 포인터. */
+	uint32_t i, current_core;               /* [한국어] 코어 인덱스 / 호출자 lcore (메인 코어). */
+	int rc;                                 /* [한국어] launch_pinned 반환값. */
 
 	g_rusage_period = (CONTEXT_SWITCH_MONITOR_PERIOD * spdk_get_ticks_hz()) / SPDK_SEC_TO_USEC;     /* [한국어] 1,000,000 us * (TSC/sec) / (us/sec) = TSC. */
 	g_reactor_state = SPDK_REACTOR_STATE_RUNNING;
@@ -1863,11 +1888,11 @@ spdk_reactors_start(void)
 static void
 _reactors_stop(void *arg1, void *arg2)
 {
-	uint32_t i;
-	int rc;
-	struct spdk_reactor *reactor;
-	struct spdk_reactor *local_reactor;
-	uint64_t notify = 1;
+	uint32_t i;                             /* [한국어] 코어 순회 인덱스. */
+	int rc;                                 /* [한국어] write(2) 반환값. */
+	struct spdk_reactor *reactor;           /* [한국어] 깨우려는 target reactor. */
+	struct spdk_reactor *local_reactor;     /* [한국어] 호출자 reactor (스케줄링 reactor). */
+	uint64_t notify = 1;                    /* [한국어] eventfd 의 의미 없는 카운터 증가 값 — 8B write 필요. */
 
 	g_reactor_state = SPDK_REACTOR_STATE_EXITING;           /* [한국어] reactor_run 의 break 트리거. */
 	local_reactor = spdk_reactor_get(spdk_env_get_current_core());  /* [한국어] 호출 reactor (스케줄링 reactor). */
@@ -1892,10 +1917,21 @@ _reactors_stop(void *arg1, void *arg2)
 /*
  * [한국어]
  * nop - 빈 콜백 (spdk_for_each_reactor 의 fn 자리표시용)
+ *
+ * @arg1, arg2: unused (spdk_event_fn 시그니처 호환 위함).
+ *
+ * spdk_reactors_stop 는 "모든 코어를 한 바퀴 돌고" 마지막에 _reactors_stop 가
+ * 호출되도록 spdk_for_each_reactor(nop, ..., _reactors_stop) 패턴을 쓴다. 각
+ * 코어에서 실제 할 일은 없지만, chain 자체가 "모든 코어의 펜딩 이벤트 큐를
+ * 한 번 비우고 도착" 함을 보장하므로 안전한 종료 시점을 만들어 준다.
+ *
+ * 호출 체인:
+ *   spdk_reactors_stop → spdk_for_each_reactor → on_reactor → [nop]
  */
 static void
 nop(void *arg1, void *arg2)
 {
+	/* [한국어] 본문은 비어 있음. chain 진행 자체가 동기화 효과. */
 }
 
 /*
@@ -1939,22 +1975,22 @@ static uint32_t g_next_core = UINT32_MAX;       /* [한국어] 라운드로빈 n
 static void
 _schedule_thread(void *arg1, void *arg2)
 {
-	struct spdk_lw_thread *lw_thread = arg1;
-	struct spdk_thread *thread;
-	struct spdk_reactor *reactor;
-	uint32_t current_core;
-	struct spdk_fd_group *grp;
+	struct spdk_lw_thread *lw_thread = arg1;        /* [한국어] _reactor_schedule_thread 가 spdk_event_allocate 시 넘긴 lw_thread. */
+	struct spdk_thread *thread;                     /* [한국어] lw_thread 의 부모 spdk_thread. */
+	struct spdk_reactor *reactor;                   /* [한국어] 현재 reactor (=target). */
+	uint32_t current_core;                          /* [한국어] 현재 lcore. */
+	struct spdk_fd_group *grp;                      /* [한국어] interrupt 모드에서 thread fd_group 임시 포인터. */
 
-	current_core = spdk_env_get_current_core();
+	current_core = spdk_env_get_current_core();     /* [한국어] _event_call 의 target lcore 와 일치 (DPDK 가 reactor pthread 핀했음). */
 	reactor = spdk_reactor_get(current_core);
 	assert(reactor != NULL);
 
 	/* Update total_stats to reflect state of thread
 	* at the end of the move. */
-	thread = spdk_thread_get_from_ctx(lw_thread);
-	spdk_set_thread(thread);
+	thread = spdk_thread_get_from_ctx(lw_thread);   /* [한국어] lw_thread → 부모 spdk_thread 복원. */
+	spdk_set_thread(thread);                        /* [한국어] TLS 활성 thread 설정 — get_stats 가 현재 thread 의 통계를 읽음. */
 	spdk_thread_get_stats(&lw_thread->total_stats);         /* [한국어] 이동 직후 시점의 누적 stats — 다음 gather 의 prev 기준. */
-	spdk_set_thread(NULL);
+	spdk_set_thread(NULL);                          /* [한국어] TLS 클리어 — event 실행 컨텍스트는 thread 컨텍스트가 아님. */
 
 	if (lw_thread->initial_lcore == SPDK_ENV_LCORE_ID_ANY) {        /* [한국어] 처음 schedule 되는 thread 면 initial 기록. */
 		lw_thread->initial_lcore = current_core;
@@ -2006,26 +2042,26 @@ _schedule_thread(void *arg1, void *arg2)
 static int
 _reactor_schedule_thread(struct spdk_thread *thread)
 {
-	uint32_t core, initial_core;
-	struct spdk_lw_thread *lw_thread;
-	struct spdk_event *evt = NULL;
-	struct spdk_cpuset *cpumask;
-	uint32_t i;
-	struct spdk_reactor *local_reactor = NULL;
-	uint32_t current_lcore = spdk_env_get_current_core();
+	uint32_t core, initial_core;                            /* [한국어] core: 최종 결정된 target lcore. initial_core: lw_thread 가 처음 schedule 됐던 lcore (보존 필요). */
+	struct spdk_lw_thread *lw_thread;                       /* [한국어] thread 의 lw 컨텍스트. */
+	struct spdk_event *evt = NULL;                          /* [한국어] target 코어로 보낼 _schedule_thread 이벤트. */
+	struct spdk_cpuset *cpumask;                            /* [한국어] 후보 코어 집합 (사용자 cpumask 또는 valid/polling 마스크로 교체). */
+	uint32_t i;                                             /* [한국어] 라운드로빈 시도 카운터. */
+	struct spdk_reactor *local_reactor = NULL;              /* [한국어] 호출자 reactor (DPDK 외 스레드에서 호출되면 NULL). */
+	uint32_t current_lcore = spdk_env_get_current_core();   /* [한국어] 호출 시점의 lcore (DPDK 외면 SPDK_ENV_LCORE_ID_ANY). */
 	struct spdk_cpuset polling_cpumask;             /* [한국어] polling 모드인 reactor 들의 마스크. */
 	struct spdk_cpuset valid_cpumask;               /* [한국어] 사용자 cpumask ∩ polling. */
 
-	cpumask = spdk_thread_get_cpumask(thread);
+	cpumask = spdk_thread_get_cpumask(thread);      /* [한국어] thread 생성 시 사용자가 지정한 허용 코어 마스크. */
 
 	lw_thread = spdk_thread_get_ctx(thread);
 	assert(lw_thread != NULL);
-	core = lw_thread->lcore;                /* [한국어] 호출자가 지정한 의도 코어 (ANY 면 자유 선택). */
-	initial_core = lw_thread->initial_lcore;
-	memset(lw_thread, 0, sizeof(*lw_thread));       /* [한국어] lw_thread 재초기화 — total_stats 등 클리어. */
-	lw_thread->initial_lcore = initial_core;        /* [한국어] initial 만 보존. */
+	core = lw_thread->lcore;                /* [한국어] 호출자가 지정한 의도 코어 (ANY 면 자유 선택). NEW 호출이면 reactor_thread_op 가 ANY 로 set. RESCHED 면 이전 _threads_reschedule_thread 가 새 lcore set. */
+	initial_core = lw_thread->initial_lcore;        /* [한국어] 보존 — 첫 schedule 시점 코어. */
+	memset(lw_thread, 0, sizeof(*lw_thread));       /* [한국어] lw_thread 재초기화 — total_stats, link, resched 등 모두 클리어. */
+	lw_thread->initial_lcore = initial_core;        /* [한국어] initial 만 보존 — 통계 및 마이그레이션 기록용. */
 
-	if (current_lcore != SPDK_ENV_LCORE_ID_ANY) {
+	if (current_lcore != SPDK_ENV_LCORE_ID_ANY) {   /* [한국어] DPDK 컨텍스트 내부에서 호출됐다면 호출자 reactor 확인. */
 		local_reactor = spdk_reactor_get(current_lcore);
 		assert(local_reactor);
 	}
@@ -2119,11 +2155,11 @@ _reactor_schedule_thread(struct spdk_thread *thread)
 static void
 _reactor_request_thread_reschedule(struct spdk_thread *thread)
 {
-	struct spdk_lw_thread *lw_thread;
-	struct spdk_reactor *reactor;
-	uint32_t current_core;
+	struct spdk_lw_thread *lw_thread;       /* [한국어] thread 의 lw 컨텍스트. resched 플래그/lcore 설정 대상. */
+	struct spdk_reactor *reactor;           /* [한국어] 현재 thread 가 속한 reactor. */
+	uint32_t current_core;                  /* [한국어] 현재 lcore. */
 
-	assert(thread == spdk_get_thread());            /* [한국어] thread 가 자기 자신에 대해 요청해야 함 — 다른 thread 가 임의로 RESCHED 요청 불가. */
+	assert(thread == spdk_get_thread());            /* [한국어] thread 가 자기 자신에 대해 요청해야 함 — 다른 thread 가 임의로 RESCHED 요청 불가. spdk_get_thread() 는 TLS 의 활성 thread. */
 
 	lw_thread = spdk_thread_get_ctx(thread);
 
@@ -2163,19 +2199,19 @@ _reactor_request_thread_reschedule(struct spdk_thread *thread)
 static int
 reactor_thread_op(struct spdk_thread *thread, enum spdk_thread_op op)
 {
-	struct spdk_lw_thread *lw_thread;
+	struct spdk_lw_thread *lw_thread;       /* [한국어] thread 의 lw 컨텍스트 — thread lib 가 spdk_thread 뒤에 reserve 한 영역. */
 
 	switch (op) {
-	case SPDK_THREAD_OP_NEW:
-		lw_thread = spdk_thread_get_ctx(thread);
-		lw_thread->lcore = SPDK_ENV_LCORE_ID_ANY;               /* [한국어] 신규 thread — 코어 미결정. */
-		lw_thread->initial_lcore = SPDK_ENV_LCORE_ID_ANY;       /* [한국어] 첫 schedule 시 결정. */
-		return _reactor_schedule_thread(thread);
-	case SPDK_THREAD_OP_RESCHED:
-		_reactor_request_thread_reschedule(thread);
+	case SPDK_THREAD_OP_NEW:                                        /* [한국어] spdk_thread_create 직후 호출 — 새 thread 의 첫 배치. */
+		lw_thread = spdk_thread_get_ctx(thread);                /* [한국어] reserve 된 lw_thread 영역 포인터 획득. */
+		lw_thread->lcore = SPDK_ENV_LCORE_ID_ANY;               /* [한국어] 신규 thread — 코어 미결정. _reactor_schedule_thread 가 라운드로빈/cpumask 로 결정. */
+		lw_thread->initial_lcore = SPDK_ENV_LCORE_ID_ANY;       /* [한국어] 첫 schedule 시 _schedule_thread 가 current_core 로 set. */
+		return _reactor_schedule_thread(thread);                /* [한국어] 동기 dispatch — 코어 결정 후 _schedule_thread 이벤트 enqueue. */
+	case SPDK_THREAD_OP_RESCHED:                                    /* [한국어] thread 자기 자신이 재배치 요청. */
+		_reactor_request_thread_reschedule(thread);             /* [한국어] resched 플래그 set + interrupt 모드라면 resched_fd 깨움. */
 		return 0;
 	default:
-		return -ENOTSUP;
+		return -ENOTSUP;                                        /* [한국어] 모르는 op — thread lib 가 fallback 처리. */
 	}
 }
 
@@ -2185,16 +2221,22 @@ reactor_thread_op(struct spdk_thread *thread, enum spdk_thread_op op)
  *
  * @op: 검사할 op.
  * @return: NEW/RESCHED 만 true.
+ *
+ * thread lib 는 이 콜백으로 reactor 가 어떤 op 를 처리할 수 있는지 미리 알아내,
+ * 미지원 op 는 reactor 에 넘기지 않는다. spdk_thread_lib_init_ext 에 등록됨.
+ *
+ * 호출 체인:
+ *   thread lib 내부 op dispatcher → [reactor_thread_op_supported]
  */
 static bool
 reactor_thread_op_supported(enum spdk_thread_op op)
 {
 	switch (op) {
-	case SPDK_THREAD_OP_NEW:
-	case SPDK_THREAD_OP_RESCHED:
+	case SPDK_THREAD_OP_NEW:                /* [한국어] 신규 thread 배치 지원. */
+	case SPDK_THREAD_OP_RESCHED:            /* [한국어] 재배치 지원. */
 		return true;
 	default:
-		return false;
+		return false;                   /* [한국어] 그 외 op (미래 확장 포함) 는 미지원으로 보고. */
 	}
 }
 
@@ -2256,8 +2298,8 @@ struct call_reactor {
 static void
 on_reactor(void *arg1, void *arg2)
 {
-	struct call_reactor *cr = arg1;
-	struct spdk_event *evt;
+	struct call_reactor *cr = arg1;         /* [한국어] spdk_for_each_reactor 가 calloc 으로 만든 chain 컨텍스트. */
+	struct spdk_event *evt;                 /* [한국어] 다음 코어 또는 orig_core 로 보낼 event. */
 
 	cr->fn(cr->arg1, cr->arg2);             /* [한국어] 자기 코어에서 사용자 콜백 실행. */
 
@@ -2290,12 +2332,12 @@ on_reactor(void *arg1, void *arg2)
 static void
 end_reactor(void *arg1, void *arg2)
 {
-	struct call_reactor *cr = arg1;
-	(void)arg2;
+	struct call_reactor *cr = arg1;         /* [한국어] chain 컨텍스트. */
+	(void)arg2;                             /* [한국어] arg2 미사용 명시 — compile warning 회피. */
 
-	cr->cpl(cr->arg1, cr->arg2);            /* [한국어] 사용자 완료 콜백. */
+	cr->cpl(cr->arg1, cr->arg2);            /* [한국어] 사용자 완료 콜백 — orig_core 에서 실행 (호출자가 시작한 reactor 와 동일). */
 
-	free(cr);                               /* [한국어] chain 컨텍스트 해제 — 메모리 leak 방지. */
+	free(cr);                               /* [한국어] chain 컨텍스트 해제 — 메모리 leak 방지. cpl 가 cr 을 참조했더라도 이 시점에는 더 안 씀. */
 }
 
 /*
@@ -2318,7 +2360,7 @@ end_reactor(void *arg1, void *arg2)
 void
 spdk_for_each_reactor(spdk_event_fn fn, void *arg1, void *arg2, spdk_event_fn cpl)
 {
-	struct call_reactor *cr;
+	struct call_reactor *cr;                /* [한국어] chain 진행을 추적할 컨텍스트 — calloc 으로 heap 에 할당해 chain 끝까지 살게 함. */
 
 	/* When the application framework is shutting down, we will send one
 	 * final for_each_reactor operation with completion callback _reactors_stop,
@@ -2371,14 +2413,14 @@ spdk_for_each_reactor(spdk_event_fn fn, void *arg1, void *arg2, spdk_event_fn cp
 static int
 reactor_schedule_thread_event(void *arg)
 {
-	struct spdk_reactor *reactor = arg;
-	struct spdk_lw_thread *lw_thread, *tmp;
-	uint32_t count = 0;
+	struct spdk_reactor *reactor = arg;             /* [한국어] 자기 reactor (init 시 콜백 컨텍스트로 등록됨). */
+	struct spdk_lw_thread *lw_thread, *tmp;         /* [한국어] _SAFE 순회 — post_process 가 리스트에서 제거할 수 있음. */
+	uint32_t count = 0;                             /* [한국어] 처리한 (destroy 또는 reschedule) thread 수. */
 
-	assert(reactor->in_interrupt);          /* [한국어] interrupt 모드에서만 fd_group_wait 가 호출됨. */
+	assert(reactor->in_interrupt);          /* [한국어] interrupt 모드에서만 fd_group_wait 가 호출됨 — polling 모드면 이 콜백이 진입할 수 없음. */
 
-	TAILQ_FOREACH_SAFE(lw_thread, &reactor->threads, link, tmp) {
-		count += reactor_post_process_lw_thread(reactor, lw_thread) ? 1 : 0;    /* [한국어] true 반환 (재배치/destroy 발생) 시 카운트. */
+	TAILQ_FOREACH_SAFE(lw_thread, &reactor->threads, link, tmp) {   /* [한국어] 자기 reactor 의 모든 lw_thread 후처리. */
+		count += reactor_post_process_lw_thread(reactor, lw_thread) ? 1 : 0;    /* [한국어] true 반환 (재배치/destroy 발생) 시 카운트. fd_group 콜백 시그니처가 처리 수 반환 요구. */
 	}
 
 	return count;
@@ -2407,8 +2449,8 @@ reactor_schedule_thread_event(void *arg)
 static int
 reactor_interrupt_init(struct spdk_reactor *reactor)
 {
-	struct spdk_event_handler_opts opts = {};       /* [한국어] fd_group 콜백 옵션 — fd_type 등. */
-	int rc;
+	struct spdk_event_handler_opts opts = {};       /* [한국어] fd_group 콜백 옵션 — fd_type 등. 0 초기화 후 get_default_event_handler_opts 로 기본값 채움. */
+	int rc;                                         /* [한국어] 각 단계 system call 의 반환 코드. */
 
 	rc = spdk_fd_group_create(&reactor->fgrp);      /* [한국어] epoll fd 생성. fgrp 가 NULL 이면 interrupt 모드 비활성. */
 	if (rc != 0) {
@@ -2485,10 +2527,10 @@ reactor_interrupt_init(struct spdk_reactor *reactor)
 static void
 reactor_interrupt_fini(struct spdk_reactor *reactor)
 {
-	struct spdk_fd_group *fgrp = reactor->fgrp;
+	struct spdk_fd_group *fgrp = reactor->fgrp;     /* [한국어] reactor 의 epoll fd_group — init 실패 시 NULL. */
 
 	if (!fgrp) {
-		return;
+		return;                                 /* [한국어] init 안 됐거나 이전에 fini 됨 — 안전한 no-op. */
 	}
 
 	spdk_fd_group_remove(fgrp, reactor->events_fd);         /* [한국어] events_fd 콜백 제거. */
@@ -2505,21 +2547,28 @@ reactor_interrupt_fini(struct spdk_reactor *reactor)
  * [한국어]
  * _governor_find - g_governor_list 에서 이름으로 governor 검색
  *
- * @name: governor 이름.
- * @return: 일치 governor 또는 NULL.
+ * @name: governor 이름 (예: "dpdk_governor"). NULL 불가.
+ * @return: 일치 governor 포인터 또는 NULL (없을 시).
+ *
+ * governor 플러그인은 SPDK_GOVERNOR_REGISTER 매크로(constructor)로
+ * g_governor_list TAILQ 에 등록된다. spdk_governor_set 의 이름 → 객체 룩업 및
+ * 중복 등록 검사용. 단일 스레드(메인 reactor)에서만 호출되므로 별도 락 불필요.
+ *
+ * 호출 체인:
+ *   spdk_governor_set / spdk_governor_register → [_governor_find]
  */
 static struct spdk_governor *
 _governor_find(const char *name)
 {
-	struct spdk_governor *governor, *tmp;   /* [한국어] _SAFE 버전 사용 — 콜백이 리스트 수정해도 안전. */
+	struct spdk_governor *governor, *tmp;   /* [한국어] 순회 노드 + _SAFE 버전 임시 포인터 — 콜백이 리스트 수정해도 안전. governor 검색 자체는 노드를 지우지 않지만, 동일 헬퍼 시그니처를 따르기 위함. */
 
-	TAILQ_FOREACH_SAFE(governor, &g_governor_list, link, tmp) {
-		if (strcmp(name, governor->name) == 0) {
-			return governor;
+	TAILQ_FOREACH_SAFE(governor, &g_governor_list, link, tmp) {     /* [한국어] g_governor_list 의 link 필드를 따라 모든 노드 순회 (BSD TAILQ 매크로). _SAFE 버전이 tmp 에 next 를 미리 저장해 둠. */
+		if (strcmp(name, governor->name) == 0) {                /* [한국어] 이름 문자열 비교 — governor->name 은 빌드 시점 정적 상수. */
+			return governor;                                /* [한국어] 일치 발견 시 즉시 반환 — 중복 등록은 spdk_governor_register 가 거부. */
 		}
 	}
 
-	return NULL;
+	return NULL;                            /* [한국어] 전체 순회 후 미발견 — 호출자가 -EINVAL 등으로 처리. */
 }
 
 /*
@@ -2539,64 +2588,81 @@ _governor_find(const char *name)
 int
 spdk_governor_set(const char *name)
 {
-	struct spdk_governor *governor;
-	int rc = 0;
+	struct spdk_governor *governor;         /* [한국어] 새로 활성화할 governor 후보 포인터. */
+	int rc = 0;                             /* [한국어] 반환 코드 — init 실패 시 음수 errno 전달. */
 
 	/* NULL governor was specifically requested */
-	if (name == NULL) {
-		if (g_governor) {
-			g_governor->deinit();
+	if (name == NULL) {                     /* [한국어] NULL 입력 = "주파수 조절 비활성" 의도. RPC 로 명시적 OFF 가능. */
+		if (g_governor) {               /* [한국어] 기존 활성 governor 가 있으면 정상 종료 시킨다. */
+			g_governor->deinit();   /* [한국어] 플러그인 deinit 콜백 — 주파수 설정을 시스템 기본값으로 복원하고 내부 자원 해제. */
 		}
-		g_governor = NULL;
+		g_governor = NULL;              /* [한국어] 전역 포인터 클리어 — 이후 spdk_governor_get 가 NULL 반환. */
 		return 0;
 	}
 
-	governor = _governor_find(name);
-	if (governor == NULL) {
+	governor = _governor_find(name);        /* [한국어] 이름으로 등록 리스트 검색. */
+	if (governor == NULL) {                 /* [한국어] 미등록 이름 — 사용자 입력 오류. */
 		return -EINVAL;
 	}
 
-	if (g_governor == governor) {           /* [한국어] 이미 같음 — no-op. */
+	if (g_governor == governor) {           /* [한국어] 이미 같은 governor 가 활성 — 아무것도 안 하고 OK. */
 		return 0;
 	}
 
-	rc = governor->init();                  /* [한국어] 새 governor init 시도. */
-	if (rc == 0) {                          /* [한국어] 성공 시에만 기존 deinit + 교체. */
-		if (g_governor) {
+	rc = governor->init();                  /* [한국어] 새 governor init 시도 — CPU 주파수 sysfs 진입 권한 검사, MSR 매핑 등. */
+	if (rc == 0) {                          /* [한국어] 성공 시에만 기존 deinit + 교체 (scheduler 와 반대 순서). */
+		if (g_governor) {               /* [한국어] 시스템 전역 영향이 있는 주파수 조절을 안정적으로 인계하기 위해 새 것이 확실히 init 된 뒤 기존 것을 deinit. */
 			g_governor->deinit();
 		}
-		g_governor = governor;
+		g_governor = governor;          /* [한국어] 전역 포인터 갱신 — 다음 _reactors_scheduler_balance 가 새 governor 사용. */
 	}
 
-	return rc;
+	return rc;                              /* [한국어] init 의 반환값을 그대로 사용자에게 전달 (성공 0, 실패 음수 errno). */
 }
 
 /*
  * [한국어]
  * spdk_governor_get - 현재 활성 governor 반환
+ *
+ * @return: 현재 활성 governor 포인터, 비활성이면 NULL.
+ *
+ * 단순 getter. RPC framework_get_governor 등에서 이름 조회용. lock 없음 —
+ * 포인터 읽기는 원자적이고 토글 빈도가 낮음.
+ *
+ * 호출 체인:
+ *   RPC / scheduler 페이즈 → [spdk_governor_get]
  */
 struct spdk_governor *
 spdk_governor_get(void)
 {
-	return g_governor;
+	return g_governor;      /* [한국어] 전역 포인터 그대로 반환 (NULL 가능). */
 }
 
 /*
  * [한국어]
  * spdk_governor_register - governor 플러그인 등록 (constructor 시점)
  *
- * 동일 이름 중복 등록은 assert(false).
+ * @governor: 등록할 governor 객체 (정적 저장 수명). name 필드가 고유해야 함.
+ *
+ * SPDK_GOVERNOR_REGISTER 매크로가 __attribute__((constructor)) 로 호출하여
+ * main 진입 전 자동 등록. 동일 이름 중복 등록은 assert(false) 로 즉시 abort —
+ * 빌드 구성 오류 신호.
+ *
+ * 실행 컨텍스트: 프로세스 시작 단일 스레드 (constructor) — 락 불필요.
+ *
+ * 호출 체인:
+ *   SPDK_GOVERNOR_REGISTER (constructor) → [spdk_governor_register]
  */
 void
 spdk_governor_register(struct spdk_governor *governor)
 {
-	if (_governor_find(governor->name)) {
+	if (_governor_find(governor->name)) {           /* [한국어] 동일 이름 사전 검사 — 두 모듈이 같은 이름으로 등록되는 빌드 구성 오류 탐지. */
 		SPDK_ERRLOG("governor named '%s' already registered.\n", governor->name);
-		assert(false);
+		assert(false);                          /* [한국어] 디버그 빌드에서는 즉시 abort — 개발자가 즉시 알 수 있도록. */
 		return;
 	}
 
-	TAILQ_INSERT_TAIL(&g_governor_list, governor, link);
+	TAILQ_INSERT_TAIL(&g_governor_list, governor, link);    /* [한국어] 리스트 끝에 삽입. 등록 순서 = constructor 순서. */
 }
 
 SPDK_LOG_REGISTER_COMPONENT(reactor)    /* [한국어] "reactor" 로그 컴포넌트 등록 — SPDK_DEBUGLOG(reactor, ...) 가 이 이름의 활성화 여부에 따라 출력. */

@@ -658,15 +658,21 @@ vbdev_passthru_get_io_channel(void *ctx)
 static int
 vbdev_passthru_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 {
+	/* [한국어] bdev_fn_table.dump_info_json 콜백 — ctx는 spdk_bdev_register 시 등록한 pt_bdev.ctxt. */
 	struct vbdev_passthru *pt_node = (struct vbdev_passthru *)ctx;
 
+	/* [한국어] "passthru" 키 시작 — bdev_get_bdevs 응답의 driver_specific 섹션에 추가됨. */
 	spdk_json_write_name(w, "passthru");
+	/* [한국어] 객체 시작 토큰 '{' 작성. */
 	spdk_json_write_object_begin(w);
+	/* [한국어] "name":"<vbdev 이름>" 키-값 쌍 작성. spdk_bdev_get_name은 bdev->name 반환. */
 	spdk_json_write_named_string(w, "name", spdk_bdev_get_name(&pt_node->pt_bdev));
+	/* [한국어] "base_bdev_name":"<base 이름>" — 상위 도구가 위임 관계를 인지하도록. */
 	spdk_json_write_named_string(w, "base_bdev_name", spdk_bdev_get_name(pt_node->base_bdev));
+	/* [한국어] 객체 끝 토큰 '}' 작성. */
 	spdk_json_write_object_end(w);
 
-	return 0;
+	return 0;  /* [한국어] 성공 항상 0. JSON 직렬화 자체가 실패하는 케이스는 writer 내부에서 처리. */
 }
 
 /* This is used to generate JSON that can configure this module to its current state. */
@@ -677,23 +683,32 @@ vbdev_passthru_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 static int
 vbdev_passthru_config_json(struct spdk_json_write_ctx *w)
 {
-	struct vbdev_passthru *pt_node;
+	struct vbdev_passthru *pt_node;  /* [한국어] g_pt_nodes 순회용 임시 변수. */
 
+	/* [한국어] 모든 활성 passthru 인스턴스를 RPC 호출 객체로 직렬화. save_config 시 호출됨. */
 	TAILQ_FOREACH(pt_node, &g_pt_nodes, link) {
+		/* [한국어] 현재 인스턴스의 UUID 조회 — auto-gen이면 base에서 파생된 결정적 값. */
 		const struct spdk_uuid *uuid = spdk_bdev_get_uuid(&pt_node->pt_bdev);
 
+		/* [한국어] 한 RPC 호출 객체 '{' 시작. */
 		spdk_json_write_object_begin(w);
+		/* [한국어] "method":"bdev_passthru_create" — 복원 시 호출할 RPC 메서드 이름. */
 		spdk_json_write_named_string(w, "method", "bdev_passthru_create");
+		/* [한국어] "params":{ 시작 — 메서드 인자 객체. */
 		spdk_json_write_named_object_begin(w, "params");
+		/* [한국어] params.base_bdev_name — 원본 base bdev 이름. */
 		spdk_json_write_named_string(w, "base_bdev_name", spdk_bdev_get_name(pt_node->base_bdev));
+		/* [한국어] params.name — vbdev 이름. */
 		spdk_json_write_named_string(w, "name", spdk_bdev_get_name(&pt_node->pt_bdev));
 		if (!spdk_uuid_is_null(uuid)) {
 			spdk_json_write_named_uuid(w, "uuid", uuid);  /* [한국어] 명시 UUID만 출력(자동 생성은 생략). */
 		}
+		/* [한국어] params 객체 종료. */
 		spdk_json_write_object_end(w);
+		/* [한국어] RPC 호출 객체 종료. */
 		spdk_json_write_object_end(w);
 	}
-	return 0;
+	return 0;  /* [한국어] 성공 항상 0. */
 }
 
 /* We provide this callback for the SPDK channel code to create a channel using
@@ -756,40 +771,46 @@ static int
 vbdev_passthru_insert_name(const char *bdev_name, const char *vbdev_name,
 			   const struct spdk_uuid *uuid)
 {
-	struct bdev_names *name;
+	struct bdev_names *name;  /* [한국어] 순회/할당 공용 포인터. */
 
+	/* [한국어] 중복 검사 — 동일 vbdev_name이 이미 있으면 EEXIST. */
 	TAILQ_FOREACH(name, &g_bdev_names, link) {
 		if (strcmp(vbdev_name, name->vbdev_name) == 0) {
 			SPDK_ERRLOG("passthru bdev %s already exists\n", vbdev_name);
-			return -EEXIST;
+			return -EEXIST;  /* [한국어] 호출자(RPC)가 사용자에게 그대로 전달. */
 		}
 	}
 
+	/* [한국어] calloc — 0-init 보장으로 uuid 미설정 시에도 spdk_uuid_is_null 사용 가능. */
 	name = calloc(1, sizeof(struct bdev_names));
 	if (!name) {
 		SPDK_ERRLOG("could not allocate bdev_names\n");
 		return -ENOMEM;
 	}
 
+	/* [한국어] base bdev 이름 복사 — RPC 입력이 임시일 수 있으므로 강제 strdup. */
 	name->bdev_name = strdup(bdev_name);
 	if (!name->bdev_name) {
 		SPDK_ERRLOG("could not allocate name->bdev_name\n");
-		free(name);
+		free(name);  /* [한국어] 부분 할당 누수 방지. */
 		return -ENOMEM;
 	}
 
+	/* [한국어] vbdev 이름 복사 — 동일 이유. */
 	name->vbdev_name = strdup(vbdev_name);
 	if (!name->vbdev_name) {
 		SPDK_ERRLOG("could not allocate name->vbdev_name\n");
-		free(name->bdev_name);
+		free(name->bdev_name);  /* [한국어] 역순으로 해제. */
 		free(name);
 		return -ENOMEM;
 	}
 
+	/* [한국어] UUID 복사 — NULL UUID(자동 생성 모드)도 그대로 보관 → register에서 분기. */
 	spdk_uuid_copy(&name->uuid, uuid);
+	/* [한국어] 전역 리스트 꼬리에 추가 — examine 시 순회됨. */
 	TAILQ_INSERT_TAIL(&g_bdev_names, name, link);
 
-	return 0;
+	return 0;  /* [한국어] 등록 완료. */
 }
 
 /* On init, just perform bdev module specific initialization. */
@@ -800,6 +821,9 @@ vbdev_passthru_insert_name(const char *bdev_name, const char *vbdev_name,
 static int
 vbdev_passthru_init(void)
 {
+	/* [한국어] passthru는 전역 상태(g_bdev_names/g_pt_nodes)를 TAILQ_HEAD_INITIALIZER로
+	 *           컴파일 타임 초기화하므로 런타임 init이 필요 없다. 비교: delay 모듈은
+	 *           spdk_poller_register를 위해 채널마다 초기화가 필요. */
 	return 0;
 }
 
@@ -811,13 +835,14 @@ vbdev_passthru_init(void)
 static void
 vbdev_passthru_finish(void)
 {
-	struct bdev_names *name;
+	struct bdev_names *name;  /* [한국어] head를 반복적으로 꺼낼 임시 포인터. */
 
+	/* [한국어] 모든 매핑을 head부터 순차 제거 — 모든 vbdev은 이미 destruct로 해제된 후 호출됨. */
 	while ((name = TAILQ_FIRST(&g_bdev_names))) {
-		TAILQ_REMOVE(&g_bdev_names, name, link);
-		free(name->bdev_name);
-		free(name->vbdev_name);
-		free(name);
+		TAILQ_REMOVE(&g_bdev_names, name, link);  /* [한국어] 리스트에서 분리. */
+		free(name->bdev_name);                    /* [한국어] strdup 메모리 해제. */
+		free(name->vbdev_name);                   /* [한국어] strdup 메모리 해제. */
+		free(name);                               /* [한국어] 노드 자체 해제. */
 	}
 }
 
@@ -832,6 +857,8 @@ vbdev_passthru_finish(void)
 static int
 vbdev_passthru_get_ctx_size(void)
 {
+	/* [한국어] bdev 코어는 모든 bdev_io에 driver_ctx 영역을 함께 할당한다. 본 모듈은 매 I/O마다
+	 *           passthru_bdev_io(test 마커 + bdev_io_wait + 채널)를 보관해야 하므로 그 크기를 반환. */
 	return sizeof(struct passthru_bdev_io);
 }
 
@@ -847,6 +874,8 @@ static void
 vbdev_passthru_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
 {
 	/* No config per bdev needed */
+	/* [한국어] per-bdev 옵션이 없어 noop. delay 모듈과 달리 passthru는 추가 파라미터(latency 등)가
+	 *           없으므로 모듈 레벨 config_json만으로 충분 — 위 vbdev_passthru_config_json 참조. */
 }
 
 /*
@@ -886,10 +915,13 @@ static const struct spdk_bdev_fn_table vbdev_passthru_fn_table = {
 static void
 vbdev_passthru_base_bdev_hotremove_cb(struct spdk_bdev *bdev_find)
 {
-	struct vbdev_passthru *pt_node, *tmp;
+	struct vbdev_passthru *pt_node, *tmp;  /* [한국어] SAFE 순회 — 본 루프 안에서 unregister가 노드를 제거할 수 있음. */
 
+	/* [한국어] 동일 base를 공유하는 모든 passthru 인스턴스에 대해 unregister 발행.
+	 *           unregister가 비동기이므로 spdk_bdev_unregister 호출 후 destruct가 나중에 실행됨. */
 	TAILQ_FOREACH_SAFE(pt_node, &g_pt_nodes, link, tmp) {
 		if (bdev_find == pt_node->base_bdev) {
+			/* [한국어] 비동기 unregister 시작 — cb_fn=NULL은 결과 통지 불필요. */
 			spdk_bdev_unregister(&pt_node->pt_bdev, NULL, NULL);
 		}
 	}
@@ -910,9 +942,12 @@ vbdev_passthru_base_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bd
 {
 	switch (type) {
 	case SPDK_BDEV_EVENT_REMOVE:
+		/* [한국어] hot-remove(예: NVMe surprise removal, AIO/loop 디바이스 unlink 등) —
+		 *           본 모듈은 즉시 모든 자식 vbdev을 unregister해서 상위 클라이언트가 오류를 받도록. */
 		vbdev_passthru_base_bdev_hotremove_cb(bdev);
 		break;
 	default:
+		/* [한국어] RESIZE/MEDIA_MGMT 등 다른 이벤트는 현재 미지원 — 로그만 남김. */
 		SPDK_NOTICELOG("Unsupported bdev event: type %d\n", type);
 		break;
 	}
@@ -1098,21 +1133,24 @@ int
 bdev_passthru_create_disk(const char *bdev_name, const char *vbdev_name,
 			  const struct spdk_uuid *uuid)
 {
-	int rc;
+	int rc;  /* [한국어] 단계별 결과 누적용. */
 
 	/* Insert the bdev name into our global name list even if it doesn't exist yet,
 	 * it may show up soon...
 	 */
+	/* [한국어] 1단계: 매핑 등록. base가 아직 없어도 등록해 두면 추후 examine 시 자동 활성화. */
 	rc = vbdev_passthru_insert_name(bdev_name, vbdev_name, uuid);
 	if (rc) {
-		return rc;
+		return rc;  /* [한국어] EEXIST/ENOMEM는 그대로 클라이언트에 전달. */
 	}
 
+	/* [한국어] 2단계: 즉시 vbdev 등록 시도. base가 이미 있으면 그 자리에서 활성화. */
 	rc = vbdev_passthru_register(bdev_name);
 	if (rc == -ENODEV) {
 		/* This is not an error, we tracked the name above and it still
 		 * may show up later.
 		 */
+		/* [한국어] base 부재는 정상 케이스 — 매핑은 보관됐고 examine 콜백에서 처리될 것. */
 		SPDK_NOTICELOG("vbdev creation deferred pending base bdev arrival\n");
 		rc = 0;
 	}
@@ -1135,23 +1173,27 @@ bdev_passthru_create_disk(const char *bdev_name, const char *vbdev_name,
 void
 bdev_passthru_delete_disk(const char *bdev_name, spdk_bdev_unregister_cb cb_fn, void *cb_arg)
 {
-	struct bdev_names *name;
-	int rc;
+	struct bdev_names *name;  /* [한국어] g_bdev_names 매칭 노드 포인터. */
+	int rc;                   /* [한국어] unregister 즉시 결과. */
 
 	/* Some cleanup happens in the destruct callback. */
+	/* [한국어] bdev 코어에 unregister 요청 — 동기 단계는 큐잉/검증, 실제 destruct는 비동기.
+	 *           rc==0이면 unregister가 큐잉됐고, cb_fn은 destruct 완료 시 호출됨. */
 	rc = spdk_bdev_unregister_by_name(bdev_name, &passthru_if, cb_fn, cb_arg);
 	if (rc == 0) {
 		/* Remove the association (vbdev, bdev) from g_bdev_names. This is required so that the
 		 * vbdev does not get re-created if the same bdev is constructed at some other time,
 		 * unless the underlying bdev was hot-removed.
 		 */
+		/* [한국어] g_bdev_names에서도 매핑 제거 — 사용자가 명시적으로 삭제했으므로
+		 *           이후 동일 base가 다시 examine되어도 자동 재생성되면 안 됨. */
 		TAILQ_FOREACH(name, &g_bdev_names, link) {
 			if (strcmp(name->vbdev_name, bdev_name) == 0) {
-				TAILQ_REMOVE(&g_bdev_names, name, link);
-				free(name->bdev_name);
-				free(name->vbdev_name);
-				free(name);
-				break;
+				TAILQ_REMOVE(&g_bdev_names, name, link);  /* [한국어] 리스트에서 분리. */
+				free(name->bdev_name);                    /* [한국어] base 이름 strdup 해제. */
+				free(name->vbdev_name);                   /* [한국어] vbdev 이름 strdup 해제. */
+				free(name);                               /* [한국어] 노드 자체 해제. */
+				break;                                    /* [한국어] vbdev_name은 유일 — 첫 매칭에서 종료. */
 			}
 		}
 	} else {
@@ -1176,9 +1218,11 @@ bdev_passthru_delete_disk(const char *bdev_name, spdk_bdev_unregister_cb cb_fn, 
 static void
 vbdev_passthru_examine(struct spdk_bdev *bdev)
 {
+	/* [한국어] 새로 나타난 bdev 이름으로 register 시도. 매칭 없으면 register 내부에서 no-op.
+	 *           matching된 매핑이 있다면 즉시 vbdev이 생성/노출됨. */
 	vbdev_passthru_register(bdev->name);
 
-	spdk_bdev_module_examine_done(&passthru_if);  /* [한국어] examine 완료 알림. */
+	spdk_bdev_module_examine_done(&passthru_if);  /* [한국어] examine 완료 알림 — 다음 모듈로 control 넘김. */
 }
 
 /* [한국어] "vbdev_passthru" 디버그 컴포넌트 등록. */

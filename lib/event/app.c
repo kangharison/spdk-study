@@ -752,6 +752,9 @@ spdk_app_opts_init(struct spdk_app_opts *opts, size_t opts_size)
 static int
 app_setup_signal_handlers(struct spdk_app_opts *opts)
 {
+	/* [한국어] 현재 함수는 opts를 직접 참조하지 않지만, 호출자가 NULL 가드 책임이 없도록 시그니처는 보존.
+	 *         spdk_app_start 측에서 opts->disable_signal_handlers를 보고 이 함수를 부르지 않을지 결정하므로
+	 *         여기 들어오면 무조건 핸들러를 설치한다. 향후 옵션 의존 동작이 추가될 여지 대비해 인자 받음. */
 	struct sigaction	sigact;   /* [한국어] sigaction 시스템콜 인자 — 핸들러와 동작 플래그 명세. */
 	sigset_t		sigmask;  /* [한국어] 마지막 sigprocmask 호출에 쓸 unblock 셋. */
 	int			rc;
@@ -980,8 +983,8 @@ app_setup_env(struct spdk_app_opts *opts)
 		return rc;
 	}
 
-	env_opts.opts_size = sizeof(env_opts);     /* [한국어] ABI 호환 — env 측이 새로운 필드를 추가했더라도 안전. */
-	spdk_env_opts_init(&env_opts);             /* [한국어] env 측 디폴트값(예: lcore_map=NULL) 채움. */
+	env_opts.opts_size = sizeof(env_opts);     /* [한국어] ABI 호환 — env 측이 새로운 필드를 추가했더라도 안전. spdk_env_opts_init의 SET_FIELD가 이 size 안에 맞는 필드만 디폴트 채움. */
+	spdk_env_opts_init(&env_opts);             /* [한국어] env 측 디폴트값(예: lcore_map=NULL) 채움. lib/env_dpdk/init.c 구현. */
 
 	/* [한국어] 이하 앱 옵션 → env 옵션 1:1 매핑. 의미는 옵션 정의의 인라인 주석 참고. */
 	env_opts.name = opts->name;                /* [한국어] DPDK rte_eal_init의 program name(로그/공유 메모리 prefix에 사용). */
@@ -1276,9 +1279,9 @@ app_copy_opts(struct spdk_app_opts *opts, struct spdk_app_opts *opts_user, size_
 static int
 unclaim_cpu_cores(uint32_t *failed_core)
 {
-	char core_name[40];  /* [한국어] /var/tmp/spdk_cpu_lock_NNN 경로 합성 버퍼. */
-	uint32_t i;
-	int rc;
+	char core_name[40];  /* [한국어] /var/tmp/spdk_cpu_lock_NNN 경로 합성 버퍼. SPDK_CONFIG_MAX_LCORES가 1024라도 3자리이므로 40바이트면 충분. */
+	uint32_t i;          /* [한국어] g_core_locks 배열 순회 인덱스. error 라벨에서 *failed_core로 전달. */
+	int rc;              /* [한국어] close/unlink 시스템콜 반환값(0=성공). */
 
 	for (i = 0; i < SPDK_CONFIG_MAX_LCORES; i++) {  /* [한국어] 모든 가능한 코어 슬롯을 순회. */
 		if (g_core_locks[i] != -1 && g_core_locks[i] != 0) {  /* [한국어] -1=미점유, 0=초기화 안 된 슬롯 — 실제 fd는 양수. */
@@ -1329,8 +1332,8 @@ claim_cpu_cores(uint32_t *failed_core)
 {
 	char core_name[40];           /* [한국어] /var/tmp/spdk_cpu_lock_NNN 합성 버퍼. */
 	int core_fd, pid;             /* [한국어] core_fd: 새로 연 fd, pid: 락 보유 중인 다른 프로세스 PID. */
-	int *core_map;                /* [한국어] 락 파일을 mmap한 4바이트 영역 — PID 저장용. */
-	uint32_t core;
+	int *core_map;                /* [한국어] 락 파일을 mmap한 4바이트 영역 — PID 저장용. mmap 후 *core_map = getpid()로 자신을 표시. */
+	uint32_t core;                /* [한국어] SPDK_ENV_FOREACH_CORE가 채워주는 현재 lcore 번호. error 시 *failed_core에 기록. */
 
 	struct flock core_lock = {    /* [한국어] fcntl(F_SETLK)에 넘길 락 명세 — 파일 전체에 write lock. */
 		.l_type = F_WRLCK,    /* [한국어] write 락(=배타적). 같은 fd가 자기 자신과 충돌하진 않음. */
@@ -1465,18 +1468,20 @@ spdk_app_start(struct spdk_app_opts *opts_user, spdk_msg_fn start_fn,
 		opts->reactor_mask = SPDK_APP_DPDK_DEFAULT_CORE_MASK;  /* [한국어] -m / --lcores 둘 다 미지정 → 기본 0x1(코어 0). */
 	}
 
-	tty = ttyname(STDERR_FILENO);  /* [한국어] stderr 디바이스 경로 조회 — /dev/tty 계열 여부 판단용. */
+	tty = ttyname(STDERR_FILENO);  /* [한국어] stderr 디바이스 경로 조회 — /dev/tty 계열 여부 판단용. NULL이면 파일/파이프로 리다이렉트됨. */
+	/* [한국어] 4개 조건 AND: (1) print_level이 WARN보다 verbose (INFO/NOTICE/DEBUG),
+	 *         (2) stderr가 터미널, (3) ttyname이 유효 경로, (4) /dev/tty* 형태 — 콘솔에 직접 출력 중. */
 	if (opts->print_level > SPDK_LOG_WARN &&
 	    isatty(STDERR_FILENO) &&
 	    tty &&
 	    !strncmp(tty, "/dev/tty", strlen("/dev/tty"))) {
 		/* [한국어] 사용자가 INFO/NOTICE 출력을 켠 채로 콘솔 tty에 stderr를 그대로 두면 화면이 매우 시끄럽다.
 		 *         의도치 않은 상태일 가능성이 높아 10초 지연 + 경고 출력. */
-		printf("Warning: printing stderr to console terminal without -q option specified.\n");
-		printf("Suggest using --silence-noticelog to disable logging to stderr and\n");
-		printf("monitor syslog, or redirect stderr to a file.\n");
-		printf("(Delaying for 10 seconds...)\n");
-		sleep(10);
+		printf("Warning: printing stderr to console terminal without -q option specified.\n");  /* [한국어] 사용자에게 "stderr이 콘솔로 새고 있다"고 경고. */
+		printf("Suggest using --silence-noticelog to disable logging to stderr and\n");  /* [한국어] --silence-noticelog로 WARN 이상만 보이게 하라는 안내. */
+		printf("monitor syslog, or redirect stderr to a file.\n");  /* [한국어] 또는 syslog/파일로 리다이렉트 권장. */
+		printf("(Delaying for 10 seconds...)\n");  /* [한국어] 사용자가 메시지를 읽을 시간 제공. */
+		sleep(10);  /* [한국어] 10초 sleep — 의도 확인을 강제하는 UX 장치. */
 	}
 
 	spdk_log_set_print_level(opts->print_level);  /* [한국어] stderr 인쇄 임계 적용. */
@@ -1496,16 +1501,17 @@ spdk_app_start(struct spdk_app_opts *opts_user, spdk_msg_fn start_fn,
 
 	memset(&g_spdk_app, 0, sizeof(g_spdk_app));  /* [한국어] 전역 라이프사이클 상태 0-clear — 재진입 대응. */
 
-	/* [한국어] opts → g_spdk_app 매핑(부팅 후 다른 함수가 참조할 필드만 골라 복사). */
-	g_spdk_app.json_config_ignore_errors = opts->json_config_ignore_errors;
-	g_spdk_app.rpc_addr = opts->rpc_addr;
-	g_spdk_app.rpc_allowlist = opts->rpc_allowlist;
-	g_spdk_app.rpc_log_file = opts->rpc_log_file;
-	g_spdk_app.rpc_log_level = opts->rpc_log_level;
-	g_spdk_app.shm_id = opts->shm_id;
-	g_spdk_app.shutdown_cb = opts->shutdown_cb;
-	g_spdk_app.rc = 0;
-	g_spdk_app.stopped = false;
+	/* [한국어] opts → g_spdk_app 매핑(부팅 후 다른 함수가 참조할 필드만 골라 복사).
+	 *         opts(=opts_local)는 stack에 있어 함수 종료와 함께 사라지므로, 살아남아야 할 값은 g_spdk_app에 복사. */
+	g_spdk_app.json_config_ignore_errors = opts->json_config_ignore_errors;  /* [한국어] subsystem_load_config의 stop_on_error 부정형으로 전달됨. */
+	g_spdk_app.rpc_addr = opts->rpc_addr;                       /* [한국어] app_do_spdk_subsystem_init / app_start_application이 참조. NULL이면 RPC 서버 미동작. */
+	g_spdk_app.rpc_allowlist = opts->rpc_allowlist;             /* [한국어] STARTUP에서 bootstrap_fn이, RUNTIME에서 app_subsystem_init_done이 적용. */
+	g_spdk_app.rpc_log_file = opts->rpc_log_file;               /* [한국어] spdk_rpc_initialize의 opts.log_file로 전달. */
+	g_spdk_app.rpc_log_level = opts->rpc_log_level;             /* [한국어] spdk_rpc_initialize의 opts.log_level로 전달. */
+	g_spdk_app.shm_id = opts->shm_id;                           /* [한국어] spdk_app_get_shm_id() 공개 API와 spdk_app_setup_trace의 SHM 이름 합성에 사용. */
+	g_spdk_app.shutdown_cb = opts->shutdown_cb;                 /* [한국어] SIGINT/SIGTERM 또는 spdk_app_start_shutdown 호출 시 app_start_shutdown이 호출. */
+	g_spdk_app.rc = 0;                                          /* [한국어] 종료 코드 초기값 — app_stop이 비-제로 인자로 호출되면 그 값을 보존. */
+	g_spdk_app.stopped = false;                                 /* [한국어] 멱등성 플래그 초기화 — 첫 spdk_app_stop만 실제 종료 시퀀스 실행. */
 
 	spdk_log_set_level(SPDK_APP_DEFAULT_LOG_LEVEL);  /* [한국어] 내부 로그 임계 NOTICE 고정 — print_level과는 별개. */
 
@@ -1794,12 +1800,15 @@ static void
 usage_memory_size(void)
 {
 #ifndef __linux__
+	/* [한국어] 비-Linux(FreeBSD 등) 분기: mem_size <= 0 (미지정)이면 "사용 가능한 hugepage 전체"라는 의미를
+	 *         사람이 읽기 쉬운 문장으로 출력. else로 흘러가면 아래 공용 분기에서 MB 단위 숫자를 보여줌. */
 	if (g_default_opts.mem_size <= 0) {
 		printf("all hugepage memory)\n");  /* [한국어] FreeBSD: -1=가용 hugepage 전부. */
 	} else
 #endif
 	{
-		/* [한국어] Linux 또는 mem_size>0인 경우. mem_size가 음수이면 0으로 표시(미지정 안내). */
+		/* [한국어] Linux 또는 mem_size>0인 경우. mem_size가 음수이면 0으로 표시(미지정 안내).
+		 *         Linux는 DPDK가 동적으로 hugepage를 가져가므로 0=요청 안 함이 의미상 자연. */
 		printf("%dMB)\n", g_default_opts.mem_size >= 0 ? g_default_opts.mem_size : 0);
 	}
 }
@@ -1821,9 +1830,12 @@ usage(void (*app_usage)(void))
 {
 	printf("%s [options]\n", g_executable_name);  /* [한국어] argv[0] 기반 사용법 헤더. */
 	/* Keep entries inside categories roughly sorted by frequency of use. */
+	/* [한국어] === CPU 카테고리: 코어 선택/매핑/락/모드 관련 옵션. */
 	printf("\nCPU options:\n");
+	/* [한국어] -m: 사용자 친화적 hex 마스크(0xF=코어 0~3) 또는 DPDK 스타일 리스트 [0,1,10]. case CPUMASK_OPT_IDX 분기에서 opts->reactor_mask로 저장. */
 	printf(" -m, --cpumask <mask or list>    core mask (like 0xF) or core list of '[]' embraced for DPDK\n");
 	printf("                                 (like [0,1,10])\n");
+	/* [한국어] --lcores: DPDK lcore→CPU 매핑 고급 표현식. -m과 상호 배타. case LCORES_OPT_IDX 분기. */
 	printf("     --lcores <list>       lcore to CPU mapping list. The list is in the format:\n");
 	printf("                           <lcores[@CPUs]>[<,lcores[@CPUs]>...]\n");
 	printf("                           lcores and cpus list are grouped by '(' and ')', e.g '--lcores \"(5-7)@(10-12)\"'\n");
@@ -1831,55 +1843,93 @@ usage(void (*app_usage)(void))
 	printf("                           ',' is used for single number separator.\n");
 	printf("                           '( )' can be omitted for single element group,\n");
 	printf("                           '@' can be omitted if cpus and lcores have the same value\n");
+	/* [한국어] --disable-cpumask-locks: /var/tmp/spdk_cpu_lock_NNN 파일 생성/잠금을 생략 — 컨테이너/CI에서 권한 회피용. */
 	printf("     --disable-cpumask-locks    Disable CPU core lock files.\n");
+	/* [한국어] --interrupt-mode: 모든 poller가 interrupt 모드를 지원할 때만 효과 — eventfd 기반 wakeup으로 CPU idle 가능. */
 	printf("     --interrupt-mode      set app to interrupt mode (Warning: CPU usage will be reduced only if all\n");
 	printf("                           pollers in the app support interrupt mode)\n");
+	/* [한국어] -p: DPDK main lcore. SPDK는 app_thread를 보통 이 코어에 배치. */
 	printf(" -p, --main-core <id>      main (primary) core for DPDK\n");
 
+	/* [한국어] === Configuration 카테고리: JSON config / RPC 서버 관련. */
 	printf("\nConfiguration options:\n");
+	/* [한국어] -c/--config/--json: 세 별칭 모두 JSON config 파일 경로로 동일 처리. case CONFIG_FILE/JSON_CONFIG_OPT_IDX. */
 	printf(" -c, --config, --json  <config>     JSON config file\n");
+	/* [한국어] -r: UNIX 소켓 경로(기본 /var/tmp/spdk.sock). spdk_rpc_initialize에 전달. */
 	printf(" -r, --rpc-socket <path>   RPC listen address (default %s)\n", SPDK_DEFAULT_RPC_ADDR);
+	/* [한국어] --no-rpc-server: rpc_addr=NULL → spdk_rpc_initialize 자체를 건너뜀. -r 값은 무시됨. */
 	printf("     --no-rpc-server       skip RPC server initialization. This option ignores '--rpc-socket' value.\n");
+	/* [한국어] --wait-for-rpc: subsystem_init을 framework_start_init RPC 수신 시까지 보류 → 외부 부팅 스크립트 친화. */
 	printf("     --wait-for-rpc        wait for RPCs to initialize subsystems\n");
+	/* [한국어] --rpcs-allowed: 콤마 분리 RPC 메서드 화이트리스트 → spdk_rpc_set_allowlist 적용. */
 	printf("     --rpcs-allowed	   comma-separated list of permitted RPCS\n");
+	/* [한국어] --json-ignore-init-errors: 일부 RPC 실패해도 다음 항목 계속 — 부분 작동 가능성 우선. */
 	printf("     --json-ignore-init-errors    don't exit on invalid config entry\n");
 
+	/* [한국어] === Memory 카테고리: hugepage / 가상주소 / IOVA / 메시지 풀 관련. */
 	printf("\nMemory options:\n");
+	/* [한국어] --iova-mode: 'pa' = 물리주소(IOMMU 없음/vfio-pci with no-iommu), 'va' = 가상주소(IOMMU 사용). */
 	printf("     --iova-mode <pa/va>   set IOVA mode ('pa' for IOVA_PA and 'va' for IOVA_VA)\n");
+	/* [한국어] --base-virtaddr: hugepage 매핑 시작 가상주소. ASLR 충돌 회피로 32TiB 기본. */
 	printf("     --base-virtaddr <addr>      the base virtual address for DPDK (default: 0x200000000000)\n");
+	/* [한국어] --huge-dir: 여러 hugetlbfs mount 환경에서 특정 mount만 사용. */
 	printf("     --huge-dir <path>     use a specific hugetlbfs mount to reserve memory from\n");
+	/* [한국어] -R: hugepage backing 파일을 init 직후 unlink → 비정상 종료 시 잔여 파일 방지. */
 	printf(" -R, --huge-unlink         unlink huge files after initialization\n");
+	/* [한국어] -n: DPDK가 사용할 메모리 채널 수(NUMA/메모리 컨트롤러). -1=자동 감지. */
 	printf(" -n, --mem-channels <num>  number of memory channels used for DPDK\n");
+	/* [한국어] -s: DPDK 사전 할당 메모리(MB). usage_memory_size()가 기본값 출력. */
 	printf(" -s, --mem-size <size>     memory size in MB for DPDK (default: ");
 	usage_memory_size();
+	/* [한국어] --msg-mempool-size: SPDK thread 간 메시지 풀 슬롯 수. 0/미지정이면 calculate_mempool_size가 자동. */
 	printf("     --msg-mempool-size <size>  global message memory pool size in count (default: %d)\n",
 	       SPDK_DEFAULT_MSG_MEMPOOL_SIZE);
+	/* [한국어] --no-huge: hugepage 없이 일반 페이지로 동작 — 성능 큰 폭 저하, 주로 테스트용. */
 	printf("     --no-huge             run without using hugepages\n");
+	/* [한국어] --enforce-numa: 지정 NUMA 노드 외 할당 거부. NUMA-locality 강제. */
 	printf("     --enforce-numa        enforce NUMA allocations from the specified NUMA node\n");
+	/* [한국어] -i: SHM ID. 다중 SPDK 인스턴스 식별용. 미지정 시 pid 기반. */
 	printf(" -i, --shm-id <id>         shared memory ID (optional)\n");
+	/* [한국어] -g: hugepage 매핑을 단일 파일로 모음 → DPDK rte_eal --single-file-segments. */
 	printf(" -g, --single-file-segments   force creating just one hugetlbfs file\n");
 
+	/* [한국어] === PCI 카테고리: vfio-pci/uio_pci_generic 디바이스 필터링. */
 	printf("\nPCI options:\n");
+	/* [한국어] -A: BDF 허용 리스트(allowlist). 여러 번 사용 시 누적. -B와 상호 배타. */
 	printf(" -A, --pci-allowed <bdf>   pci addr to allow (-B and -A cannot be used at the same time)\n");
+	/* [한국어] -B: BDF 차단 리스트. 여러 번 사용 시 누적. -A와 상호 배타. */
 	printf(" -B, --pci-blocked <bdf>   pci addr to block (can be used more than once)\n");
+	/* [한국어] -u: DPDK PCI probe 자체 비활성화. 메모리/소켓 모드에서 사용. */
 	printf(" -u, --no-pci              disable PCI access\n");
+	/* [한국어] --vfio-vf-token: SR-IOV PF/VF 사이 vfio_pci 인증 UUID. */
 	printf("     --vfio-vf-token       VF token (UUID) shared between SR-IOV PF and VFs for vfio_pci driver\n");
 
+	/* [한국어] === Log 카테고리: 콘솔/syslog 임계와 모듈별 디버그 플래그. */
 	printf("\nLog options:\n");
+	/* [한국어] spdk_log_usage: lib/log/log.c가 등록된 모듈별 -L 플래그 목록을 직접 출력. */
 	spdk_log_usage(stdout, "-L");
+	/* [한국어] --silence-noticelog: print_level=WARN으로 올려 NOTICE/INFO 라인 stderr 출력 차단. */
 	printf("     --silence-noticelog   disable notice level logging to stderr\n");
 
+	/* [한국어] === Trace 카테고리: /dev/shm 기반 트레이스 버퍼 구성. */
 	printf("\nTrace options:\n");
+	/* [한국어] --num-trace-entries: 코어당 ringbuffer 슬롯 수. 0=비활성, 그 외는 2의 거듭제곱(getopt 분기에서 검증). */
 	printf("     --num-trace-entries <num>   number of trace entries for each core, must be power of 2,\n");
 	printf("                                 setting 0 to disable trace (default %d)\n",
 	       SPDK_APP_DEFAULT_NUM_TRACE_ENTRIES);
 	printf("                                 Tracepoints vary in size and can use more than one trace entry.\n");
+	/* [한국어] spdk_trace_mask_usage: 등록된 모든 tpoint 그룹(nvmf/bdev/...) 이름을 -e 사용법과 함께 출력. */
 	spdk_trace_mask_usage(stdout, "-e");
 
+	/* [한국어] === Other 카테고리: 도움말/버전/디버그/env-context. */
 	printf("\nOther options:\n");
+	/* [한국어] -h: usage() 호출 후 HELP 반환 → main이 정상 종료(exit code 0). */
 	printf(" -h, --help                show this usage\n");
+	/* [한국어] -v: SPDK_VERSION_STRING 출력 후 HELP와 동일하게 정상 종료. */
 	printf(" -v, --version             print SPDK version\n");
+	/* [한국어] -d: enable_coredump=false → setrlimit(RLIMIT_CORE) 호출 안 함. */
 	printf(" -d, --limit-coredump      do not set max coredump size to RLIM_INFINITY\n");
+	/* [한국어] --env-context: env 백엔드(주로 DPDK)에 패스스루되는 불투명 추가 인자. */
 	printf("     --env-context         Opaque context for use of the env implementation\n");
 
 	if (app_usage) {  /* [한국어] 앱 측 콜백이 있으면 별도 섹션으로 출력 — 표준 옵션과 시각적으로 분리. */
@@ -2491,9 +2541,9 @@ static void
 rpc_framework_enable_cpumask_locks(struct spdk_jsonrpc_request *request,
 				   const struct spdk_json_val *params)
 {
-	char msg[128];
-	int rc;
-	uint32_t failed_core;
+	char msg[128];        /* [한국어] 실패 시 클라이언트에 돌려줄 에러 메시지 버퍼(파일명/코어번호 합성). */
+	int rc;               /* [한국어] claim_cpu_cores 반환값(0=성공, -1=실패). */
+	uint32_t failed_core; /* [한국어] claim_cpu_cores가 실패한 코어 번호를 기록 — 사용자가 어떤 코어가 점유 중인지 진단. */
 
 	if (params != NULL) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,

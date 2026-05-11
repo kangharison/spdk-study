@@ -246,11 +246,11 @@ static void vbdev_delay_submit_request(struct spdk_io_channel *ch, struct spdk_b
 static void
 _device_unregister_cb(void *io_device)
 {
-	struct vbdev_delay *delay_node  = io_device;
+	struct vbdev_delay *delay_node  = io_device;  /* [한국어] io_device 등록 시 등록한 vbdev_delay 자체. */
 
 	/* Done with this delay_node. */
-	free(delay_node->delay_bdev.name);
-	free(delay_node);
+	free(delay_node->delay_bdev.name);  /* [한국어] strdup된 vbdev 이름 해제. */
+	free(delay_node);                    /* [한국어] vbdev_delay 본체 해제. */
 }
 
 /*
@@ -262,9 +262,9 @@ _device_unregister_cb(void *io_device)
 static void
 _vbdev_delay_destruct(void *ctx)
 {
-	struct spdk_bdev_desc *desc = ctx;
+	struct spdk_bdev_desc *desc = ctx;  /* [한국어] send_msg ctx로 전달된 base 디스크립터. */
 
-	spdk_bdev_close(desc);
+	spdk_bdev_close(desc);  /* [한국어] open한 thread에서만 안전한 호출 — wrapper 함수의 존재 이유. */
 }
 
 /*
@@ -293,10 +293,12 @@ vbdev_delay_destruct(void *ctx)
 		/* [한국어] 다른 thread에서 destruct가 일어났으면 send_msg로 open thread에 위임. */
 		spdk_thread_send_msg(delay_node->thread, _vbdev_delay_destruct, delay_node->base_desc);
 	} else {
+		/* [한국어] 동일 thread면 직접 close. */
 		spdk_bdev_close(delay_node->base_desc);
 	}
 
 	/* Unregister the io_device. */
+	/* [한국어] 4) io_device 비동기 해제 — 모든 채널이 닫히면 _device_unregister_cb이 free 수행. */
 	spdk_io_device_unregister(delay_node, _device_unregister_cb);
 
 	return 0;
@@ -318,10 +320,11 @@ vbdev_delay_destruct(void *ctx)
 static int
 _process_io_stailq(void *arg, uint64_t ticks)
 {
-	STAILQ_HEAD(, delay_bdev_io) *head = arg;
-	struct delay_bdev_io *io_ctx, *tmp;
-	int completions = 0;
+	STAILQ_HEAD(, delay_bdev_io) *head = arg;  /* [한국어] 4개 STAILQ 중 하나의 헤드. */
+	struct delay_bdev_io *io_ctx, *tmp;        /* [한국어] SAFE 순회용 — 본 루프가 노드를 제거하므로 tmp 필요. */
+	int completions = 0;                        /* [한국어] 본 호출에서 완료시킨 I/O 수. 반환값으로 사용. */
 
+	/* [한국어] 큐 머리부터 만료 시점을 검사. spdk_bdev_io_from_ctx는 driver_ctx로부터 bdev_io 컨테이너 복원. */
 	STAILQ_FOREACH_SAFE(io_ctx, head, link, tmp) {
 		if (io_ctx->completion_tick <= ticks) {
 			/* [한국어] 만료 — 큐에서 분리하고 클라이언트에 완료 통지. */
@@ -359,15 +362,19 @@ _process_io_stailq(void *arg, uint64_t ticks)
 static int
 _delay_finish_io(void *arg)
 {
-	struct delay_io_channel *delay_ch = arg;
-	uint64_t ticks = spdk_get_ticks();   /* [한국어] 현재 TSC tick — DPDK rdtsc 기반. */
-	int completions = 0;
+	struct delay_io_channel *delay_ch = arg;  /* [한국어] SPDK_POLLER_REGISTER 시 등록된 ctx — 채널 본체. */
+	uint64_t ticks = spdk_get_ticks();   /* [한국어] 현재 TSC tick — DPDK rdtsc 기반. 호출 1회로 4개 큐 모두 처리. */
+	int completions = 0;                 /* [한국어] 본 호출 동안 완료시킨 I/O 총합 — IDLE/BUSY 결정용. */
 
+	/* [한국어] 4개 큐 모두 한 번씩 처리 — 우선순위 없이 순차적으로 만료 검사.
+	 *           실제로는 각 큐가 같은 지연을 공유하므로 큐 간 만료 순서가 다를 수 있음. */
 	completions += _process_io_stailq(&delay_ch->avg_read_io, ticks);
 	completions += _process_io_stailq(&delay_ch->avg_write_io, ticks);
 	completions += _process_io_stailq(&delay_ch->p99_read_io, ticks);
 	completions += _process_io_stailq(&delay_ch->p99_write_io, ticks);
 
+	/* [한국어] BUSY 반환 시 reactor는 본 poller가 일을 하고 있다고 판단해 polling 빈도 유지.
+	 *           IDLE이 누적되면 power management/sleep 모드 진입(low power thread). */
 	return completions == 0 ? SPDK_POLLER_IDLE : SPDK_POLLER_BUSY;
 }
 
@@ -394,10 +401,10 @@ _delay_finish_io(void *arg)
 static void
 _delay_complete_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
-	struct spdk_bdev_io *orig_io = cb_arg;
-	struct vbdev_delay *delay_node = SPDK_CONTAINEROF(orig_io->bdev, struct vbdev_delay, delay_bdev);
-	struct delay_bdev_io *io_ctx = (struct delay_bdev_io *)orig_io->driver_ctx;
-	struct delay_io_channel *delay_ch = spdk_io_channel_get_ctx(io_ctx->ch);
+	struct spdk_bdev_io *orig_io = cb_arg;                                                   /* [한국어] submit 시 cb_arg로 전달한 원본 bdev_io 복원. */
+	struct vbdev_delay *delay_node = SPDK_CONTAINEROF(orig_io->bdev, struct vbdev_delay, delay_bdev);  /* [한국어] vbdev → vbdev_delay 컨테이너 매크로(offsetof 기반). */
+	struct delay_bdev_io *io_ctx = (struct delay_bdev_io *)orig_io->driver_ctx;              /* [한국어] driver_ctx에 저장된 per-IO 컨텍스트(ch, type 등). */
+	struct delay_io_channel *delay_ch = spdk_io_channel_get_ctx(io_ctx->ch);                 /* [한국어] submit 단계에서 보관한 ch에서 채널 ctx 복원. */
 
 	io_ctx->status = spdk_bdev_io_set_base_io_status(orig_io, bdev_io);  /* [한국어] base 상태를 orig에 set + 반환. */
 
@@ -445,9 +452,10 @@ _delay_complete_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 static void
 vbdev_delay_resubmit_io(void *arg)
 {
-	struct spdk_bdev_io *bdev_io = (struct spdk_bdev_io *)arg;
-	struct delay_bdev_io *io_ctx = (struct delay_bdev_io *)bdev_io->driver_ctx;
+	struct spdk_bdev_io *bdev_io = (struct spdk_bdev_io *)arg;                   /* [한국어] wait 엔트리에 cb_arg로 저장한 bdev_io. */
+	struct delay_bdev_io *io_ctx = (struct delay_bdev_io *)bdev_io->driver_ctx;  /* [한국어] 저장된 ch 복원용. */
 
+	/* [한국어] 동일 channel + 동일 bdev_io로 submit_request 재진입. is_p99/type은 재계산되므로 결정성 없음(설계상 OK). */
 	vbdev_delay_submit_request(io_ctx->ch, bdev_io);
 }
 
@@ -458,16 +466,19 @@ vbdev_delay_resubmit_io(void *arg)
 static void
 vbdev_delay_queue_io(struct spdk_bdev_io *bdev_io)
 {
-	struct delay_bdev_io *io_ctx = (struct delay_bdev_io *)bdev_io->driver_ctx;
-	struct delay_io_channel *delay_ch = spdk_io_channel_get_ctx(io_ctx->ch);
-	int rc;
+	struct delay_bdev_io *io_ctx = (struct delay_bdev_io *)bdev_io->driver_ctx;  /* [한국어] driver_ctx 내부의 wait 엔트리 사용. */
+	struct delay_io_channel *delay_ch = spdk_io_channel_get_ctx(io_ctx->ch);     /* [한국어] base 채널 추출용. */
+	int rc;                                                                       /* [한국어] queue_io_wait 결과 — 0이면 큐잉 성공. */
 
-	io_ctx->bdev_io_wait.bdev = bdev_io->bdev;
-	io_ctx->bdev_io_wait.cb_fn = vbdev_delay_resubmit_io;
-	io_ctx->bdev_io_wait.cb_arg = bdev_io;
+	/* [한국어] wait 엔트리 채우기 — base가 자원 회복 시 cb_fn(cb_arg) 호출하도록 약속. */
+	io_ctx->bdev_io_wait.bdev = bdev_io->bdev;                /* [한국어] 어느 bdev에 대한 대기인지 명시. */
+	io_ctx->bdev_io_wait.cb_fn = vbdev_delay_resubmit_io;     /* [한국어] 자원 회복 시 호출될 콜백. */
+	io_ctx->bdev_io_wait.cb_arg = bdev_io;                    /* [한국어] 콜백 인자 — 재발행할 bdev_io. */
 
+	/* [한국어] base 채널의 wait 큐에 등록. base bdev 모듈은 자원 회복 시 큐를 비우며 cb_fn을 호출. */
 	rc = spdk_bdev_queue_io_wait(bdev_io->bdev, delay_ch->base_ch, &io_ctx->bdev_io_wait);
 	if (rc != 0) {
+		/* [한국어] 큐잉 자체가 실패한 비정상 케이스 — 클라이언트에 즉시 실패 통지. */
 		SPDK_ERRLOG("Queue io failed in vbdev_delay_queue_io, rc=%d.\n", rc);
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 	}
@@ -480,11 +491,11 @@ vbdev_delay_queue_io(struct spdk_bdev_io *bdev_io)
 static void
 delay_init_ext_io_opts(struct spdk_bdev_io *bdev_io, struct spdk_bdev_ext_io_opts *opts)
 {
-	memset(opts, 0, sizeof(*opts));
-	opts->size = sizeof(*opts);
-	opts->memory_domain = bdev_io->u.bdev.memory_domain;
-	opts->memory_domain_ctx = bdev_io->u.bdev.memory_domain_ctx;
-	opts->metadata = bdev_io->u.bdev.md_buf;
+	memset(opts, 0, sizeof(*opts));                                /* [한국어] 모든 옵션 0으로 초기화 — 이후 명시 필드만 채움. */
+	opts->size = sizeof(*opts);                                    /* [한국어] ABI 호환을 위한 size 필드(구버전 SPDK 호환). */
+	opts->memory_domain = bdev_io->u.bdev.memory_domain;           /* [한국어] DPDK 외 메모리 도메인(GPU 등)이면 그대로 forwarding. */
+	opts->memory_domain_ctx = bdev_io->u.bdev.memory_domain_ctx;   /* [한국어] 도메인별 보조 컨텍스트. */
+	opts->metadata = bdev_io->u.bdev.md_buf;                       /* [한국어] DIF/DIX 메타 버퍼 포인터. passthru와 달리 dif_check_flags는 미설정. */
 }
 
 /*
@@ -497,26 +508,31 @@ static void
 delay_read_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bool success)
 {
 	struct vbdev_delay *delay_node = SPDK_CONTAINEROF(bdev_io->bdev, struct vbdev_delay,
-					 delay_bdev);
-	struct delay_io_channel *delay_ch = spdk_io_channel_get_ctx(ch);
-	struct spdk_bdev_ext_io_opts io_opts;
-	int rc;
+					 delay_bdev);                                /* [한국어] vbdev → vbdev_delay 복원. */
+	struct delay_io_channel *delay_ch = spdk_io_channel_get_ctx(ch);                 /* [한국어] 채널 ctx 추출. */
+	struct spdk_bdev_ext_io_opts io_opts;                                            /* [한국어] base에 전달할 확장 옵션. */
+	int rc;                                                                          /* [한국어] readv 결과 — 0/ENOMEM/기타. */
 
 	if (!success) {
+		/* [한국어] 버퍼 풀 고갈 — read 진행 불가, 클라이언트에 즉시 FAILED 통지. */
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		return;
 	}
 
-	delay_init_ext_io_opts(bdev_io, &io_opts);
+	delay_init_ext_io_opts(bdev_io, &io_opts);                                       /* [한국어] 메모리 도메인/메타 옵션 채움. */
+	/* [한국어] base에 readv 발행. iovs/offset/num은 원본 그대로. cb=_delay_complete_io로 완료 시 큐 적재.
+	 *           cb_arg=bdev_io로 콜백에서 orig_io 복원. */
 	rc = spdk_bdev_readv_blocks_ext(delay_node->base_desc, delay_ch->base_ch, bdev_io->u.bdev.iovs,
 					bdev_io->u.bdev.iovcnt, bdev_io->u.bdev.offset_blocks,
 					bdev_io->u.bdev.num_blocks, _delay_complete_io,
 					bdev_io, &io_opts);
 
 	if (rc == -ENOMEM) {
+		/* [한국어] base 자원 부족 — wait 큐에 등록 후 재시도 대기. */
 		SPDK_ERRLOG("No memory, start to queue io for delay.\n");
 		vbdev_delay_queue_io(bdev_io);
 	} else if (rc != 0) {
+		/* [한국어] 기타 에러(예: -EINVAL) — 회복 불가, 즉시 FAILED. */
 		SPDK_ERRLOG("ERROR on bdev_io submission!\n");
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 	}
@@ -535,19 +551,22 @@ delay_read_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, 
 static void
 vbdev_delay_reset_dev(struct spdk_io_channel_iter *i, int status)
 {
-	struct spdk_bdev_io *bdev_io = spdk_io_channel_iter_get_ctx(i);
-	struct delay_bdev_io *io_ctx = (struct delay_bdev_io *)bdev_io->driver_ctx;
-	struct delay_io_channel *delay_ch = spdk_io_channel_get_ctx(io_ctx->ch);
-	struct vbdev_delay *delay_node = spdk_io_channel_iter_get_io_device(i);
-	int rc;
+	struct spdk_bdev_io *bdev_io = spdk_io_channel_iter_get_ctx(i);             /* [한국어] for_each_channel 시작 시 ctx로 등록된 reset bdev_io. */
+	struct delay_bdev_io *io_ctx = (struct delay_bdev_io *)bdev_io->driver_ctx; /* [한국어] driver_ctx → io_ctx. */
+	struct delay_io_channel *delay_ch = spdk_io_channel_get_ctx(io_ctx->ch);    /* [한국어] reset을 트리거한 채널의 base 채널 사용. */
+	struct vbdev_delay *delay_node = spdk_io_channel_iter_get_io_device(i);     /* [한국어] iterator가 등록된 io_device(vbdev_delay). */
+	int rc;                                                                      /* [한국어] reset 결과. */
 
+	/* [한국어] 모든 채널 abort가 끝났으므로 이제 base에 실제 reset 발행 — 완료 시 _delay_complete_io로 라우팅. */
 	rc = spdk_bdev_reset(delay_node->base_desc, delay_ch->base_ch,
 			     _delay_complete_io, bdev_io);
 
 	if (rc == -ENOMEM) {
+		/* [한국어] reset도 base 자원 부족할 수 있음 — 재시도 대기. */
 		SPDK_ERRLOG("No memory, start to queue io for delay.\n");
 		vbdev_delay_queue_io(bdev_io);
 	} else if (rc != 0) {
+		/* [한국어] 회복 불가 에러 — reset 자체 실패 통지. */
 		SPDK_ERRLOG("ERROR on bdev_io submission!\n");
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 	}
@@ -562,6 +581,8 @@ vbdev_delay_reset_dev(struct spdk_io_channel_iter *i, int status)
 static void
 abort_zcopy_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
+	/* [한국어] zcopy_end(commit=false) 완료 시 호출. abort 경로에서는 결과를 검사할 필요가 없음 —
+	 *           base bdev_io만 해제하면 충분(원본 bdev_io는 호출자가 따로 ABORTED 처리). */
 	spdk_bdev_free_io(bdev_io);
 }
 
@@ -577,15 +598,17 @@ abort_zcopy_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 static void
 _abort_all_delayed_io(void *arg)
 {
-	STAILQ_HEAD(, delay_bdev_io) *head = arg;
-	struct delay_bdev_io *io_ctx, *tmp;
+	STAILQ_HEAD(, delay_bdev_io) *head = arg;  /* [한국어] 4개 STAILQ 중 하나의 헤드. */
+	struct delay_bdev_io *io_ctx, *tmp;        /* [한국어] SAFE 순회 — 본 루프가 노드 제거. */
 
+	/* [한국어] 큐에 남은 모든 I/O를 ABORTED 상태로 즉시 완료 — reset 경로의 cleanup. */
 	STAILQ_FOREACH_SAFE(io_ctx, head, link, tmp) {
-		STAILQ_REMOVE(head, io_ctx, delay_bdev_io, link);
+		STAILQ_REMOVE(head, io_ctx, delay_bdev_io, link);  /* [한국어] 큐에서 분리. */
 		if (io_ctx->zcopy_bdev_io != NULL) {
 			/* [한국어] 진행 중인 ZCOPY는 commit=false로 종료해 base 자원 회수. */
 			spdk_bdev_zcopy_end(io_ctx->zcopy_bdev_io, false, abort_zcopy_io, NULL);
 		}
+		/* [한국어] 클라이언트에 ABORTED 상태로 완료 통지(io_ctx->status는 무시). */
 		spdk_bdev_io_complete(spdk_bdev_io_from_ctx(io_ctx), SPDK_BDEV_IO_STATUS_ABORTED);
 	}
 }
@@ -600,15 +623,16 @@ _abort_all_delayed_io(void *arg)
 static void
 vbdev_delay_reset_channel(struct spdk_io_channel_iter *i)
 {
-	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
-	struct delay_io_channel *delay_ch = spdk_io_channel_get_ctx(ch);
+	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);  /* [한국어] 현재 순회 중인 채널 핸들. */
+	struct delay_io_channel *delay_ch = spdk_io_channel_get_ctx(ch);   /* [한국어] 채널 ctx — 4개 STAILQ 접근용. */
 
+	/* [한국어] 채널 내 모든 지연 큐 비우기 — 본 함수는 spdk_for_each_channel로 각 reactor에서 실행된다. */
 	_abort_all_delayed_io(&delay_ch->avg_read_io);
 	_abort_all_delayed_io(&delay_ch->avg_write_io);
 	_abort_all_delayed_io(&delay_ch->p99_read_io);
 	_abort_all_delayed_io(&delay_ch->p99_write_io);
 
-	spdk_for_each_channel_continue(i, 0);  /* [한국어] 다음 채널 진행. */
+	spdk_for_each_channel_continue(i, 0);  /* [한국어] 다음 채널 진행. 마지막 채널 이후 cpl_fn=vbdev_delay_reset_dev 호출. */
 }
 
 /*
@@ -623,23 +647,25 @@ vbdev_delay_reset_channel(struct spdk_io_channel_iter *i)
 static bool
 abort_delayed_io(void *_head, struct spdk_bdev_io *bio_to_abort)
 {
-	STAILQ_HEAD(, delay_bdev_io) *head = _head;
-	struct delay_bdev_io *io_ctx_to_abort = (struct delay_bdev_io *)bio_to_abort->driver_ctx;
-	struct delay_bdev_io *io_ctx;
+	STAILQ_HEAD(, delay_bdev_io) *head = _head;                                              /* [한국어] 검색할 큐 헤드. */
+	struct delay_bdev_io *io_ctx_to_abort = (struct delay_bdev_io *)bio_to_abort->driver_ctx; /* [한국어] 대상 I/O의 driver_ctx — 큐 노드와 비교용. */
+	struct delay_bdev_io *io_ctx;                                                            /* [한국어] 순회용. */
 
+	/* [한국어] 포인터 직접 비교 — driver_ctx는 bdev_io에 내장된 메모리이므로 주소가 유일 식별자. */
 	STAILQ_FOREACH(io_ctx, head, link) {
 		if (io_ctx == io_ctx_to_abort) {
 			/* [한국어] 일치 — 큐에서 분리 + ZCOPY 정리 + ABORTED 완료. */
 			STAILQ_REMOVE(head, io_ctx_to_abort, delay_bdev_io, link);
 			if (io_ctx->zcopy_bdev_io != NULL) {
+				/* [한국어] ZCOPY 진행 중이었으면 commit=false로 종료 — 변경분 폐기. */
 				spdk_bdev_zcopy_end(io_ctx->zcopy_bdev_io, false, abort_zcopy_io, NULL);
 			}
-			spdk_bdev_io_complete(bio_to_abort, SPDK_BDEV_IO_STATUS_ABORTED);
-			return true;
+			spdk_bdev_io_complete(bio_to_abort, SPDK_BDEV_IO_STATUS_ABORTED);  /* [한국어] 클라이언트에 즉시 ABORTED 통지. */
+			return true;  /* [한국어] 찾았음 — 호출자가 SUCCESS 응답하도록 시그널. */
 		}
 	}
 
-	return false;
+	return false;  /* [한국어] 본 큐에 없음 — 다음 큐 검색 또는 base에 위임. */
 }
 
 /*
@@ -654,7 +680,7 @@ static int
 vbdev_delay_abort(struct vbdev_delay *delay_node, struct delay_io_channel *delay_ch,
 		  struct spdk_bdev_io *bdev_io)
 {
-	struct spdk_bdev_io *bio_to_abort = bdev_io->u.abort.bio_to_abort;
+	struct spdk_bdev_io *bio_to_abort = bdev_io->u.abort.bio_to_abort;  /* [한국어] ABORT 명령의 대상 I/O — abort_io 유니온 멤버. */
 
 	/* [한국어] 4개 지연 큐 순서대로 검색 — short-circuit OR. */
 	if (abort_delayed_io(&delay_ch->avg_read_io, bio_to_abort) ||
@@ -694,9 +720,9 @@ vbdev_delay_abort(struct vbdev_delay *delay_node, struct delay_io_channel *delay
 static void
 vbdev_delay_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
-	struct vbdev_delay *delay_node = SPDK_CONTAINEROF(bdev_io->bdev, struct vbdev_delay, delay_bdev);
-	struct delay_io_channel *delay_ch = spdk_io_channel_get_ctx(ch);
-	struct delay_bdev_io *io_ctx = (struct delay_bdev_io *)bdev_io->driver_ctx;
+	struct vbdev_delay *delay_node = SPDK_CONTAINEROF(bdev_io->bdev, struct vbdev_delay, delay_bdev);  /* [한국어] bdev → vbdev_delay 컨테이너. */
+	struct delay_io_channel *delay_ch = spdk_io_channel_get_ctx(ch);                                   /* [한국어] 채널 ctx — STAILQ/base_ch 접근. */
+	struct delay_bdev_io *io_ctx = (struct delay_bdev_io *)bdev_io->driver_ctx;                        /* [한국어] driver_ctx → per-IO 컨텍스트. */
 	struct spdk_bdev_ext_io_opts io_opts;
 	int rc = 0;
 	bool is_p99;
@@ -714,13 +740,16 @@ vbdev_delay_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev
 
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
+		/* [한국어] READ — 1% 확률로 P99, 나머지는 AVG. base 발행은 get_buf_cb에서. */
 		io_ctx->type = is_p99 ? DELAY_P99_READ : DELAY_AVG_READ;
+		/* [한국어] 클라이언트 버퍼 없으면 풀에서 확보 후 delay_read_get_buf_cb 호출 (총 바이트 = num_blocks * blocklen). */
 		spdk_bdev_io_get_buf(bdev_io, delay_read_get_buf_cb,
 				     bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE:
+		/* [한국어] WRITE — type 분류 후 즉시 base에 writev. 버퍼는 클라이언트 소유 그대로 forwarding. */
 		io_ctx->type = is_p99 ? DELAY_P99_WRITE : DELAY_AVG_WRITE;
-		delay_init_ext_io_opts(bdev_io, &io_opts);
+		delay_init_ext_io_opts(bdev_io, &io_opts);  /* [한국어] 메모리 도메인/메타 옵션 채움. */
 		rc = spdk_bdev_writev_blocks_ext(delay_node->base_desc, delay_ch->base_ch, bdev_io->u.bdev.iovs,
 						 bdev_io->u.bdev.iovcnt, bdev_io->u.bdev.offset_blocks,
 						 bdev_io->u.bdev.num_blocks, _delay_complete_io,
@@ -785,9 +814,11 @@ vbdev_delay_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev
 	}
 
 	if (rc == -ENOMEM) {
+		/* [한국어] base 자원 부족 — 재시도 큐로. switch 이후 통합 처리. */
 		SPDK_ERRLOG("No memory, start to queue io for delay.\n");
 		vbdev_delay_queue_io(bdev_io);
 	} else if (rc != 0) {
+		/* [한국어] 회복 불가 에러 — 즉시 FAILED. */
 		SPDK_ERRLOG("ERROR on bdev_io submission!\n");
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 	}
@@ -800,8 +831,9 @@ vbdev_delay_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev
 static bool
 vbdev_delay_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 {
-	struct vbdev_delay *delay_node = (struct vbdev_delay *)ctx;
+	struct vbdev_delay *delay_node = (struct vbdev_delay *)ctx;  /* [한국어] register 시 등록한 ctxt. */
 
+	/* [한국어] base bdev에 직접 질의 — delay 모듈은 데이터 변형 없이 어떤 I/O 타입이든 통과시킴. */
 	return spdk_bdev_io_type_supported(delay_node->base_bdev, io_type);
 }
 
@@ -812,9 +844,11 @@ vbdev_delay_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 static struct spdk_io_channel *
 vbdev_delay_get_io_channel(void *ctx)
 {
-	struct vbdev_delay *delay_node = (struct vbdev_delay *)ctx;
-	struct spdk_io_channel *delay_ch = NULL;
+	struct vbdev_delay *delay_node = (struct vbdev_delay *)ctx;  /* [한국어] register 시 등록한 ctxt. */
+	struct spdk_io_channel *delay_ch = NULL;                     /* [한국어] 반환할 채널 — 실패 시 NULL. */
 
+	/* [한국어] 등록된 io_device(=delay_node)에 대한 새 채널을 요청. 채널이 처음 생성되는 thread면
+	 *           delay_bdev_ch_create_cb가 동기 호출되어 STAILQ/poller/base_ch 초기화 수행. */
 	delay_ch = spdk_get_io_channel(delay_node);
 
 	return delay_ch;
@@ -831,13 +865,18 @@ vbdev_delay_get_io_channel(void *ctx)
 static void
 _delay_write_conf_values(struct vbdev_delay *delay_node, struct spdk_json_write_ctx *w)
 {
-	struct spdk_uuid *uuid = &delay_node->delay_bdev.uuid;
+	struct spdk_uuid *uuid = &delay_node->delay_bdev.uuid;  /* [한국어] vbdev UUID 포인터. */
 
+	/* [한국어] "name":"<vbdev 이름>" — 클라이언트 식별자. */
 	spdk_json_write_named_string(w, "name", spdk_bdev_get_name(&delay_node->delay_bdev));
+	/* [한국어] "base_bdev_name":"<base 이름>" — 위임 대상. */
 	spdk_json_write_named_string(w, "base_bdev_name", spdk_bdev_get_name(delay_node->base_bdev));
 	if (!spdk_uuid_is_null(uuid)) {
+		/* [한국어] 명시 UUID만 출력 — 자동 생성은 base에서 파생되므로 직렬화 불필요. */
 		spdk_json_write_named_uuid(w, "uuid", uuid);
 	}
+	/* [한국어] 4개 지연을 ticks → us로 역변환하여 출력.
+	 *           ticks * SEC_TO_USEC / ticks_hz = us 단위 정수. 단순 산술 — 정밀도 손실 가능하지만 us 단위로 충분. */
 	spdk_json_write_named_int64(w, "avg_read_latency",
 				    delay_node->average_read_latency_ticks * SPDK_SEC_TO_USEC / spdk_get_ticks_hz());
 	spdk_json_write_named_int64(w, "p99_read_latency",
@@ -855,14 +894,14 @@ _delay_write_conf_values(struct vbdev_delay *delay_node, struct spdk_json_write_
 static int
 vbdev_delay_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 {
-	struct vbdev_delay *delay_node = (struct vbdev_delay *)ctx;
+	struct vbdev_delay *delay_node = (struct vbdev_delay *)ctx;  /* [한국어] register 시 ctxt. */
 
-	spdk_json_write_name(w, "delay");
-	spdk_json_write_object_begin(w);
-	_delay_write_conf_values(delay_node, w);
-	spdk_json_write_object_end(w);
+	spdk_json_write_name(w, "delay");                    /* [한국어] "delay" 키 — bdev_get_bdevs 응답의 driver_specific. */
+	spdk_json_write_object_begin(w);                     /* [한국어] '{' 시작. */
+	_delay_write_conf_values(delay_node, w);             /* [한국어] name/base/uuid/4개 지연 출력. */
+	spdk_json_write_object_end(w);                       /* [한국어] '}' 종료. */
 
-	return 0;
+	return 0;  /* [한국어] 성공 항상 0. */
 }
 
 /* This is used to generate JSON that can configure this module to its current state. */
@@ -873,15 +912,16 @@ vbdev_delay_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 static int
 vbdev_delay_config_json(struct spdk_json_write_ctx *w)
 {
-	struct vbdev_delay *delay_node;
+	struct vbdev_delay *delay_node;  /* [한국어] 순회용. */
 
+	/* [한국어] 모든 활성 delay 인스턴스를 RPC 호출 객체로 직렬화 — save_config 시 호출. */
 	TAILQ_FOREACH(delay_node, &g_delay_nodes, link) {
-		spdk_json_write_object_begin(w);
-		spdk_json_write_named_string(w, "method", "bdev_delay_create");
-		spdk_json_write_named_object_begin(w, "params");
-		_delay_write_conf_values(delay_node, w);
-		spdk_json_write_object_end(w);
-		spdk_json_write_object_end(w);
+		spdk_json_write_object_begin(w);                                       /* [한국어] 한 RPC 호출 '{' 시작. */
+		spdk_json_write_named_string(w, "method", "bdev_delay_create");        /* [한국어] 복원 시 호출할 메서드. */
+		spdk_json_write_named_object_begin(w, "params");                       /* [한국어] "params":{ */
+		_delay_write_conf_values(delay_node, w);                               /* [한국어] 동일 필드 세트로 출력. */
+		spdk_json_write_object_end(w);                                         /* [한국어] params 종료. */
+		spdk_json_write_object_end(w);                                         /* [한국어] RPC 호출 객체 종료. */
 	}
 	return 0;
 }
@@ -902,21 +942,23 @@ vbdev_delay_config_json(struct spdk_json_write_ctx *w)
 static int
 delay_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 {
-	struct delay_io_channel *delay_ch = ctx_buf;
-	struct vbdev_delay *delay_node = io_device;
+	struct delay_io_channel *delay_ch = ctx_buf;       /* [한국어] spdk_io_device_register 시 size로 지정한 영역. */
+	struct vbdev_delay *delay_node = io_device;        /* [한국어] register 시 등록한 io_device. */
 
-	/* [한국어] 4개 지연 큐 헤드 초기화. */
+	/* [한국어] 4개 지연 큐 헤드 초기화. STAILQ는 FIFO 단방향 — 만료 검사 시 머리에서 꺼냄. */
 	STAILQ_INIT(&delay_ch->avg_read_io);
 	STAILQ_INIT(&delay_ch->p99_read_io);
 	STAILQ_INIT(&delay_ch->avg_write_io);
 	STAILQ_INIT(&delay_ch->p99_write_io);
 
-	/* [한국어] 폴러 등록 — 주기 0us는 매 reactor 루프에서 호출(busy-poll 모드). */
+	/* [한국어] 폴러 등록 — 주기 0us는 매 reactor 루프에서 호출(busy-poll 모드).
+	 *           SPDK_POLLER_REGISTER 매크로는 spdk_poller_register(_delay_finish_io, delay_ch, 0)로 확장.
+	 *           반환된 핸들은 destroy_cb의 unregister에 사용. */
 	delay_ch->io_poller = SPDK_POLLER_REGISTER(_delay_finish_io, delay_ch, 0);
 	delay_ch->base_ch = spdk_bdev_get_io_channel(delay_node->base_desc);  /* [한국어] base 채널 획득. */
 	delay_ch->rand_seed = time(NULL);  /* [한국어] p99 결정용 시드 — 채널마다 독립. */
 
-	return 0;
+	return 0;  /* [한국어] 성공 항상 0. */
 }
 
 /* We provide this callback for the SPDK channel code to destroy a channel
@@ -930,9 +972,12 @@ delay_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 static void
 delay_bdev_ch_destroy_cb(void *io_device, void *ctx_buf)
 {
-	struct delay_io_channel *delay_ch = ctx_buf;
+	struct delay_io_channel *delay_ch = ctx_buf;  /* [한국어] 해제 대상 채널 ctx. */
 
+	/* [한국어] 폴러 등록 해제 — 다음 reactor 루프부터 _delay_finish_io 미호출. unregister는 즉시 동기.
+	 *           이중 포인터 인자로 호출 후 *poller=NULL이 되어 부분 정리 안전. */
 	spdk_poller_unregister(&delay_ch->io_poller);
+	/* [한국어] base 채널 반납 — refcount-- 후 0이면 base 채널 destroy. */
 	spdk_put_io_channel(delay_ch->base_ch);
 }
 
@@ -950,8 +995,9 @@ vbdev_delay_insert_association(const char *bdev_name, const char *vbdev_name,
 			       uint64_t avg_read_latency, uint64_t p99_read_latency,
 			       uint64_t avg_write_latency, uint64_t p99_write_latency)
 {
-	struct bdev_association *assoc;
+	struct bdev_association *assoc;  /* [한국어] 순회/할당 공용 포인터. */
 
+	/* [한국어] 중복 검사 — vbdev_name은 SPDK 전역에서 유일해야 함. */
 	TAILQ_FOREACH(assoc, &g_bdev_associations, link) {
 		if (strcmp(vbdev_name, assoc->vbdev_name) == 0) {
 			SPDK_ERRLOG("delay bdev %s already exists\n", vbdev_name);
@@ -959,33 +1005,39 @@ vbdev_delay_insert_association(const char *bdev_name, const char *vbdev_name,
 		}
 	}
 
+	/* [한국어] 0-init 할당 — uuid가 미지정(NULL UUID)일 때 spdk_uuid_is_null이 true 반환하도록. */
 	assoc = calloc(1, sizeof(struct bdev_association));
 	if (!assoc) {
 		SPDK_ERRLOG("could not allocate bdev_association\n");
 		return -ENOMEM;
 	}
 
+	/* [한국어] base bdev 이름 strdup — RPC 입력 수명이 짧을 수 있음. */
 	assoc->bdev_name = strdup(bdev_name);
 	if (!assoc->bdev_name) {
 		SPDK_ERRLOG("could not allocate assoc->bdev_name\n");
-		free(assoc);
+		free(assoc);  /* [한국어] 부분 할당 누수 방지. */
 		return -ENOMEM;
 	}
 
+	/* [한국어] vbdev 이름 strdup. */
 	assoc->vbdev_name = strdup(vbdev_name);
 	if (!assoc->vbdev_name) {
 		SPDK_ERRLOG("could not allocate assoc->vbdev_name\n");
-		free(assoc->bdev_name);
+		free(assoc->bdev_name);  /* [한국어] 역순 해제. */
 		free(assoc);
 		return -ENOMEM;
 	}
 
+	/* [한국어] 4개 지연 값(us)을 그대로 보관 — register 시 ticks로 변환된다. */
 	assoc->avg_read_latency = avg_read_latency;
 	assoc->p99_read_latency = p99_read_latency;
 	assoc->avg_write_latency = avg_write_latency;
 	assoc->p99_write_latency = p99_write_latency;
+	/* [한국어] UUID 복사 — NULL UUID도 그대로 보관(register에서 분기 처리). */
 	spdk_uuid_copy(&assoc->uuid, uuid);
 
+	/* [한국어] 전역 리스트 꼬리에 추가. */
 	TAILQ_INSERT_TAIL(&g_bdev_associations, assoc, link);
 
 	return 0;
@@ -1007,20 +1059,22 @@ vbdev_delay_insert_association(const char *bdev_name, const char *vbdev_name,
 int
 vbdev_delay_update_latency_value(char *delay_name, uint64_t latency_us, enum delay_io_type type)
 {
-	struct vbdev_delay *delay_node;
+	struct vbdev_delay *delay_node;  /* [한국어] 검색 결과 보관. */
 	uint64_t ticks_mhz = spdk_get_ticks_hz() / SPDK_SEC_TO_USEC;  /* [한국어] 1us 당 tick 수. */
 
 	/* [한국어] 이름으로 g_delay_nodes 검색. */
 	TAILQ_FOREACH(delay_node, &g_delay_nodes, link) {
 		if (strcmp(delay_node->delay_bdev.name, delay_name) == 0) {
-			break;
+			break;  /* [한국어] 매칭 — 이후 update. */
 		}
 	}
 
 	if (delay_node == NULL) {
-		return -ENODEV;
+		return -ENODEV;  /* [한국어] 매칭 없음. */
 	}
 
+	/* [한국어] type별로 해당 ticks 필드만 atomic 갱신. 다른 thread의 _delay_complete_io가 동시에 read해도
+	 *           64-bit 정렬된 store는 x86에서 단일 명령으로 원자적 — read-modify-write가 아니므로 안전. */
 	switch (type) {
 	case DELAY_AVG_READ:
 		delay_node->average_read_latency_ticks = ticks_mhz * latency_us;  /* [한국어] 64bit atomic store. */
@@ -1035,10 +1089,10 @@ vbdev_delay_update_latency_value(char *delay_name, uint64_t latency_us, enum del
 		delay_node->p99_write_latency_ticks = ticks_mhz * latency_us;
 		break;
 	default:
-		return -EINVAL;
+		return -EINVAL;  /* [한국어] DELAY_NONE 등 잘못된 type. */
 	}
 
-	return 0;
+	return 0;  /* [한국어] 갱신 성공. */
 }
 
 /*
@@ -1049,6 +1103,8 @@ static int
 vbdev_delay_init(void)
 {
 	/* Not allowing for .ini style configuration. */
+	/* [한국어] 전역 상태(g_bdev_associations/g_delay_nodes)는 TAILQ_HEAD_INITIALIZER로 컴파일 타임
+	 *           초기화되므로 런타임 init 불필요. .ini 스타일 설정도 미지원(RPC 전용). */
 	return 0;
 }
 
@@ -1059,13 +1115,14 @@ vbdev_delay_init(void)
 static void
 vbdev_delay_finish(void)
 {
-	struct bdev_association *assoc;
+	struct bdev_association *assoc;  /* [한국어] head 반복 추출용 임시 포인터. */
 
+	/* [한국어] 모든 매핑을 head부터 순차 제거 — 모든 vbdev은 이미 destruct로 해제된 후 호출. */
 	while ((assoc = TAILQ_FIRST(&g_bdev_associations))) {
-		TAILQ_REMOVE(&g_bdev_associations, assoc, link);
-		free(assoc->bdev_name);
-		free(assoc->vbdev_name);
-		free(assoc);
+		TAILQ_REMOVE(&g_bdev_associations, assoc, link);  /* [한국어] 리스트에서 분리. */
+		free(assoc->bdev_name);                            /* [한국어] strdup 메모리. */
+		free(assoc->vbdev_name);                           /* [한국어] strdup 메모리. */
+		free(assoc);                                       /* [한국어] 노드 본체. */
 	}
 }
 
@@ -1076,6 +1133,8 @@ vbdev_delay_finish(void)
 static int
 vbdev_delay_get_ctx_size(void)
 {
+	/* [한국어] 매 bdev_io에 함께 할당될 driver_ctx 크기 — 본 모듈의 per-IO 컨텍스트.
+	 *           status/completion_tick/type/ch/bdev_io_wait/zcopy_bdev_io/link를 모두 보관. */
 	return sizeof(struct delay_bdev_io);
 }
 
@@ -1087,6 +1146,7 @@ static void
 vbdev_delay_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
 {
 	/* No config per bdev needed */
+	/* [한국어] per-bdev 옵션이 별도로 노출되지 않아 noop. 모듈 레벨 config_json이 모든 정보를 포함. */
 }
 
 /*
@@ -1096,9 +1156,10 @@ vbdev_delay_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx
 static int
 vbdev_delay_get_memory_domains(void *ctx, struct spdk_memory_domain **domains, int array_size)
 {
-	struct vbdev_delay *delay_node = (struct vbdev_delay *)ctx;
+	struct vbdev_delay *delay_node = (struct vbdev_delay *)ctx;  /* [한국어] register 시 ctxt. */
 
 	/* Delay bdev doesn't work with data buffers, so it supports any memory domain used by base_bdev */
+	/* [한국어] delay는 데이터 버퍼를 읽지/쓰지 않으므로 base가 지원하는 메모리 도메인을 그대로 광고. */
 	return spdk_bdev_get_memory_domains(delay_node->base_bdev, domains, array_size);
 }
 
@@ -1121,11 +1182,12 @@ static const struct spdk_bdev_fn_table vbdev_delay_fn_table = {
 static void
 vbdev_delay_base_bdev_hotremove_cb(struct spdk_bdev *bdev_find)
 {
-	struct vbdev_delay *delay_node, *tmp;
+	struct vbdev_delay *delay_node, *tmp;  /* [한국어] SAFE 순회 — unregister가 노드 제거 가능. */
 
+	/* [한국어] 동일 base를 공유하는 모든 delay 인스턴스에 대해 비동기 unregister 발행. */
 	TAILQ_FOREACH_SAFE(delay_node, &g_delay_nodes, link, tmp) {
 		if (bdev_find == delay_node->base_bdev) {
-			spdk_bdev_unregister(&delay_node->delay_bdev, NULL, NULL);
+			spdk_bdev_unregister(&delay_node->delay_bdev, NULL, NULL);  /* [한국어] cb 없이 비동기 시작. */
 		}
 	}
 }
@@ -1141,9 +1203,11 @@ vbdev_delay_base_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev 
 {
 	switch (type) {
 	case SPDK_BDEV_EVENT_REMOVE:
+		/* [한국어] hot-remove — 모든 자식 delay vbdev을 즉시 unregister해 상위에 EIO 통지. */
 		vbdev_delay_base_bdev_hotremove_cb(bdev);
 		break;
 	default:
+		/* [한국어] RESIZE/MEDIA_MGMT 등은 현재 미지원 — 로그만 남김. */
 		SPDK_NOTICELOG("Unsupported bdev event: type %d\n", type);
 		break;
 	}
@@ -1181,65 +1245,70 @@ vbdev_delay_register(const char *bdev_name)
 	struct spdk_uuid ns_uuid;
 	int rc = 0;
 
-	spdk_uuid_parse(&ns_uuid, BDEV_DELAY_NAMESPACE_UUID);
+	spdk_uuid_parse(&ns_uuid, BDEV_DELAY_NAMESPACE_UUID);  /* [한국어] 문자열 namespace UUID → 16바이트 바이너리. */
 
 	/* Check our list of names from config versus this bdev and if
 	 * there's a match, create the delay_node & bdev accordingly.
 	 */
+	/* [한국어] 모든 매핑을 순회하며 bdev_name이 일치하는 항목에 대해 vbdev 생성. */
 	TAILQ_FOREACH(assoc, &g_bdev_associations, link) {
 		if (strcmp(assoc->bdev_name, bdev_name) != 0) {
-			continue;
+			continue;  /* [한국어] 다른 base에 대한 매핑은 skip. */
 		}
 
+		/* [한국어] 0-init 할당 — UUID/포인터 필드가 안전한 초기값을 갖도록. */
 		delay_node = calloc(1, sizeof(struct vbdev_delay));
 		if (!delay_node) {
 			rc = -ENOMEM;
 			SPDK_ERRLOG("could not allocate delay_node\n");
-			break;
+			break;  /* [한국어] 루프 종료, 호출자에게 ENOMEM 보고. */
 		}
+		/* [한국어] vbdev 이름 strdup — bdev->name은 자체 lifecycle. */
 		delay_node->delay_bdev.name = strdup(assoc->vbdev_name);
 		if (!delay_node->delay_bdev.name) {
 			rc = -ENOMEM;
 			SPDK_ERRLOG("could not allocate delay_bdev name\n");
-			free(delay_node);
+			free(delay_node);  /* [한국어] 부분 할당 회수. */
 			break;
 		}
-		delay_node->delay_bdev.product_name = "delay";
+		delay_node->delay_bdev.product_name = "delay";  /* [한국어] product_name은 정적 문자열로 충분. */
 
 		/* The base bdev that we're attaching to. */
+		/* [한국어] write 권한 true로 open — claim_bdev 위해 필수. event_cb로 hot-remove 등 알림 수신. */
 		rc = spdk_bdev_open_ext(bdev_name, true, vbdev_delay_base_bdev_event_cb,
 					NULL, &delay_node->base_desc);
 		if (rc) {
 			if (rc != -ENODEV) {
 				SPDK_ERRLOG("could not open bdev %s\n", bdev_name);
 			}
+			/* [한국어] open 실패 — 부분 자원 정리 후 종료. ENODEV는 정상(매핑은 이미 g_bdev_associations에 보관). */
 			free(delay_node->delay_bdev.name);
 			free(delay_node);
 			break;
 		}
 
-		bdev = spdk_bdev_desc_get_bdev(delay_node->base_desc);
-		delay_node->base_bdev = bdev;
+		bdev = spdk_bdev_desc_get_bdev(delay_node->base_desc);  /* [한국어] desc → bdev 포인터. */
+		delay_node->base_bdev = bdev;                            /* [한국어] base 포인터 보관. */
 
 		/* [한국어] base 메타 복제 — 클라이언트는 delay vbdev을 base와 동일한 디스크처럼 본다. */
-		delay_node->delay_bdev.write_cache = bdev->write_cache;
-		delay_node->delay_bdev.required_alignment = bdev->required_alignment;
-		delay_node->delay_bdev.optimal_io_boundary = bdev->optimal_io_boundary;
-		delay_node->delay_bdev.blocklen = bdev->blocklen;
-		delay_node->delay_bdev.blockcnt = bdev->blockcnt;
+		delay_node->delay_bdev.write_cache = bdev->write_cache;              /* [한국어] write cache 지원 여부. */
+		delay_node->delay_bdev.required_alignment = bdev->required_alignment;/* [한국어] DMA 정렬 요구사항. */
+		delay_node->delay_bdev.optimal_io_boundary = bdev->optimal_io_boundary; /* [한국어] 최적 I/O 경계(NVMe NOIOB). */
+		delay_node->delay_bdev.blocklen = bdev->blocklen;                    /* [한국어] 블록 크기(512/4096 등). */
+		delay_node->delay_bdev.blockcnt = bdev->blockcnt;                    /* [한국어] 총 블록 수. */
 
-		delay_node->delay_bdev.md_interleave = bdev->md_interleave;
-		delay_node->delay_bdev.md_len = bdev->md_len;
-		delay_node->delay_bdev.dif_type = bdev->dif_type;
-		delay_node->delay_bdev.dif_is_head_of_md = bdev->dif_is_head_of_md;
-		delay_node->delay_bdev.dif_check_flags = bdev->dif_check_flags;
-		delay_node->delay_bdev.dif_pi_format = bdev->dif_pi_format;
+		delay_node->delay_bdev.md_interleave = bdev->md_interleave;          /* [한국어] DIF/DIX 메타데이터 interleave 여부. */
+		delay_node->delay_bdev.md_len = bdev->md_len;                        /* [한국어] 메타 길이. */
+		delay_node->delay_bdev.dif_type = bdev->dif_type;                    /* [한국어] DIF 타입(0/1/2/3). */
+		delay_node->delay_bdev.dif_is_head_of_md = bdev->dif_is_head_of_md;  /* [한국어] DIF가 메타 헤더에 있는지. */
+		delay_node->delay_bdev.dif_check_flags = bdev->dif_check_flags;      /* [한국어] DIF 검사 플래그. */
+		delay_node->delay_bdev.dif_pi_format = bdev->dif_pi_format;          /* [한국어] DIF PI 포맷. */
 
-		delay_node->delay_bdev.ctxt = delay_node;
-		delay_node->delay_bdev.fn_table = &vbdev_delay_fn_table;
-		delay_node->delay_bdev.module = &delay_if;
+		delay_node->delay_bdev.ctxt = delay_node;                             /* [한국어] fn_table 콜백의 ctx 인자. */
+		delay_node->delay_bdev.fn_table = &vbdev_delay_fn_table;              /* [한국어] dispatch 테이블 연결. */
+		delay_node->delay_bdev.module = &delay_if;                            /* [한국어] 모듈 식별자 — claim 시 사용. */
 
-		delay_node->delay_bdev.numa = bdev->numa;
+		delay_node->delay_bdev.numa = bdev->numa;                             /* [한국어] NUMA 정보 — affinity 결정. */
 
 		/* Store the number of ticks you need to add to get the I/O expiration time. */
 		/* [한국어] us → ticks 사전 변환 — submit/complete 마다 변환 비용 절감. */
@@ -1254,35 +1323,42 @@ vbdev_delay_register(const char *bdev_name)
 			rc = spdk_uuid_generate_sha1(&delay_node->delay_bdev.uuid, &ns_uuid,
 						     (const char *)&bdev->uuid, sizeof(struct spdk_uuid));
 			if (rc) {
+				/* [한국어] SHA1 실패는 드물지만 — 부분 자원 정리 후 종료. */
 				spdk_bdev_close(delay_node->base_desc);
 				free(delay_node->delay_bdev.name);
 				free(delay_node);
 				break;
 			}
 		} else {
+			/* [한국어] 사용자가 명시한 UUID를 그대로 사용. */
 			spdk_uuid_copy(&delay_node->delay_bdev.uuid, &assoc->uuid);
 		}
 
+		/* [한국어] io_device 등록 — delay_io_channel 크기 명시. spdk_get_io_channel이 자동 할당.
+		 *           ctx_buf로 channel ctx 영역이 함께 할당되어 create_cb에 전달됨. */
 		spdk_io_device_register(delay_node, delay_bdev_ch_create_cb, delay_bdev_ch_destroy_cb,
 					sizeof(struct delay_io_channel),
 					assoc->vbdev_name);
 
 		/* Save the thread where the base device is opened */
-		delay_node->thread = spdk_get_thread();
+		delay_node->thread = spdk_get_thread();  /* [한국어] close를 동일 thread에서 수행하기 위해 보관. */
 
+		/* [한국어] base에 대한 exclusive claim — 다른 모듈이 attach 못 하게. */
 		rc = spdk_bdev_module_claim_bdev(bdev, delay_node->base_desc, delay_node->delay_bdev.module);
 		if (rc) {
 			SPDK_ERRLOG("could not claim bdev %s\n", bdev_name);
-			goto error_close;
+			goto error_close;  /* [한국어] 통합 cleanup 경로. */
 		}
 
+		/* [한국어] 마지막 단계 — vbdev을 bdev 레이어에 노출. 이 시점부터 외부 사용 가능. */
 		rc = spdk_bdev_register(&delay_node->delay_bdev);
 		if (rc) {
 			SPDK_ERRLOG("could not register delay_bdev\n");
-			spdk_bdev_module_release_bdev(delay_node->base_bdev);
+			spdk_bdev_module_release_bdev(delay_node->base_bdev);  /* [한국어] claim 해제. */
 			goto error_close;
 		}
 
+		/* [한국어] 성공 — 전역 리스트에 추가. passthru와 달리 register 성공 후 INSERT한다. */
 		TAILQ_INSERT_TAIL(&g_delay_nodes, delay_node, link);
 	}
 
@@ -1316,24 +1392,28 @@ create_delay_disk(const char *bdev_name, const char *vbdev_name, struct spdk_uui
 		  uint64_t avg_read_latency,
 		  uint64_t p99_read_latency, uint64_t avg_write_latency, uint64_t p99_write_latency)
 {
-	int rc = 0;
+	int rc = 0;  /* [한국어] 단계별 결과 누적. */
 
+	/* [한국어] 의미적 검증 — p99는 평균 이상이어야 함. 아니면 통계적으로 무효한 설정. */
 	if (p99_read_latency < avg_read_latency || p99_write_latency < avg_write_latency) {
 		SPDK_ERRLOG("Unable to create a delay bdev where p99 latency is less than average latency.\n");
 		return -EINVAL;
 	}
 
+	/* [한국어] 1단계: 매핑 등록. base가 아직 없어도 보관됨. */
 	rc = vbdev_delay_insert_association(bdev_name, vbdev_name, uuid, avg_read_latency, p99_read_latency,
 					    avg_write_latency, p99_write_latency);
 	if (rc) {
-		return rc;
+		return rc;  /* [한국어] EEXIST/ENOMEM 그대로 전달. */
 	}
 
+	/* [한국어] 2단계: 즉시 vbdev 등록 시도. */
 	rc = vbdev_delay_register(bdev_name);
 	if (rc == -ENODEV) {
 		/* This is not an error, we tracked the name above and it still
 		 * may show up later.
 		 */
+		/* [한국어] base 부재는 정상 — examine에서 처리. 클라이언트에는 성공으로 보고. */
 		SPDK_NOTICELOG("vbdev creation deferred pending base bdev arrival\n");
 		rc = 0;
 	}
@@ -1353,22 +1433,24 @@ create_delay_disk(const char *bdev_name, const char *vbdev_name, struct spdk_uui
 void
 delete_delay_disk(const char *vbdev_name, spdk_bdev_unregister_cb cb_fn, void *cb_arg)
 {
-	struct bdev_association *assoc;
-	int rc;
+	struct bdev_association *assoc;  /* [한국어] 매핑 검색 결과. */
+	int rc;                           /* [한국어] unregister 즉시 결과. */
 
+	/* [한국어] 비동기 unregister 시작 — 실제 destruct는 콜백에서 완료된다. */
 	rc = spdk_bdev_unregister_by_name(vbdev_name, &delay_if, cb_fn, cb_arg);
 	if (rc == 0) {
+		/* [한국어] g_bdev_associations에서도 매핑 제거 — 같은 base가 재등록되어도 자동 재생성 방지. */
 		TAILQ_FOREACH(assoc, &g_bdev_associations, link) {
 			if (strcmp(assoc->vbdev_name, vbdev_name) == 0) {
-				TAILQ_REMOVE(&g_bdev_associations, assoc, link);
-				free(assoc->bdev_name);
-				free(assoc->vbdev_name);
-				free(assoc);
-				break;
+				TAILQ_REMOVE(&g_bdev_associations, assoc, link);  /* [한국어] 분리. */
+				free(assoc->bdev_name);                            /* [한국어] strdup 해제. */
+				free(assoc->vbdev_name);                           /* [한국어] strdup 해제. */
+				free(assoc);                                       /* [한국어] 노드 해제. */
+				break;                                             /* [한국어] vbdev_name 유일. */
 			}
 		}
 	} else {
-		cb_fn(cb_arg, rc);
+		cb_fn(cb_arg, rc);  /* [한국어] 즉시 실패 — cb_fn에 에러 코드 전달, 비동기 경로 안 탐. */
 	}
 }
 
@@ -1379,9 +1461,10 @@ delete_delay_disk(const char *vbdev_name, spdk_bdev_unregister_cb cb_fn, void *c
 static void
 vbdev_delay_examine(struct spdk_bdev *bdev)
 {
+	/* [한국어] 새로 등록된 base 이름으로 vbdev 생성 시도. 매핑이 없으면 register 내부 no-op. */
 	vbdev_delay_register(bdev->name);
 
-	spdk_bdev_module_examine_done(&delay_if);
+	spdk_bdev_module_examine_done(&delay_if);  /* [한국어] examine 완료 알림 — 다음 모듈에 control 전달. */
 }
 
 /* [한국어] "vbdev_delay" 디버그 컴포넌트 등록. */

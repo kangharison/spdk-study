@@ -137,10 +137,10 @@ rpc_bdev_delay_update_latency(struct spdk_jsonrpc_request *request,
 	if (spdk_json_decode_object(params, rpc_bdev_delay_update_latency_decoders,
 				    SPDK_COUNTOF(rpc_bdev_delay_update_latency_decoders),
 				    &req)) {
-		SPDK_DEBUGLOG(vbdev_delay, "spdk_json_decode_object failed\n");
+		SPDK_DEBUGLOG(vbdev_delay, "spdk_json_decode_object failed\n");  /* [한국어] 디버그 컴포넌트는 vbdev_delay.c에서 등록. */
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
 						 "spdk_json_decode_object failed");
-		goto cleanup;
+		goto cleanup;  /* [한국어] 부분 디코딩된 문자열 free. */
 	}
 
 	/* [한국어] 문자열 → enum 매핑. strncmp의 두 번째 인자 길이는 각 토큰의 정확한 길이.
@@ -160,7 +160,11 @@ rpc_bdev_delay_update_latency(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	/* [한국어] 핵심 호출 — vbdev 내부 atomic 변수에 새 값을 store. */
+	/* [한국어] 핵심 호출 — vbdev 내부 atomic 변수에 새 값을 store.
+	 *           반환값:
+	 *             0       : 성공.
+	 *             -ENODEV : 이름의 delay vbdev이 g_delay_nodes에 없음.
+	 *             -EINVAL : 잘못된 type(정상 분기에서 발생 안 함 — 사전 검증으로 막힘). */
 	rc = vbdev_delay_update_latency_value(req.delay_bdev_name, req.latency_us, latency_type);
 
 	if (rc == -ENODEV) {
@@ -178,11 +182,11 @@ rpc_bdev_delay_update_latency(struct spdk_jsonrpc_request *request,
 		SPDK_UNREACHABLE();
 	}
 
-	/* [한국어] 성공 응답. */
+	/* [한국어] 성공 응답. boolean true는 RPC 표준 OK 시그널. */
 	spdk_jsonrpc_send_bool_response(request, true);
 
 cleanup:
-	free_rpc_update_latency(&req);  /* [한국어] strdup 문자열 정리. */
+	free_rpc_update_latency(&req);  /* [한국어] strdup 문자열 정리 — 성공/실패 무관 공통 경로. */
 }
 /* [한국어] "bdev_delay_update_latency" RPC를 디스패처에 등록. */
 SPDK_RPC_REGISTER("bdev_delay_update_latency", rpc_bdev_delay_update_latency, SPDK_RPC_RUNTIME)
@@ -279,19 +283,21 @@ rpc_bdev_delay_create(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	/* [한국어] 핵심 호출 — base bdev 위에 delay vbdev 등록. 4개 지연값을 초기치로 전달. */
+	/* [한국어] 핵심 호출 — base bdev 위에 delay vbdev 등록. 4개 지연값을 초기치로 전달.
+	 *           내부에서 p99 < avg 검증과 매핑 등록을 수행. ENODEV는 0으로 보정되어 반환됨. */
 	rc = create_delay_disk(req.base_bdev_name, req.name, &req.uuid, req.avg_read_latency,
 			       req.p99_read_latency,
 			       req.avg_write_latency, req.p99_write_latency);
 	if (rc != 0) {
+		/* [한국어] EINVAL(p99<avg), EEXIST(이름 중복), ENOMEM 등 — 그대로 클라이언트에 전달. */
 		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto cleanup;
 	}
 
 	/* [한국어] 성공 응답 — 생성된 vbdev 이름을 단일 문자열로 회신. */
-	w = spdk_jsonrpc_begin_result(request);
-	spdk_json_write_string(w, req.name);
-	spdk_jsonrpc_end_result(request, w);
+	w = spdk_jsonrpc_begin_result(request);     /* [한국어] 응답 writer 시작. */
+	spdk_json_write_string(w, req.name);        /* [한국어] 결과: vbdev 이름 문자열. */
+	spdk_jsonrpc_end_result(request, w);        /* [한국어] writer 종료 — TCP/Unix 소켓 전송. */
 
 cleanup:
 	free_rpc_construct_delay(&req);  /* [한국어] strdup 문자열 정리. */
@@ -378,7 +384,8 @@ rpc_bdev_delay_delete(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	/* [한국어] 비동기 unregister 시작. request를 cb_arg로 보존. */
+	/* [한국어] 비동기 unregister 시작. request를 cb_arg로 보존 — 콜백에서 응답 회신.
+	 *           내부에서 spdk_bdev_unregister_by_name → 모든 채널 정리 → destruct 콜백 → 본 cb. */
 	delete_delay_disk(req.name, rpc_bdev_delay_delete_cb, request);
 
 cleanup:

@@ -273,18 +273,25 @@ static int
 bdev_null_destruct(void *ctx)
 {
 	struct null_bdev *bdev = ctx;
-	/* [한국어] void * → null_bdev * 캐스트. spdk_bdev->ctxt에 자기 자신을 저장해두었으므로 안전. */
+	/* [한국어] void * → null_bdev * 캐스트. bdev_null_create에서 spdk_bdev->ctxt에 자기
+	 * 자신을 저장해두었으므로 안전한 변환. (bdev core의 fn_table 콜백 호출 시 ctxt가 첫 인자) */
 
 	TAILQ_REMOVE(&g_null_bdev_head, bdev, tailq);
 	/* [한국어] 모듈 글로벌 리스트에서 자신 제거. 이후 다른 init/fini 경로가 이 인스턴스를
-	 * 보지 못하도록 한다. 단일 스레드에서만 갱신되므로 락 불필요. */
+	 * 보지 못하도록 한다. 단일 스레드(보통 main thread)에서만 갱신되므로 락 불필요.
+	 * 만약 이 단계 이후 fini가 와도 g_null_bdev_head에 남아 있지 않으므로 안전. */
 	free(bdev->bdev.name);
-	/* [한국어] bdev_null_create에서 strdup으로 복사해둔 name 문자열 해제. */
+	/* [한국어] bdev_null_create에서 strdup으로 복사해둔 name 문자열 해제. bdev 본체는
+	 * null_bdev 안에 임베드되어 있지만 name만 별도 동적 할당이라 명시적 free 필요. */
 	free(bdev);
-	/* [한국어] null_bdev 구조체 자체 해제. (bdev 본체는 임베드되어 있으므로 같이 사라짐) */
+	/* [한국어] null_bdev 구조체 자체 해제. (spdk_bdev 본체는 임베드되어 있으므로 같이 사라짐.
+	 * 이후 이 포인터는 무효이므로 함수가 즉시 반환. ctxt가 NULL을 가리키게 정리하는 작업은
+	 * bdev core 측에서 spdk_bdev 객체 자체를 더 이상 참조하지 않으므로 불필요.) */
 
 	return 0;
-	/* [한국어] 0 = destruct 동기 완료. core가 이후 bdev_io 풀에서 해당 bdev 관련 리소스 정리. */
+	/* [한국어] 0 = destruct 동기 완료. 1을 반환하면 "async 진행 중"으로 처리되어 core가
+	 * spdk_bdev_destruct_done()을 기다린다. null bdev는 매체가 없어 정리할 비동기 작업이
+	 * 없으므로 항상 0(=sync 완료) 반환. 이후 core는 bdev_io pool에서 이 bdev 관련 자원 해제. */
 }
 
 /*
@@ -826,25 +833,46 @@ bdev_null_create(struct spdk_bdev **bdev, const struct null_bdev_opts *opts)
 	/* [한국어] 사용자 친화적 product 이름 (RPC bdev_get_bdevs 등에서 노출). 정적 문자열. */
 
 	null_disk->bdev.write_cache = 0;
-	/* [한국어] write back 캐시 없음(매체 없음 → cache flush 의미 없음). */
+	/* [한국어] write back 캐시 없음(매체 없음 → cache flush 의미 없음).
+	 * bdev core는 이 플래그를 보고 사용자에게 "FLUSH가 필요한 디바이스인가"를 알려준다.
+	 * 또한 io_type_supported에서 FLUSH를 false로 반환하는 것과 일관성을 맞춰준다. */
 	null_disk->bdev.blocklen = block_size;
-	/* [한국어] 블록 크기. 위 계산 결과. */
+	/* [한국어] 블록 크기(data + md 합산). 위 line "block_size = opts->block_size + opts->md_size"
+	 * 의 계산 결과를 그대로 노출. 모든 I/O는 이 단위의 배수로 처리된다. */
 	null_disk->bdev.preferred_write_alignment = opts->preferred_write_alignment;
-	/* [한국어] 상위 최적화 힌트로 그대로 노출. */
+	/* [한국어] 상위 컨슈머에 권장 쓰기 정렬(블록 단위)을 노출. 사용자가 명시하지 않았으면 0.
+	 * bdev core가 RPC bdev_get_bdevs 결과에 포함시켜 응답하므로, fio 같은 워크로드 도구가
+	 * 이 힌트를 활용할 수 있다. */
 	null_disk->bdev.preferred_write_granularity = opts->preferred_write_granularity;
+	/* [한국어] 권장 쓰기 단위. preferred_write_alignment와 함께 노출 힌트. null bdev에서는
+	 * 실제 매체가 없으므로 어떤 값이든 성능 영향 없음 — 테스트용 메타데이터. */
 	null_disk->bdev.optimal_write_size = opts->optimal_write_size;
+	/* [한국어] 최적 쓰기 크기(블록). 상위 레이어가 이 크기 배수로 쓰기를 정렬할 수 있는 힌트. */
 	null_disk->bdev.preferred_unmap_alignment = opts->preferred_unmap_alignment;
+	/* [한국어] UNMAP(=NVMe Deallocate / SCSI UNMAP) 권장 정렬. null bdev는 UNMAP을 지원하지
+	 * 않지만(io_type_supported가 false), 메타데이터로는 보존하여 config save/restore에서
+	 * 동일한 값을 다시 만들 수 있게 한다. */
 	null_disk->bdev.preferred_unmap_granularity = opts->preferred_unmap_granularity;
+	/* [한국어] UNMAP 권장 단위. 위와 동일한 형식적 메타데이터. */
 	null_disk->bdev.phys_blocklen = opts->physical_block_size;
 	/* [한국어] 물리 블록 크기. */
 	null_disk->bdev.blockcnt = opts->num_blocks;
 	/* [한국어] 디스크 총 블록 수. blocklen * blockcnt = 디스크 용량. */
 	null_disk->bdev.md_len = opts->md_size;
-	/* [한국어] 메타 길이. */
+	/* [한국어] 메타데이터(PI 포함) 길이(바이트). NVMe Spec §6.5 LBA Format의 MS 필드와 대응.
+	 * 0이면 메타 없음(=PI 비활성), 8 이상이면 DIF 영역으로 사용 가능. */
 	null_disk->bdev.md_interleave = true;
-	/* [한국어] null bdev는 인터리브 모드 고정 (별도 메타 영역을 가지지 않음). */
+	/* [한국어] null bdev는 인터리브 모드 고정 (별도 메타 영역을 가지지 않음).
+	 * 인터리브 모드: 한 블록 내에 [data][meta] 또는 [meta][data] 형태로 배치.
+	 * 분리(separate) 모드는 데이터 버퍼와 메타 버퍼가 다른 iovec로 전달되는 형태인데
+	 * 본 모듈은 그것을 지원하지 않으므로 단순화를 위해 항상 인터리브. */
 	null_disk->bdev.dif_type = opts->dif_type;
+	/* [한국어] DIF(Data Integrity Field) 타입을 사용자 지정 값으로 설정.
+	 * 0=Disable, 1=Type1(reftag=LBA), 2=Type2(reftag 사용자 지정), 3=Type3(reftag 검사 없음).
+	 * NVMe Base Spec §8.3 End-to-End Data Protection 참조. */
 	null_disk->bdev.dif_is_head_of_md = opts->dif_is_head_of_md;
+	/* [한국어] PI(Protection Information)가 메타데이터 영역의 머리(true) 또는 꼬리(false)에
+	 * 위치하는지. spdk_dif_generate/verify가 PI 오프셋 계산에 사용한다. */
 	/* Current block device layer API does not propagate
 	 * any DIF related information from user. So, we can
 	 * not generate or verify Application Tag.
@@ -1049,11 +1077,15 @@ static void
 null_bdev_destroy_cb(void *io_device, void *ctx_buf)
 {
 	struct null_io_channel *ch = ctx_buf;
-	/* [한국어] ctx_buf → null_io_channel로 캐스트. */
+	/* [한국어] ctx_buf → null_io_channel로 캐스트. io_device 인자는 사용하지 않음
+	 * (등록 시 키였던 &g_null_bdev_head 주소가 들어오지만 본 콜백에서는 불필요). */
 
 	spdk_poller_unregister(&ch->poller);
-	/* [한국어] poller 해제. 더 이상 null_io_poll이 호출되지 않음. 큐가 비어있어야 하지만
-	 * 본 모듈은 unregister 시점 잔여 I/O가 없다고 가정한다. */
+	/* [한국어] poller 해제. spdk_poller_unregister는 ch->poller를 NULL로 설정하고
+	 * 내부적으로 reactor에서 안전하게 떼어낸다. 이후로 null_io_poll이 호출되지 않음.
+	 * 큐가 비어있어야 하지만 본 모듈은 unregister 시점 잔여 I/O가 없다고 가정한다
+	 * (보류 I/O가 남아 있는 채로 채널이 destroy되면 메모리 누수 및 미완료 콜백 가능성).
+	 * ctx_buf 자체의 free는 SPDK thread 레이어가 수행 → 본 함수는 메모리 해제 책임 없음. */
 }
 
 /*
@@ -1113,15 +1145,25 @@ bdev_null_initialize(void)
  * [한국어]
  * dummy_bdev_event_cb - bdev_null_resize에서 spdk_bdev_open_ext에 전달하는 빈 이벤트 콜백
  *
- * @type, @bdev, @ctx: 사용하지 않음.
+ * @type: 이벤트 종류 (SPDK_BDEV_EVENT_REMOVE / SPDK_BDEV_EVENT_RESIZE 등). 미사용.
+ * @bdev: 이벤트가 발생한 bdev. 미사용.
+ * @ctx : 사용자 ctx. 미사용.
  *
  * spdk_bdev_open_ext API는 "remove/resize 이벤트가 발생했을 때 사용자에게 알리기 위한 콜백"을
- * 필수로 받는다. resize 같은 일회성 작업에서는 이벤트가 의미가 없으므로 더미를 전달.
+ * 필수로 받는다(NULL 불가). resize 같은 일회성 작업에서는 open 후 즉시 close하므로
+ * 이벤트 콜백이 호출될 일이 거의 없다 — 따라서 더미를 전달.
+ *
+ * 호출 컨텍스트: bdev core가 이벤트 통지 스레드에서 호출(만약 호출된다면).
+ *
+ * 호출 체인:
+ *   bdev core 내부 이벤트 디스패치 → [이 함수](실질적으로 호출되지 않음)
  */
 static void
 dummy_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *ctx)
 {
-	/* [한국어] 의도적으로 비어 있음. resize 작업 동안만 desc를 잡아두는 형식적 콜백. */
+	/* [한국어] 의도적으로 비어 있음. resize 작업 동안만 desc를 잡아두는 형식적 콜백.
+	 * 만약 resize 실행 중 bdev가 외부에서 unregister되어 REMOVE 이벤트가 발생하더라도
+	 * 본 함수는 무시한다(spdk_bdev_close가 모든 핸들을 정리). */
 }
 
 /*
@@ -1244,12 +1286,22 @@ static void
 bdev_null_finish(void)
 {
 	if (g_null_read_buf == NULL) {
-		/* [한국어] init이 read 버퍼 할당 전에 실패했거나 처음부터 등록되지 않음 → 추가 정리 없음. */
+		/* [한국어] init이 read 버퍼 할당 전에 실패했거나 처음부터 등록되지 않음 → 추가 정리 없음.
+		 * 이 경우 spdk_io_device_register도 호출되지 않았으므로 unregister하면 안 된다
+		 * (등록되지 않은 io device를 unregister하면 SPDK가 abort). */
 		spdk_bdev_module_fini_done();
+		/* [한국어] async_fini=true이므로 모듈 종료 완료를 코어에 즉시 통보. */
 		return;
 	}
 	spdk_io_device_unregister(&g_null_bdev_head, _bdev_null_finish_cb);
-	/* [한국어] io device 해제 후 콜백을 통해 read 버퍼 free + fini_done 호출. */
+	/* [한국어] io device 해제. 등록된 모든 코어 채널의 destroy_cb를 비동기로 호출하고,
+	 * 모두 끝나면 _bdev_null_finish_cb를 호출해 read 버퍼 free + spdk_bdev_module_fini_done.
+	 * 비동기 종료 흐름:
+	 *   spdk_io_device_unregister
+	 *     → 각 reactor에 채널 destroy 메시지 전송
+	 *     → 모든 reactor에서 null_bdev_destroy_cb 실행
+	 *     → 마지막 reactor 완료 후 _bdev_null_finish_cb (= 콜백 인자)
+	 *     → spdk_free(g_null_read_buf) + spdk_bdev_module_fini_done() */
 }
 
 SPDK_LOG_REGISTER_COMPONENT(bdev_null)
