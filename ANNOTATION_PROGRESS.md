@@ -257,7 +257,59 @@ shared_lib/            # 빌드 산출 .so
 | ☑ | lib/trace/trace.c | 2026-05-02 **완료** (병렬 agent J) — 원본 408 → 808줄. **lockless ring 핵심** — _spdk_trace_record per-lcore history.entries[next_entry++] single-producer + spdk_smp_wmb store-release → reader 항상 안전 prefix, mmap MAP_SHARED + Linux mlock no-page-fault, **entry chaining alias 트릭** — 가변 인자가 args[8] 초과 시 다음 ring 슬롯을 spdk_trace_entry_buffer (같은 24B alias) 로 재해석 + tpoint_id=MAX sentinel. |
 | ☑ | lib/trace/trace_flags.c | 2026-05-02 **완료** (병렬 agent J) — 원본 632 → 1133줄. SPDK_TRACE_REGISTER_FN constructor 자동 등록 + tgroup_id 정렬 삽입 (g_reg_fn_head 항상 group_id 순), tgroup_id/name 중복 assert(false), owner_id_start=256 레거시 충돌 회피. cleanup 정책 — entries[0].tsc==0 모든 코어 만족 시만 shm_unlink (한 entry 라도 있으면 사후 분석 위해 보존). |
 
-`lib/nvmf/*`, `lib/env_dpdk/*`, `lib/accel/*`, `lib/util/*` 일부 (bit_array/crc16/fd_group/string/dif/base64_neon/base64_sve), `lib/log/*` 완료, `lib/trace_parser/*`, `lib/scsi/*`, `lib/iscsi/*`, `lib/nbd/*`, `lib/ublk/*`, `lib/vhost/*`, `lib/blob/*`, `lib/lvol/*`, `lib/ftl/*`, `lib/fsdev/*`, `lib/fuse_dispatcher/*`, `lib/rdma_provider/*`, `lib/rdma_utils/*`, `lib/mlx5/*`, `lib/idxd/*`, `lib/ioat/*`, `lib/ae4dma/*`, `lib/vmd/*`, `lib/virtio/*`, `lib/vfio_user/*`, `lib/vfu_tgt/*`, `lib/env_ocf/*` — 각 ☐.
+`lib/nvmf/*` (auth/ctrlr_bdev/transport/nvmf 완료), `lib/env_dpdk/*` (env_internal.h, pci_dpdk.h, sigbus_handler.c, threads.c, env.c, init.c, pci_event.c, pci_dpdk.c, pci_dpdk_2207.c, pci_dpdk_2211.c 모두 완료), `lib/accel/*` (accel.c, accel_internal.h, accel_rpc.c 완료), `lib/util/*` (dif.c, base64_neon.c, base64_sve.c, bit_array.c, crc16.c, fd_group.c, string.c 완료), `lib/log/*` 완료, `lib/scsi/*` 완료, `lib/iscsi/*` 일부 (task.c, conn.h 완료), `lib/nbd/*` 완료, `lib/ublk/*` 완료, `lib/vhost/*` 일부 (vhost.c 완료), `lib/blob/*` 일부 (blob_bs_dev.c, request.c, request.h, zeroes.c 완료), `lib/ftl/*` 일부 (ftl_l2p_flat/ftl_debug/ftl_init/ftl_io/ftl_l2p 완료), `lib/fsdev/*` 완료, `lib/rdma_provider/*` 완료, `lib/rdma_utils/*` 완료, `lib/idxd/*` 일부 (idxd_internal.h, idxd_kernel.c 완료), `lib/ioat/*` 일부 (ioat_internal.h 완료), `lib/ae4dma/*` 완료, `lib/vmd/*` 일부 (vmd_internal.h, led.c 완료), `lib/virtio/*` 완료, `lib/vfu_tgt/*` 완료, `lib/env_ocf/*` 완료. **잔여 미시작**: `lib/trace_parser/*`, `lib/lvol/*`, `lib/blob/blobstore.c`, `lib/iscsi/*` 대부분, `lib/vhost/*` 대부분, `lib/ftl/*` 대부분, `lib/fuse_dispatcher/*`, `lib/mlx5/*` 대부분, `lib/idxd/*` 대부분(idxd.c, idxd_user.c), `lib/ioat/*` (ioat.c).
+
+### 2026-05-10 세션 2차 — 추가 병렬 agent (9 agent, 일부 token-limit 후 7:50pm 리셋)
+**완료된 파일 (2차)**:
+- **lib/mlx5/** mlx5_dma.c (451→928), mlx5_crypto.c (554→955), mlx5_qp.c (644→1064) — mlx5_umr.c (1273) 잔여
+- **lib/iscsi/** param.c (1199→1893), iscsi_subsystem.c (1356→2032), tgt_node.c (1422→2027) + portal_grp.c·init_grp.c 검증(이미 완료)
+- **lib/ftl/** ftl_band_ops.c (547→1034), ftl_band.c (718→1312), ftl_layout.c (876→1344), ftl_core.c (917→1538)
+- **lib/trace_parser/trace.cpp** (456→810)
+- **lib/idxd/** idxd_user.c (571→883), idxd.c (2218→2711)
+- **lib/ioat/ioat.c** (743→1101)
+- **lib/vhost/** vhost_scsi.c (1669→2807), rte_vhost_user.c (2038→2402, 일부) — vhost_internal.h(1088)·vhost_rpc.c(1165) 부분 또는 이미 상태
+- **module/bdev/null/bdev_null.c** (525→1257), **bdev/aio/bdev_aio.c** (1230→2217), **bdev/malloc/bdev_malloc.c** (1006→1195, 부분)
+- **lib/lvol/lvol.c** (2428→4069, 일부 — token-limit 도달)
+- **module/bdev/passthru/** vbdev_passthru_rpc.c (115→296), vbdev_passthru.c (788→1185, 부분)
+- **module/bdev/split/** vbdev_split_rpc.c (122→269), vbdev_split.c (495→913)
+- **module/bdev/error/** vbdev_error_rpc.c (199→393), vbdev_error.c (607→1015)
+- **module/bdev/delay/** vbdev_delay_rpc.c (190→388), vbdev_delay.c (941→1388, 부분)
+- **module/bdev/raid/** concat.c (330→728), bdev_raid_sb.c (430→899), raid0.c (449→782), bdev_raid.h (569→1038), raid1.c (634→1109) — bdev_raid_rpc.c·raid5f.c·bdev_raid.c 잔여
+
+**Token limit (7:50pm 리셋)으로 부분 또는 미반영**: lib/vhost/{vhost_internal.h, vhost_rpc.c}, module/bdev/{malloc/bdev_malloc.c rest, passthru/vbdev_passthru.c rest, delay/vbdev_delay.c rest}, lib/lvol/lvol.c rest, module/bdev/raid/{bdev_raid.c, raid5f.c}, lib/mlx5/mlx5_umr.c.
+
+### 2026-05-10 세션 1차 — 대규모 병렬 agent (12 agent, 각 자체 완료/일부 token-limit)
+**완료된 파일 (이번 세션)**:
+- **lib/env_dpdk/** 10 파일 전체: env_internal.h (73→279), pci_dpdk.h (87→245), sigbus_handler.c (109→272), threads.c (200→444), env.c (500→1048), init.c (858→1238), pci_event.c (231→444), pci_dpdk.c (232→642), pci_dpdk_2207.c (249→594), pci_dpdk_2211.c (256→504)
+- **lib/accel/** accel_internal.h (이미), accel_rpc.c (503→796)
+- **lib/util/dif.c** 2917→4165 (대규모, T10 DIF/DIX 전체 함수/매크로/구조체 + stream API + remap)
+- **lib/util/base64_sve.c** 853→969 (NEON은 이미 완료 상태)
+- **lib/rdma_provider/** 3 파일: common.c (160→391), rdma_provider_verbs.c (192→434), rdma_provider_mlx5_dv.c (349→705)
+- **lib/rdma_utils/rdma_utils.c** 553→1118
+- **lib/idxd/** idxd_internal.h (160→594), idxd_kernel.c (211→446)
+- **lib/vmd/** vmd_internal.h (149→453), led.c (138→323)
+- **lib/vfu_tgt/** tgt_internal.h (32→149), tgt_rpc.c (59→167)
+- **lib/env_ocf/** mpool.c (145→345), ocf_env.c (177→423), mpool.h (36→133), ocf_env_headers.h (15→45), ocf_env_list.h (163→303)
+- **lib/fsdev/fsdev.c** 1189→2082 + fsdev_internal.h, fsdev_rpc.c (이미)
+- **lib/nvmf/** ctrlr_discovery.c (334→577), nvmf.c (2099→3471, 전체 완료) — stubs.c, mdns_server.c는 이미 완료 상태였음
+- **lib/ublk/** ublk_internal.h (78→269), ublk_rpc.c (357→687)
+- **lib/nbd/nbd.c** 1429→1968 (nbd_rpc.c는 이미 완료 상태)
+- **lib/vhost/vhost.c** 535→1123
+- **lib/iscsi/task.c** 82→222
+- **lib/virtio/** virtio.c (702→1314), virtio_pci.c (779→1357), virtio_vfio_user.c (465→763), virtio_vhost_user.c (1063→1675) — 4 파일 전체
+- **lib/ftl/** ftl_l2p_flat.c (197→515), ftl_debug.c (223→460), ftl_init.c (233→475), ftl_io.c (248→501), ftl_l2p.c (254→593)
+- **module/bdev/malloc/** bdev_malloc.h (35→188), bdev_malloc_rpc.c (117→348)
+- **module/bdev/null/** bdev_null_rpc.c (164→400)
+- **module/bdev/aio/** bdev_aio_rpc.c (175→413)
+- **module/bdev/passthru/** vbdev_passthru.h (35→143)
+- **module/bdev/split/** vbdev_split.h (40→149)
+- **module/bdev/error/** vbdev_error.h (60→183)
+- **module/bdev/delay/** vbdev_delay.h (59→174)
+- **lib/mlx5/mlx5_priv.h** 334→842
+
+**확인만 (이미 완료 상태)**: lib/util/{bit_array.c, crc16.c, fd_group.c, string.c, base64_neon.c}, lib/scsi/{scsi_rpc.c, port.c, scsi.c, task.c}, lib/nbd/nbd_internal.h, lib/nbd/nbd_rpc.c, lib/iscsi/conn.h, lib/blob/{zeroes.c, blob_bs_dev.c, request.c, request.h}, lib/ae4dma/ 전체, lib/ioat/ioat_internal.h, lib/nvmf/{stubs.c, mdns_server.c}, lib/fsdev/{fsdev_internal.h, fsdev_rpc.c}.
+
+**Token limit 도달로 부분 또는 미반영 (다음 세션 재시도)**: module/bdev/{null/bdev_null.c, malloc/bdev_malloc.c, passthru/vbdev_passthru_rpc.c+vbdev_passthru.c, split/vbdev_split_rpc.c+vbdev_split.c, error/vbdev_error_rpc.c+vbdev_error.c, delay/vbdev_delay_rpc.c+vbdev_delay.c}, lib/mlx5/{mlx5_dma.c, mlx5_crypto.c, mlx5_qp.c}.
 
 제외: `lib/ut/`, `lib/ut_mock/` (단위 테스트 보조), 필요 시에만 주석.
 

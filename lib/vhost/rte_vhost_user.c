@@ -4,57 +4,149 @@
  *   Copyright (c) 2021 Mellanox Technologies LTD. All rights reserved.
  */
 
+/*
+ * [한국어 설명] SPDK vhost <-> DPDK rte_vhost 통합 레이어 (rte_vhost_user.c)
+ *
+ * === 파일의 역할 ===
+ * 이 파일은 SPDK vhost 백엔드와 DPDK rte_vhost 라이브러리 사이의 어댑터다.
+ * DPDK rte_vhost는 QEMU와의 vhost-user 프로토콜(UNIX 소켓 위 메시지 교환,
+ * 게스트 메모리 mmap, virtqueue 셋업 등)을 모두 처리해 주는 라이브러리이지만,
+ * 이를 SPDK의 단일 thread reactor 모델과 결합하려면:
+ *   - DPDK 내부 pthread에서 호출되는 콜백을 SPDK thread로 옮기고,
+ *   - GPA→VVA 변환, used ring/IRQ 시그널링, dirty page 로깅, inflight 처리,
+ *   - virtqueue desc chain 순회 (split/packed) 등 핵심 헬퍼를 제공해야 한다.
+ * 이 모든 결합 코드가 이 파일에 있다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ *   [QEMU/게스트 VM]
+ *      ↕ (UNIX 도메인 소켓, vhost-user 메시지)
+ *   [DPDK rte_vhost 라이브러리]
+ *      ↕ (콜백: new_device/destroy_device/new_connection/.../get_config 등)
+ *   [이 파일: rte_vhost_user.c]   <— SPDK ↔ DPDK 어댑터
+ *      ↕ (spdk_thread_send_msg/sem_wait)
+ *   [vhost_blk.c / vhost_scsi.c] (백엔드)
+ *
+ * 호출 컨텍스트: 두 종류 thread를 명확히 구분.
+ *   1) DPDK pthread (rte_vhost 내부): 콜백(new_device 등) 진입점. 동기 호출.
+ *   2) SPDK reactor thread: vsession이 할당된 lcore의 spdk_thread.
+ * 두 thread 사이는 dpdk_sem 세마포어로 동기화 (DPDK pthread가 wait, SPDK가 post).
+ *
+ * === 타 모듈과의 연결 ===
+ * - 의존: rte_vhost.h, vhost_internal.h, spdk/thread.h, spdk_internal/vhost_user.h.
+ * - 사용처: vhost_blk.c, vhost_scsi.c (백엔드 콜백 vtable 통해), vhost.c (공통 인프라).
+ * - 데이터 흐름:
+ *     게스트 메모리 → rte_vhost가 mmap → vhost_session_mem_register로 DPDK env에 등록 →
+ *     백엔드가 vhost_gpa_to_vva로 호스트 주소 변환해 SPDK bdev I/O 발급.
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - vhost_gpa_to_vva: 게스트 GPA → 호스트 VVA 변환 (모든 백엔드의 핵심 헬퍼).
+ * - vhost_vq_avail_ring_get / vhost_vq_used_ring_enqueue / vhost_vq_used_signal:
+ *   split ring 처리 핵심 (avail 폴, used 등록, IRQ).
+ * - vhost_vq_get_desc / _packed: descriptor 체인 획득.
+ * - vhost_vring_desc_to_iov / _packed_desc_to_iov: desc → 호스트 iovec 변환.
+ * - new_connection / destroy_connection / new_device / destroy_device:
+ *   DPDK rte_vhost가 호출하는 콜백들 (vhost-user 라이프사이클).
+ * - vhost_user_session_send_event: DPDK pthread → SPDK thread 메시지 전달 + sem_wait.
+ * - vhost_user_session_start / stop: 백엔드 콜백 디스패처 (foreach_session 패턴 사용).
+ * - vhost_register_unix_socket: UNIX 소켓을 rte_vhost에 등록 (디바이스 생성 시 호출).
+ * - vhost_session_install_rte_compat_hooks: DPDK 버전별 콜백 호환 등록.
+ * - dpdk_sem 동기화 패턴: DPDK 콜백 → 메시지 enqueue → sem_wait → SPDK가 post.
+ */
+
 #include "spdk/stdinc.h"
+/* [한국어] 표준 C 헤더 통합. */
 
 #include "spdk/env.h"
+/* [한국어] DPDK 환경 추상화. */
 #include "spdk/likely.h"
+/* [한국어] 분기 힌트. */
 #include "spdk/string.h"
+/* [한국어] spdk_strerror 등. */
 #include "spdk/util.h"
+/* [한국어] SPDK_CONTAINEROF 등. */
 #include "spdk/memory.h"
+/* [한국어] DMA 메모리 등록 헬퍼. */
 #include "spdk/barrier.h"
+/* [한국어] spdk_smp_rmb/wmb 등 메모리 배리어 (멀티코어 가시성 보장). */
 #include "spdk/vhost.h"
+/* [한국어] vhost 공개 API. */
 #include "vhost_internal.h"
+/* [한국어] vhost 내부 헤더. */
 #include <rte_version.h>
+/* [한국어] DPDK 버전 매크로 — 콜백 시그니처가 버전마다 다르므로 #if 분기에 사용. */
 
 #include "spdk_internal/vhost_user.h"
+/* [한국어] SPDK 내부 vhost-user 인터페이스 (spdk_vhost_fini_cb 등). */
 
 /* Path to folder where character device will be created. Can be set by user. */
 static char g_vhost_user_dev_dirname[PATH_MAX] = "";
+/* [한국어] vhost-user UNIX 소켓을 만들 디렉토리(보통 /var/tmp). 사용자가 spdk_vhost_set_socket_path로 설정.
+ * 빈 문자열이면 path 인자가 절대 경로여야 함. */
 
 static struct spdk_thread *g_vhost_user_init_thread;
+/* [한국어] vhost-user 서브시스템 초기화 시점의 thread 포인터.
+ * 디바이스 등록 등 관리 작업의 기본 thread로 사용. */
 
 struct vhost_session_fn_ctx {
 	/** Device pointer obtained before enqueueing the event */
 	struct spdk_vhost_dev *vdev;
+	/* [한국어] foreach_session enqueue 시점에 캡처한 vdev 포인터.
+	 * 콜백 진입 시 vdev 유효성 보장(이 컨텍스트가 살아있으면 unregister 진행 안 됨). */
 
 	/** ID of the session to send event to. */
 	uint32_t vsession_id;
+	/* [한국어] 대상 세션의 SPDK 자체 ID — 콜백 진입 후 vid_to_session으로 변환. */
 
 	/** User provided function to be executed on session's thread. */
 	spdk_vhost_session_fn cb_fn;
+	/* [한국어] 세션의 lcore에서 호출될 사용자 콜백. */
 
 	/**
 	 * User provided function to be called on the init thread
 	 * after iterating through all sessions.
 	 */
 	spdk_vhost_dev_fn cpl_fn;
+	/* [한국어] 모든 세션 처리 후 init thread에서 호출할 완료 콜백 (옵션). */
 
 	/** Custom user context */
 	void *user_ctx;
+	/* [한국어] cb_fn/cpl_fn에 전달할 사용자 컨텍스트. */
 };
 
 static int vhost_user_wait_for_session_stop(struct spdk_vhost_session *vsession,
 		unsigned timeout_sec, const char *errmsg);
+/* [한국어] forward declaration — DPDK pthread가 SPDK 백엔드의 stop 완료를 기다리는 함수. */
 
+/*
+ * [한국어]
+ * vhost_gpa_to_vva - 게스트 물리 주소(GPA) → 호스트 가상 주소(VVA) 변환.
+ *
+ * @vsession: 메모리 매핑 표(vsession->mem)를 보유한 세션.
+ * @addr: 변환할 게스트 물리 주소.
+ * @len: 필요한 연속 길이 (이 길이만큼이 단일 매핑 영역 안에 있어야 함).
+ * @return: 호스트 가상 주소 또는 NULL(매핑 영역 경계를 넘는 경우).
+ *
+ * 모든 백엔드가 게스트 desc/buf 접근 시 사용하는 가장 중요한 헬퍼.
+ * rte_vhost_va_from_guest_pa는 newlen에 실제 매핑된 연속 길이를 채워주므로
+ * 요청 len과 일치하지 않으면 NULL 반환 — 부분 매핑은 호출자가 처리해야 함.
+ *
+ * 호출 컨텍스트: SPDK reactor thread (백엔드 핫패스).
+ */
 void *
 vhost_gpa_to_vva(struct spdk_vhost_session *vsession, uint64_t addr, uint64_t len)
 {
 	void *vva;
+	/* [한국어] 변환 결과. */
 	uint64_t newlen;
+	/* [한국어] 실제 매핑 연속 길이 (rte_vhost가 채워줌). */
 
 	newlen = len;
+	/* [한국어] 입력 길이로 초기화. */
 	vva = (void *)rte_vhost_va_from_guest_pa(vsession->mem, addr, &newlen);
+	/* [한국어] DPDK가 mmap한 영역에서 GPA를 검색해 호스트 주소 반환.
+	 * mem은 rte_vhost_get_mem_table로 받은 게스트 메모리 영역 표. */
 	if (newlen != len) {
+		/* [한국어] 매핑 경계를 넘음 — 두 영역에 걸친 GPA, 안전하게 NULL 반환. */
 		return NULL;
 	}
 
@@ -62,6 +154,17 @@ vhost_gpa_to_vva(struct spdk_vhost_session *vsession, uint64_t addr, uint64_t le
 
 }
 
+/*
+ * [한국어]
+ * vhost_log_req_desc - 요청 desc chain의 모든 device-write buf 페이지를 dirty page log에 기록.
+ *
+ * @vsession: 세션.
+ * @virtqueue: 큐.
+ * @req_id: avail ring에서 받은 desc head 인덱스.
+ *
+ * VHOST_F_LOG_ALL이 협상돼 있을 때만 동작 — live migration 시 dirty page tracking에 사용.
+ * 실제로는 device-write buf의 전체 영역을 dirty로 표시 — 정확도보다 단순함 우선.
+ */
 static void
 vhost_log_req_desc(struct spdk_vhost_session *vsession, struct spdk_vhost_virtqueue *virtqueue,
 		   uint16_t req_id)
@@ -72,6 +175,7 @@ vhost_log_req_desc(struct spdk_vhost_session *vsession, struct spdk_vhost_virtqu
 
 	if (spdk_likely(!vhost_dev_has_feature(vsession, VHOST_F_LOG_ALL))) {
 		return;
+		/* [한국어] migration 비활성 시 fast path 즉시 리턴. */
 	}
 
 	rc = vhost_vq_get_desc(vsession, virtqueue, req_id, &desc, &desc_table, &desc_table_size);
@@ -87,11 +191,20 @@ vhost_log_req_desc(struct spdk_vhost_session *vsession, struct spdk_vhost_virtqu
 			 * Also backend most likely will touch all/most of those pages so
 			 * for lets assume we touched all pages passed to as writeable buffers. */
 			rte_vhost_log_write(vsession->vid, desc->addr, desc->len);
+			/* [한국어] 게스트 GPA 영역을 dirty로 마킹 — DPDK가 log 비트맵에 기록. */
 		}
 		vhost_vring_desc_get_next(&desc, desc_table, desc_table_size);
+		/* [한국어] 다음 desc 이동. */
 	} while (desc);
 }
 
+/*
+ * [한국어]
+ * vhost_log_used_vring_elem - used ring의 한 엔트리(idx)를 dirty page log에 기록.
+ *
+ * 게스트가 보는 used ring 자체도 마이그레이션 시 동기화돼야 하므로, 우리가 used를 갱신할 때마다
+ * 그 영역을 dirty로 표시.
+ */
 static void
 vhost_log_used_vring_elem(struct spdk_vhost_session *vsession,
 			  struct spdk_vhost_virtqueue *virtqueue,
@@ -104,9 +217,11 @@ vhost_log_used_vring_elem(struct spdk_vhost_session *vsession,
 	}
 
 	if (spdk_unlikely(virtqueue->packed.packed_ring)) {
+		/* [한국어] packed ring: 단일 desc 배열에 used flag도 함께 들어감 — 배열 i 위치 기록. */
 		offset = idx * sizeof(struct vring_packed_desc);
 		len = sizeof(struct vring_packed_desc);
 	} else {
+		/* [한국어] split ring: used 영역 ring[i] 위치만 dirty. */
 		offset = offsetof(struct vring_used, ring[idx]);
 		len = sizeof(virtqueue->vring.used->ring[idx]);
 	}
@@ -114,6 +229,12 @@ vhost_log_used_vring_elem(struct spdk_vhost_session *vsession,
 	rte_vhost_log_used_vring(vsession->vid, virtqueue->vring_idx, offset, len);
 }
 
+/*
+ * [한국어]
+ * vhost_log_used_vring_idx - used ring의 idx 필드 변경을 dirty page log에 기록.
+ *
+ * used ring의 idx 필드는 SPDK가 갱신할 때마다 게스트 측 동기화가 필요.
+ */
 static void
 vhost_log_used_vring_idx(struct spdk_vhost_session *vsession,
 			 struct spdk_vhost_virtqueue *virtqueue)
@@ -128,6 +249,7 @@ vhost_log_used_vring_idx(struct spdk_vhost_session *vsession,
 	offset = offsetof(struct vring_used, idx);
 	len = sizeof(virtqueue->vring.used->idx);
 	vq_idx = virtqueue - vsession->virtqueue;
+	/* [한국어] 포인터 산술로 큐 인덱스 추출 (배열 첫 원소 주소 빼기). */
 
 	rte_vhost_log_used_vring(vsession->vid, vq_idx, offset, len);
 }
@@ -135,22 +257,49 @@ vhost_log_used_vring_idx(struct spdk_vhost_session *vsession,
 /*
  * Get available requests from avail ring.
  */
+/*
+ * [한국어]
+ * vhost_vq_avail_ring_get - split ring avail 영역에서 새 요청들을 한 번에 가져오기.
+ *
+ * @virtqueue: 대상 큐.
+ * @reqs: 채울 desc head 인덱스 배열.
+ * @reqs_len: reqs 배열 크기 (보통 32).
+ * @return: 채워진 요청 수(<=reqs_len).
+ *
+ * 핵심 단계:
+ *   1) spdk_smp_rmb로 메모리 배리어 — avail->idx의 최신값 읽기 보장.
+ *   2) interrupt 모드면 kickfd read (0으로 클리어).
+ *   3) avail->idx - last_avail_idx로 새 요청 수 계산.
+ *   4) reqs에 desc 인덱스 복사 (size_mask로 wrap).
+ *   5) interrupt 모드에서 race 발생 시 kickfd 자가 트리거.
+ *
+ * 호출 컨텍스트: 디바이스 thread (백엔드 폴러).
+ */
 uint16_t
 vhost_vq_avail_ring_get(struct spdk_vhost_virtqueue *virtqueue, uint16_t *reqs,
 			uint16_t reqs_len)
 {
 	struct rte_vhost_vring *vring = &virtqueue->vring;
+	/* [한국어] 큐 메타. */
 	struct vring_avail *avail = vring->avail;
+	/* [한국어] avail ring 포인터 (게스트 메모리에 직접 접근). */
 	uint16_t size_mask = vring->size - 1;
+	/* [한국어] 큐 크기 - 1 (큐 size는 2의 거듭제곱이라 가정 — wrap을 비트 AND로 처리). */
 	uint16_t last_idx = virtqueue->last_avail_idx, avail_idx = avail->idx;
+	/* [한국어] 마지막 처리 인덱스(SPDK 측), 게스트가 채운 인덱스 — 둘의 차가 새 요청 수. */
 	uint16_t count, i;
+	/* [한국어] 새 요청 수, 루프 변수. */
 	int rc;
 	uint64_t u64_value;
+	/* [한국어] kickfd read/write 임시 변수. */
 
 	spdk_smp_rmb();
+	/* [한국어] 메모리 배리어 — 게스트가 desc 작성 후 avail->idx 갱신했으므로,
+	 * avail->idx 읽기 전 reordering 방지가 필요. */
 
 	if (virtqueue->vsession && spdk_unlikely(spdk_interrupt_mode_is_enabled())) {
 		/* Read to clear vring's kickfd */
+		/* [한국어] interrupt 모드에서는 kickfd가 일반 fd처럼 동작 — 이벤트 회수를 위해 read 필요. */
 		rc = read(vring->kickfd, &u64_value, sizeof(u64_value));
 		if (rc < 0) {
 			SPDK_ERRLOG("failed to acknowledge kickfd: %s.\n", spdk_strerror(errno));
@@ -159,29 +308,38 @@ vhost_vq_avail_ring_get(struct spdk_vhost_virtqueue *virtqueue, uint16_t *reqs,
 	}
 
 	count = avail_idx - last_idx;
+	/* [한국어] 16비트 wrap-around 의미 — count는 자연스럽게 모듈로 65536. */
 	if (spdk_likely(count == 0)) {
 		return 0;
+		/* [한국어] 새 요청 없음 — fast path. */
 	}
 
 	if (spdk_unlikely(count > vring->size)) {
 		/* TODO: the queue is unrecoverably broken and should be marked so.
 		 * For now we will fail silently and report there are no new avail entries.
 		 */
+		/* [한국어] 큐 크기보다 큰 요청 수 — 게스트 측 손상. 안전하게 무시. */
 		return 0;
 	}
 
 	count = spdk_min(count, reqs_len);
+	/* [한국어] 호출자가 받을 수 있는 만큼만 처리. */
 
 	virtqueue->last_avail_idx += count;
+	/* [한국어] last_avail_idx 갱신 — 다음 호출 시 여기부터 시작. */
 	/* Check whether there are unprocessed reqs in vq, then kick vq manually */
 	if (virtqueue->vsession && spdk_unlikely(spdk_interrupt_mode_is_enabled())) {
 		/* If avail_idx is larger than virtqueue's last_avail_idx, then there is unprocessed reqs.
 		 * avail_idx should get updated here from memory, in case of race condition with guest.
 		 */
+		/* [한국어] interrupt 모드 race: 게스트가 우리가 read 후 또 enqueue했을 수 있음.
+		 * avail->idx 다시 읽어 unprocessed가 있으면 자가 kickfd write로 다음 콜백 트리거. */
 		avail_idx = * (volatile uint16_t *) &avail->idx;
+		/* [한국어] volatile 캐스팅으로 컴파일러 캐시 회피 — 매번 메모리에서 읽기. */
 		if (avail_idx > virtqueue->last_avail_idx) {
 			/* Write to notify vring's kickfd */
 			rc = write(vring->kickfd, &u64_value, sizeof(u64_value));
+			/* [한국어] kickfd에 카운터 write — eventfd라면 자기 자신 깨움. */
 			if (rc < 0) {
 				SPDK_ERRLOG("failed to kick vring: %s.\n", spdk_strerror(errno));
 				return -errno;
@@ -191,6 +349,7 @@ vhost_vq_avail_ring_get(struct spdk_vhost_virtqueue *virtqueue, uint16_t *reqs,
 
 	for (i = 0; i < count; i++) {
 		reqs[i] = vring->avail->ring[(last_idx + i) & size_mask];
+		/* [한국어] avail ring[i]에 든 desc head 인덱스를 reqs로 복사. */
 	}
 
 	SPDK_DEBUGLOG(vhost_ring,
@@ -200,24 +359,55 @@ vhost_vq_avail_ring_get(struct spdk_vhost_virtqueue *virtqueue, uint16_t *reqs,
 	return count;
 }
 
+/*
+ * [한국어]
+ * vhost_vring_desc_is_indirect - split desc의 INDIRECT 플래그 검사.
+ *
+ * VIRTIO_RING_F_INDIRECT_DESC가 협상되면 게스트는 한 desc 안에 별도의 desc table 주소를 둘 수 있다.
+ * 그 desc는 head desc로만 쓰이고 실제 chain은 이 indirect table을 따라간다.
+ */
 static bool
 vhost_vring_desc_is_indirect(struct vring_desc *cur_desc)
 {
 	return !!(cur_desc->flags & VRING_DESC_F_INDIRECT);
+	/* [한국어] flags의 INDIRECT 비트 boolean 반환. */
 }
 
+/*
+ * [한국어]
+ * vhost_vring_packed_desc_is_indirect - packed desc의 INDIRECT 검사 (split과 동일 비트). */
 static bool
 vhost_vring_packed_desc_is_indirect(struct vring_packed_desc *cur_desc)
 {
 	return (cur_desc->flags & VRING_DESC_F_INDIRECT) != 0;
 }
 
+/*
+ * [한국어]
+ * vhost_inflight_packed_desc_is_indirect - inflight 영역의 packed desc INDIRECT 검사. */
 static bool
 vhost_inflight_packed_desc_is_indirect(spdk_vhost_inflight_desc *cur_desc)
 {
 	return (cur_desc->flags & VRING_DESC_F_INDIRECT) != 0;
 }
 
+/*
+ * [한국어]
+ * vhost_vq_get_desc - split ring에서 req_idx 위치 desc + desc_table 획득.
+ *
+ * @vsession: 세션 (GPA 변환에 사용).
+ * @virtqueue: 큐.
+ * @req_idx: avail에서 받은 desc head 인덱스.
+ * @desc: 출력 - 첫 desc 포인터.
+ * @desc_table: 출력 - 사용할 desc table (기본 vring 또는 indirect).
+ * @desc_table_size: 출력 - desc table 크기.
+ * @return: 0=성공, -1=실패(범위 초과 또는 indirect 매핑 실패).
+ *
+ * INDIRECT 비트가 켜져 있으면 desc->addr이 게스트 메모리의 별도 desc table을 가리킴 → 매핑하여
+ * desc를 첫 원소로 설정. 아니면 큐의 기본 desc 배열을 쓰고 desc는 큐 desc[req_idx]를 가리킴.
+ *
+ * 호출 컨텍스트: 디바이스 thread (백엔드 핫패스).
+ */
 int
 vhost_vq_get_desc(struct spdk_vhost_session *vsession, struct spdk_vhost_virtqueue *virtqueue,
 		  uint16_t req_idx, struct vring_desc **desc, struct vring_desc **desc_table,
@@ -225,15 +415,21 @@ vhost_vq_get_desc(struct spdk_vhost_session *vsession, struct spdk_vhost_virtque
 {
 	if (spdk_unlikely(req_idx >= virtqueue->vring.size)) {
 		return -1;
+		/* [한국어] 범위 가드 — 게스트가 보낸 손상된 인덱스 방어. */
 	}
 
 	*desc = &virtqueue->vring.desc[req_idx];
+	/* [한국어] 일단 큐의 desc 배열에서 가져오기. */
 
 	if (vhost_vring_desc_is_indirect(*desc)) {
+		/* [한국어] INDIRECT — desc 자체가 별도 desc table을 가리킴. */
 		*desc_table_size = (*desc)->len / sizeof(**desc);
+		/* [한국어] table 크기 = 영역 길이 / desc 크기 (16바이트). */
 		*desc_table = vhost_gpa_to_vva(vsession, (*desc)->addr,
 					       sizeof(**desc) * *desc_table_size);
+		/* [한국어] 게스트 GPA → 호스트 주소 매핑. */
 		*desc = *desc_table;
+		/* [한국어] 첫 desc는 indirect table[0]. */
 		if (*desc == NULL) {
 			return -1;
 		}
@@ -242,6 +438,7 @@ vhost_vq_get_desc(struct spdk_vhost_session *vsession, struct spdk_vhost_virtque
 	}
 
 	*desc_table = virtqueue->vring.desc;
+	/* [한국어] 일반 — 큐 desc 배열 그대로. */
 	*desc_table_size = virtqueue->vring.size;
 
 	return 0;
@@ -319,12 +516,26 @@ vhost_inflight_queue_get_desc(struct spdk_vhost_session *vsession,
 	return 0;
 }
 
+/*
+ * [한국어]
+ * vhost_vq_used_signal - 누적된 used 변경분에 대해 게스트에 IRQ(callfd) 신호 송신.
+ *
+ * @vsession: 세션.
+ * @virtqueue: 큐.
+ * @return: 1=IRQ 송신, 0=송신 안 함.
+ *
+ * used_req_cnt가 0이면 송신 불필요(게스트는 이미 모든 used를 봤음).
+ * rte_vhost_vring_call(_nonblock)이 callfd write — 게스트는 이를 IRQ로 인지.
+ *
+ * DPDK 22.11 이후 nonblock 버전 사용 — call이 차단되어 SPDK reactor를 막는 일 방지.
+ */
 int
 vhost_vq_used_signal(struct spdk_vhost_session *vsession,
 		     struct spdk_vhost_virtqueue *virtqueue)
 {
 	if (virtqueue->used_req_cnt == 0) {
 		return 0;
+		/* [한국어] 보낼 게 없음 — fast path. */
 	}
 
 	SPDK_DEBUGLOG(vhost_ring,
@@ -333,12 +544,16 @@ vhost_vq_used_signal(struct spdk_vhost_session *vsession,
 
 #if RTE_VERSION < RTE_VERSION_NUM(22, 11, 0, 0)
 	if (rte_vhost_vring_call(vsession->vid, virtqueue->vring_idx) == 0) {
+	/* [한국어] 22.11 이전: 차단형 — 콜백이 끝나야 리턴. */
 #else
 	if (rte_vhost_vring_call_nonblock(vsession->vid, virtqueue->vring_idx) == 0) {
+	/* [한국어] 22.11 이후: nonblock — 즉시 리턴, 송신 실패 시 다음에 재시도. */
 #endif
 		/* interrupt signalled */
 		virtqueue->req_cnt += virtqueue->used_req_cnt;
+		/* [한국어] 통계용 누적 — coalescing 의사결정에 사용. */
 		virtqueue->used_req_cnt = 0;
+		/* [한국어] 송신 완료 — coalescing window 리셋. */
 		return 1;
 	} else {
 		/* interrupt not signalled */
@@ -439,42 +654,82 @@ vhost_session_vq_used_signal(struct spdk_vhost_virtqueue *virtqueue)
 /*
  * Enqueue id and len to used ring.
  */
+/*
+ * [한국어]
+ * vhost_vq_used_ring_enqueue - split ring used 영역에 (id, len) 엔트리 enqueue.
+ *
+ * @vsession: 세션.
+ * @virtqueue: 큐.
+ * @id: 완료된 desc head 인덱스.
+ * @len: device가 작성한 바이트 수 (게스트가 used에서 읽음).
+ *
+ * 핵심 단계:
+ *   1) dirty page 로깅 (req desc 영역 + used ring 영역).
+ *   2) last_used_idx++ → used->ring[i] 채움.
+ *   3) spdk_smp_wmb로 ring 갱신을 idx 갱신 전 가시화.
+ *   4) inflight 영역에서 이 io를 "마지막 처리됨"으로 마킹 후, 완료 후 클리어.
+ *   5) used->idx volatile write — 게스트가 이 변화를 감지해 새 used 발견.
+ *   6) used_req_cnt++로 IRQ 송신 통계.
+ *   7) interrupt 모드면 즉시 IRQ 송신.
+ *
+ * 호출 컨텍스트: 디바이스 thread (백엔드 완료 콜백).
+ */
 void
 vhost_vq_used_ring_enqueue(struct spdk_vhost_session *vsession,
 			   struct spdk_vhost_virtqueue *virtqueue,
 			   uint16_t id, uint32_t len)
 {
 	struct rte_vhost_vring *vring = &virtqueue->vring;
+	/* [한국어] 큐 메타. */
 	struct vring_used *used = vring->used;
+	/* [한국어] used ring 포인터 (게스트 메모리). */
 	uint16_t last_idx = virtqueue->last_used_idx & (vring->size - 1);
+	/* [한국어] used ring slot 위치 (모듈로 size). */
 	uint16_t vq_idx = virtqueue->vring_idx;
+	/* [한국어] 큐 인덱스. */
 
 	SPDK_DEBUGLOG(vhost_ring,
 		      "Queue %td - USED RING: last_idx=%"PRIu16" req id=%"PRIu16" len=%"PRIu32"\n",
 		      virtqueue - vsession->virtqueue, virtqueue->last_used_idx, id, len);
 
 	vhost_log_req_desc(vsession, virtqueue, id);
+	/* [한국어] migration용 dirty page 로깅 (요청 desc chain의 device-write buf). */
 
 	virtqueue->last_used_idx++;
+	/* [한국어] free-running counter — wrap은 캐스팅에 의해 자연 처리. */
 	used->ring[last_idx].id = id;
+	/* [한국어] 슬롯에 desc head id 기록. */
 	used->ring[last_idx].len = len;
+	/* [한국어] 슬롯에 device가 쓴 바이트 수 기록. */
 
 	/* Ensure the used ring is updated before we log it or increment used->idx. */
 	spdk_smp_wmb();
+	/* [한국어] write 배리어 — 게스트가 used->idx 보고 ring을 read할 때 부분 갱신 보지 않도록.
+	 * x86에서는 컴파일러 배리어, ARM 등에서는 dmb st 등 실제 명령. */
 
 	rte_vhost_set_last_inflight_io_split(vsession->vid, vq_idx, id);
+	/* [한국어] inflight 공유 메모리에 "이 io를 곧 used에 기록할 것"이라고 표시.
+	 * crash 시점이 used 갱신 직전이면 재기동 후 inflight 분석으로 복구. */
 
 	vhost_log_used_vring_elem(vsession, virtqueue, last_idx);
+	/* [한국어] used ring 슬롯 dirty 로깅. */
 	* (volatile uint16_t *) &used->idx = virtqueue->last_used_idx;
+	/* [한국어] used->idx 갱신 — 게스트가 이 값으로 새 used 인지.
+	 * volatile 캐스팅으로 컴파일러 최적화 회피. */
 	vhost_log_used_vring_idx(vsession, virtqueue);
+	/* [한국어] used->idx 영역도 dirty 로깅. */
 
 	rte_vhost_clr_inflight_desc_split(vsession->vid, vq_idx, virtqueue->last_used_idx, id);
+	/* [한국어] inflight 마킹 클리어 — used 갱신까지 완료됐으므로 더 이상 inflight 아님. */
 
 	virtqueue->used_req_cnt++;
+	/* [한국어] coalescing window 카운트 증가 — used_signal이 임계 도달 시 IRQ 발사. */
 
 	if (spdk_unlikely(spdk_interrupt_mode_is_enabled())) {
+		/* [한국어] interrupt 모드면 즉시 IRQ 송신 — 폴러 없음. */
 		if (virtqueue->vring.desc == NULL || vhost_vq_event_is_suppressed(virtqueue)) {
 			return;
+			/* [한국어] 큐 비활성 또는 게스트가 IRQ 억제 중이면 송신 안 함. */
 		}
 
 		vhost_vq_used_signal(vsession, virtqueue);
@@ -716,25 +971,50 @@ vhost_vring_desc_to_iov(struct spdk_vhost_session *vsession, struct iovec *iov,
 					       desc->addr, desc->len);
 }
 
+/*
+ * [한국어]
+ * vhost_session_mem_region_calc - 한 메모리 region의 등록 범위(start/end/len)를 2MB 정렬로 계산.
+ *
+ * @previous_start: 직전 region의 시작 주소(in/out) — 같으면 한 페이지 건너뛰기.
+ * @region: 입력 region.
+ *
+ * SPDK env(DPDK)는 hugepage 단위(2MB)로 메모리 매핑을 추적한다. 따라서 게스트 region을
+ * 2MB 경계로 floor/ceil 정렬하여 등록한다. 같은 시작 주소가 또 등장하면 +2MB로 미뤄 중복 등록 방지.
+ */
 static inline void
 vhost_session_mem_region_calc(uint64_t *previous_start, uint64_t *start, uint64_t *end,
 			      uint64_t *len, struct rte_vhost_mem_region *region)
 {
 	*start = FLOOR_2MB(region->mmap_addr);
+	/* [한국어] 시작 주소를 2MB 경계로 floor. */
 	*end = CEIL_2MB(region->mmap_addr + region->mmap_size);
+	/* [한국어] 끝 주소를 2MB 경계로 ceil. */
 	if (*start == *previous_start) {
 		*start += (size_t) VALUE_2MB;
+		/* [한국어] 직전 region과 시작이 겹치면 한 페이지 건너뛰어 중복 회피. */
 	}
 	*previous_start = *start;
 	*len = *end - *start;
 }
 
+/*
+ * [한국어]
+ * vhost_session_mem_register - 게스트 메모리 영역들을 SPDK env(DPDK)에 DMA 가능 영역으로 등록.
+ *
+ * @mem: rte_vhost가 채워준 게스트 메모리 영역 배열.
+ *
+ * 백엔드가 spdk_vtophys로 GPA→DMA addr 변환할 수 있게 메모리를 등록한다.
+ * NVMe bdev이 게스트 buf로 직접 DMA할 때 필수.
+ *
+ * 호출 컨텍스트: 디바이스 thread (세션 시작 시).
+ */
 void
 vhost_session_mem_register(struct rte_vhost_memory *mem)
 {
 	uint64_t start, end, len;
 	uint32_t i;
 	uint64_t previous_start = UINT64_MAX;
+	/* [한국어] 첫 region에서 비교가 거짓이 되도록 큰 값으로 초기화. */
 
 
 	for (i = 0; i < mem->nregions; i++) {
@@ -743,6 +1023,7 @@ vhost_session_mem_register(struct rte_vhost_memory *mem)
 			     start, len);
 
 		if (spdk_mem_register((void *)start, len) != 0) {
+			/* [한국어] DPDK env에 등록 — 이후 spdk_vtophys로 변환 가능. 실패해도 다음 region 시도. */
 			SPDK_WARNLOG("Failed to register memory region %"PRIu32". Future vtophys translation might fail.\n",
 				     i);
 			continue;
@@ -750,6 +1031,15 @@ vhost_session_mem_register(struct rte_vhost_memory *mem)
 	}
 }
 
+/*
+ * [한국어]
+ * vhost_session_mem_unregister - 위에서 등록한 메모리 영역을 모두 해제.
+ *
+ * @mem: rte_vhost 메모리 영역 배열.
+ *
+ * 등록된 영역만 해제 — spdk_vtophys 결과로 미등록 region은 건너뜀.
+ * 호출 컨텍스트: 세션 종료 또는 메모리 영역 변경 시.
+ */
 void
 vhost_session_mem_unregister(struct rte_vhost_memory *mem)
 {
@@ -761,9 +1051,11 @@ vhost_session_mem_unregister(struct rte_vhost_memory *mem)
 		vhost_session_mem_region_calc(&previous_start, &start, &end, &len, &mem->regions[i]);
 		if (spdk_vtophys((void *) start, NULL) == SPDK_VTOPHYS_ERROR) {
 			continue; /* region has not been registered */
+			/* [한국어] vtophys가 변환 실패하면 미등록 region — 건너뛰기. */
 		}
 
 		spdk_mem_unregister((void *)start, len);
+		/* [한국어] DPDK env에서 등록 해제. */
 	}
 }
 
@@ -834,6 +1126,19 @@ vhost_register_memtable_if_required(struct spdk_vhost_session *vsession, int vid
 	return 0;
 }
 
+/*
+ * [한국어]
+ * _stop_session - 세션 종료 헬퍼 — 백엔드 stop 대기 + 큐 메타 DPDK에 반환.
+ *
+ * @vsession: 종료할 세션.
+ * @return: 0=성공, 음수=백엔드 stop 실패.
+ *
+ * 1) 백엔드(blk/scsi)의 stop이 완료될 때까지 대기 (3초 타임아웃).
+ * 2) 모든 큐에 대해 last_avail_idx/last_used_idx를 DPDK에 반환 — packed ring은 wrap 비트도 인코딩.
+ * 3) max_queues=0으로 표시.
+ *
+ * 호출 컨텍스트: DPDK pthread (destroy_device 콜백 안).
+ */
 static int
 _stop_session(struct spdk_vhost_session *vsession)
 {
@@ -843,6 +1148,7 @@ _stop_session(struct spdk_vhost_session *vsession)
 
 	rc = vhost_user_wait_for_session_stop(vsession, SPDK_VHOST_SESSION_STOP_TIMEOUT_IN_SEC,
 					      "stop session");
+	/* [한국어] 백엔드 stop_session 콜백 완료 대기 (sem_wait 패턴). */
 	if (rc != 0) {
 		SPDK_ERRLOG("Couldn't stop device with vid %d.\n", vsession->vid);
 		return rc;
@@ -856,12 +1162,14 @@ _stop_session(struct spdk_vhost_session *vsession)
 		 */
 		if (q->vring.desc == NULL) {
 			continue;
+			/* [한국어] 비활성 큐 스킵. */
 		}
 
 		/* Packed virtqueues support up to 2^15 entries each
 		 * so left one bit can be used as wrap counter.
 		 */
 		if (q->packed.packed_ring) {
+			/* [한국어] packed ring은 last_avail_idx 최상위 비트(15)에 wrap 인코딩 후 DPDK에 반환. */
 			q->last_avail_idx = q->last_avail_idx |
 					    ((uint16_t)q->packed.avail_phase << 15);
 			q->last_used_idx = q->last_used_idx |
@@ -869,24 +1177,51 @@ _stop_session(struct spdk_vhost_session *vsession)
 		}
 
 		rte_vhost_set_vring_base(vsession->vid, i, q->last_avail_idx, q->last_used_idx);
+		/* [한국어] DPDK에 마지막 인덱스 보고 — 다음 start 시 이 위치부터 재개. */
 		q->vring.desc = NULL;
+		/* [한국어] desc 포인터 NULL로 — 큐 비활성화 표시. */
 	}
 	vsession->max_queues = 0;
 
 	return 0;
 }
 
+/*
+ * [한국어]
+ * new_connection - DPDK rte_vhost가 새 게스트 연결을 발견했을 때 호출하는 콜백.
+ *
+ * @vid: DPDK가 부여한 연결 ID.
+ * @return: 0=성공, -1=실패.
+ *
+ * 처리 흐름:
+ *   1) rte_vhost_get_ifname으로 UNIX 소켓 경로 → 디바이스 이름 추출.
+ *   2) spdk_vhost_dev_find로 매칭되는 vdev 검색.
+ *   3) backend session_ctx_size를 고려해 vsession + 백엔드 컨테이너 통합 할당.
+ *   4) dpdk_sem 세마포어 초기화 (DPDK pthread ↔ SPDK thread 동기화용).
+ *   5) user_dev->vsessions 리스트에 append (id 오름차순 정렬 유지 — foreach 구현 가정).
+ *   6) DPDK 호환 hook 등록.
+ *
+ * 호출 컨텍스트: DPDK pthread (rte_vhost-internal). SPDK thread 아님.
+ * 동기화: spdk_vhost_lock으로 vdev tree 보호, user_dev->lock으로 vsessions 리스트 보호.
+ */
 static int
 new_connection(int vid)
 {
 	struct spdk_vhost_dev *vdev;
+	/* [한국어] 매칭된 vhost 디바이스. */
 	struct spdk_vhost_user_dev *user_dev;
+	/* [한국어] vhost-user 컨텍스트. */
 	struct spdk_vhost_session *vsession;
+	/* [한국어] 새로 만들 세션. */
 	size_t dev_dirname_len;
+	/* [한국어] 디렉토리 prefix 길이. */
 	char ifname[PATH_MAX];
+	/* [한국어] DPDK가 알려주는 소켓 경로 임시 버퍼. */
 	char *ctrlr_name;
+	/* [한국어] prefix 제거 후 컨트롤러 이름. */
 
 	if (rte_vhost_get_ifname(vid, ifname, PATH_MAX) < 0) {
+		/* [한국어] vid에 해당하는 ifname(소켓 경로) 조회 실패. */
 		SPDK_ERRLOG("Couldn't get a valid ifname for device with vid %d\n", vid);
 		return -1;
 	}
@@ -895,6 +1230,7 @@ new_connection(int vid)
 	dev_dirname_len = strlen(g_vhost_user_dev_dirname);
 	if (strncmp(ctrlr_name, g_vhost_user_dev_dirname, dev_dirname_len) == 0) {
 		ctrlr_name += dev_dirname_len;
+		/* [한국어] /var/tmp/ctrlr → ctrlr 형태로 prefix 제거. */
 	}
 
 	spdk_vhost_lock();
@@ -905,9 +1241,11 @@ new_connection(int vid)
 		return -1;
 	}
 	spdk_vhost_unlock();
+	/* [한국어] vdev 포인터 획득 후 락 해제 — vdev 자체는 unregister 전까지 유효. */
 
 	user_dev = to_user_dev(vdev);
 	pthread_mutex_lock(&user_dev->lock);
+	/* [한국어] 디바이스 단위 lock — vsessions 리스트 보호. */
 	if (user_dev->registered == false) {
 		SPDK_ERRLOG("Device %s is unregistered\n", ctrlr_name);
 		pthread_mutex_unlock(&user_dev->lock);
@@ -920,6 +1258,7 @@ new_connection(int vid)
 	 * This is required for vhost_user_dev_foreach_session() to work.
 	 */
 	if (user_dev->vsessions_num == UINT_MAX) {
+		/* [한국어] 카운터 overflow 방어. */
 		pthread_mutex_unlock(&user_dev->lock);
 		assert(false);
 		return -EINVAL;
@@ -927,16 +1266,22 @@ new_connection(int vid)
 
 	if (posix_memalign((void **)&vsession, SPDK_CACHE_LINE_SIZE, sizeof(*vsession) +
 			   user_dev->user_backend->session_ctx_size)) {
+		/* [한국어] base + 백엔드 컨텍스트를 한 덩어리로 캐시라인 정렬 할당. */
 		SPDK_ERRLOG("vsession alloc failed\n");
 		pthread_mutex_unlock(&user_dev->lock);
 		return -1;
 	}
 	memset(vsession, 0, sizeof(*vsession) + user_dev->user_backend->session_ctx_size);
+	/* [한국어] 0 클리어 — 모든 포인터 NULL, 카운터 0. */
 
 	vsession->vdev = vdev;
+	/* [한국어] 부모 vdev 역참조. */
 	vsession->vid = vid;
+	/* [한국어] DPDK 부여 vid 저장. */
 	vsession->id = user_dev->vsessions_num++;
+	/* [한국어] SPDK 자체 ID — 카운터 증가. */
 	vsession->name = spdk_sprintf_alloc("%ss%u", vdev->name, vsession->vid);
+	/* [한국어] "ctrlr_namesNN" 형식 이름 생성. */
 	if (vsession->name == NULL) {
 		SPDK_ERRLOG("vsession alloc failed\n");
 		free(vsession);
@@ -945,6 +1290,7 @@ new_connection(int vid)
 	}
 
 	if (sem_init(&vsession->dpdk_sem, 0, 0) != 0) {
+		/* [한국어] DPDK pthread ↔ SPDK thread 동기화 세마포어 초기화. value=0, pshared=0. */
 		SPDK_ERRLOG("Failed to initialize semaphore for rte_vhost pthread.\n");
 		free(vsession->name);
 		free(vsession);
@@ -957,13 +1303,27 @@ new_connection(int vid)
 	vsession->next_stats_check_time = 0;
 	vsession->stats_check_interval = SPDK_VHOST_STATS_CHECK_INTERVAL_MS *
 					 spdk_get_ticks_hz() / 1000UL;
+	/* [한국어] coalescing 통계 검사 주기를 ticks로 변환 (10ms × ticks_per_sec / 1000). */
 	TAILQ_INSERT_TAIL(&user_dev->vsessions, vsession, tailq);
+	/* [한국어] 리스트 끝에 append — id 오름차순 유지. */
 	vhost_session_install_rte_compat_hooks(vsession);
+	/* [한국어] DPDK 버전별 콜백 hook 등록. */
 	pthread_mutex_unlock(&user_dev->lock);
 
 	return 0;
 }
 
+/*
+ * [한국어]
+ * vhost_user_session_start - 디바이스 thread에서 실행되는 세션 시작 메시지 콜백.
+ *
+ * @arg1: spdk_vhost_session*.
+ *
+ * start_device 콜백이 spdk_thread_send_msg로 enqueue한 메시지의 진입점.
+ * backend->start_session(blk: vhost_blk_start, scsi: vhost_scsi_start)을 호출.
+ *
+ * 호출 컨텍스트: 디바이스 SPDK reactor thread.
+ */
 static void
 vhost_user_session_start(void *arg1)
 {
@@ -975,11 +1335,15 @@ vhost_user_session_start(void *arg1)
 
 	SPDK_INFOLOG(vhost, "Starting new session for device %s with vid %d\n", vdev->name, vsession->vid);
 	pthread_mutex_lock(&user_dev->lock);
+	/* [한국어] 디바이스 lock — start_session 진행 중 다른 세션 변경 차단. */
 	vsession->starting = false;
+	/* [한국어] 과도기 플래그 해제 — start_session 후 started로 전환. */
 	backend = user_dev->user_backend;
 	rc = backend->start_session(vdev, vsession, NULL);
+	/* [한국어] 백엔드별 시작 콜백 호출 (poller 등록 등). */
 	if (rc == 0) {
 		vsession->started = true;
+		/* [한국어] 시작 성공 — I/O 처리 가능 상태. */
 	}
 	pthread_mutex_unlock(&user_dev->lock);
 }

@@ -4,38 +4,191 @@
  *   Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  */
 
+/*
+ * [한국어 설명] SPDK Malloc bdev 모듈 구현 (bdev_malloc.c)
+ *
+ * === 파일의 역할 ===
+ * 이 파일은 RAM(특히 DPDK가 관리하는 hugepage)을 백엔드로 하는 SPDK bdev 모듈을 구현한다.
+ * 즉, 디스크 매체 없이 hugepage 위에 큰 블록 버퍼 한 덩어리를 잡아 두고, read/write를 그
+ * 버퍼 영역에 대한 메모리 카피로 처리한다. 카피는 단순 memcpy가 아니라 SPDK의 accel framework
+ * (DSA/DMA 엔진 또는 소프트웨어 fallback)을 통해 수행되어 zero-copy/오프로드 시나리오를
+ * 지원한다. 주된 용도는 (1) 고성능 인메모리 디스크 — 매우 빠른 임시 저장소, (2) 상위
+ * 스택(NVMe-oF target, vhost) 테스트의 일관성 있는 저지연 백엔드, (3) 데이터 무결성(DIF/DIX)
+ * end-to-end 검증용. null bdev와 달리 실제로 write 데이터가 메모리에 보존되며, 다음 read에서
+ * 그대로 회수된다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ *   [Application / NVMe-oF / vhost target / Test harness]
+ *      ↓ spdk_bdev_read/write
+ *   [bdev core (lib/bdev/)]
+ *      ↓ fn_table->submit_request → bdev_malloc_submit_request
+ *   [bdev_malloc (이 파일)]
+ *      ↓ spdk_accel_submit_copy / spdk_accel_append_copy
+ *   [SPDK Accel framework (lib/accel)]
+ *      ↓ HW: Intel DSA / Intel IAA / IOAT / SW: memcpy
+ *   [hugepage backed RAM (mdisk->malloc_buf, mdisk->malloc_md_buf)]
+ *
+ * 전체 흐름 (read 예):
+ *   사용자 buffer ← spdk_accel copy ← mdisk->malloc_buf + offset (RAM)
+ *
+ * 전체 흐름 (write 예):
+ *   mdisk->malloc_buf + offset (RAM) ← spdk_accel copy ← 사용자 buffer
+ *
+ * 코어 로컬 채널(malloc_channel)은 (a) accel framework의 io channel과 (b) "이번 tick에 완료될
+ * 작업" 큐를 가진다. 즉시 완료 가능한 작업(RESET, FLUSH 등)은 큐에 넣어 다음 poller tick에
+ * 일괄 spdk_bdev_io_complete를 호출하고, accel 작업은 accel 콜백이 직접 malloc_done을 호출.
+ *
+ * === 타 모듈과의 연결 ===
+ * - lib/bdev/ : 모듈 등록, fn_table, spdk_bdev_io 라이프사이클.
+ * - lib/accel/ : spdk_accel_submit_copy / spdk_accel_submit_fill / spdk_accel_append_copy /
+ *   spdk_accel_sequence_finish — 메모리 카피와 zero-fill을 HW 엔진(DSA/IOAT)으로 오프로드.
+ *   accel framework은 자체 io_channel을 제공하며 본 모듈은 그 채널을 그대로 빌려 쓴다.
+ * - lib/util/ (DIF): spdk_dif_ctx_init, spdk_dif_generate, spdk_dif_verify, spdk_dix_generate/
+ *   verify — interleaved(DIF)와 separated(DIX) 메타데이터 모두 처리. NVMe Base Spec §8.3.
+ * - lib/env_dpdk/ (env): spdk_zmalloc(SPDK_MALLOC_DMA, NUMA 지정) — hugepage backed memory.
+ *   2MiB 정렬로 할당해 DMA(예: DSA 엔진 또는 RDMA)와 직접 호환되도록 한다.
+ * - lib/json/ : write_config_json 직렬화.
+ * - lib/thread/ : spdk_io_device, spdk_get_io_channel, SPDK_POLLER_REGISTER, accel_channel 호출.
+ * - module/bdev/malloc/bdev_malloc_rpc.c : RPC 핸들러가 본 파일의 create_malloc_disk /
+ *   delete_malloc_disk를 호출.
+ *
+ * 데이터 흐름:
+ *   [hugepage RAM] ←→ [accel HW/SW copy] ←→ [user iovec buffer]
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - struct malloc_disk : 디스크 인스턴스. spdk_bdev 임베드 + malloc_buf/malloc_md_buf 포인터.
+ * - struct malloc_task : bdev_io당 컨텍스트(driver_ctx). num_outstanding과 status 보관.
+ * - struct malloc_channel : 코어 로컬 채널. accel io channel + 완료 task 큐 + poller.
+ * - bdev_malloc_readv / bdev_malloc_writev : 핵심 read/write 처리. accel sequence 사용.
+ * - bdev_malloc_unmap / bdev_malloc_copy : zero-fill, 영역 복사.
+ * - malloc_done : accel 완료 콜백. num_outstanding 감소 → 모두 끝나면 PI 검증/생성 후 완료.
+ * - malloc_completion_poller : 즉시 완료 task를 다음 tick에 일괄 통보하는 poller.
+ * - create_malloc_disk : RPC 핸들러가 호출하는 인스턴스 생성.
+ * - malloc_disk_setup_pi : 생성 직후 hugepage 전체에 대해 초기 PI 태그를 미리 채워두는 함수.
+ */
+
 #include "spdk/stdinc.h"
+/* [한국어] 표준 헤더 모음. */
 
 #include "bdev_malloc.h"
+/* [한국어] 같은 디렉토리의 공개 헤더. struct malloc_bdev_opts와 create_malloc_disk/
+ * delete_malloc_disk 프로토타입을 노출. RPC 핸들러가 사용. */
 #include "spdk/endian.h"
+/* [한국어] 엔디언 변환 매크로. (현재 파일에서는 직접 사용 없으나 공통 헤더 의존성.) */
 #include "spdk/env.h"
+/* [한국어] DPDK 환경 추상화. spdk_zmalloc/spdk_free, SPDK_ENV_NUMA_ID_ANY,
+ * SPDK_ENV_FOREACH_NUMA_ID, SPDK_MALLOC_DMA. hugepage 메모리 할당의 핵심. */
 #include "spdk/accel.h"
+/* [한국어] 메모리 가속(memcpy/zero-fill) 추상화. spdk_accel_submit_copy/fill,
+ * spdk_accel_append_copy, spdk_accel_sequence_finish, spdk_accel_get_io_channel 등.
+ * Intel DSA/IOAT 같은 HW 엔진을 사용하거나 SW fallback. */
 #include "spdk/dma.h"
+/* [한국어] DMA / memory_domain 관련. spdk_memory_domain_get_first/next — get_memory_domains
+ * 콜백에서 사용. */
 #include "spdk/likely.h"
+/* [한국어] 분기 예측 매크로. */
 #include "spdk/string.h"
+/* [한국어] spdk_sprintf_alloc — Malloc%d 자동 이름 생성에 사용. */
 
 #include "spdk/log.h"
+/* [한국어] 로그 매크로(SPDK_DEBUGLOG/ERRLOG)와 SPDK_LOG_REGISTER_COMPONENT. */
 
+/*
+ * [한국어] struct malloc_disk
+ *
+ * Malloc bdev 인스턴스 1개당 1개. spdk_bdev를 임베드해 SPDK_CONTAINEROF로 역포인터 가능.
+ * malloc_buf는 데이터(또는 인터리브 시 데이터+메타) hugepage 영역, malloc_md_buf는 분리 메타
+ * 모드일 때만 사용되는 별도 메타데이터 영역.
+ */
 struct malloc_disk {
 	struct spdk_bdev		disk;
+	/* [한국어] bdev core가 인식하는 공개 메타데이터.
+	 * 설정자: create_malloc_disk가 RPC 옵션으로부터 채움. 읽는 자: bdev core / 사용자.
+	 * 동기화: 등록 후 read-only가 일반적. */
+
 	void				*malloc_buf;
+	/* [한국어] 데이터 백엔드 hugepage 영역 시작 주소. 크기 = num_blocks * blocklen.
+	 * 인터리브 모드면 데이터+메타가 한 영역에 섞여 있고, 분리 모드면 데이터만.
+	 * 설정자: create_malloc_disk의 spdk_zmalloc.
+	 * 읽는 자: read/write/unmap/copy 처리에서 base + offset 계산.
+	 * 값 범위: 비-NULL DMA 가능 hugepage 포인터.
+	 * 동기화: 핫패스에서 같은 LBA에 동시 read/write 시 race는 사용자 책임(NVMe와 동일 의미). */
+
 	void				*malloc_md_buf;
+	/* [한국어] 분리 메타데이터(DIX) 영역. 인터리브 모드(md_interleave=true)거나 md_size=0이면 NULL.
+	 * 크기 = num_blocks * md_len.
+	 * 설정자: create_malloc_disk(분리 모드 전용 분기에서 spdk_zmalloc).
+	 * 읽는 자: malloc_get_md_buf, _malloc_verify_pi(분리 모드 분기), bdev_malloc_readv/writev. */
+
 	TAILQ_ENTRY(malloc_disk)	link;
+	/* [한국어] g_malloc_disks 글로벌 리스트 노드. 단일 RPC 스레드에서만 갱신. */
 };
 
+/*
+ * [한국어] struct malloc_task
+ *
+ * spdk_bdev_io 1개당 모듈 컨텍스트(driver_ctx). 한 bdev_io가 여러 accel 호출(데이터+메타)을
+ * 사용할 수 있어 num_outstanding 카운터로 모두 끝났는지 추적한다.
+ */
 struct malloc_task {
 	struct iovec			iov;
+	/* [한국어] 모듈이 채우는 단일 iovec — accel API에 전달할 src/dst 표현.
+	 * read 시: malloc_buf+offset (src). write 시: malloc_buf+offset (dst).
+	 * 설정자/읽는 자: bdev_malloc_readv / writev. */
+
 	int				num_outstanding;
+	/* [한국어] 이 task가 발행한 accel 작업 중 아직 완료되지 않은 수. 데이터 전송 1 + (분리 메타면 +1).
+	 * 설정자: 각 accel 호출 직전에 ++.
+	 * 읽는 자: malloc_done이 -- 후 0이 되면 spdk_bdev_io_complete 호출.
+	 * 동기화: 채널 reactor 안에서만 갱신되므로 atomic 불필요. */
+
 	enum spdk_bdev_io_status	status;
+	/* [한국어] task의 누적 상태. 첫 번째 실패가 sticky하게 기록된다.
+	 * 설정자: malloc_done이 status에 따라 SUCCESS/FAILED/NOMEM 갱신.
+	 * 읽는 자: malloc_done 마지막에 spdk_bdev_io_complete에 전달. */
+
 	TAILQ_ENTRY(malloc_task)	tailq;
+	/* [한국어] malloc_channel.completed_tasks 노드. 즉시 완료(RESET 등)된 task를 큐잉해
+	 * 다음 poller tick에 일괄 통보. */
 };
 
+/*
+ * [한국어] struct malloc_channel
+ *
+ * 코어 로컬 채널. accel framework의 io channel을 빌려 쓰고, "이번 tick에 완료될 task"의 큐와
+ * poller를 가진다. 코어 로컬이므로 락 없이 접근 가능.
+ */
 struct malloc_channel {
 	struct spdk_io_channel		*accel_channel;
+	/* [한국어] accel framework의 io channel. spdk_accel_get_io_channel로 획득.
+	 * accel 작업(spdk_accel_submit_copy 등)에 첫 인자로 전달.
+	 * 설정자: malloc_create_channel_cb. 읽는 자: read/write/unmap/copy 처리 함수. */
+
 	struct spdk_poller		*completion_poller;
+	/* [한국어] completed_tasks 큐를 비우는 polling 콜백 핸들. SPDK_POLLER_REGISTER 결과.
+	 * 설정자: malloc_create_channel_cb. 읽는 자: malloc_destroy_channel_cb의 unregister. */
+
 	TAILQ_HEAD(, malloc_task)	completed_tasks;
+	/* [한국어] 즉시 완료된 task가 다음 poller tick에 spdk_bdev_io_complete를 호출받기 위해
+	 * 잠시 대기하는 큐. RESET/FLUSH/ZCOPY 같은 즉시 완료 케이스에 사용.
+	 * 설정자: malloc_complete_task의 INSERT_TAIL.
+	 * 읽는 자: malloc_completion_poller의 SWAP/REMOVE.
+	 * 동기화: 채널 reactor 로컬. */
 };
 
+/*
+ * [한국어]
+ * _malloc_verify_pi - 주어진 iovec/메타에 대해 DIF/DIX(Protection Information)를 검증
+ *
+ * @bdev_io: I/O.
+ * @iovs/@iovcnt: 검증할 데이터 iovec.
+ * @md_buf: 분리 메타 모드일 때 메타 버퍼(인터리브 모드는 무시).
+ * @return: 0 = OK, 음수 = 실패.
+ *
+ * DIF(인터리브) 또는 DIX(분리)에 따라 spdk_dif_verify / spdk_dix_verify 중 하나를 호출.
+ * NVMe Base Spec §8.3 End-to-End Data Protection. memory_domain이 NULL일 때만 사용 가능
+ * (CPU 직접 접근 가능한 버퍼에서만 검증 수행).
+ */
 static int
 _malloc_verify_pi(struct spdk_bdev_io *bdev_io, struct iovec *iovs, int iovcnt,
 		  void *md_buf)
@@ -47,6 +200,8 @@ _malloc_verify_pi(struct spdk_bdev_io *bdev_io, struct iovec *iovs, int iovcnt,
 	struct spdk_dif_ctx_init_ext_opts dif_opts;
 
 	assert(bdev_io->u.bdev.memory_domain == NULL);
+	/* [한국어] memory_domain이 있는 경우는 데이터가 외부 메모리(예: GPU/SmartNIC)에 있어
+	 * CPU 직접 검증 불가. 호출 전 바깥에서 보장해야 함. */
 	dif_opts.size = SPDK_SIZEOF(&dif_opts, dif_pi_format);
 	dif_opts.dif_pi_format = bdev->dif_pi_format;
 	rc = spdk_dif_ctx_init(&dif_ctx,
@@ -57,6 +212,7 @@ _malloc_verify_pi(struct spdk_bdev_io *bdev_io, struct iovec *iovs, int iovcnt,
 			       bdev->dif_type,
 			       bdev_io->u.bdev.dif_check_flags,
 			       bdev_io->u.bdev.offset_blocks & 0xFFFFFFFF,
+			       /* [한국어] 시작 LBA의 하위 32비트 → reftag 초기값. */
 			       0xFFFF, 0, 0, 0, &dif_opts);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to initialize DIF/DIX context\n");
@@ -64,18 +220,21 @@ _malloc_verify_pi(struct spdk_bdev_io *bdev_io, struct iovec *iovs, int iovcnt,
 	}
 
 	if (spdk_bdev_is_md_interleaved(bdev)) {
+		/* [한국어] 인터리브: 각 블록 끝(또는 앞)에 PI가 포함됨. spdk_dif_verify가 통합 처리. */
 		rc = spdk_dif_verify(iovs,
 				     iovcnt,
 				     bdev_io->u.bdev.num_blocks,
 				     &dif_ctx,
 				     &err_blk);
 	} else {
+		/* [한국어] 분리(DIX): 데이터 iovec와 메타 iovec를 별도로 받아 PI를 검증. */
 		struct iovec md_iov = {
 			.iov_base	= md_buf,
 			.iov_len	= bdev_io->u.bdev.num_blocks * bdev->md_len,
 		};
 
 		if (bdev_io->u.bdev.md_buf == NULL) {
+			/* [한국어] 사용자가 메타 버퍼를 안 줬으면 검증 생략(상위가 PI를 사용 안 한다고 간주). */
 			return 0;
 		}
 
@@ -88,6 +247,7 @@ _malloc_verify_pi(struct spdk_bdev_io *bdev_io, struct iovec *iovs, int iovcnt,
 	}
 
 	if (rc != 0) {
+		/* [한국어] 첫 실패 블록의 위치/원인을 자세히 출력 — 디버깅에 유용. */
 		SPDK_ERRLOG("DIF/DIX verify failed: lba %" PRIu64 ", num_blocks %" PRIu64 ", "
 			    "err_type %u, expected %lu, actual %lu, err_offset %u\n",
 			    bdev_io->u.bdev.offset_blocks,
@@ -101,6 +261,12 @@ _malloc_verify_pi(struct spdk_bdev_io *bdev_io, struct iovec *iovs, int iovcnt,
 	return rc;
 }
 
+/*
+ * [한국어]
+ * malloc_verify_pi_io_buf - 사용자 iovec와 사용자 md_buf로 PI 검증
+ *
+ * write 경로: 사용자가 보낸 데이터의 PI를 검증해 매체(=hugepage)에 들어가기 전에 깨진 데이터를 차단.
+ */
 static int
 malloc_verify_pi_io_buf(struct spdk_bdev_io *bdev_io)
 {
@@ -110,6 +276,12 @@ malloc_verify_pi_io_buf(struct spdk_bdev_io *bdev_io)
 				 bdev_io->u.bdev.md_buf);
 }
 
+/*
+ * [한국어]
+ * malloc_verify_pi_malloc_buf - hugepage 안의 데이터에 대해 PI 검증
+ *
+ * read after copy / write hide_metadata 경로 등에서 매체 측 데이터에 PI가 들어 있을 때 사용.
+ */
 static int
 malloc_verify_pi_malloc_buf(struct spdk_bdev_io *bdev_io)
 {
@@ -119,14 +291,28 @@ malloc_verify_pi_malloc_buf(struct spdk_bdev_io *bdev_io)
 	uint64_t len, offset;
 
 	len = bdev_io->u.bdev.num_blocks * bdev->blocklen;
+	/* [한국어] 검증 영역 길이 (바이트). 인터리브 모드면 데이터+메타 모두 포함하는 합산 크기. */
 	offset = bdev_io->u.bdev.offset_blocks * bdev->blocklen;
+	/* [한국어] hugepage 시작에서의 바이트 오프셋. */
 
 	iov.iov_base = mdisk->malloc_buf + offset;
 	iov.iov_len = len;
 
 	return _malloc_verify_pi(bdev_io, &iov, 1, NULL);
+	/* [한국어] 인터리브 모드라 메타 버퍼는 NULL — _malloc_verify_pi가 내부에서 데이터 안의 PI 사용. */
 }
 
+/*
+ * [한국어]
+ * malloc_unmap_write_zeroes_generate_pi - UNMAP/WRITE_ZEROES 후 hugepage에 PI 태그 재생성
+ *
+ * @bdev_io: I/O.
+ * @return: 0 = OK, 음수 = 실패.
+ *
+ * UNMAP과 WRITE_ZEROES는 데이터를 0으로 만든다. DIF가 활성화된 디스크에서는 0 데이터에 대한
+ * 합법적 PI(guard tag = 0의 CRC, reftag = LBA 등)를 다시 만들어 두어야 다음 read에서 검증
+ * 통과가 가능하다. APPTAG/REFTAG는 IGNORE 플래그로 강제해 사용자 정의 값을 무시.
+ */
 static int
 malloc_unmap_write_zeroes_generate_pi(struct spdk_bdev_io *bdev_io)
 {
@@ -142,6 +328,7 @@ malloc_unmap_write_zeroes_generate_pi(struct spdk_bdev_io *bdev_io)
 	dif_opts.dif_pi_format = bdev->dif_pi_format;
 	dif_check_flags = bdev->dif_check_flags | SPDK_DIF_CHECK_TYPE_REFTAG |
 			  SPDK_DIF_FLAGS_APPTAG_CHECK;
+	/* [한국어] 비트마스크에 reftag/apptag 검사 추가 — 다만 reftag/apptag 값은 IGNORE 처리. */
 	rc = spdk_dif_ctx_init(&dif_ctx,
 			       bdev->blocklen,
 			       bdev->md_len,
@@ -158,6 +345,7 @@ malloc_unmap_write_zeroes_generate_pi(struct spdk_bdev_io *bdev_io)
 	}
 
 	if (bdev->md_interleave) {
+		/* [한국어] 인터리브: 데이터 iovec 하나로 in-place에 PI 생성. */
 		struct iovec iov = {
 			.iov_base	= mdisk->malloc_buf + bdev_io->u.bdev.offset_blocks * block_size,
 			.iov_len	= bdev_io->u.bdev.num_blocks * block_size,
@@ -165,6 +353,7 @@ malloc_unmap_write_zeroes_generate_pi(struct spdk_bdev_io *bdev_io)
 
 		rc = spdk_dif_generate(&iov, 1, bdev_io->u.bdev.num_blocks, &dif_ctx);
 	} else {
+		/* [한국어] 분리: 데이터 영역과 메타 영역에 각각 접근해 spdk_dix_generate 호출. */
 		struct iovec iov = {
 			.iov_base	= mdisk->malloc_buf + bdev_io->u.bdev.offset_blocks * block_size,
 			.iov_len	= bdev_io->u.bdev.num_blocks * block_size,

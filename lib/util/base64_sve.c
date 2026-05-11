@@ -116,14 +116,18 @@ table_lookup_8vec(svuint8_t tbl_vec0, svuint8_t tbl_vec1, svuint8_t tbl_vec2, sv
 	*output = svdup_n_u8(0);
 	/* [한국어] 누적 합 시작값으로 0벡터 준비. */
 	*output = svadd_u8_z(p8_in, res2, *output);
-	/* [한국어] 각 청크 룩업 결과를 누적: 입력 인덱스마다 정확히 한 청크에서만 0이 아닌 값이 나오므로
-	 * 결과는 그 한 값이 된다. */
+	/* [한국어] tbl_vec2 청크(ASCII [32..47]) 결과 누적. 입력 인덱스마다 정확히 한
+	 * 청크에서만 0이 아닌 값이 나오므로 결과는 그 한 값이 된다. */
 	*output = svadd_u8_z(p8_in, res3, *output);
+	/* [한국어] tbl_vec3 청크(ASCII [48..63]) 결과 누적. */
 	*output = svadd_u8_z(p8_in, res4, *output);
+	/* [한국어] tbl_vec4 청크(ASCII [64..79]) 결과 누적. */
 	*output = svadd_u8_z(p8_in, res5, *output);
+	/* [한국어] tbl_vec5 청크(ASCII [80..95]) 결과 누적. */
 	*output = svadd_u8_z(p8_in, res6, *output);
+	/* [한국어] tbl_vec6 청크(ASCII [96..111]) 결과 누적. */
 	*output = svadd_u8_z(p8_in, res7, *output);
-	/* [한국어] 6개 부분 결과를 모두 합산하여 최종 디코드 결과를 *output에 기록. */
+	/* [한국어] tbl_vec7 청크(ASCII [112..127]) 결과 누적 → 6개 부분 결과 합산 완료. */
 
 	if (svcntp_b8(p8_in, svcmpeq_n_u8(p8_in, *output, 255))) {
 		/* [한국어] 결과에 0xFF가 있는 활성 레인 수. 0이 아니면 invalid base64 문자가 발견된 것.
@@ -137,18 +141,27 @@ table_lookup_8vec(svuint8_t tbl_vec0, svuint8_t tbl_vec1, svuint8_t tbl_vec2, sv
 
 /*
  * [한국어]
- * table_lookup_4vec - 64B LUT를 4개 SVE 벡터(VL=16)로 분할 적재한 경우의 인코드/디코드 LUT 룩업.
+ * table_lookup_4vec - LUT를 4개 SVE 벡터로 분할 적재한 경우의 인코드/디코드 LUT 룩업.
  *
- * @tbl_vec0..3: LUT의 16B 청크 4개 (인코드 LUT나 VL=32 디코드 LUT의 처음 절반).
- * @indices:     인덱스 벡터(인코드: 0..63 6비트값 / 디코드: ASCII 0..127).
- * @output:      [out] 룩업 결과 벡터.
- * @p8_in:       유효 레인 술어.
- * @vl:          현재 벡터 길이(바이트). 이 헬퍼는 VL=16 또는 32에서 사용.
- * @return:      0 성공, -1 결과에 0xFF(invalid) 검출.
+ * @tbl_vec0: LUT의 [0..vl-1] 영역 (첫 청크).
+ * @tbl_vec1: LUT의 [vl..2*vl-1] 영역.
+ * @tbl_vec2: LUT의 [2*vl..3*vl-1] 영역.
+ * @tbl_vec3: LUT의 [3*vl..4*vl-1] 영역 (마지막 청크).
+ * @indices:  인덱스 벡터(인코드: 0..63 6비트값 / 디코드: ASCII 0..127).
+ * @output:   [out] 룩업 결과 벡터. 0..63 또는 0xFF(invalid).
+ * @p8_in:    유효 레인 술어(루프 잔여 처리에서 일부만 활성).
+ * @vl:       현재 SVE 벡터 길이(바이트). 이 헬퍼는 VL=16(64B LUT 4분할 인코드) 또는
+ *            VL=32(128B LUT 4분할 디코드)에서 사용.
+ * @return:   0 성공, -1 결과에 0xFF(invalid) 검출(디코드 컨텍스트에서만 의미).
+ *
+ * 동작: svtbl_u8은 인덱스 ≥ vl 이면 0 반환. 매 단계 indices에서 vl 차감하며 다음
+ * 청크의 [0..vl-1] 인덱스로 정규화. 4개 결과를 svadd로 누적하면 입력별로 한
+ * 청크에서만 nonzero이므로 OR과 같은 효과.
  *
  * 호출 체인:
- *   base64_encode_sve(VL=16) → [table_lookup_4vec]  (인코드 LUT 4개 분할)
- *   base64_decode_sve(VL=32) → [table_lookup_4vec]  (디코드 LUT 4개 분할, 첫 64B만 사용 가능)
+ *   base64_encode_sve(VL=16) → [table_lookup_4vec]  (인코드 64B LUT 4분할)
+ *   base64_decode_sve(VL=32) → [table_lookup_4vec]  (디코드 128B LUT 4분할)
+ * 실행 컨텍스트: 같은 스레드 인라인, 부수 효과 없음.
  */
 static int
 table_lookup_4vec(svuint8_t tbl_vec0, svuint8_t tbl_vec1, svuint8_t tbl_vec2, svuint8_t tbl_vec3,
@@ -176,11 +189,13 @@ table_lookup_4vec(svuint8_t tbl_vec0, svuint8_t tbl_vec1, svuint8_t tbl_vec2, sv
 	/* [한국어] 0벡터로 누적 시작. */
 
 	*output = svadd_u8_z(p8_in, res0, *output);
-	/* [한국어] 각 청크 결과를 누적 - 입력별로 한 청크에서만 nonzero이므로 OR과 같은 효과. */
+	/* [한국어] 1번째 청크 결과 누적. 입력별로 한 청크에서만 nonzero이므로 OR과 동일. */
 	*output = svadd_u8_z(p8_in, res1, *output);
+	/* [한국어] 2번째 청크 결과 누적. */
 	*output = svadd_u8_z(p8_in, res2, *output);
+	/* [한국어] 3번째 청크 결과 누적. */
 	*output = svadd_u8_z(p8_in, res3, *output);
-	/* [한국어] 4개 부분 결과 합산 완료. */
+	/* [한국어] 4번째 청크 결과 누적 → 4개 부분 결과 합산 완료. */
 
 	if (svcntp_b8(p8_in, svcmpeq_n_u8(p8_in, *output, 255))) {
 		/* [한국어] 결과에 0xFF가 있으면 디코드 시 invalid 입력. */
@@ -193,8 +208,22 @@ table_lookup_4vec(svuint8_t tbl_vec0, svuint8_t tbl_vec1, svuint8_t tbl_vec2, sv
 /*
  * [한국어]
  * table_lookup_3vec - 128B LUT를 3개 SVE 벡터(VL=48)로 분할 적재한 경우의 디코드 LUT 룩업.
- * VL=48 환경(SVE 384비트)에서 base64_decode_sve가 사용한다.
- * @return: 0 성공, -1 invalid.
+ *
+ * @tbl_vec0: LUT의 [0..vl-1] 영역(=[0..47]).
+ * @tbl_vec1: LUT의 [vl..2*vl-1] 영역(=[48..95]).
+ * @tbl_vec2: LUT의 [2*vl..127] 영역(=[96..127], 마지막 32B만 유효 — 부분 술어로 적재됨).
+ * @indices:  ASCII 입력 바이트 벡터(0..127).
+ * @output:   [out] 디코드된 6비트 값 또는 0xFF(invalid).
+ * @p8_in:    유효 레인 술어(루프 잔여 처리에서 일부만 활성).
+ * @vl:       SVE 벡터 길이(바이트). 이 분기에서는 48.
+ * @return:   0 성공, -1 결과에 0xFF가 있어 invalid 입력 검출.
+ *
+ * 동작: 각 청크에서 svtbl_u8은 인덱스 < vl 일 때만 nonzero 반환하고, 그 이상이면 0.
+ * 매 단계 indices에서 vl만큼 saturating sub하여 다음 청크의 [0..vl-1] 인덱스로 변환.
+ * 결과를 svadd로 누적하면 입력별로 정확히 한 청크에서 nonzero가 나와 OR과 같은 효과.
+ *
+ * 호출 체인: base64_decode_sve(VL=48 분기) → [table_lookup_3vec]
+ * 실행 컨텍스트: 같은 스레드 인라인 호출, 부수 효과 없음.
  */
 static int
 table_lookup_3vec(svuint8_t tbl_vec0, svuint8_t tbl_vec1, svuint8_t tbl_vec2, svuint8_t indices,
@@ -234,8 +263,23 @@ table_lookup_3vec(svuint8_t tbl_vec0, svuint8_t tbl_vec1, svuint8_t tbl_vec2, sv
 /*
  * [한국어]
  * table_lookup_2vec - LUT를 2개 SVE 벡터로 분할 적재한 경우의 룩업.
- * 인코드(VL=32, 64B LUT 두 청크) 또는 디코드(VL=64..112, 128B LUT 두 청크)에서 사용.
- * @return: 0 성공, -1 invalid.
+ *
+ * @tbl_vec0: LUT의 [0..vl-1] 영역.
+ * @tbl_vec1: LUT의 [vl..end-1] 영역(인코드 시 64B 中 두 번째 청크, 디코드 시 128B 中 두 번째 청크).
+ * @indices:  인덱스 벡터(인코드: 0..63 6비트값, 디코드: ASCII 0..127).
+ * @output:   [out] 룩업 결과 벡터. 디코드 시 0..63 또는 0xFF(invalid).
+ * @p8_in:    유효 레인 술어.
+ * @vl:       SVE 벡터 길이(바이트).
+ * @return:   0 성공, -1 결과에 0xFF(invalid) 검출(디코드 컨텍스트에서만 의미).
+ *
+ * 사용처:
+ *  - 인코드(VL=32 또는 48): 64B LUT를 두 청크로 분할(첫 vl B + 둘째 64-vl B).
+ *  - 디코드(VL=64..112): 128B LUT를 두 청크로 분할(첫 vl B + 둘째 128-vl B).
+ *
+ * 호출 체인:
+ *   base64_encode_sve(VL=32|48) → [table_lookup_2vec]
+ *   base64_decode_sve(VL=64|80|96|112) → [table_lookup_2vec]
+ * 실행 컨텍스트: 같은 스레드 인라인, 부수 효과 없음.
  */
 static int
 table_lookup_2vec(svuint8_t tbl_vec0, svuint8_t tbl_vec1, svuint8_t indices, svuint8_t *output,
@@ -270,14 +314,22 @@ table_lookup_2vec(svuint8_t tbl_vec0, svuint8_t tbl_vec1, svuint8_t indices, svu
 /*
  * [한국어]
  * convert_6bits_to_8bits - 입력 24비트(3바이트)를 6비트 4그룹으로 분해(인코드 전처리).
+ * (함수명은 다소 혼동되지만, 실제로는 8비트 입력 3개를 6비트 4개로 변환)
  *
- * @pred:   유효 레인 술어.
- * @src:    원본 8비트 데이터 시작 주소.
- * @temp0..3: [out] 4개의 0..63 인덱스 벡터.
+ * @pred:   유효 레인 술어. 비활성 레인은 zeroing predicate로 0 처리.
+ * @src:    원본 8비트 데이터 시작 주소(인코드 입력 바이트 스트림).
+ * @temp0:  [out] 첫 번째 6비트 인덱스 벡터(b0의 상위 6비트).
+ * @temp1:  [out] 두 번째 6비트 인덱스(b0 하위 2비트 + b1 상위 4비트).
+ * @temp2:  [out] 세 번째 6비트 인덱스(b1 하위 4비트 + b2 상위 2비트).
+ * @temp3:  [out] 네 번째 6비트 인덱스(b2 하위 6비트).
+ * @return: 없음.
  *
- * SIMD 친화적 svld3_u8가 src의 트리플(3채널 인터리브)을 자동 deinterleave한다.
- * 그 후 NEON 인코더와 동일한 비트 시프트/마스크로 24비트를 6비트 4분할.
- * 호출 체인: base64_encode_sve → [convert_6bits_to_8bits] → 이후 LUT 룩업.
+ * 동작: SIMD 친화적 svld3_u8가 src의 트리플(3채널 인터리브)을 b0/b1/b2 세 채널로
+ * 자동 deinterleave한다. 그 후 NEON 인코더와 동일한 비트 시프트/마스크 패턴으로
+ * 24비트를 6비트 4분할하여 LUT 인덱스를 생성한다.
+ *
+ * 호출 체인: base64_encode_sve → [convert_6bits_to_8bits] → 이후 svtbl/table_lookup_*vec 룩업.
+ * 실행 컨텍스트: 같은 스레드 인라인, 부수 효과 없음(메모리 read-only + 스택 변수 갱신).
  */
 static inline void
 convert_6bits_to_8bits(svbool_t pred, uint8_t *src, svuint8_t *temp0, svuint8_t *temp1,
@@ -316,13 +368,25 @@ convert_6bits_to_8bits(svbool_t pred, uint8_t *src, svuint8_t *temp0, svuint8_t 
 /*
  * [한국어]
  * convert_8bits_to_6bits - 6비트 4그룹을 8비트 3바이트로 패킹(디코드 후처리).
+ * (함수명은 다소 혼동되지만, 실제로는 6비트 4개 → 8비트 3개로 변환)
  *
- * @pred:   유효 레인 술어.
- * @temp0..3:  4개 6비트값(0..63) 벡터.
- * @output0..2: [out] 8비트 출력 3채널.
+ * @pred:    유효 레인 술어.
+ * @temp0:   첫 번째 6비트값(0..63) 벡터(LUT 룩업 결과).
+ * @temp1:   두 번째 6비트값.
+ * @temp2:   세 번째 6비트값.
+ * @temp3:   네 번째 6비트값.
+ * @output0: [out] 디코드된 첫 번째 8비트 바이트(b0).
+ * @output1: [out] 디코드된 두 번째 8비트 바이트(b1).
+ * @output2: [out] 디코드된 세 번째 8비트 바이트(b2).
+ * @return:  없음.
  *
- * NEON 디코더와 동일한 비트 시프트/OR로 4×6 = 24비트 → 3×8 비트 패킹.
- * 호출 체인: base64_decode_sve → [convert_8bits_to_6bits] → svst3_u8로 저장.
+ * 동작: NEON 디코더와 동일한 비트 시프트/OR 패턴으로 4×6 = 24비트를 3×8 = 24비트로 패킹.
+ *  - out0 = (t0 << 2) | (t1 >> 4)
+ *  - out1 = (t1 << 4) | (t2 >> 2)
+ *  - out2 = (t2 << 6) | t3
+ *
+ * 호출 체인: base64_decode_sve → [convert_8bits_to_6bits] → svst3_u8로 인터리브 저장.
+ * 실행 컨텍스트: 같은 스레드 인라인, 부수 효과 없음.
  */
 static inline void
 convert_8bits_to_6bits(svbool_t pred, svuint8_t temp0, svuint8_t temp1, svuint8_t temp2,
@@ -648,50 +712,57 @@ base64_decode_sve(void **dst, const uint8_t *dec_table, const uint8_t **src, siz
 
 		while (i < N) {
 			pred = svwhilelt_b8(i / 4, N / 4);
-			/* [한국어] 처리 범위 술어. */
+			/* [한국어] 처리 범위 술어. i/4..N/4의 base64 그룹 인덱스 활성화. */
 
 			ld_dec_input = svld4_u8(pred, *src);
-			/* [한국어] 4채널 deinterleave 로드. */
+			/* [한국어] 4채널 deinterleave 로드: 각 그룹의 c0/c1/c2/c3 ASCII 문자. */
 
 			str0 = svget4_u8(ld_dec_input, 0);
-			/* [한국어] 채널 0 추출. */
+			/* [한국어] 채널 0(첫 ASCII 문자) 추출. */
 			str1 = svget4_u8(ld_dec_input, 1);
-			/* [한국어] 채널 1. */
+			/* [한국어] 채널 1(두 번째). */
 			str2 = svget4_u8(ld_dec_input, 2);
-			/* [한국어] 채널 2. */
+			/* [한국어] 채널 2(세 번째). */
 			str3 = svget4_u8(ld_dec_input, 3);
-			/* [한국어] 채널 3. */
+			/* [한국어] 채널 3(네 번째). */
 
 			if (svcntp_b8(pred, svcmpge_n_u8(pred, str0, 128))) { return; }
-			/* [한국어] ASCII 범위 외 검사 4채널. */
+			/* [한국어] 채널 0에 ASCII 범위 외(>=128) 바이트가 활성 레인 중 하나라도 있으면
+			 * 즉시 함수 반환 → 호출자가 잔여를 스칼라로 처리. svcntp_b8은 활성 레인 카운트. */
 			if (svcntp_b8(pred, svcmpge_n_u8(pred, str1, 128))) { return; }
+			/* [한국어] 채널 1 검사. */
 			if (svcntp_b8(pred, svcmpge_n_u8(pred, str2, 128))) { return; }
+			/* [한국어] 채널 2 검사. */
 			if (svcntp_b8(pred, svcmpge_n_u8(pred, str3, 128))) { return; }
+			/* [한국어] 채널 3 검사. */
 
 			if (table_lookup_4vec(tbl_dec0, tbl_dec1, tbl_dec2, tbl_dec3, str0, &temp0, pred, vl)) { return; }
-			/* [한국어] 채널 0 LUT 룩업. */
+			/* [한국어] 채널 0 LUT 룩업, invalid시 즉시 종료. */
 			if (table_lookup_4vec(tbl_dec0, tbl_dec1, tbl_dec2, tbl_dec3, str1, &temp1, pred, vl)) { return; }
-			/* [한국어] 채널 1. */
+			/* [한국어] 채널 1 LUT 룩업. */
 			if (table_lookup_4vec(tbl_dec0, tbl_dec1, tbl_dec2, tbl_dec3, str2, &temp2, pred, vl)) { return; }
-			/* [한국어] 채널 2. */
+			/* [한국어] 채널 2 LUT 룩업. */
 			if (table_lookup_4vec(tbl_dec0, tbl_dec1, tbl_dec2, tbl_dec3, str3, &temp3, pred, vl)) { return; }
-			/* [한국어] 채널 3. */
+			/* [한국어] 채널 3 LUT 룩업. */
 
 			convert_8bits_to_6bits(pred, temp0, temp1, temp2, temp3, &output0, &output1, &output2);
-			/* [한국어] 6→8 패킹. */
+			/* [한국어] 4×6비트 → 3×8비트 패킹. */
 
 			st_dec_output = svcreate3_u8(output0, output1, output2);
-			/* [한국어] 3채널 묶기. */
+			/* [한국어] 3채널 컴파운드 묶기. */
 			svst3_u8(pred, (uint8_t *)*dst, st_dec_output);
-			/* [한국어] 인터리브 저장. */
+			/* [한국어] 인터리브 저장(자연스러운 바이트 순서). */
 
 			pred_count = svcntp_b8(pred, pred);
-			/* [한국어] 활성 레인 수. */
+			/* [한국어] 이번 반복에 처리한 활성 레인 수. */
 			*src += pred_count * 4;
+			/* [한국어] 입력은 그룹당 4B 전진. */
 			*dst = (uint8_t *)*dst + pred_count * 3;
+			/* [한국어] 출력은 그룹당 3B 전진. */
 			*src_len -= pred_count * 4;
+			/* [한국어] 남은 입력 길이 차감. */
 			i += pred_count * 4;
-			/* [한국어] 포인터/카운터 갱신(VL=16과 동일 패턴). */
+			/* [한국어] 처리 누적자 갱신. */
 
 		}
 
@@ -708,42 +779,56 @@ base64_decode_sve(void **dst, const uint8_t *dec_table, const uint8_t **src, siz
 
 		while (i < N) {
 			pred = svwhilelt_b8(i / 4, N / 4);
-			/* [한국어] 처리 범위 술어. */
+			/* [한국어] 처리 범위 술어. i/4..N/4의 base64 그룹 인덱스만 활성. */
 
 			ld_dec_input = svld4_u8(pred, *src);
-			/* [한국어] 4채널 deinterleave 로드. */
+			/* [한국어] 4채널 deinterleave 로드(c0/c1/c2/c3). */
 
 			str0 = svget4_u8(ld_dec_input, 0);
+			/* [한국어] 채널 0 추출. */
 			str1 = svget4_u8(ld_dec_input, 1);
+			/* [한국어] 채널 1 추출. */
 			str2 = svget4_u8(ld_dec_input, 2);
+			/* [한국어] 채널 2 추출. */
 			str3 = svget4_u8(ld_dec_input, 3);
-			/* [한국어] 4채널 추출. */
+			/* [한국어] 채널 3 추출. */
 
 			if (svcntp_b8(pred, svcmpge_n_u8(pred, str0, 128))) { return; }
+			/* [한국어] 채널 0 ASCII 범위 외(>=128) 검사 → 발견 시 함수 종료(스칼라 폴백). */
 			if (svcntp_b8(pred, svcmpge_n_u8(pred, str1, 128))) { return; }
+			/* [한국어] 채널 1. */
 			if (svcntp_b8(pred, svcmpge_n_u8(pred, str2, 128))) { return; }
+			/* [한국어] 채널 2. */
 			if (svcntp_b8(pred, svcmpge_n_u8(pred, str3, 128))) { return; }
-			/* [한국어] ASCII 범위(>=128) 외 검사 4채널. */
+			/* [한국어] 채널 3. */
 
 			if (table_lookup_3vec(tbl_dec0, tbl_dec1, tbl_dec2, str0, &temp0, pred, vl)) { return; }
+			/* [한국어] 채널 0 LUT 룩업(3개 청크 분할). invalid 시 종료. */
 			if (table_lookup_3vec(tbl_dec0, tbl_dec1, tbl_dec2, str1, &temp1, pred, vl)) { return; }
+			/* [한국어] 채널 1. */
 			if (table_lookup_3vec(tbl_dec0, tbl_dec1, tbl_dec2, str2, &temp2, pred, vl)) { return; }
+			/* [한국어] 채널 2. */
 			if (table_lookup_3vec(tbl_dec0, tbl_dec1, tbl_dec2, str3, &temp3, pred, vl)) { return; }
-			/* [한국어] 4채널 LUT 룩업, invalid시 즉시 종료. */
+			/* [한국어] 채널 3. */
 
 			convert_8bits_to_6bits(pred, temp0, temp1, temp2, temp3, &output0, &output1, &output2);
-			/* [한국어] 6→8 패킹. */
+			/* [한국어] 4×6비트 → 3×8비트 패킹. */
 
 			st_dec_output = svcreate3_u8(output0, output1, output2);
+			/* [한국어] 3채널 묶기. */
 			svst3_u8(pred, (uint8_t *)*dst, st_dec_output);
 			/* [한국어] 인터리브 저장. */
 
 			pred_count = svcntp_b8(pred, pred);
+			/* [한국어] 활성 레인 수. */
 			*src += pred_count * 4;
+			/* [한국어] 입력 그룹당 4B 전진. */
 			*dst = (uint8_t *)*dst + pred_count * 3;
+			/* [한국어] 출력 그룹당 3B 전진. */
 			*src_len -= pred_count * 4;
+			/* [한국어] 남은 입력 길이 차감. */
 			i += pred_count * 4;
-			/* [한국어] 포인터/카운터 갱신. */
+			/* [한국어] 처리 누적자 갱신. */
 
 		}
 	} else if (vl == 64 || vl == 80 || vl == 96 || vl == 112) {
@@ -763,36 +848,50 @@ base64_decode_sve(void **dst, const uint8_t *dec_table, const uint8_t **src, siz
 			/* [한국어] 4채널 deinterleave 로드. */
 
 			str0 = svget4_u8(ld_dec_input, 0);
+			/* [한국어] 채널 0 추출. */
 			str1 = svget4_u8(ld_dec_input, 1);
+			/* [한국어] 채널 1 추출. */
 			str2 = svget4_u8(ld_dec_input, 2);
+			/* [한국어] 채널 2 추출. */
 			str3 = svget4_u8(ld_dec_input, 3);
-			/* [한국어] 4채널 추출. */
+			/* [한국어] 채널 3 추출. */
 
 			if (svcntp_b8(pred, svcmpge_n_u8(pred, str0, 128))) { return; }
+			/* [한국어] 채널 0 ASCII 범위 외 검사 → 발견 시 즉시 종료. */
 			if (svcntp_b8(pred, svcmpge_n_u8(pred, str1, 128))) { return; }
+			/* [한국어] 채널 1. */
 			if (svcntp_b8(pred, svcmpge_n_u8(pred, str2, 128))) { return; }
+			/* [한국어] 채널 2. */
 			if (svcntp_b8(pred, svcmpge_n_u8(pred, str3, 128))) { return; }
-			/* [한국어] ASCII 범위 외 검사. */
+			/* [한국어] 채널 3. */
 
 			if (table_lookup_2vec(tbl_dec0, tbl_dec1, str0, &temp0, pred, vl)) { return; }
+			/* [한국어] 채널 0 LUT 룩업(2개 청크 분할). invalid 시 종료. */
 			if (table_lookup_2vec(tbl_dec0, tbl_dec1, str1, &temp1, pred, vl)) { return; }
+			/* [한국어] 채널 1. */
 			if (table_lookup_2vec(tbl_dec0, tbl_dec1, str2, &temp2, pred, vl)) { return; }
+			/* [한국어] 채널 2. */
 			if (table_lookup_2vec(tbl_dec0, tbl_dec1, str3, &temp3, pred, vl)) { return; }
-			/* [한국어] 4채널 LUT 룩업. */
+			/* [한국어] 채널 3. */
 
 			convert_8bits_to_6bits(pred, temp0, temp1, temp2, temp3, &output0, &output1, &output2);
-			/* [한국어] 6→8 패킹. */
+			/* [한국어] 4×6비트 → 3×8비트 패킹. */
 
 			st_dec_output = svcreate3_u8(output0, output1, output2);
+			/* [한국어] 3채널 묶기. */
 			svst3_u8(pred, (uint8_t *)*dst, st_dec_output);
 			/* [한국어] 인터리브 저장. */
 
 			pred_count = svcntp_b8(pred, pred);
+			/* [한국어] 활성 레인 수. */
 			*src += pred_count * 4;
+			/* [한국어] 입력 그룹당 4B 전진. */
 			*dst = (uint8_t *)*dst + pred_count * 3;
+			/* [한국어] 출력 그룹당 3B 전진. */
 			*src_len -= pred_count * 4;
+			/* [한국어] 남은 입력 길이 차감. */
 			i += pred_count * 4;
-			/* [한국어] 포인터/카운터 갱신. */
+			/* [한국어] 처리 누적자 갱신. */
 
 		}
 	} else if (vl >= 128) {
@@ -810,43 +909,60 @@ base64_decode_sve(void **dst, const uint8_t *dec_table, const uint8_t **src, siz
 			/* [한국어] 4채널 deinterleave 로드. */
 
 			str0 = svget4_u8(ld_dec_input, 0);
+			/* [한국어] 채널 0 추출. */
 			str1 = svget4_u8(ld_dec_input, 1);
+			/* [한국어] 채널 1 추출. */
 			str2 = svget4_u8(ld_dec_input, 2);
+			/* [한국어] 채널 2 추출. */
 			str3 = svget4_u8(ld_dec_input, 3);
-			/* [한국어] 4채널 추출. */
+			/* [한국어] 채널 3 추출. */
 
 			if (svcntp_b8(pred, svcmpge_n_u8(pred, str0, 128))) { return; }
+			/* [한국어] 채널 0 ASCII 범위 외 검사. */
 			if (svcntp_b8(pred, svcmpge_n_u8(pred, str1, 128))) { return; }
+			/* [한국어] 채널 1. */
 			if (svcntp_b8(pred, svcmpge_n_u8(pred, str2, 128))) { return; }
+			/* [한국어] 채널 2. */
 			if (svcntp_b8(pred, svcmpge_n_u8(pred, str3, 128))) { return; }
-			/* [한국어] ASCII 범위 외 검사. */
+			/* [한국어] 채널 3. */
 
 			temp0 = svtbl_u8(tbl_dec0, str0);
-			/* [한국어] 단일 svtbl_u8 룩업: 인덱스 0..127 모두 한 벡터에서 룩업 가능. */
+			/* [한국어] 단일 svtbl_u8 룩업: 인덱스 0..127 모두 한 벡터에서 룩업 가능
+			 * (VL>=128이므로 LUT가 한 SVE 벡터에 통째로 들어감). */
 			temp1 = svtbl_u8(tbl_dec0, str1);
+			/* [한국어] 채널 1 단일 룩업. */
 			temp2 = svtbl_u8(tbl_dec0, str2);
+			/* [한국어] 채널 2 단일 룩업. */
 			temp3 = svtbl_u8(tbl_dec0, str3);
-			/* [한국어] 채널 1/2/3 각각 룩업. */
+			/* [한국어] 채널 3 단일 룩업. */
 
 			if (svcntp_b8(pred, svcmpeq_n_u8(pred, temp0, 255))) { return; }
-			/* [한국어] invalid(0xFF) 검출 시 즉시 종료. */
+			/* [한국어] 채널 0 LUT 룩업 결과에 0xFF(invalid)가 있으면 즉시 종료. */
 			if (svcntp_b8(pred, svcmpeq_n_u8(pred, temp1, 255))) { return; }
+			/* [한국어] 채널 1 invalid 검사. */
 			if (svcntp_b8(pred, svcmpeq_n_u8(pred, temp2, 255))) { return; }
+			/* [한국어] 채널 2 invalid 검사. */
 			if (svcntp_b8(pred, svcmpeq_n_u8(pred, temp3, 255))) { return; }
+			/* [한국어] 채널 3 invalid 검사. */
 
 			convert_8bits_to_6bits(pred, temp0, temp1, temp2, temp3, &output0, &output1, &output2);
-			/* [한국어] 6→8 패킹. */
+			/* [한국어] 4×6비트 → 3×8비트 패킹. */
 
 			st_dec_output = svcreate3_u8(output0, output1, output2);
+			/* [한국어] 3채널 묶기. */
 			svst3_u8(pred, (uint8_t *)*dst, st_dec_output);
 			/* [한국어] 인터리브 저장. */
 
 			pred_count = svcntp_b8(pred, pred);
+			/* [한국어] 활성 레인 수. */
 			*src += pred_count * 4;
+			/* [한국어] 입력 그룹당 4B 전진. */
 			*dst = (uint8_t *)*dst + pred_count * 3;
+			/* [한국어] 출력 그룹당 3B 전진. */
 			*src_len -= pred_count * 4;
+			/* [한국어] 남은 입력 길이 차감. */
 			i += pred_count * 4;
-			/* [한국어] 포인터/카운터 갱신. */
+			/* [한국어] 처리 누적자 갱신. */
 
 		}
 	}
