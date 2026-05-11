@@ -116,7 +116,72 @@ SPDK 코드의 특성상, 주석에 다음 사항을 반드시 포함한다:
 
 ## 주석 작업 진행 현황
 
-### 완료 (10 파일)
+### 완료 (14 파일)
+
+- `lib/nvmf/subsystem.c` (4377 → 4748 라인) — 4섹션 상단 블록(subsystem 코어 역할/
+  state machine/listener/host/NS 라이프사이클),
+  헤더 인클루드/매크로/forward decl 인라인, enum spdk_nvmf_nqn_domain_states §4,
+  핵심 §2 함수 헤더 (nvmf_valid_ascii_string / nvmf_nqn_is_valid /
+  spdk_nvmf_subsystem_create / spdk_nvmf_subsystem_destroy /
+  nvmf_subsystem_set_state / spdk_nvmf_subsystem_start / stop / pause / resume /
+  spdk_nvmf_subsystem_add_listener / add_listener_ext / remove_listener /
+  spdk_nvmf_subsystem_add_host_ext / remove_host /
+  spdk_nvmf_subsystem_add_ns_ext / spdk_nvmf_subsystem_remove_ns /
+  spdk_nvmf_subsystem_set_ana_state),
+  spdk_nvmf_subsystem_create / nvmf_subsystem_set_state 본문 라인별 인라인.
+  잔여(reservation/PR 처리 함수들, ANA helper 일부) 미완.
+- `lib/nvmf/tcp.c` (4000 → 4598 라인) — 4섹션 상단 블록(NVMe-TCP wire protocol/
+  PDU 흐름/HDgst·DDgst/per-CPU poll group 구조 설명),
+  모든 매크로 인라인 주석,
+  enum spdk_nvmf_tcp_req_state §4 (전체 16개 상태에 대한 lifecycle 설명),
+  enum nvmf_tcp_qpair_state §4,
+  핵심 구조체 §4 멀티라인 (spdk_nvmf_tcp_req / spdk_nvmf_tcp_qpair /
+  spdk_nvmf_tcp_control_msg / control_msg_list / spdk_nvmf_tcp_poll_group /
+  spdk_nvmf_tcp_port / tcp_transport_opts / tcp_psk_entry /
+  spdk_nvmf_tcp_transport),
+  핵심 §2 함수 헤더 (nvmf_tcp_req_set_state / nvmf_tcp_req_get / nvmf_tcp_create /
+  nvmf_tcp_destroy / nvmf_tcp_listen / nvmf_tcp_stop_listen /
+  nvmf_tcp_handle_connect / nvmf_tcp_accept / nvmf_tcp_accept_cb /
+  nvmf_tcp_capsule_cmd_hdr_handle / capsule_cmd_payload_handle /
+  h2c_data_hdr_handle / h2c_data_payload_handle / send_capsule_resp_pdu /
+  send_r2t_pdu / _nvmf_tcp_send_c2h_data / nvmf_tcp_sock_process /
+  nvmf_tcp_qpair_process / nvmf_tcp_sock_cb / nvmf_tcp_req_complete /
+  nvmf_tcp_poll_group_poll / nvmf_tcp_req_process),
+  forward declaration 모두 인라인,
+  spdk_nvmf_transport_tcp ops 테이블 멤버별 인라인 주석,
+  sock_process AWAIT_PDU_READY/CH 케이스 본문 인라인.
+  잔여(다수 helper static 함수, qpair_init / mem_resource init / digest 처리 /
+  zcopy 처리 / abort 처리 등) 미완.
+
+### 이전 완료 (12 파일)
+
+- `lib/nvmf/ctrlr.c` (5707 → 6312 라인) — 4섹션 상단 블록(파일 역할/위치/연결/주요 함수),
+  핵심 매크로(NVMF_CC_RESET_SHN_TIMEOUT_IN_MS, FW_VERSION, NVMF_ABORT_COMMAND_LIMIT 등) 인라인,
+  spdk_nvmf_custom_admin_cmd / nvmf_prop §4 멀티라인 구조체 주석,
+  핵심 함수(nvmf_ctrlr_create / _nvmf_ctrlr_destruct / nvmf_ctrlr_destruct /
+  nvmf_ctrlr_stop_keep_alive_timer / start_keep_alive_timer / stop_association_timer /
+  nvmf_qpair_set_ctrlr / nvmf_ctrlr_send_connect_rsp / nvmf_ctrlr_add_qpair /
+  nvmf_invalid_connect_response / SPDK_NVMF_INVALID_CONNECT_CMD/DATA 매크로 /
+  nvmf_ctrlr_disconnect_qpairs_done / _nvmf_ctrlr_disconnect_qpairs_on_pg /
+  nvmf_ctrlr_disconnect_qpairs_on_pg / nvmf_ctrlr_disconnect_io_qpairs_on_pg /
+  nvmf_ctrlr_keep_alive_poll / nvmf_ctrlr_cmd_connect / _nvmf_ctrlr_connect /
+  nvmf_property_get / nvmf_property_set / nvmf_prop_set_cc / find_prop /
+  nvmf_ctrlr_async_event_request / nvmf_ctrlr_get_log_page / nvmf_ctrlr_identify /
+  nvmf_ctrlr_process_admin_cmd / nvmf_ctrlr_process_fabrics_cmd /
+  nvmf_ctrlr_process_io_cmd / spdk_nvmf_request_complete / spdk_nvmf_request_exec) §2 헤더,
+  nvmf_ctrlr_create 본문 핵심 라인 인라인.
+- `lib/nvmf/nvmf_rpc.c` (3298 → 3713 라인) — 4섹션 상단 블록,
+  주요 ctx 구조체(rpc_get_subsystem / rpc_subsystem_create / rpc_listen_address /
+  nvmf_rpc_listen_op / nvmf_rpc_listener_ctx / nvmf_rpc_ns_params / nvmf_rpc_ns_ctx /
+  nvmf_rpc_host_ctx / nvmf_rpc_create_transport_ctx) §4 멀티라인 필드 주석,
+  핵심 RPC 핸들러(rpc_nvmf_get_subsystems / rpc_nvmf_create_subsystem /
+  rpc_nvmf_delete_subsystem / rpc_nvmf_subsystem_add_listener /
+  rpc_nvmf_subsystem_remove_listener / rpc_nvmf_subsystem_add_ns /
+  rpc_nvmf_subsystem_remove_ns / rpc_nvmf_subsystem_add_host /
+  rpc_nvmf_create_target / rpc_nvmf_create_transport / rpc_nvmf_get_stats /
+  _rpc_nvmf_subsystem_query) §2 헤더.
+
+### 이전 완료 (10 파일)
 
 - `lib/blob/blobstore.c` (10402 라인) — 4섹션 상단 블록 + 모든 공개 API(spdk_*) §2 함수 헤더
   + 핵심 함수(spdk_bs_init/load/unload/destroy/create_blob/open_blob/close/io_*) 인라인 주석.

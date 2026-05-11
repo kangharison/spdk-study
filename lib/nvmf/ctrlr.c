@@ -6,6 +6,91 @@
  *   Copyright (c) 2025, Oracle and/or its affiliates.
  */
 
+/*
+ * [한국어 설명] NVMe-oF Target 컨트롤러(ctrlr) 라이프사이클 및 명령 디스패처 (ctrlr.c)
+ *
+ * === 파일의 역할 ===
+ * 본 파일은 SPDK NVMe-over-Fabrics(NVMf) Target 측에서 "컨트롤러(spdk_nvmf_ctrlr)"
+ * 객체의 라이프사이클(생성/Connect/Property Get/Set/AER/Keep-Alive/Shutdown/소멸)과
+ * 호스트가 보낸 NVMe Admin/Fabric/I/O 명령을 적절한 핸들러로 디스패치하는 핵심
+ * 로직을 구현한다. 호스트가 Fabric Connect Capsule(qid=0)을 보내면 본 파일의
+ * nvmf_ctrlr_create()가 컨트롤러 객체를 만들고, 후속 Connect(qid>0)는 IO QPair를
+ * 동일 컨트롤러에 등록하여 멀티 큐 페어 NVMe 세션을 구성한다.
+ * 이후 호스트가 보낸 Admin 명령(Identify/Get Log Page/Set Features/AER 등)은
+ * nvmf_ctrlr_process_admin_cmd()에서, IO 명령은 nvmf_ctrlr_process_io_cmd()에서
+ * 처리되며, Fabric 캡슐 명령(Property Get/Set/Authentication Send/Recv)은
+ * nvmf_ctrlr_process_fabrics_cmd()에서 처리된다. 컨트롤러 라이프사이클의
+ * 종결(Keep-Alive 만료, Shutdown 요청, 명시적 disconnect)도 본 파일의 타이머
+ * 폴러와 disconnect 헬퍼에서 담당한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * 호출 체인 (수신 경로):
+ *   transport(rdma/tcp/fc/vfio) → spdk_nvmf_request_exec() → 본 파일의
+ *   nvmf_ctrlr_process_{fabrics,admin,io}_cmd → 개별 핸들러 → nvmf_bdev_ctrlr_*
+ *   → bdev 레이어 → bdev 모듈 (예: bdev_nvme/bdev_malloc) → 백엔드
+ * 호출 체인 (응답 경로):
+ *   bdev 완료 콜백 → spdk_nvmf_request_complete() → _nvmf_request_complete()
+ *   (해당 컨트롤러를 소유한 SPDK thread로 메시지 전송)
+ *   → nvmf_transport_req_complete() → transport가 RDMA/TCP/FC로 CQE/Capsule 송신
+ * 실행 컨텍스트:
+ *   - 컨트롤러 객체는 admin qpair를 처음 받은 SPDK thread(=poll group)에
+ *     "고정(thread affinity)"되며 이후 모든 컨트롤러 상태 변경은 ctrlr->thread에서만
+ *     수행된다. 다른 스레드에서의 작업은 spdk_thread_send_msg()로 위임된다.
+ *   - polled-mode: keep_alive_poller, association_timer, cc_timeout_timer 등은
+ *     모두 SPDK_POLLER_REGISTER로 등록되어 reactor 루프에서 주기적으로 호출된다.
+ *
+ * === 타 모듈과의 연결 ===
+ * - lib/nvmf/subsystem.c: spdk_nvmf_subsystem 객체와 호스트/리스너 ACL을 관리한다.
+ *   본 파일은 nvmf_subsystem_add_ctrlr/remove_ctrlr/host_allowed/listener_allowed
+ *   등을 호출하여 subsystem과 컨트롤러를 결합한다.
+ * - lib/nvmf/transport.c, rdma.c, tcp.c, fc.c: transport-specific qpair을 생성하고,
+ *   본 파일의 nvmf_ctrlr_add_qpair()로 컨트롤러에 등록한다. 응답 송신은
+ *   nvmf_transport_req_complete()를 통해 transport에 위임된다.
+ * - lib/nvmf/ctrlr_bdev.c: nvmf_bdev_ctrlr_read/write/flush/identify 등 NVMe ↔ bdev
+ *   I/O 변환 함수가 정의되어 있으며, 본 파일이 호출자(caller)이다.
+ * - lib/nvmf/auth.c: nvmf_qpair_auth_init/nvmf_auth_request_exec 등 DH-HMAC-CHAP
+ *   인증 흐름을 제공하며, Connect 응답 시 인증 필요 여부에 따라 본 파일이 위임한다.
+ * - lib/nvmf/ctrlr_discovery.c: Discovery Subsystem 전용 Get Log Page(LID=0x70)를
+ *   처리하는 nvmf_get_discovery_log_page_async()를 본 파일이 호출한다.
+ * - include/spdk/nvme_spec.h: NVMe 1.x/2.x 스펙의 명령/완료/레지스터 비트필드 정의.
+ *   본 파일은 spec 정의를 직접 사용하여 호스트와 wire-compatible한 응답을 만든다.
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - nvmf_ctrlr_create(): qid=0(admin) Connect 처리 중 호출되어 spdk_nvmf_ctrlr를
+ *   할당하고 vcprop(가상 컨트롤러 레지스터)/cdata(Identify Controller 데이터)를
+ *   초기화한다. KAS, Number of Queues, ANA, Discovery 여부에 따라 다른 기본값을
+ *   적용하고, qpair_mask/visible_ns 등 비트맵을 만든다.
+ * - nvmf_ctrlr_destruct(): subsystem에서 컨트롤러를 제거한 뒤 ctrlr->thread로
+ *   메시지를 보내 _nvmf_ctrlr_destruct()에서 실제 free를 수행한다.
+ * - nvmf_ctrlr_cmd_connect() / _nvmf_ctrlr_connect() / _nvmf_ctrlr_add_io_qpair():
+ *   Fabric Connect 명령 처리. qid=0이면 새 컨트롤러 생성, qid>0이면 기존
+ *   컨트롤러에 IO qpair를 추가한다.
+ * - nvmf_property_get() / nvmf_property_set(): NVMe-oF Property Get/Set Capsule.
+ *   호스트가 가상 컨트롤러 레지스터(CC/CSTS/CAP/VS/AQA/ASQ/ACQ/CRTO)를 읽거나
+ *   쓰는 wire 진입점. nvmf_props[] 테이블이 매핑을 담당한다.
+ * - nvmf_prop_set_cc(): CC 레지스터 변경 처리 (EN/SHN/IOSQES/IOCQES). Enable이
+ *   1이면 CSTS.RDY=1로 만들고, Shutdown/Disable이면 IO qpair들을 끊고 association
+ *   타이머를 시작한다.
+ * - nvmf_ctrlr_keep_alive_poll() / nvmf_ctrlr_async_event_*(): Keep-Alive 만료
+ *   감시와 AER(Async Event Request) 통지(NS Attribute Change/ANA Change/Discovery
+ *   Log Change/Reservation Notice/Error 등) 발송.
+ * - nvmf_ctrlr_get_log_page(): Get Log Page 명령. SUPPORTED_LOG_PAGES, ERROR,
+ *   FIRMWARE_SLOT, ANA, COMMAND_EFFECTS, CHANGED_NS_LIST, RESERVATION_NOTIFICATION,
+ *   FEATURE_IDS_EFFECTS, NVME_MI_EFFECTS, DISCOVERY 등을 분기한다.
+ * - nvmf_ctrlr_identify(): Identify 명령. CNS 값에 따라 NS/CTRLR/Active NS List/
+ *   NS ID Descriptor/IOCS-specific 데이터를 만든다.
+ * - nvmf_ctrlr_process_admin_cmd() / nvmf_ctrlr_process_io_cmd():
+ *   각각 Admin/IO 명령의 최상위 디스패처. opcode별 핸들러 분기 + 디스커버리
+ *   컨트롤러 한정 검사 + ANA 상태 검사 + Reservation 충돌 검사 등을 수행.
+ * - spdk_nvmf_request_exec(): transport가 호출하는 본 파일의 진입점.
+ *   subsystem/qpair 활성 검사 후 위 디스패처들로 분기.
+ * - spdk_nvmf_request_complete() / _nvmf_request_complete(): 모든 NVMe 응답이
+ *   거치는 중앙 완료 경로. outstanding 큐에서 빼고, mgmt_io_outstanding/
+ *   io_outstanding 카운터를 감소시키고, subsystem이 PAUSING이면 일괄 PAUSED 전환.
+ * - struct spdk_nvmf_custom_admin_cmd: bdev 모듈이 등록한 사용자 정의 admin 핸들러.
+ * - struct nvmf_prop: vcprop 가상 레지스터의 offset/size/get_cb/set_cb 매핑 테이블.
+ */
+
 #include "spdk/stdinc.h"
 
 #include "nvmf_internal.h"
@@ -24,78 +109,161 @@
 #include "spdk/log.h"
 #include "spdk_internal/usdt.h"
 
+/* [한국어] CC.SHN(Shutdown Notification)/CC.EN=0(Reset) 처리 후 IO qpair가 모두
+ * 정리되기를 기다리는 자체 타임아웃(밀리초). NVMe 호스트 측 reset/shutdown
+ * 타임아웃보다 짧게 잡아, 호스트가 timeout 으로 강제 reset하기 전에 컨트롤러가
+ * 깔끔하게 fatal status 표시 등을 할 수 있게 한다. */
 #define NVMF_CC_RESET_SHN_TIMEOUT_IN_MS	10000
 
+/* [한국어] 위 타임아웃 + 5초 여유. 호스트 측이 컨트롤러 ready/shutdown complete를
+ * 기다리는 최대 시간으로 사용되며, vcprop.cap.bits.to (500ms 단위)에도 반영된다. */
 #define NVMF_CTRLR_RESET_SHN_TIMEOUT_IN_MS	(NVMF_CC_RESET_SHN_TIMEOUT_IN_MS + 5000)
 
+/* [한국어] IO Connect 시 동일 QID가 비트맵에 이미 set되어 있을 때 재시도 간격(μs).
+ * 호스트가 같은 QID로 재접속을 시도하는 동안 이전 qpair 정리가 비동기로 끝나기를
+ * 기다리는 폴러 주기. 너무 짧으면 비트맵 race가, 너무 길면 호스트가 connect timeout
+ * 을 보게 된다. */
 #define DUPLICATE_QID_RETRY_US 1000
 
 /*
  * Report the SPDK version as the firmware revision.
  * SPDK_VERSION_STRING won't fit into FR (only 8 bytes), so try to fit the most important parts.
  */
+/* [한국어] Identify Controller 응답의 FR(Firmware Revision) 8바이트에 들어갈 SPDK
+ * 버전 문자열. SPDK_VERSION_STRING 전체는 8바이트를 초과하므로 major.minor.patch
+ * 부분만 연결한다. NVMe 호스트의 nvme-cli가 "nvme list" 등에서 표시한다. */
 #define FW_VERSION SPDK_VERSION_MAJOR_STRING SPDK_VERSION_MINOR_STRING SPDK_VERSION_PATCH_STRING
 
+/* [한국어] ANA(Asymmetric Namespace Access) 상태 전이 시 호스트가 기다려야 할
+ * 최대 시간(초). Identify Controller의 anatt 필드로 보고된다 (NVMe 1.4 8.18). */
 #define ANA_TRANSITION_TIME_IN_SEC 10
 
+/* [한국어] Identify Controller의 ACL(Abort Command Limit) 필드 값 (0-based).
+ * 동시에 처리할 수 있는 abort 명령 수 = 이 값 + 1. SPDK는 실제 제한이 없지만
+ * 스펙 권장값을 따른다 (NVMe 1.4 5.15). */
 #define NVMF_ABORT_COMMAND_LIMIT 3
 
 /*
  * Support for custom admin command handlers
  */
+/* [한국어] bdev 모듈(예: bdev_nvme)이 특정 admin opcode를 가로채서 직접 처리할 수
+ * 있게 해주는 후크 등록 테이블의 단위 항목. spdk_nvmf_set_custom_admin_cmd_hdlr()/
+ * spdk_nvmf_set_passthru_admin_cmd()로 등록되며, nvmf_ctrlr_process_admin_cmd()
+ * 안에서 표준 디스패치 직전에 hdlr가 우선 호출된다. */
 struct spdk_nvmf_custom_admin_cmd {
 	spdk_nvmf_custom_cmd_hdlr hdlr;
+	/* [한국어] 등록된 사용자 콜백.
+	 * 설정자: spdk_nvmf_set_custom_admin_cmd_hdlr()/spdk_nvmf_set_passthru_admin_cmd().
+	 * 읽는 자: nvmf_ctrlr_process_admin_cmd()가 cmd->opc 진입 직후 비교.
+	 * 값 범위: NULL이면 표준 처리, non-NULL이면 호출되어 SPDK_NVMF_REQUEST_EXEC_*
+	 * 상태를 반환해야 한다.
+	 * 동기화: 단일 ctrlr->thread에서만 읽히므로 락 없음 (하지만 등록은 보통
+	 * RPC 콜백/초기화 시점에 한 번만). */
+
 	uint32_t nsid; /* nsid to forward */
+	/* [한국어] passthru가 enable일 때 명령을 어느 NSID의 bdev로 forward할지.
+	 * 0이면 cmd->nsid를 그대로 사용. spdk_nvmf_set_passthru_admin_cmd()가 설정.
+	 * nvmf_passthru_admin_cmd()에서 읽는다. */
 };
 
+/* [한국어] opcode(0~SPDK_NVME_MAX_OPC) 별 사용자 admin 핸들러 전역 테이블.
+ * NVMe admin opcode는 1바이트(0~255). bdev_nvme 모듈이 startup 시 등록한 후
+ * 모든 ctrlr 객체가 공유한다. 동기화: 등록은 초기화 단계에서만 발생한다고 가정. */
 static struct spdk_nvmf_custom_admin_cmd g_nvmf_custom_admin_cmd_hdlrs[SPDK_NVME_MAX_OPC + 1];
 
+/* [한국어] 전방 선언들. _nvmf_request_complete: 응답 송신 + 카운터 정리 (스레드
+ * 메시지 콜백). nvmf_passthru_admin_cmd_for_ctrlr: 컨트롤러 첫 NS로 admin 명령
+ * 우회. nvmf_passthru_admin_cmd: cmd->nsid 또는 hdlrs[opc].nsid로 우회. */
 static void _nvmf_request_complete(void *ctx);
 int nvmf_passthru_admin_cmd_for_ctrlr(struct spdk_nvmf_request *req, struct spdk_nvmf_ctrlr *ctrlr);
 static int nvmf_passthru_admin_cmd(struct spdk_nvmf_request *req);
 
+/*
+ * [한국어]
+ * nvmf_invalid_connect_response - Connect Capsule에 INVALID_PARAM 상태를 채운다
+ *
+ * @rsp: Connect 응답 캡슐 포인터.
+ * @iattr: 0=command capsule 내 잘못된 필드, 1=data capsule(connect_data) 내 잘못된 필드.
+ * @ipo: 잘못된 필드의 byte offset (connect_cmd 또는 connect_data 구조체 기준).
+ *
+ * NVMe-oF 1.1 스펙 (Figure 28 Fabric Status) 의 INVALID_PARAM (sct=COMMAND_SPECIFIC,
+ * sc=02h) 형식으로 응답을 만들고, 어느 필드가 문제인지 호스트에 알려준다.
+ * SPDK_NVMF_INVALID_CONNECT_CMD/DATA 매크로의 공통 헬퍼.
+ */
 static inline void
 nvmf_invalid_connect_response(struct spdk_nvmf_fabric_connect_rsp *rsp,
 			      uint8_t iattr, uint16_t ipo)
 {
-	rsp->status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
-	rsp->status.sc = SPDK_NVMF_FABRIC_SC_INVALID_PARAM;
-	rsp->status_code_specific.invalid.iattr = iattr;
-	rsp->status_code_specific.invalid.ipo = ipo;
+	rsp->status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC; /* [한국어] SCT=01h Command Specific */
+	rsp->status.sc = SPDK_NVMF_FABRIC_SC_INVALID_PARAM; /* [한국어] SC=02h Invalid Parameter */
+	rsp->status_code_specific.invalid.iattr = iattr; /* [한국어] cmd vs data 구분 비트 */
+	rsp->status_code_specific.invalid.ipo = ipo; /* [한국어] 잘못된 필드 오프셋 */
 }
 
+/* [한국어] Connect Command Capsule(SQE 본문) 내 잘못된 필드를 보고할 때 사용.
+ * iattr=0, ipo=struct spdk_nvmf_fabric_connect_cmd 의 해당 필드 offset. */
 #define SPDK_NVMF_INVALID_CONNECT_CMD(rsp, field)	\
 	nvmf_invalid_connect_response(rsp, 0, offsetof(struct spdk_nvmf_fabric_connect_cmd, field))
+/* [한국어] Connect Data Capsule(이어붙은 in-capsule 데이터) 내 잘못된 필드를 보고.
+ * iattr=1, ipo=struct spdk_nvmf_fabric_connect_data 의 해당 필드 offset. */
 #define SPDK_NVMF_INVALID_CONNECT_DATA(rsp, field)	\
 	nvmf_invalid_connect_response(rsp, 1, offsetof(struct spdk_nvmf_fabric_connect_data, field))
 
 
+/*
+ * [한국어]
+ * nvmf_ctrlr_stop_keep_alive_timer - Keep-Alive 만료 감시 폴러를 해제한다
+ *
+ * @ctrlr: 컨트롤러 객체. NULL이면 ERRLOG만 찍고 반환.
+ *
+ * Keep-Alive(Admin opcode 18h, NVMe 1.4 Section 5.18)는 호스트가 KATO 시간 안에
+ * 이 명령을 다시 보내지 않으면 컨트롤러가 association을 끊도록 하는 watchdog이다.
+ * 본 함수는 association을 끊거나 컨트롤러가 destruct될 때 호출되어 폴러를 unregister한다.
+ * 호출 컨텍스트: ctrlr->thread (ctrlr 라이프사이클을 관리하는 스레드).
+ *
+ * 호출 체인:
+ *   nvmf_ctrlr_keep_alive_poll(만료 감지) → 본 함수
+ *   _nvmf_ctrlr_destruct → 본 함수
+ *   nvmf_prop_set_cc(SHN 진입) → 본 함수
+ */
 static void
 nvmf_ctrlr_stop_keep_alive_timer(struct spdk_nvmf_ctrlr *ctrlr)
 {
-	if (!ctrlr) {
+	if (!ctrlr) { /* [한국어] 방어적 NULL 체크 - 호출자가 항상 valid를 줘야 정상 */
 		SPDK_ERRLOG("Controller is NULL\n");
 		return;
 	}
 
-	if (ctrlr->keep_alive_poller == NULL) {
+	if (ctrlr->keep_alive_poller == NULL) { /* [한국어] 이미 멈춰있거나 KATO=0이라 등록되지 않았을 수 있음 */
 		return;
 	}
 
 	SPDK_DEBUGLOG(nvmf, "Stop keep alive poller\n");
-	spdk_poller_unregister(&ctrlr->keep_alive_poller);
+	spdk_poller_unregister(&ctrlr->keep_alive_poller); /* [한국어] reactor 폴러 리스트에서 제거 (포인터는 NULL로 set됨) */
 }
 
+/*
+ * [한국어]
+ * nvmf_ctrlr_stop_association_timer - "association preserve" 타임아웃 폴러 해제
+ *
+ * @ctrlr: 컨트롤러 객체.
+ *
+ * NVMe-oF 스펙은 CC.EN이 1→0으로 전이된 후에도 일정 시간(association_timeout)
+ * 동안 호스트-컨트롤러 association을 유지해야 한다고 규정한다 (스펙 Figure 26 등).
+ * 호스트가 이 시간 안에 다시 CC.EN=1을 쓰면 동일 ctrlr 객체가 재사용된다.
+ * 호스트가 다시 enable하지 않으면 nvmf_ctrlr_association_remove() 폴러가 발화하여
+ * admin qpair을 disconnect한다. 본 함수는 그 폴러를 정리한다.
+ */
 static void
 nvmf_ctrlr_stop_association_timer(struct spdk_nvmf_ctrlr *ctrlr)
 {
 	if (!ctrlr) {
 		SPDK_ERRLOG("Controller is NULL\n");
-		assert(false);
+		assert(false); /* [한국어] 정상 흐름에서는 절대 NULL이 와선 안 됨 */
 		return;
 	}
 
-	if (ctrlr->association_timer == NULL) {
+	if (ctrlr->association_timer == NULL) { /* [한국어] CC.EN=0 상태가 아니거나 이미 해제됨 */
 		return;
 	}
 
@@ -103,6 +271,17 @@ nvmf_ctrlr_stop_association_timer(struct spdk_nvmf_ctrlr *ctrlr)
 	spdk_poller_unregister(&ctrlr->association_timer);
 }
 
+/*
+ * [한국어]
+ * nvmf_ctrlr_disconnect_qpairs_done - spdk_for_each_channel 종료 콜백 (로깅용)
+ *
+ * @i: 채널 iterator (사용 안 함).
+ * @status: 0=모든 poll group 순회 성공, <0=실패.
+ *
+ * spdk_for_each_channel(target, fn, ctx, done)에서 모든 reactor의 poll group을
+ * 순회한 뒤 호출되는 종료 후크. 본 함수는 결과 로깅만 하고 추가 작업은 없다.
+ * (Keep-Alive 만료 시점의 IO/Admin qpair 일괄 disconnect 흐름의 마무리.)
+ */
 static void
 nvmf_ctrlr_disconnect_qpairs_done(struct spdk_io_channel_iter *i, int status)
 {
@@ -113,6 +292,21 @@ nvmf_ctrlr_disconnect_qpairs_done(struct spdk_io_channel_iter *i, int status)
 	}
 }
 
+/*
+ * [한국어]
+ * _nvmf_ctrlr_disconnect_qpairs_on_pg - 한 poll group의 qpair 중 ctrlr 소유분 끊기
+ *
+ * @i: spdk_for_each_channel iterator. ctx에 spdk_nvmf_ctrlr*가 들어 있다.
+ * @include_admin: true면 admin qpair도 끊고, false면 IO qpair만 끊는다.
+ * @return: 0 또는 spdk_nvmf_qpair_disconnect()의 음수 에러.
+ *
+ * 각 reactor에 배치된 poll group을 순회하면서 해당 group이 들고 있는 qpair 중
+ * 본 컨트롤러 소유(qpair->ctrlr == ctrlr)인 것들을 disconnect한다. EINPROGRESS는
+ * "비동기 진행 중"의 정상 흐름이라 0으로 정규화한다.
+ *
+ * 호출 컨텍스트: 각 poll group의 SPDK thread (spdk_for_each_channel가 메시지로
+ * 디스패치). qpair는 그 thread에 소속되므로 안전하게 disconnect 가능.
+ */
 static int
 _nvmf_ctrlr_disconnect_qpairs_on_pg(struct spdk_io_channel_iter *i, bool include_admin)
 {
@@ -143,18 +337,48 @@ _nvmf_ctrlr_disconnect_qpairs_on_pg(struct spdk_io_channel_iter *i, bool include
 	return rc;
 }
 
+/*
+ * [한국어]
+ * nvmf_ctrlr_disconnect_qpairs_on_pg - per-pg 콜백: admin 포함 모든 qpair 해제
+ * Keep-Alive 만료 시 호스트와의 연결을 완전히 끊을 때 사용된다.
+ */
 static void
 nvmf_ctrlr_disconnect_qpairs_on_pg(struct spdk_io_channel_iter *i)
 {
 	spdk_for_each_channel_continue(i, _nvmf_ctrlr_disconnect_qpairs_on_pg(i, true));
 }
 
+/*
+ * [한국어]
+ * nvmf_ctrlr_disconnect_io_qpairs_on_pg - per-pg 콜백: IO qpair만 해제 (admin 보존)
+ * CC.EN=1→0 또는 SHN(Shutdown) 진입 시 사용된다. admin qpair는 호스트가 다시
+ * 사용할 수 있도록 보존하고, IO qpair만 닫아 in-flight IO를 중단한다.
+ */
 static void
 nvmf_ctrlr_disconnect_io_qpairs_on_pg(struct spdk_io_channel_iter *i)
 {
 	spdk_for_each_channel_continue(i, _nvmf_ctrlr_disconnect_qpairs_on_pg(i, false));
 }
 
+/*
+ * [한국어]
+ * nvmf_ctrlr_keep_alive_poll - KATO 만료 감시 폴러 (주기 = KATO ms)
+ *
+ * @ctx: 컨트롤러 객체 포인터 (poller 등록 시 전달됨).
+ * @return: SPDK_POLLER_IDLE/BUSY (work 수행 여부). reactor의 통계용.
+ *
+ * 마지막 Keep-Alive 명령 이후 KATO 시간이 흐르면 호스트가 죽었다고 간주하여
+ * CSTS.CFS(Controller Fatal Status)=1을 set하고 모든 qpair를 끊는다. 정상
+ * 호스트는 KATO 절반 정도마다 Keep-Alive를 보내므로 last_keep_alive_tick이
+ * 자주 갱신된다.
+ *
+ * 호출 컨텍스트: ctrlr->thread (Keep-Alive Admin 명령도 같은 스레드에서
+ * last_keep_alive_tick을 갱신하므로 락 불필요).
+ *
+ * 호출 체인:
+ *   reactor 폴 루프 → 본 함수 → nvmf_ctrlr_set_fatal_status + spdk_for_each_channel
+ *     → nvmf_ctrlr_disconnect_qpairs_on_pg → spdk_nvmf_qpair_disconnect
+ */
 static int
 nvmf_ctrlr_keep_alive_poll(void *ctx)
 {
@@ -195,6 +419,19 @@ nvmf_ctrlr_keep_alive_poll(void *ctx)
 	return SPDK_POLLER_IDLE;
 }
 
+/*
+ * [한국어]
+ * nvmf_ctrlr_start_keep_alive_timer - KATO 폴러를 등록한다
+ *
+ * @ctrlr: 컨트롤러 객체. KATO=0이면 아무 일도 하지 않음.
+ *
+ * Keep-Alive 기능이 enable(KATO≠0)된 경우 last_keep_alive_tick를 현재 ticks로
+ * 초기화하고, KATO ms 주기의 폴러를 등록한다. KATO 단위는 ms이며 SPDK_POLLER_REGISTER
+ * 의 마지막 인자는 μs이므로 *1000을 곱한다.
+ *
+ * 호출 컨텍스트: ctrlr->thread. _nvmf_ctrlr_add_admin_qpair() 또는
+ * nvmf_ctrlr_set_features_keep_alive_timer()에서 호출된다.
+ */
 static void
 nvmf_ctrlr_start_keep_alive_timer(struct spdk_nvmf_ctrlr *ctrlr)
 {
@@ -204,32 +441,62 @@ nvmf_ctrlr_start_keep_alive_timer(struct spdk_nvmf_ctrlr *ctrlr)
 	}
 
 	/* if cleared to 0 then the Keep Alive Timer is disabled */
-	if (ctrlr->feat.keep_alive_timer.bits.kato != 0) {
+	if (ctrlr->feat.keep_alive_timer.bits.kato != 0) { /* [한국어] KATO=0이면 KA 비활성 (스펙 5.18) */
 
-		ctrlr->last_keep_alive_tick = spdk_get_ticks();
+		ctrlr->last_keep_alive_tick = spdk_get_ticks(); /* [한국어] 시계 origin = 지금. 첫 만료 = now+KATO */
 
 		SPDK_DEBUGLOG(nvmf, "Ctrlr add keep alive poller\n");
 		ctrlr->keep_alive_poller = SPDK_POLLER_REGISTER(nvmf_ctrlr_keep_alive_poll, ctrlr,
-					   ctrlr->feat.keep_alive_timer.bits.kato * 1000);
+					   ctrlr->feat.keep_alive_timer.bits.kato * 1000); /* [한국어] ms→μs */
 	}
 }
 
+/*
+ * [한국어]
+ * nvmf_qpair_set_ctrlr - qpair에 컨트롤러 포인터를 결합한다 (idempotent)
+ *
+ * @qpair: NVMe-oF qpair (admin or IO).
+ * @ctrlr: 결합 대상 컨트롤러.
+ *
+ * Connect 처리 도중 qpair->ctrlr를 set하는 헬퍼. admin qpair의 경우 _nvmf_subsystem_add_ctrlr
+ * 와 _nvmf_ctrlr_add_admin_qpair 양쪽에서 set 시도가 발생하므로 두 번 호출되어도
+ * 무해하도록 idempotent로 작성됨. trace_id에 subsystem NQN 문자열을 추가하여
+ * SPDK trace 분석 시 구분되게 한다.
+ */
 static void
 nvmf_qpair_set_ctrlr(struct spdk_nvmf_qpair *qpair, struct spdk_nvmf_ctrlr *ctrlr)
 {
 	if (qpair->ctrlr != NULL) {
 		/* Admin queues will call this function twice. */
-		assert(qpair->ctrlr == ctrlr);
+		assert(qpair->ctrlr == ctrlr); /* [한국어] 두 번째 호출이라면 같은 ctrlr여야 함 */
 		return;
 	}
 
-	qpair->ctrlr = ctrlr;
+	qpair->ctrlr = ctrlr; /* [한국어] 이후 모든 dispatch는 qpair->ctrlr를 통해 ctrlr 접근 */
 	spdk_trace_owner_append_description(qpair->trace_id,
 					    spdk_nvmf_subsystem_get_nqn(ctrlr->subsys));
 }
 
 static int _retry_qid_check(void *ctx);
 
+/*
+ * [한국어]
+ * nvmf_ctrlr_send_connect_rsp - Connect 명령에 대한 최종 응답 캡슐을 송신한다
+ *
+ * @ctx: spdk_nvmf_request* (메시지 콜백 인자).
+ *
+ * Connect 처리의 마지막 단계. 인증이 필요한 subsystem이면 qpair을
+ * AUTHENTICATING 상태로 두고 응답의 ATR(authreq) 비트를 1로 표시하여 호스트가
+ * Authentication Send/Recv를 시작하도록 알린다. 인증이 필요 없으면 바로 ENABLED
+ * 로 전환한다. 응답에는 새로 할당된 cntlid를 채워 넣는다 (admin Connect의 경우).
+ *
+ * 호출 컨텍스트: qpair->group->thread (qpair_set_state, request_complete가
+ * 그 스레드에서 수행되어야 하므로 spdk_thread_send_msg로 진입).
+ *
+ * 호출 체인:
+ *   nvmf_ctrlr_add_qpair → spdk_thread_send_msg(qpair->group->thread, 본 함수)
+ *   → spdk_nvmf_request_complete → transport가 Connect Response Capsule 송신
+ */
 static void
 nvmf_ctrlr_send_connect_rsp(void *ctx)
 {
@@ -267,6 +534,24 @@ nvmf_ctrlr_send_connect_rsp(void *ctx)
 	spdk_nvmf_request_complete(req);
 }
 
+/*
+ * [한국어]
+ * nvmf_ctrlr_add_qpair - 컨트롤러의 qpair 비트맵에 새 qpair를 등록한다
+ *
+ * @qpair: 등록할 qpair.
+ * @ctrlr: 소속 컨트롤러.
+ * @req: Connect 요청 객체. 처리 결과(success/error)를 채워 응답한다.
+ *
+ * Connect 흐름의 핵심 단계로, 다음을 수행한다:
+ * 1) admin_qpair가 사라졌으면 INVALID_PARAM으로 거절.
+ * 2) 동일 QID가 이미 비트맵에 set이면 (a) 진행 중인 connect_req이 없으면 즉시
+ *    INVALID_QUEUE_IDENTIFIER로 거절, (b) 있으면 DUPLICATE_QID_RETRY_US 폴러를
+ *    걸어 잠시 후 재시도 (이전 qpair의 disconnect가 진행 중일 가능성).
+ * 3) 비트맵에 set하고 성공 응답을 admin qpair의 thread로 보낸다.
+ *
+ * 호출 컨텍스트: ctrlr->thread (admin qpair가 소속된 SPDK thread). admin이
+ * 사라진 경우의 보호 로직이 들어 있다.
+ */
 static void
 nvmf_ctrlr_add_qpair(struct spdk_nvmf_qpair *qpair,
 		     struct spdk_nvmf_ctrlr *ctrlr,
@@ -434,6 +719,31 @@ nvmf_ctrlr_init_visible_ns(struct spdk_nvmf_ctrlr *ctrlr)
 	}
 }
 
+/*
+ * [한국어]
+ * nvmf_ctrlr_create - 호스트의 admin Connect(qid=0)에 대해 새 컨트롤러를 만든다
+ *
+ * @subsystem: 호스트가 접속하려는 NVM subsystem (subnqn으로 룩업됨).
+ * @req: Connect 요청 객체 (응답 채우기에 사용).
+ * @connect_cmd: Connect SQE (KATO, qid, sqsize 등).
+ * @connect_data: Connect 데이터 캡슐 (hostnqn, hostid, cntlid 등 NQN/UUID).
+ * @return: 신규 spdk_nvmf_ctrlr* (성공) 또는 NULL (할당/리스너 검색 실패).
+ *
+ * 흐름 요약:
+ *  1) calloc으로 ctrlr 객체 할당.
+ *  2) Fabrics(rdma/tcp/fc)이면 dynamic ctrlr (cntlid는 후속 add_ctrlr에서 할당).
+ *  3) qpair_mask, visible_ns 비트맵 생성. nvmf_ctrlr_cdata_init()으로
+ *     Identify Controller 데이터(cdata) 기본값 채움.
+ *  4) KATO 정규화 (transport->opts.min_kato 보정 + KAS unit 라운드업).
+ *  5) Discovery subsystem이면 KATO=0일 때 NVMF_DISC_KATO_IN_MS 기본값을 부여.
+ *  6) vcprop(가상 NVMe 레지스터) 초기화: CAP/VS/CC/CSTS/CRTO. NVMe 2.0 호환을 위해
+ *     vs.mjr=2, cap.crwms=1, cap.cqr=1 (NVMe-oF 필수) 등을 set.
+ *  7) NVM subsystem이면 listener 정보를 찾아 둠 (ANA reporting을 위해).
+ *  8) qpair에 ctrlr 결합 후 subsystem->thread로 _nvmf_subsystem_add_ctrlr 메시지 송신.
+ *
+ * 호출 컨텍스트: qpair->group->thread (Connect 명령을 처음 받은 곳).
+ * 이후 라이프사이클은 ctrlr->thread = qpair->group->thread로 고정된다.
+ */
 static struct spdk_nvmf_ctrlr *
 nvmf_ctrlr_create(struct spdk_nvmf_subsystem *subsystem,
 		  struct spdk_nvmf_request *req,
@@ -445,34 +755,41 @@ nvmf_ctrlr_create(struct spdk_nvmf_subsystem *subsystem,
 	struct spdk_nvme_transport_id listen_trid = {};
 	bool subsys_has_multi_iocs = false;
 
-	ctrlr = calloc(1, sizeof(*ctrlr));
+	ctrlr = calloc(1, sizeof(*ctrlr)); /* [한국어] zero-init된 ctrlr 객체 할당 */
 	if (ctrlr == NULL) {
 		SPDK_ERRLOG("Memory allocation failed\n");
 		return NULL;
 	}
 
 	if (spdk_nvme_trtype_is_fabrics(transport->ops->type)) {
+		/* [한국어] RDMA/TCP/FC 등 Fabrics transport는 dynamic ctrlr 모드만 지원.
+		 * cntlid는 _nvmf_subsystem_add_ctrlr()에서 할당된다 (호스트가 0xFFFF 보냈음). */
 		ctrlr->dynamic_ctrlr = true;
 	} else {
+		/* [한국어] Local(PCIe-style) transport는 호스트가 명시한 cntlid 사용 (vfio-user 등). */
 		ctrlr->cntlid = connect_data->cntlid;
 	}
 
 	SPDK_DTRACE_PROBE3_TICKS(nvmf_ctrlr_create, ctrlr, subsystem->subnqn,
-				 spdk_thread_get_id(req->qpair->group->thread));
+				 spdk_thread_get_id(req->qpair->group->thread)); /* [한국어] DTrace 프로브 - 성능분석용 */
 
-	STAILQ_INIT(&ctrlr->async_events);
-	TAILQ_INIT(&ctrlr->log_head);
-	ctrlr->subsys = subsystem;
-	ctrlr->thread = req->qpair->group->thread;
+	STAILQ_INIT(&ctrlr->async_events); /* [한국어] AER 통지 큐 초기화 (호스트가 AER 안 걸어둔 동안 누적) */
+	TAILQ_INIT(&ctrlr->log_head); /* [한국어] Reservation Notification 로그 페이지 큐 초기화 */
+	ctrlr->subsys = subsystem; /* [한국어] 모든 ctrlr는 정확히 하나의 subsystem에 속함 */
+	ctrlr->thread = req->qpair->group->thread; /* [한국어] thread affinity 고정 - 이후 모든 라이프사이클은 이 thread에서만 */
 	ctrlr->disconnect_in_progress = false;
-	ctrlr->executing_nssr = false;
+	ctrlr->executing_nssr = false; /* [한국어] NSSR(NVM Subsystem Reset) 진행 중 표지 */
 
+	/* [한국어] qpair_mask는 transport 설정의 max_qpairs_per_ctrlr 길이 비트맵.
+	 * QID 1..max-1의 점유 여부를 1비트씩 표시하여 IO Connect 중복을 검출한다. */
 	ctrlr->qpair_mask = spdk_bit_array_create(transport->opts.max_qpairs_per_ctrlr);
 	if (!ctrlr->qpair_mask) {
 		SPDK_ERRLOG("Failed to allocate controller qpair mask\n");
 		goto err_qpair_mask;
 	}
 
+	/* [한국어] Identify Controller 응답으로 호스트에 보낼 cdata를 채운다.
+	 * (kas, vendor id, sgls, ioccsz/iorcsz/icdoff/msdbd 등 NVMe-oF specific 포함) */
 	nvmf_ctrlr_cdata_init(transport, subsystem, &ctrlr->cdata);
 
 	/*
@@ -623,6 +940,25 @@ err_qpair_mask:
 	return NULL;
 }
 
+/*
+ * [한국어]
+ * _nvmf_ctrlr_destruct - 컨트롤러 객체의 실제 free (ctrlr->thread에서 실행)
+ *
+ * @ctx: 해제할 spdk_nvmf_ctrlr*.
+ *
+ * subsystem 등록 해제와 disconnect 처리가 모두 끝난 후 호출되는 마지막 단계.
+ * - keep_alive/association 폴러 정리
+ * - qpair_mask, visible_ns 비트맵 free
+ * - log_head(reservation log) 큐 비우기
+ * - async_events 큐 비우기 (호스트가 가져가지 못한 AER 통지들)
+ * - ctrlr 자체 free
+ *
+ * 만약 disconnect_in_progress가 아직 true이면 자기 자신을 다시 메시지로 큐잉해
+ * 다음 폴 사이클에 재시도한다 (race 방지).
+ *
+ * 호출 컨텍스트: ctrlr->thread (assert로 강제). nvmf_ctrlr_destruct()의
+ * spdk_thread_send_msg에 의해 진입됨.
+ */
 static void
 _nvmf_ctrlr_destruct(void *ctx)
 {
@@ -659,12 +995,25 @@ _nvmf_ctrlr_destruct(void *ctx)
 	free(ctrlr);
 }
 
+/*
+ * [한국어]
+ * nvmf_ctrlr_destruct - 컨트롤러 소멸 진입점 (다른 스레드에서 호출 가능)
+ *
+ * @ctrlr: 소멸시킬 컨트롤러.
+ *
+ * subsystem의 ctrlrs 리스트에서 ctrlr를 즉시 제거하고 (subsystem->thread에서
+ * 안전하게 처리되도록 nvmf_subsystem_remove_ctrlr가 처리), 실제 해제는
+ * ctrlr->thread로 메시지를 보내 _nvmf_ctrlr_destruct()에서 수행한다. 이로써
+ * cross-thread 호출 안전성이 보장된다.
+ *
+ * 호출자: subsystem 정지/삭제 RPC, qpair disconnect 마지막 단계 등.
+ */
 void
 nvmf_ctrlr_destruct(struct spdk_nvmf_ctrlr *ctrlr)
 {
-	nvmf_subsystem_remove_ctrlr(ctrlr->subsys, ctrlr);
+	nvmf_subsystem_remove_ctrlr(ctrlr->subsys, ctrlr); /* [한국어] subsystem->ctrlrs 리스트에서 제거 */
 
-	spdk_thread_send_msg(ctrlr->thread, _nvmf_ctrlr_destruct, ctrlr);
+	spdk_thread_send_msg(ctrlr->thread, _nvmf_ctrlr_destruct, ctrlr); /* [한국어] 실제 free는 ctrlr 소유 스레드에서 */
 }
 
 static void
@@ -858,6 +1207,21 @@ nvmf_qpair_access_allowed(struct spdk_nvmf_qpair *qpair, struct spdk_nvmf_subsys
 	return true;
 }
 
+/*
+ * [한국어]
+ * _nvmf_ctrlr_connect - Connect 명령의 SQ size/QID 검증 + qid=0/>0 분기
+ *
+ * @req: Connect 요청.
+ * @return: COMPLETE 또는 ASYNCHRONOUS.
+ *
+ * - sqsize=0 거절 (스펙: SQSIZE는 0-based, 최소 1).
+ * - admin queue: sqsize < max_aq_depth, IO queue: sqsize < max_queue_depth.
+ * - sq_head_max/qid 설정, current_unassociated_qpairs 감소, admin/io stat++.
+ * - qid=0 (admin):
+ *     Fabrics + cntlid != 0xFFFF면 거절 (SPDK는 dynamic 모드만 지원).
+ *     nvmf_ctrlr_create로 새 ctrlr 생성 → ASYNCHRONOUS.
+ * - qid>0 (IO): subsystem->thread로 _nvmf_ctrlr_add_io_qpair 메시지 송신.
+ */
 static int
 _nvmf_ctrlr_connect(struct spdk_nvmf_request *req)
 {
@@ -1026,6 +1390,22 @@ out:
 	return status;
 }
 
+/*
+ * [한국어]
+ * nvmf_ctrlr_cmd_connect - Fabric Connect 명령(fctype=01h)의 진입점
+ *
+ * @req: Connect 요청.
+ * @return: COMPLETE/ASYNCHRONOUS.
+ *
+ * 호스트가 admin(qid=0) 또는 IO(qid>0) qpair을 만들 때 보내는 명령.
+ * 검증:
+ *  - in-capsule data 길이 = sizeof(spdk_nvmf_fabric_connect_data) (cntlid/hostid/subnqn/hostnqn).
+ *  - subsystem 룩업 (subnqn). 없으면 INVALID_PARAM.
+ *  - subsystem이 INACTIVE/PAUSING/PAUSED/DEACTIVATING이면 sgroup->queued로 큐잉(나중에 재시도).
+ *  - hostnqn null-terminated 검사.
+ *  - subsystem ACL (host_allowed) + listener ACL.
+ * 통과하면 _nvmf_ctrlr_connect로 진행.
+ */
 static int
 nvmf_ctrlr_cmd_connect(struct spdk_nvmf_request *req)
 {
@@ -1259,13 +1639,36 @@ nvmf_prop_get_nssr(struct spdk_nvmf_ctrlr *ctrlr)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * nvmf_prop_set_cc - CC(Controller Configuration) 레지스터 쓰기 처리
+ *
+ * @ctrlr: 컨트롤러.
+ * @value: 호스트가 쓴 32비트 값.
+ * @return: true=수용, false=거절(INVALID_PARAM).
+ *
+ * NVMe 호스트의 정상 시퀀스:
+ *   1) Connect(qid=0) → AQA/ASQ/ACQ Property Set → CC.EN=1 set
+ *      → CSTS.RDY=1 폴링 → IO Connect(qid>0) → 정상 IO
+ *   2) 종료 시 CC.SHN=01b/10b → CSTS.SHST=10b 폴링 → CC.EN=0
+ *
+ * 본 함수는 비트별 변경(diff) 분석 후 다음을 처리한다:
+ *  - EN 1→0: nvmf_ctrlr_disconnect_io_qpairs_on_pg를 모든 PG에 디스패치하고
+ *    cc_timeout_timer를 걸어 fatal status 처리. 끝나면 association_timer 시작.
+ *  - EN 0→1: association_timer 정지, CSTS.RDY=1 (호스트는 이걸 폴링하다 IO Connect로 진행).
+ *  - SHN: NORMAL/ABRUPT shutdown 처리. EN=0과 거의 동일하지만 CSTS.SHST를 셋팅.
+ *  - IOSQES/IOCQES: SQ/CQ entry size 갱신 (호스트가 16/64B로 보고).
+ *  - AMS/MPS/CSS: SPDK 비지원 또는 제한값 검사.
+ *
+ * 호출 컨텍스트: ctrlr->thread (Property Set capsule 처리 경로).
+ */
 static bool
 nvmf_prop_set_cc(struct spdk_nvmf_ctrlr *ctrlr, uint32_t value)
 {
 	union spdk_nvme_cc_register cc, diff;
 	uint32_t cc_timeout_ms;
 
-	cc.raw = value;
+	cc.raw = value; /* [한국어] 호스트가 쓴 새 값 */
 
 	SPDK_DEBUGLOG(nvmf, "cur CC: 0x%08x\n", ctrlr->vcprop.cc.raw);
 	SPDK_DEBUGLOG(nvmf, "new CC: 0x%08x\n", cc.raw);
@@ -1544,15 +1947,36 @@ nvmf_prop_get_crto(struct spdk_nvmf_ctrlr *ctrlr)
 	return ctrlr->vcprop.crto.raw;
 }
 
+/* [한국어] NVMe-oF Property Get/Set Capsule이 다루는 가상 NVMe 컨트롤러 레지스터의
+ * 메타테이블 항목. 호스트는 PCIe NVMe라면 BAR0의 컨트롤러 레지스터를 MMIO로
+ * 읽고/쓰지만, NVMe-oF는 transport 캡슐(Property Get/Set, fctype=04h/00h)로 대신
+ * 한다. SPDK는 진짜 BAR가 없으므로 ctrlr->vcprop에 가상 레지스터 값을 두고
+ * 본 테이블의 get_cb/set_cb를 통해 호스트 요청에 응답한다. */
 struct nvmf_prop {
 	uint32_t ofst;
+	/* [한국어] spdk_nvme_registers 구조체 안에서의 byte offset.
+	 * 호스트가 보낸 cmd->ofst와 일치하는 항목을 find_prop()로 찾는다. */
+
 	uint8_t size;
+	/* [한국어] 레지스터 폭(바이트). 4 또는 8. CAP/ASQ/ACQ는 8, 그 외는 4. */
+
 	char name[11];
+	/* [한국어] 디버그 로그 출력용 짧은 이름 ("cap", "vs", "cc", "csts", ...). */
+
 	uint64_t (*get_cb)(struct spdk_nvmf_ctrlr *ctrlr);
+	/* [한국어] Property Get 처리. 호스트가 SET만 한 NSSR 같은 경우 NULL이 가능하며,
+	 * 그러면 find_prop가 매치하지 못한 것처럼 INVALID_PARAM으로 응답된다. */
+
 	bool (*set_cb)(struct spdk_nvmf_ctrlr *ctrlr, uint32_t value);
+	/* [한국어] Property Set 처리 (8B의 경우 하위 4B 또는 4B 전체). NULL이면 RO.
+	 * true 반환 = 성공, false = INVALID_PARAM 응답 유발. */
+
 	bool (*set_upper_cb)(struct spdk_nvmf_ctrlr *ctrlr, uint32_t value);
+	/* [한국어] 8B 레지스터(ASQ/ACQ)의 상위 4B 쓰기. 4B 레지스터에서는 NULL. */
 };
 
+/* [한국어] PROP 매크로: nvmf_prop 항목을 spec 레지스터의 field 이름과 size로
+ * 한 줄에 선언한다. offsetof로 spdk_nvme_registers 안에서의 위치를 자동 추출. */
 #define PROP(field, size, get_cb, set_cb, set_upper_cb) \
 	{ \
 		offsetof(struct spdk_nvme_registers, field), \
@@ -1561,6 +1985,17 @@ struct nvmf_prop {
 		get_cb, set_cb, set_upper_cb \
 	}
 
+/* [한국어] NVMe-oF가 지원하는 가상 컨트롤러 레지스터 목록.
+ * - cap (RO): Controller Capabilities. mqes, to, dstrd, css, mpsmin/max 등.
+ * - vs (RO): Version. SPDK는 NVMe 2.0 보고.
+ * - cc (RW): Controller Configuration. EN/SHN/IOSQES/IOCQES/CSS/MPS/AMS.
+ * - csts (R/W1C): Controller Status. RDY/CFS/SHST/NSSRO 비트.
+ * - nssr (WO): NVM Subsystem Reset. 4E564D65h ("NVMe") 쓰면 reset 트리거.
+ * - aqa (RW): Admin Queue Attributes. ASQS/ACQS.
+ * - asq (RW, 8B): Admin SQ base address (NVMe-oF에서는 의미 약함).
+ * - acq (RW, 8B): Admin CQ base address.
+ * - crto (RO): Controller Ready Timeouts. CRWMT/CRIMT.
+ */
 static const struct nvmf_prop nvmf_props[] = {
 	PROP(cap,  8, nvmf_prop_get_cap,  NULL,                    NULL),
 	PROP(vs,   4, nvmf_prop_get_vs,   NULL,                    NULL),
@@ -1573,6 +2008,17 @@ static const struct nvmf_prop nvmf_props[] = {
 	PROP(crto, 4, nvmf_prop_get_crto, NULL,                    NULL)
 };
 
+/*
+ * [한국어]
+ * find_prop - cmd->ofst/size에 매치되는 nvmf_prop 항목을 룩업한다
+ *
+ * @ofst: 호스트가 보낸 byte offset.
+ * @size: 호스트가 요청한 폭 (4 또는 8).
+ * @return: 매치 항목 포인터 또는 NULL.
+ *
+ * 8B 레지스터(CAP/ASQ/ACQ)는 4B 단위로 나눠 읽기/쓰기될 수 있으므로
+ * "[ofst, ofst+size) ⊆ [prop->ofst, prop->ofst+prop->size)" 포함 관계로 매치한다.
+ */
 static const struct nvmf_prop *
 find_prop(uint32_t ofst, uint8_t size)
 {
@@ -1589,6 +2035,20 @@ find_prop(uint32_t ofst, uint8_t size)
 	return NULL;
 }
 
+/*
+ * [한국어]
+ * nvmf_property_get - Fabric Property Get capsule(fctype=04h) 처리
+ *
+ * @req: 요청 객체. cmd->prop_get_cmd, rsp->prop_get_rsp 사용.
+ * @return: SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE.
+ *
+ * 호스트가 가상 컨트롤러 레지스터를 읽기 위해 보낸 capsule. PCIe NVMe라면
+ * BAR0 MMIO read에 해당. cmd->attrib.size로 폭(4 또는 8B)을 받아 find_prop()로
+ * 매핑 후 get_cb() 호출. 8B 레지스터를 4B로 부분 읽기하는 경우 상하위 절반을
+ * 마스크/시프트로 추출하여 응답한다.
+ *
+ * 호출 컨텍스트: nvmf_ctrlr_process_fabrics_cmd()에서 호출 → ctrlr->thread.
+ */
 static int
 nvmf_property_get(struct spdk_nvmf_request *req)
 {
@@ -1648,6 +2108,20 @@ nvmf_property_get(struct spdk_nvmf_request *req)
 	return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 }
 
+/*
+ * [한국어]
+ * nvmf_property_set - Fabric Property Set capsule(fctype=00h) 처리
+ *
+ * @req: 요청 객체. cmd->prop_set_cmd, rsp->nvme_cpl 사용.
+ * @return: SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE.
+ *
+ * 호스트가 가상 컨트롤러 레지스터에 값을 쓰기 위한 capsule. PCIe NVMe라면
+ * BAR0 MMIO write에 해당. find_prop()로 항목을 찾고 set_cb 또는
+ * set_upper_cb를 호출. 8B 레지스터를 4B로 부분 쓰기하면 하위/상위 절반에
+ * 맞는 콜백을 분기 호출한다. set_cb가 false 반환 시 INVALID_PARAM 응답.
+ *
+ * 가장 흔한 변경은 CC 레지스터 (호스트 enable/shutdown 시퀀스).
+ */
 static int
 nvmf_property_set(struct spdk_nvmf_request *req)
 {
@@ -2327,6 +2801,21 @@ nvmf_ctrlr_set_features_async_event_configuration(struct spdk_nvmf_request *req)
 	return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 }
 
+/*
+ * [한국어]
+ * nvmf_ctrlr_async_event_request - AER(Async Event Request, opcode 0Ch) 처리
+ *
+ * @req: AER 요청.
+ * @return: COMPLETE(즉시 응답 가능한 pending 이벤트 있음 또는 한도 초과 에러)
+ *          또는 ASYNCHRONOUS(슬롯에 보관해 두고 이벤트 발생 시 응답).
+ *
+ * 호스트는 사전에 N개의 AER을 보내두고 컨트롤러 측에서 비동기 이벤트(NS 변경,
+ * ANA 변경, Discovery 변경, Error, Reservation 등)가 발생하면 그 AER에 응답이
+ * 채워져 돌아온다. NVMe 1.4 7.1.2.
+ * - 한도(SPDK_NVMF_MAX_ASYNC_EVENTS=4) 초과 시 즉시 AERL EXCEEDED 응답.
+ * - 보관해둔 이벤트(async_events 큐)가 있으면 즉시 그것을 cdw0로 응답.
+ * - 그 외에는 aer_req[]에 슬롯 저장. 이벤트 발생 시 nvmf_ctrlr_async_event_notification에서 응답.
+ */
 static int
 nvmf_ctrlr_async_event_request(struct spdk_nvmf_request *req)
 {
@@ -2963,6 +3452,22 @@ nvmf_get_supported_log_pages(struct spdk_nvmf_ctrlr *ctrlr, struct iovec *iovs, 
 	return 0;
 }
 
+/*
+ * [한국어]
+ * nvmf_ctrlr_get_log_page - Get Log Page admin 명령(opcode 02h) 디스패처
+ *
+ * @req: 요청.
+ * @return: COMPLETE 또는 ASYNCHRONOUS(Discovery Log의 비동기 경로).
+ *
+ * cmd->cdw10/cdw11/cdw12/cdw13에서 lid/numdl/numdu/offset(64-bit)을 추출하고,
+ * 호스트가 요구한 길이(len = (numdu<<16)+numdl+1)*4 바이트를 검증한다.
+ * Discovery subsystem이면 SUPPORTED_LOG_PAGES/DISCOVERY/FEATURE_IDS_EFFECTS만,
+ * NVM subsystem이면 ERROR/HEALTH/FIRMWARE_SLOT/ANA/COMMAND_EFFECTS/CHANGED_NS_LIST
+ * /RESERVATION_NOTIFICATION/FEATURE_IDS_EFFECTS/NVME_MI_EFFECTS를 분기 처리.
+ *
+ * 데이터는 대부분 req->iov로 직접 채워지며, RAE(Retain Async Event)=0이면 해당
+ * AEN mask bit이 풀려서 다음 이벤트를 다시 트리거할 수 있게 된다 (NVMe 1.4 5.14).
+ */
 static int
 nvmf_ctrlr_get_log_page(struct spdk_nvmf_request *req)
 {
@@ -3749,6 +4254,25 @@ nvmf_ctrlr_identify_iocs(struct spdk_nvmf_ctrlr *ctrlr,
 	return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 }
 
+/*
+ * [한국어]
+ * nvmf_ctrlr_identify - Identify admin 명령(opcode 06h) 디스패처
+ *
+ * @req: 요청.
+ * @return: COMPLETE 또는 (Identify NS의 passthru 경로일 때) ASYNCHRONOUS.
+ *
+ * Identify는 4096B 응답 데이터를 만들며 CNS(Identify Type) 분기:
+ *  - CNS=00h NS: spdk_nvmf_ctrlr_identify_ns_ext (passthru 가능)
+ *  - CNS=01h CTRLR: spdk_nvmf_ctrlr_identify_ctrlr (vendor/model/serial/oncs 등)
+ *  - CNS=02h Active NS List: nvmf_ctrlr_identify_active_ns_list
+ *  - CNS=03h NS ID Descriptor List: EUI64/NGUID/UUID/CSI 디스크립터
+ *  - CNS=05h NS IOCS Specific (NVM/ZNS), CNS=06h Ctrlr IOCS Specific
+ *  - CNS=08h NS IOCS Independent, CNS=07h Active NS List IOCS, CNS=1Ch IOCS Vector
+ * Discovery subsystem이면 CTRLR(01h)만 허용한다.
+ *
+ * 응답 buffer 분할 가능성(req->iov 여러 개) 때문에 임시 4KB tmpbuf에 만들고
+ * spdk_iov_xfer_from_buf로 흩어진 iov에 복사한다.
+ */
 static int
 nvmf_ctrlr_identify(struct spdk_nvmf_request *req)
 {
@@ -4335,6 +4859,27 @@ is_cmd_ctrlr_specific(struct spdk_nvme_cmd *cmd)
 	}
 }
 
+/*
+ * [한국어]
+ * nvmf_ctrlr_process_admin_cmd - admin queue(qid=0)로 들어온 NVMe admin 명령의 디스패처
+ *
+ * @req: 요청.
+ * @return: COMPLETE/ASYNCHRONOUS.
+ *
+ * spdk_nvmf_request_exec()가 admin qpair로 들어온 비-Fabric 명령을 본 함수에 위임.
+ * 흐름:
+ *  1) AER이면 mgmt_io_outstanding 카운터 보정 (AER은 outstanding으로 안 침).
+ *  2) FUSE 또는 ctrlr-scope 명령에 NSID 잘못 set이면 INVALID_FIELD 응답.
+ *  3) CC.EN=0이면 모든 admin 명령 거절 (COMMAND_SEQUENCE_ERROR).
+ *  4) 데이터 전송 방향이 controller→host이면 응답 버퍼를 0으로 초기화 (보안/일관성).
+ *  5) Discovery subsystem이면 IDENTIFY/GET_LOG_PAGE/KEEP_ALIVE/SET/GET_FEATURES/AER만 허용.
+ *  6) g_nvmf_custom_admin_cmd_hdlrs[opc].hdlr 등록되어 있으면 우선 호출(ABORT 제외).
+ *  7) subsystem->passthrough이고 NSID가 specific이면 nvmf_passthru_admin_cmd로.
+ *  8) 그 외 표준 opcode 분기: GET_LOG_PAGE/IDENTIFY/ABORT/GET_FEATURES/SET_FEATURES/AER/KEEP_ALIVE.
+ *  9) CREATE/DELETE IO SQ/CQ는 NVMe-oF에서 금지 (Connect로 대체).
+ *
+ * 호출 컨텍스트: ctrlr->thread (assert).
+ */
 int
 nvmf_ctrlr_process_admin_cmd(struct spdk_nvmf_request *req)
 {
@@ -4443,6 +4988,19 @@ invalid_opcode:
 	return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 }
 
+/*
+ * [한국어]
+ * nvmf_ctrlr_process_fabrics_cmd - Fabric capsule 명령(opcode 7Fh) 디스패처
+ *
+ * @req: 요청.
+ * @return: COMPLETE/ASYNCHRONOUS.
+ *
+ * fctype 분기:
+ *  - 컨트롤러가 아직 없으면 (qpair->ctrlr==NULL) Connect만 유효 → nvmf_ctrlr_cmd_connect.
+ *  - admin queue에서: PROPERTY_SET/GET, AUTHENTICATION_SEND/RECV.
+ *  - IO queue에서: AUTHENTICATION_SEND/RECV만 (Property는 admin에서만).
+ * 호출 컨텍스트: spdk_nvmf_request_exec()에서 호출 → qpair group 스레드.
+ */
 static int
 nvmf_ctrlr_process_fabrics_cmd(struct spdk_nvmf_request *req)
 {
@@ -5007,6 +5565,25 @@ spdk_nvmf_request_zcopy_end(struct spdk_nvmf_request *req, bool commit)
 	nvmf_bdev_ctrlr_zcopy_end(req, commit);
 }
 
+/*
+ * [한국어]
+ * nvmf_ctrlr_process_io_cmd - IO queue(qid>0)로 들어온 NVMe IO 명령 디스패처
+ *
+ * @req: 요청.
+ * @return: COMPLETE/ASYNCHRONOUS.
+ *
+ * 흐름:
+ *  1) CC.EN=0이면 COMMAND_SEQUENCE_ERROR.
+ *  2) cmd->nsid → spdk_nvmf_ns 룩업. 없으면 INVALID_NAMESPACE_OR_FORMAT (DNR=1).
+ *  3) ANA 상태가 OPTIMIZED/NON_OPTIMIZED가 아니면 PATH 에러로 응답.
+ *  4) ns_info(per-PG namespace info) 가져와 reservation 충돌 체크.
+ *  5) FUSE 분기: nvmf_ctrlr_process_io_fused_cmd로 위임 (compare→write 결합).
+ *  6) subsystem->passthrough면 cmd->nsid를 ns->passthru_nsid로 치환 후 passthru 경로.
+ *  7) zcopy enable이면 nvmf_bdev_ctrlr_zcopy_start.
+ *  8) 그 외 opcode 분기: READ/WRITE/FLUSH/COMPARE/WRITE_ZEROES/DSM/RESERVATION_*/COPY 등.
+ *
+ * 호출 컨텍스트: qpair->group->thread (각 IO qpair는 하나의 PG에 고정).
+ */
 int
 nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 {
@@ -5329,12 +5906,24 @@ _nvmf_request_complete(void *ctx)
 	nvmf_qpair_request_cleanup(qpair);
 }
 
+/*
+ * [한국어]
+ * spdk_nvmf_request_complete - 모든 NVMe-oF 요청의 공식 완료 진입점 (공개 API)
+ *
+ * @req: 완료할 요청.
+ * @return: 항상 0.
+ *
+ * 호출자가 어느 스레드든 안전하게 호출할 수 있도록 spdk_thread_exec_msg를 사용해
+ * qpair->group->thread에서 _nvmf_request_complete를 실행한다 (현재 스레드가 같으면
+ * 즉시, 아니면 메시지 큐잉). 이로써 transport/bdev 모듈 어디서든 동일한 코드로
+ * 응답을 보낼 수 있다.
+ */
 int
 spdk_nvmf_request_complete(struct spdk_nvmf_request *req)
 {
 	struct spdk_nvmf_qpair *qpair = req->qpair;
 
-	spdk_thread_exec_msg(qpair->group->thread, _nvmf_request_complete, req);
+	spdk_thread_exec_msg(qpair->group->thread, _nvmf_request_complete, req); /* [한국어] thread-safe 위임 */
 
 	return 0;
 }
@@ -5462,6 +6051,22 @@ nvmf_check_qpair_active(struct spdk_nvmf_request *req)
 	return false;
 }
 
+/*
+ * [한국어]
+ * spdk_nvmf_request_exec - transport에서 들어온 모든 NVMe 명령의 최상위 진입점
+ *
+ * @req: 디스패치할 요청.
+ *
+ * Transport(rdma/tcp/fc/vfio_user)는 wire에서 명령 캡슐을 수신해 spdk_nvmf_request로
+ * 변환한 뒤 본 함수를 호출한다. 흐름:
+ *  1) nvmf_check_subsystem_active: subsystem이 ACTIVE가 아니면 큐잉 후 반환.
+ *  2) nvmf_check_qpair_active: qpair가 CONNECTING/AUTHENTICATING이면 Connect/Auth만 허용.
+ *  3) outstanding 큐에 등록 (응답 시 빠짐).
+ *  4) opcode가 FABRIC이면 fabrics 디스패처, admin queue면 admin 디스패처, IO queue면 IO 디스패처.
+ *  5) 동기적으로 COMPLETE를 받으면 _nvmf_request_complete를 즉시 호출.
+ *
+ * 호출 컨텍스트: qpair->group->thread. transport 폴러가 들어오는 캡슐을 처리할 때 호출.
+ */
 void
 spdk_nvmf_request_exec(struct spdk_nvmf_request *req)
 {

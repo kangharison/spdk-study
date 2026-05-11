@@ -5,63 +5,197 @@
  *   Copyright (c) 2025, Oracle and/or its affiliates.
  */
 
-#include "spdk/stdinc.h"
+/*
+ * [한국어 설명] NVMe-oF Subsystem 코어 구현 (subsystem.c)
+ *
+ * === 파일의 역할 ===
+ * 이 파일은 SPDK NVMe-over-Fabrics (NVMe-oF) target의 핵심 단위인
+ * "subsystem"을 구현한다. NVMe-oF에서 subsystem이란 NQN(NVMe Qualified Name)으로
+ * 식별되는 논리적 NVMe target으로서, 다음을 캡슐화한다:
+ *   - 여러 namespace(NS) 컬렉션 (각 NS는 backing bdev에 매핑됨)
+ *   - 호스트(initiator) 접근 제어 리스트 (allow_any_host / 명시적 hostnqn 화이트리스트)
+ *   - listener 리스트 (이 subsystem을 노출할 transport 주소: TCP/RDMA/FC의 IP:port)
+ *   - 컨트롤러(ctrlr) 리스트 (호스트가 이 subsystem에 connect 하면 ctrlr 인스턴스 생성)
+ *   - SN(Serial Number), MN(Model Number), 컨트롤러 ID 범위 등 스펙상 식별 정보
+ *   - ANA(Asymmetric Namespace Access) 그룹 상태 머신
+ *   - PR(Persistent Reservation) 처리 콜백/등록자 리스트
+ * NQN 검증, subsystem CRUD, host/listener/NS 추가·제거, 비동기 상태 머신
+ * (INACTIVE → ACTIVATING → ACTIVE → PAUSING → PAUSED → RESUMING → ACTIVE)
+ * 의 모든 전이를 이 파일이 담당한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * SPDK NVMe-oF target은 크게 다음 계층으로 구성된다:
+ *   spdk_nvmf_tgt (전역 target)  ─ 여러 subsystem 보유
+ *      └── spdk_nvmf_subsystem    ─ 본 파일 관리 대상 (여러 NS + 여러 listener + 여러 ctrlr)
+ *            ├── spdk_nvmf_ns      ─ bdev 매핑된 NS
+ *            ├── spdk_nvmf_subsystem_listener ─ transport 주소 등록
+ *            └── spdk_nvmf_ctrlr   ─ 호스트당 컨트롤러 인스턴스 (ctrlr.c에서 정의)
+ *      └── spdk_nvmf_transport     ─ TCP/RDMA/FC transport (transport.c)
+ *            └── spdk_nvmf_qpair    ─ 호스트와의 큐 페어 연결
+ *      └── spdk_nvmf_poll_group    ─ per-CPU poll group (poll_group.c)
+ * 본 파일은 control plane (관리/구성) 측면을 담당하며, 실제 NVMe 명령
+ * 디스패치(IO/admin queue 처리)는 ctrlr.c, 데이터 plane은 각 transport
+ * 모듈(tcp.c, rdma.c, fc.c)에서 처리된다.
+ *
+ * 실행 컨텍스트: 대부분의 함수는 SPDK app thread (마스터 reactor) 또는
+ * 호출자가 지정한 thread에서 호출된다. 상태 전이 함수는 모든 poll group을
+ * 비동기적으로 순회하면서(spdk_for_each_channel) 적용 후 콜백으로 완료를
+ * 알리는 패턴을 사용한다. 이 패턴이 lockless 설계의 근간이다.
+ *
+ * === 타 모듈과의 연결 ===
+ * - nvmf.c: spdk_nvmf_tgt 라이프사이클 관리; subsystem을 tgt에 등록/해제
+ * - ctrlr.c: 컨트롤러 생성/관리, NVMe admin/IO 명령 처리; subsystem 상태와
+ *   host ACL을 참조한다
+ * - transport.c, tcp.c, rdma.c, fc.c: listener를 등록할 때 transport에
+ *   listen 요청 위임; subsystem 상태 변화 시 각 transport poll group에 통지
+ * - lib/bdev: NS가 bdev_open으로 열리고 spdk_bdev_io_complete 콜백을 통해
+ *   write/read 결과 수신
+ * - PR(Persistent Reservation): 디폴트 reservation 처리는 본 파일의
+ *   nvmf_ns_reservation_xxx 정적 함수가 담당하며, 외부에서 g_reservation_ops
+ *   교체로 커스텀 가능
+ *
+ * 데이터 흐름:
+ *   spdk_nvmf_subsystem_create → tgt에 등록 → add_ns(bdev open) →
+ *   add_listener(transport listen) → add_host(ACL) → start(상태 ACTIVE)
+ *   → 호스트 connect → ctrlr_create → admin/IO 명령 처리 → ...
+ *
+ * === 주요 함수/구조체 요약 ===
+ * 공개 API (라이프사이클):
+ *   - spdk_nvmf_subsystem_create: NQN 검증 + subsystem 객체 할당 + tgt 등록
+ *   - spdk_nvmf_subsystem_destroy: ctrlr/NS/listener/host 모두 제거 후 해제
+ *   - spdk_nvmf_subsystem_start/stop/pause/resume: 상태 머신 전이 트리거
+ *   - spdk_nvmf_subsystem_add_ns_ext / remove_ns: NS 등록/해제
+ *   - spdk_nvmf_subsystem_add_listener_ext / remove_listener: transport 주소 등록/해제
+ *   - spdk_nvmf_subsystem_add_host_ext / remove_host: 호스트 ACL 관리
+ *   - spdk_nvmf_subsystem_set_ana_state: ANA 그룹 상태 변경 (멀티패스 지원)
+ *
+ * 핵심 정적 함수:
+ *   - nvmf_nqn_is_valid: RFC 1034 도메인 + NVMe-oF NQN 형식 검증
+ *   - nvmf_subsystem_set_state: atomic CAS로 상태 전이 (lockless)
+ *   - nvmf_subsystem_state_change_on_pg: per-poll-group 상태 변경 적용
+ *   - nvmf_ns_reservation_xxx: PR-IN/OUT 명령 처리 (PRECONDITIONS, types)
+ *
+ * 핵심 자료구조 (struct는 nvmf_internal.h에 정의):
+ *   - spdk_nvmf_subsystem: NQN, state, NS 배열, host/listener/ctrlr 리스트
+ *   - spdk_nvmf_ns: NSID, bdev_desc, ANA group, reservation 상태
+ *   - spdk_nvmf_subsystem_listener: trid, ANA state per group, transport-specific opts
+ *   - spdk_nvmf_host: hostnqn ACL 엔트리
+ */
 
-#include "nvmf_internal.h"
-#include "transport.h"
+#include "spdk/stdinc.h"			/* [한국어] 표준 C 헤더 모음 (stdint, stddef, string 등) */
 
-#include "spdk/assert.h"
-#include "spdk/likely.h"
-#include "spdk/string.h"
-#include "spdk/trace.h"
-#include "spdk/nvmf_spec.h"
-#include "spdk/uuid.h"
-#include "spdk/json.h"
-#include "spdk/file.h"
-#include "spdk/bit_array.h"
-#include "spdk/bdev.h"
+#include "nvmf_internal.h"			/* [한국어] NVMe-oF 내부 자료구조 (subsystem/ctrlr/ns 정의) */
+#include "transport.h"				/* [한국어] transport 레이어 추상화 인터페이스 */
 
-#define __SPDK_BDEV_MODULE_ONLY
-#include "spdk/bdev_module.h"
-#include "spdk/log.h"
-#include "spdk_internal/utf.h"
-#include "spdk_internal/usdt.h"
+#include "spdk/assert.h"			/* [한국어] SPDK_STATIC_ASSERT/CONTAINEROF 매크로 */
+#include "spdk/likely.h"			/* [한국어] spdk_likely/spdk_unlikely 분기 힌트 */
+#include "spdk/string.h"			/* [한국어] spdk_strerror 등 문자열 유틸 */
+#include "spdk/trace.h"				/* [한국어] SPDK trace point 등록/기록 매크로 */
+#include "spdk/nvmf_spec.h"			/* [한국어] NVMe-oF 와이어 스펙 (PDU/Capsule 정의) */
+#include "spdk/uuid.h"				/* [한국어] UUID 파싱/생성 (NQN UUID 형식 검증에 사용) */
+#include "spdk/json.h"				/* [한국어] JSON 직렬화 (PR 영속화 시 활용) */
+#include "spdk/file.h"				/* [한국어] 파일 I/O 유틸 (PR 상태 파일 영속화) */
+#include "spdk/bit_array.h"			/* [한국어] cntlid/NSID 할당 추적용 비트맵 */
+#include "spdk/bdev.h"				/* [한국어] bdev API (NS의 backing storage 조작) */
+
+#define __SPDK_BDEV_MODULE_ONLY			/* [한국어] bdev_module.h를 모듈 측면만 노출 (외부 API 충돌 방지) */
+#include "spdk/bdev_module.h"			/* [한국어] bdev module 등록 (ns_bdev_module 정의용) */
+#include "spdk/log.h"				/* [한국어] SPDK_ERRLOG/INFOLOG/DEBUGLOG 매크로 */
+#include "spdk_internal/utf.h"			/* [한국어] UTF-8 검증 (Model/Serial Number 문자열 체크) */
+#include "spdk_internal/usdt.h"			/* [한국어] USDT(User Statically Defined Tracing) 마커 */
 
 #define MODEL_NUMBER_DEFAULT "SPDK bdev Controller"
+/* [한국어] NVMe Identify Controller 응답의 MN(Model Number, 40 byte ASCII) 기본값.
+ * 호스트는 nvme list 등에서 이 문자열을 모델명으로 표시한다. */
+
 #define NVMF_SUBSYSTEM_DEFAULT_NAMESPACES 32
+/* [한국어] subsystem 생성 시 사용자가 max_namespaces=0을 주면 적용되는 NS 슬롯 기본값.
+ * NS 배열(subsystem->ns)을 미리 할당하기 위한 상한; 이후 add_ns로 채워간다. */
 
 /*
  * States for parsing valid domains in NQNs according to RFC 1034
  */
+/* [한국어] NQN 검증 상태 머신.
+ * NVMe-oF NQN의 reverse-domain 부분(예: "org.nvmexpress")을 RFC 1034 도메인
+ * 라벨 규칙(letter로 시작, letter/digit/hyphen 중간, letter/digit로 끝)으로
+ * 한 글자씩 검증하는 동안 사용. nvmf_nqn_is_valid()의 switch에서 이 상태를 전이. */
 enum spdk_nvmf_nqn_domain_states {
 	/* First character of a domain must be a letter */
 	SPDK_NVMF_DOMAIN_ACCEPT_LETTER = 0,
+	/* [한국어] 라벨의 첫 글자 위치. 반드시 알파벳이어야 한다 (RFC 1034). */
 
 	/* Subsequent characters can be any of letter, digit, or hyphen */
 	SPDK_NVMF_DOMAIN_ACCEPT_LDH = 1,
+	/* [한국어] 라벨 중간 위치. Letter/Digit/Hyphen(LDH) 모두 허용.
+	 * 단, 하이픈으로 라벨이 끝나서는 안 된다 (다음 분기에서 검증). */
 
 	/* A domain label must end with either a letter or digit */
 	SPDK_NVMF_DOMAIN_ACCEPT_ANY = 2
+	/* [한국어] 직전 글자가 letter/digit이라 라벨 종료 가능한 상태.
+	 * '.'(다음 라벨로 전이), '-'(LDH로 전이), letter/digit(자기 유지) 모두 허용. */
 };
 
+/* [한국어] 자기 참조 forward declaration: subsystem 비동기 destroy의 내부 단계용.
+ * spdk_nvmf_subsystem_destroy → 모든 ctrlr disconnect 완료 콜백 →
+ * _nvmf_subsystem_destroy → 실제 메모리 해제 순서로 호출된다. */
 static int _nvmf_subsystem_destroy(struct spdk_nvmf_subsystem *subsystem);
 
 /* Returns true if is a valid ASCII string as defined by the NVMe spec */
+/*
+ * [한국어]
+ * nvmf_valid_ascii_string - NVMe 스펙 호환 ASCII 문자열 검증
+ *
+ * @buf:  검증할 바이트 버퍼 (Identify Controller의 SN/MN/FR 등 고정 크기 필드)
+ * @size: 버퍼 크기 (NVMe 스펙상 SN=20, MN=40, FR=8 등)
+ * @return: 모든 바이트가 0x20(SPACE)~0x7E(~) 범위면 true, 하나라도 벗어나면 false
+ *
+ * NVMe 1.x 스펙은 컨트롤러 식별 문자열을 "ASCII printable characters"로
+ * 제한한다 (제어문자/non-ASCII 금지). 호스트가 nvme list 등에서 표시할 때
+ * 깨진 문자가 나타나는 것을 방지한다.
+ *
+ * 실행 컨텍스트: spdk_nvmf_subsystem_set_sn/set_mn 등 관리 API에서 호출.
+ * 동기화: read-only 검증이라 락 불필요.
+ *
+ * 호출 체인:
+ *   spdk_nvmf_subsystem_set_sn/set_mn → [nvmf_valid_ascii_string]
+ */
 static bool
 nvmf_valid_ascii_string(const void *buf, size_t size)
 {
-	const uint8_t *str = buf;
-	size_t i;
+	const uint8_t *str = buf;	/* [한국어] uint8_t 캐스팅 — 부호 비교 회피 (signed char 음수값 방지) */
+	size_t i;			/* [한국어] 루프 인덱스 */
 
-	for (i = 0; i < size; i++) {
-		if (str[i] < 0x20 || str[i] > 0x7E) {
-			return false;
+	for (i = 0; i < size; i++) {				/* [한국어] 모든 바이트 순회 */
+		if (str[i] < 0x20 || str[i] > 0x7E) {		/* [한국어] printable ASCII 범위 밖이면 즉시 거부 */
+			return false;				/* [한국어] 제어문자(0x00~0x1F, 0x7F) 또는 비 ASCII(>=0x80) 포함 */
 		}
 	}
 
-	return true;
+	return true;						/* [한국어] 전 구간 합법 ASCII */
 }
 
+/*
+ * [한국어]
+ * nvmf_nqn_is_valid - NVMe-oF NQN(NVMe Qualified Name) 형식 검증
+ *
+ * @nqn: 검증할 NQN 문자열 (NULL 종결)
+ * @return: 형식 적합 시 true, 부적합 시 false (이때 SPDK_ERRLOG로 사유 출력)
+ *
+ * NVMe-oF 스펙(1.0 Section 7.9 등)은 NQN을 다음 두 가지 형식으로 정의한다:
+ *   1) Discovery NQN: "nqn.2014-08.org.nvmexpress.discovery"
+ *   2) UUID 기반:     "nqn.2014-08.org.nvmexpress:uuid:<uuid string>"
+ *   3) 일반 형식:     "nqn.YYYY-MM.<reverse domain>:<user string>"
+ * 길이 범위(11~223), reverse-domain RFC 1034 검증, 콜론 이후 user-string
+ * 존재 등 여러 단계를 거친다.
+ *
+ * 호출 컨텍스트: spdk_nvmf_subsystem_create 진입점에서 호출되어 잘못된
+ * NQN으로 subsystem이 생성되는 것을 차단한다. 또 호스트 add 시 hostnqn에
+ * 대해서도 호출.
+ *
+ * 호출 체인:
+ *   spdk_nvmf_subsystem_create → [nvmf_nqn_is_valid]
+ *   spdk_nvmf_subsystem_add_host_ext → [nvmf_nqn_is_valid]
+ */
 bool
 nvmf_nqn_is_valid(const char *nqn)
 {
@@ -214,74 +348,103 @@ nvmf_nqn_is_valid(const char *nqn)
 	return true;
 }
 
+/* [한국어] forward decl: spdk_for_each_channel 콜백.
+ * 상태 전이 시 모든 poll group(per-CPU)을 순회하며 적용하기 위한 진입점. */
 static void subsystem_state_change_on_pg(struct spdk_io_channel_iter *i);
 
+/*
+ * [한국어]
+ * spdk_nvmf_subsystem_create - NVMe-oF subsystem 객체 생성 및 tgt에 등록
+ *
+ * @tgt:    소속될 nvmf target (전역 컨테이너)
+ * @nqn:    이 subsystem의 NQN 식별자 (NVMe-oF 스펙 형식)
+ * @type:   subsystem 유형 (NVME=일반 / DISCOVERY=호스트가 listener 목록을 조회)
+ * @num_ns: 사전 할당할 NS 슬롯 수 (0이면 기본값 32; discovery는 0 강제)
+ * @return: 성공 시 subsystem 포인터, 실패 시 NULL (NQN 충돌/형식오류/메모리 부족)
+ *
+ * NVMe-oF subsystem은 호스트 시점에서 "원격 NVMe SSD" 단위로 보인다.
+ * 본 함수는 다음을 한 트랜잭션처럼 수행한다:
+ *   1) NQN 유일성/형식 검증
+ *   2) tgt의 subsystem_ids 비트맵에서 빈 slot id 할당 (cntlid 부여 등에 사용)
+ *   3) subsystem 객체 calloc, 멤버 초기화, NS 배열/ANA 그룹 calloc
+ *   4) tgt의 RB tree에 삽입
+ * 생성 직후 상태는 SPDK_NVMF_SUBSYSTEM_INACTIVE이며, NS/listener/host를
+ * 모두 추가한 뒤 spdk_nvmf_subsystem_start로 ACTIVE 전이해야 호스트 connect
+ * 수신을 시작한다.
+ *
+ * 실행 컨텍스트: 보통 RPC 콜백 또는 init 루틴에서 호출되며, 호출 thread가
+ * 곧 subsystem->thread가 된다 (이후 모든 control 작업의 home thread).
+ *
+ * 호출 체인:
+ *   RPC handler / init → [spdk_nvmf_subsystem_create] → spdk_nvmf_tgt_find_subsystem
+ *     → nvmf_nqn_is_valid → spdk_bit_array_find_first_clear → calloc → RB_INSERT
+ */
 struct spdk_nvmf_subsystem *
 spdk_nvmf_subsystem_create(struct spdk_nvmf_tgt *tgt,
 			   const char *nqn,
 			   enum spdk_nvmf_subtype type,
 			   uint32_t num_ns)
 {
-	struct spdk_nvmf_subsystem	*subsystem;
-	uint32_t			sid;
+	struct spdk_nvmf_subsystem	*subsystem;	/* [한국어] 새로 만들 subsystem 객체 */
+	uint32_t			sid;		/* [한국어] 할당받을 subsystem id (tgt 내 유일) */
 
-	if (spdk_nvmf_tgt_find_subsystem(tgt, nqn)) {
+	if (spdk_nvmf_tgt_find_subsystem(tgt, nqn)) {	/* [한국어] 동일 NQN이 이미 등록되어 있으면 거부 (NQN은 tgt 내 유일) */
 		SPDK_ERRLOG("Subsystem NQN '%s' already exists\n", nqn);
 		return NULL;
 	}
 
-	if (!nvmf_nqn_is_valid(nqn)) {
+	if (!nvmf_nqn_is_valid(nqn)) {			/* [한국어] NVMe-oF/RFC 1034 형식 검증 — 부적합 시 거부 */
 		SPDK_ERRLOG("Subsystem NQN '%s' is invalid\n", nqn);
 		return NULL;
 	}
 
 	if (type == SPDK_NVMF_SUBTYPE_DISCOVERY_CURRENT ||
-	    type == SPDK_NVMF_SUBTYPE_DISCOVERY) {
+	    type == SPDK_NVMF_SUBTYPE_DISCOVERY) {	/* [한국어] discovery subsystem은 NS를 가질 수 없다 (스펙상 listener 광고만 함) */
 		if (num_ns != 0) {
 			SPDK_ERRLOG("Discovery subsystem cannot have namespaces.\n");
 			return NULL;
 		}
-	} else if (num_ns == 0) {
+	} else if (num_ns == 0) {			/* [한국어] 일반 subsystem이고 num_ns가 0이면 기본값(32) 적용 */
 		num_ns = NVMF_SUBSYSTEM_DEFAULT_NAMESPACES;
 	}
 
 	/* Find a free subsystem id (sid) */
-	sid = spdk_bit_array_find_first_clear(tgt->subsystem_ids, 0);
-	if (sid == UINT32_MAX) {
+	sid = spdk_bit_array_find_first_clear(tgt->subsystem_ids, 0);	/* [한국어] tgt 비트맵에서 가장 작은 미사용 id 검색 (lockless O(N/64)) */
+	if (sid == UINT32_MAX) {					/* [한국어] 빈 슬롯 없음 — tgt 한도 초과 */
 		SPDK_ERRLOG("No free subsystem IDs are available for subsystem creation\n");
 		return NULL;
 	}
-	subsystem = calloc(1, sizeof(struct spdk_nvmf_subsystem));
+	subsystem = calloc(1, sizeof(struct spdk_nvmf_subsystem));	/* [한국어] 0으로 초기화된 subsystem 메모리 할당 */
 	if (subsystem == NULL) {
 		SPDK_ERRLOG("Subsystem memory allocation failed\n");
 		return NULL;
 	}
 
-	subsystem->thread = spdk_get_thread();
-	subsystem->state = SPDK_NVMF_SUBSYSTEM_INACTIVE;
-	subsystem->tgt = tgt;
-	subsystem->id = sid;
-	subsystem->subtype = type;
-	subsystem->max_nsid = num_ns;
-	subsystem->next_cntlid = 1;
-	subsystem->min_cntlid = NVMF_MIN_CNTLID;
-	subsystem->max_cntlid = NVMF_MAX_CNTLID;
-	snprintf(subsystem->subnqn, sizeof(subsystem->subnqn), "%s", nqn);
-	pthread_mutex_init(&subsystem->mutex, NULL);
-	TAILQ_INIT(&subsystem->listeners);
-	TAILQ_INIT(&subsystem->hosts);
-	TAILQ_INIT(&subsystem->ctrlrs);
-	TAILQ_INIT(&subsystem->state_changes);
-	subsystem->used_listener_ids = spdk_bit_array_create(NVMF_MAX_LISTENERS_PER_SUBSYSTEM);
-	if (subsystem->used_listener_ids == NULL) {
+	subsystem->thread = spdk_get_thread();		/* [한국어] 본 호출 thread를 home thread로 고정 — 이후 control 작업 위치 */
+	subsystem->state = SPDK_NVMF_SUBSYSTEM_INACTIVE;	/* [한국어] 초기 상태: I/O 수신 불가, NS/listener 자유 변경 가능 */
+	subsystem->tgt = tgt;				/* [한국어] 역참조용 부모 tgt 포인터 */
+	subsystem->id = sid;				/* [한국어] tgt 내 유일한 정수 id (cntlid 베이스 등에 활용) */
+	subsystem->subtype = type;			/* [한국어] NVME / DISCOVERY 구분 */
+	subsystem->max_nsid = num_ns;			/* [한국어] 사전 할당된 NS 슬롯 수 (이후 ns 배열 인덱스 상한) */
+	subsystem->next_cntlid = 1;			/* [한국어] 다음 컨트롤러에 부여할 cntlid 후보 (1부터 round-robin) */
+	subsystem->min_cntlid = NVMF_MIN_CNTLID;	/* [한국어] cntlid 최소값 (스펙 1) */
+	subsystem->max_cntlid = NVMF_MAX_CNTLID;	/* [한국어] cntlid 최대값 (스펙 0xFFEF) */
+	snprintf(subsystem->subnqn, sizeof(subsystem->subnqn), "%s", nqn);	/* [한국어] NQN 문자열을 고정 크기 버퍼에 안전 복사 */
+	pthread_mutex_init(&subsystem->mutex, NULL);	/* [한국어] hosts/state_changes 등 control plane 자료구조 보호용 mutex */
+	TAILQ_INIT(&subsystem->listeners);		/* [한국어] subsystem이 노출되는 transport 주소 리스트 */
+	TAILQ_INIT(&subsystem->hosts);			/* [한국어] 허용된 hostnqn ACL 리스트 (allow_any_host=false인 경우 의미) */
+	TAILQ_INIT(&subsystem->ctrlrs);			/* [한국어] 호스트 connect로 생성된 ctrlr 인스턴스 리스트 */
+	TAILQ_INIT(&subsystem->state_changes);		/* [한국어] 진행 중/대기 중인 상태 전이 요청 큐 (직렬화) */
+	subsystem->used_listener_ids = spdk_bit_array_create(NVMF_MAX_LISTENERS_PER_SUBSYSTEM);	/* [한국어] listener id 할당 추적 비트맵 */
+	if (subsystem->used_listener_ids == NULL) {	/* [한국어] 비트맵 할당 실패 — 부분 할당된 자원 정리 */
 		pthread_mutex_destroy(&subsystem->mutex);
 		free(subsystem);
 		SPDK_ERRLOG("Listener id array memory allocation failed\n");
 		return NULL;
 	}
 
-	if (num_ns != 0) {
-		subsystem->ns = calloc(num_ns, sizeof(struct spdk_nvmf_ns *));
+	if (num_ns != 0) {				/* [한국어] 일반 subsystem이라면 NS/ANA 배열 사전 할당 */
+		subsystem->ns = calloc(num_ns, sizeof(struct spdk_nvmf_ns *));	/* [한국어] NSID(1~max_nsid) 인덱스용 포인터 배열 */
 		if (subsystem->ns == NULL) {
 			SPDK_ERRLOG("Namespace memory allocation failed\n");
 			pthread_mutex_destroy(&subsystem->mutex);
@@ -289,7 +452,7 @@ spdk_nvmf_subsystem_create(struct spdk_nvmf_tgt *tgt,
 			free(subsystem);
 			return NULL;
 		}
-		subsystem->ana_group = calloc(num_ns, sizeof(uint32_t));
+		subsystem->ana_group = calloc(num_ns, sizeof(uint32_t));	/* [한국어] ANA 그룹 카운터 배열 (ANA 그룹 id별 NS 수 관리) */
 		if (subsystem->ana_group == NULL) {
 			SPDK_ERRLOG("ANA group memory allocation failed\n");
 			pthread_mutex_destroy(&subsystem->mutex);
@@ -300,18 +463,18 @@ spdk_nvmf_subsystem_create(struct spdk_nvmf_tgt *tgt,
 		}
 	}
 
-	memset(subsystem->sn, '0', sizeof(subsystem->sn) - 1);
-	subsystem->sn[sizeof(subsystem->sn) - 1] = '\0';
+	memset(subsystem->sn, '0', sizeof(subsystem->sn) - 1);	/* [한국어] SN(20 char) 디폴트는 '0' 채우기 (호스트가 set_sn 호출 전까지) */
+	subsystem->sn[sizeof(subsystem->sn) - 1] = '\0';	/* [한국어] NULL 종결자 보장 */
 
 	snprintf(subsystem->mn, sizeof(subsystem->mn), "%s",
-		 MODEL_NUMBER_DEFAULT);
+		 MODEL_NUMBER_DEFAULT);				/* [한국어] MN(40 char) 디폴트 "SPDK bdev Controller" */
 
-	spdk_bit_array_set(tgt->subsystem_ids, sid);
-	RB_INSERT(subsystem_tree, &tgt->subsystems, subsystem);
+	spdk_bit_array_set(tgt->subsystem_ids, sid);		/* [한국어] sid 비트 set — 다른 create가 같은 id를 못 받게 */
+	RB_INSERT(subsystem_tree, &tgt->subsystems, subsystem);	/* [한국어] tgt의 NQN-keyed RB tree에 삽입 (find subsystem O(log N)) */
 
-	SPDK_DTRACE_PROBE1(nvmf_subsystem_create, subsystem->subnqn);
+	SPDK_DTRACE_PROBE1(nvmf_subsystem_create, subsystem->subnqn);	/* [한국어] USDT trace point — DTrace/perf로 관측 가능 */
 
-	return subsystem;
+	return subsystem;					/* [한국어] 호출자에게 새 subsystem 핸들 반환 (state=INACTIVE) */
 }
 
 static void
@@ -442,6 +605,27 @@ _nvmf_subsystem_get_first_zoned_ns(struct spdk_nvmf_subsystem *subsystem)
 	return NULL;
 }
 
+/*
+ * [한국어]
+ * spdk_nvmf_subsystem_destroy - subsystem 비동기 파괴 시작
+ *
+ * @subsystem: 파괴할 subsystem (반드시 INACTIVE 상태여야 함)
+ * @cpl_cb:    파괴 완료 시 호출될 콜백 (NULL 가능)
+ * @cpl_cb_arg: 콜백 인자
+ * @return: 0=비동기 시작 또는 즉시 완료, -EINVAL/-EAGAIN/-EALREADY 등 오류
+ *
+ * INACTIVE 상태가 아니면 거부 (호출자가 먼저 stop을 호출해야 한다).
+ * 본 함수는 listener/host를 모두 제거하고 모든 NS도 제거한 뒤
+ * _nvmf_subsystem_destroy를 호출한다. NS 제거가 비동기일 수 있으므로
+ * destroy 자체도 비동기로 완료된다 (cpl_cb로 통지).
+ *
+ * 실행 컨텍스트: subsystem->thread에서 호출 필수 (assert로 강제).
+ *
+ * 호출 체인:
+ *   RPC remove → spdk_nvmf_subsystem_stop → [spdk_nvmf_subsystem_destroy]
+ *     → nvmf_subsystem_remove_all_listeners → nvmf_subsystem_remove_host (각 host)
+ *     → _nvmf_subsystem_destroy → free
+ */
 int
 spdk_nvmf_subsystem_destroy(struct spdk_nvmf_subsystem *subsystem, nvmf_subsystem_destroy_cb cpl_cb,
 			    void *cpl_cb_arg)
@@ -518,44 +702,68 @@ nvmf_subsystem_get_intermediate_state(enum spdk_nvmf_subsystem_state current_sta
 	}
 }
 
+/*
+ * [한국어]
+ * nvmf_subsystem_set_state - atomic CAS로 subsystem 상태 전이
+ *
+ * @subsystem: 대상 subsystem
+ * @state:     목표 상태
+ * @return: 0=성공 (실제 직전 상태가 예상과 일치), 음수=오류
+ *
+ * subsystem 상태 머신은 다음 그래프를 따른다:
+ *   INACTIVE → ACTIVATING → ACTIVE → PAUSING → PAUSED → RESUMING → ACTIVE
+ *                                  ↓                                 ↓
+ *                            DEACTIVATING ← ─────────────────────────┘
+ *                                  ↓
+ *                              INACTIVE
+ * 각 전이는 직전 상태가 정확히 expected_old_state여야 하며, 본 함수는
+ * GCC __atomic_compare_exchange_n으로 lockless 전이를 시도한다. 실패 시
+ * (전이 실패/중단된 ACTIVATING/RESUMING의 롤백 케이스 등) 두 번째 CAS로
+ * 원래 상태로 복원한다.
+ *
+ * 동기화: state는 atomic이며 mutex 없이 접근 — multi-thread에서 동시 호출
+ * 가능성을 가정한다 (단, 실제 호출 위치는 subsystem->thread에 직렬화됨).
+ */
 static int
 nvmf_subsystem_set_state(struct spdk_nvmf_subsystem *subsystem,
 			 enum spdk_nvmf_subsystem_state state)
 {
-	enum spdk_nvmf_subsystem_state actual_old_state, expected_old_state;
-	bool exchanged;
+	enum spdk_nvmf_subsystem_state actual_old_state, expected_old_state;	/* [한국어] CAS 비교용 / 실제 직전 상태 */
+	bool exchanged;								/* [한국어] CAS 성공 여부 */
 
-	switch (state) {
+	switch (state) {							/* [한국어] 목표 상태로부터 정당한 직전 상태를 도출 (state machine) */
 	case SPDK_NVMF_SUBSYSTEM_INACTIVE:
-		expected_old_state = SPDK_NVMF_SUBSYSTEM_DEACTIVATING;
+		expected_old_state = SPDK_NVMF_SUBSYSTEM_DEACTIVATING;		/* [한국어] DEACTIVATING → INACTIVE */
 		break;
 	case SPDK_NVMF_SUBSYSTEM_ACTIVATING:
-		expected_old_state = SPDK_NVMF_SUBSYSTEM_INACTIVE;
+		expected_old_state = SPDK_NVMF_SUBSYSTEM_INACTIVE;		/* [한국어] INACTIVE → ACTIVATING (start 시작) */
 		break;
 	case SPDK_NVMF_SUBSYSTEM_ACTIVE:
-		expected_old_state = SPDK_NVMF_SUBSYSTEM_ACTIVATING;
+		expected_old_state = SPDK_NVMF_SUBSYSTEM_ACTIVATING;		/* [한국어] ACTIVATING → ACTIVE (start 완료) */
 		break;
 	case SPDK_NVMF_SUBSYSTEM_PAUSING:
-		expected_old_state = SPDK_NVMF_SUBSYSTEM_ACTIVE;
+		expected_old_state = SPDK_NVMF_SUBSYSTEM_ACTIVE;		/* [한국어] ACTIVE → PAUSING */
 		break;
 	case SPDK_NVMF_SUBSYSTEM_PAUSED:
-		expected_old_state = SPDK_NVMF_SUBSYSTEM_PAUSING;
+		expected_old_state = SPDK_NVMF_SUBSYSTEM_PAUSING;		/* [한국어] PAUSING → PAUSED */
 		break;
 	case SPDK_NVMF_SUBSYSTEM_RESUMING:
-		expected_old_state = SPDK_NVMF_SUBSYSTEM_PAUSED;
+		expected_old_state = SPDK_NVMF_SUBSYSTEM_PAUSED;		/* [한국어] PAUSED → RESUMING */
 		break;
 	case SPDK_NVMF_SUBSYSTEM_DEACTIVATING:
-		expected_old_state = SPDK_NVMF_SUBSYSTEM_ACTIVE;
+		expected_old_state = SPDK_NVMF_SUBSYSTEM_ACTIVE;		/* [한국어] ACTIVE → DEACTIVATING (stop 시작) */
 		break;
 	default:
-		assert(false);
+		assert(false);							/* [한국어] 그 외 상태로의 직접 전이는 금지 */
 		return -1;
 	}
 
-	actual_old_state = expected_old_state;
+	actual_old_state = expected_old_state;					/* [한국어] CAS는 실제 값을 actual_old_state에 기록한다 */
 	exchanged = __atomic_compare_exchange_n(&subsystem->state, &actual_old_state, state, false,
 						__ATOMIC_RELAXED, __ATOMIC_RELAXED);
-	if (spdk_unlikely(exchanged == false)) {
+	/* [한국어] GCC built-in atomic CAS: state == actual_old_state면 state=새 state, 실패면 actual_old_state=현재값.
+	 * memory order RELAXED — 상태 전이만 동기화하고 자료구조 가시성은 별도 책임. */
+	if (spdk_unlikely(exchanged == false)) {				/* [한국어] CAS 실패 — 롤백 케이스 처리 (아래 if 체인) */
 		if (actual_old_state == SPDK_NVMF_SUBSYSTEM_RESUMING &&
 		    state == SPDK_NVMF_SUBSYSTEM_ACTIVE) {
 			expected_old_state = SPDK_NVMF_SUBSYSTEM_RESUMING;
@@ -785,6 +993,19 @@ nvmf_subsystem_state_change(struct spdk_nvmf_subsystem *subsystem,
 	return 0;
 }
 
+/*
+ * [한국어]
+ * spdk_nvmf_subsystem_start - INACTIVE → ACTIVE 전이 (호스트 connect 수신 시작)
+ *
+ * @subsystem: 대상 (현재 INACTIVE 가정)
+ * @cb_fn:     완료 콜백 (subsystem, cb_arg, status) — status 0=성공
+ * @cb_arg:    콜백 인자
+ * @return: 0=요청 큐잉 성공, -EINVAL/-ENOMEM
+ *
+ * NS/listener/host 구성 후 본 함수를 호출하면 모든 poll group이 이 subsystem을
+ * 활성화하고 호스트 connect 명령을 받기 시작한다. 비동기로 동작 — cb_fn이
+ * 호출되어야 ACTIVE 보장. 내부적으로 nvmf_subsystem_state_change 사용.
+ */
 int
 spdk_nvmf_subsystem_start(struct spdk_nvmf_subsystem *subsystem,
 			  spdk_nvmf_subsystem_state_change_done cb_fn,
@@ -793,6 +1014,13 @@ spdk_nvmf_subsystem_start(struct spdk_nvmf_subsystem *subsystem,
 	return nvmf_subsystem_state_change(subsystem, 0, SPDK_NVMF_SUBSYSTEM_ACTIVE, cb_fn, cb_arg);
 }
 
+/*
+ * [한국어]
+ * spdk_nvmf_subsystem_stop - ACTIVE → INACTIVE 전이 (모든 ctrlr disconnect)
+ *
+ * 모든 호스트 컨트롤러가 disconnect 되고, poll group에서도 subsystem이 제거된다.
+ * destroy 직전 단계에서 호출. 비동기.
+ */
 int
 spdk_nvmf_subsystem_stop(struct spdk_nvmf_subsystem *subsystem,
 			 spdk_nvmf_subsystem_state_change_done cb_fn,
@@ -801,6 +1029,13 @@ spdk_nvmf_subsystem_stop(struct spdk_nvmf_subsystem *subsystem,
 	return nvmf_subsystem_state_change(subsystem, 0, SPDK_NVMF_SUBSYSTEM_INACTIVE, cb_fn, cb_arg);
 }
 
+/*
+ * [한국어]
+ * spdk_nvmf_subsystem_pause - ACTIVE → PAUSED (특정 NS의 IO만 중단 가능)
+ *
+ * @nsid: 0=전체 IO 중단, >0=해당 NSID의 IO만 quiesce. NS hot-add/remove 시 사용.
+ * paused 상태에서 NS 추가/삭제, host ACL 변경 등 control plane 변경 가능.
+ */
 int
 spdk_nvmf_subsystem_pause(struct spdk_nvmf_subsystem *subsystem,
 			  uint32_t nsid,
@@ -810,6 +1045,12 @@ spdk_nvmf_subsystem_pause(struct spdk_nvmf_subsystem *subsystem,
 	return nvmf_subsystem_state_change(subsystem, nsid, SPDK_NVMF_SUBSYSTEM_PAUSED, cb_fn, cb_arg);
 }
 
+/*
+ * [한국어]
+ * spdk_nvmf_subsystem_resume - PAUSED → ACTIVE 전이 (IO 재개)
+ *
+ * pause 후 NS 변경 등이 끝나면 호출하여 모든 poll group의 IO 처리 재개.
+ */
 int
 spdk_nvmf_subsystem_resume(struct spdk_nvmf_subsystem *subsystem,
 			   spdk_nvmf_subsystem_state_change_done cb_fn,
@@ -972,6 +1213,26 @@ nvmf_subsystem_find_host(struct spdk_nvmf_subsystem *subsystem, const char *host
 	return NULL;
 }
 
+/*
+ * [한국어]
+ * spdk_nvmf_subsystem_add_host_ext - 호스트 NQN을 ACL에 추가 (옵션 지원)
+ *
+ * @subsystem: 대상 subsystem
+ * @hostnqn:   허용할 호스트 NQN (NVMe-oF connect 시 사용된 hostnqn과 비교)
+ * @opts:      DH-HMAC-CHAP 키 등 호스트별 인증 옵션
+ * @return: 0=성공, -EINVAL(NQN 부적합/이미 존재), -ENOMEM
+ *
+ * subsystem이 allow_any_host=false일 때만 의미가 있다 (true이면 ACL 무시).
+ * 인증 키(dhchap_key/dhchap_ctrlr_key)는 spdk_keyring에 등록된 핸들로
+ * 전달되며, 본 함수에서 ref count를 dup한다.
+ *
+ * 호출 후 모든 transport에 add_host 콜백을 호출하여 transport별 사전 작업
+ * (예: TLS PSK 등록)을 수행한다.
+ *
+ * 호출 체인:
+ *   RPC subsystem_add_host → [spdk_nvmf_subsystem_add_host_ext]
+ *     → nvmf_nqn_is_valid → spdk_key_dup → transport->subsystem_add_host (각 transport)
+ */
 int
 spdk_nvmf_subsystem_add_host_ext(struct spdk_nvmf_subsystem *subsystem,
 				 const char *hostnqn, struct spdk_nvmf_host_opts *opts)
@@ -1071,6 +1332,17 @@ spdk_nvmf_subsystem_add_host(struct spdk_nvmf_subsystem *subsystem, const char *
 	return spdk_nvmf_subsystem_add_host_ext(subsystem, hostnqn, &opts);
 }
 
+/*
+ * [한국어]
+ * spdk_nvmf_subsystem_remove_host - 호스트 NQN을 ACL에서 제거
+ *
+ * @return: 0=성공, -ENOENT(미등록)
+ *
+ * 등록된 host 객체를 free하고 listener가 있으면 discovery log notice를 통해
+ * 변경을 알린다. 각 transport에도 remove_host 콜백 통지.
+ * 주의: 이미 connect된 ctrlr는 자동 disconnect되지 않으며, 호스트가 다음에
+ * connect를 시도할 때 차단된다. 즉시 끊으려면 disconnect_host 별도 호출.
+ */
 int
 spdk_nvmf_subsystem_remove_host(struct spdk_nvmf_subsystem *subsystem, const char *hostnqn)
 {
@@ -1589,6 +1861,20 @@ _nvmf_subsystem_add_listener(struct spdk_nvmf_subsystem *subsystem,
 	_nvmf_subsystem_add_listener_done(listener, rc);
 }
 
+/*
+ * [한국어]
+ * spdk_nvmf_subsystem_add_listener - subsystem을 transport 주소에 노출 (옵션 없는 버전)
+ *
+ * @subsystem: 노출할 subsystem (INACTIVE 또는 PAUSED 상태)
+ * @trid:      transport id (trtype=TCP/RDMA/FC, traddr=IP/NN, trsvcid=port)
+ * @cb_fn:     listener 등록 완료 콜백 (rc 0=성공)
+ * @cb_arg:    콜백 인자
+ *
+ * 호스트는 trid 주소로 connect/discovery 요청 시 이 subsystem에 도달 가능.
+ * 사전 조건: 이미 spdk_nvmf_tgt_listen으로 transport 자체가 trid 주소에서
+ * 수신 중이어야 한다 (transport_listener와 subsystem_listener는 분리).
+ * 비동기 — 실제 listen_associate transport 콜백이 cb_fn으로 결과 통지.
+ */
 void
 spdk_nvmf_subsystem_add_listener(struct spdk_nvmf_subsystem *subsystem,
 				 const struct spdk_nvme_transport_id *trid,
@@ -1598,6 +1884,13 @@ spdk_nvmf_subsystem_add_listener(struct spdk_nvmf_subsystem *subsystem,
 	_nvmf_subsystem_add_listener(subsystem, trid, cb_fn, cb_arg, NULL);
 }
 
+/*
+ * [한국어]
+ * spdk_nvmf_subsystem_add_listener_ext - opts 인자가 있는 add_listener 확장판
+ *
+ * @opts: secure_channel(TLS), ana_state, sock_impl 등 listener-당 옵션
+ * 그 외는 spdk_nvmf_subsystem_add_listener와 동일.
+ */
 void
 spdk_nvmf_subsystem_add_listener_ext(struct spdk_nvmf_subsystem *subsystem,
 				     const struct spdk_nvme_transport_id *trid,
@@ -1607,6 +1900,15 @@ spdk_nvmf_subsystem_add_listener_ext(struct spdk_nvmf_subsystem *subsystem,
 	_nvmf_subsystem_add_listener(subsystem, trid, cb_fn, cb_arg, opts);
 }
 
+/*
+ * [한국어]
+ * spdk_nvmf_subsystem_remove_listener - 등록된 listener 제거
+ *
+ * @return: 0=성공, -EAGAIN(ACTIVE 상태), -ENOENT(없음)
+ *
+ * 해당 trid로의 신규 connect는 더 이상 이 subsystem에 도달하지 못한다.
+ * 기존 ctrlr는 disconnect되지 않으나 ctrlr->listener 포인터는 NULL로 갱신.
+ */
 int
 spdk_nvmf_subsystem_remove_listener(struct spdk_nvmf_subsystem *subsystem,
 				    const struct spdk_nvme_transport_id *trid)
@@ -1900,6 +2202,25 @@ nvmf_subsystem_ns_changed(struct spdk_nvmf_subsystem *subsystem, uint32_t nsid)
 
 static uint32_t nvmf_ns_reservation_clear_all_registrants(struct spdk_nvmf_ns *ns);
 
+/*
+ * [한국어]
+ * spdk_nvmf_subsystem_remove_ns - subsystem에서 NS 제거
+ *
+ * @subsystem: 대상 (INACTIVE 또는 PAUSED 필요)
+ * @nsid:      제거할 NSID
+ * @return: 0=성공, -1=상태 불일치/NSID 부적합/NS 없음
+ *
+ * 다음을 수행:
+ *   1) NS의 host ACL 모두 제거
+ *   2) PR 등록자 정리, ptpl_file/preempt_abort 메모리 해제
+ *   3) bdev claim release + close
+ *   4) ANA group 카운터 감소
+ *   5) 각 transport에 NS 제거 통지 (ns_remove 콜백)
+ *   6) 모든 ctrlr에게 NS invisible로 표시 (Identify 응답에 빠짐)
+ *
+ * 호출 컨텍스트: subsystem->thread. ACTIVE 상태에선 nvmf_ns_hot_remove를
+ * 거쳐 pause 후 호출되어야 한다 (예: SPDK_BDEV_EVENT_REMOVE 이벤트).
+ */
 int
 spdk_nvmf_subsystem_remove_ns(struct spdk_nvmf_subsystem *subsystem, uint32_t nsid)
 {
@@ -2225,6 +2546,32 @@ nvmf_subsystem_zone_append_supported(struct spdk_nvmf_subsystem *subsystem)
 	return false;
 }
 
+/*
+ * [한국어]
+ * spdk_nvmf_subsystem_add_ns_ext - subsystem에 NS(Namespace) 추가
+ *
+ * @subsystem:  대상 subsystem (INACTIVE 또는 PAUSED 상태)
+ * @bdev_name:  backing storage가 될 bdev의 이름
+ * @user_opts:  NS 옵션 (nsid, nguid, eui64, uuid, anagrpid, hide_metadata 등)
+ * @opts_size:  user_opts 구조체 크기 (전후 호환을 위해 명시; 0=NULL)
+ * @ptpl_file:  Persist Through Power Loss용 PR 영속화 파일 경로 (NULL=비영속)
+ * @return: 성공 시 할당된 NSID(>0), 실패 시 0
+ *
+ * NS는 호스트가 NVMe 명령으로 read/write할 논리 단위이며, SPDK는 각 NS를
+ * 하나의 bdev에 매핑한다. 이 함수는 다음을 수행한다:
+ *   1) 빈 NSID slot 검색 (opts.nsid==0이면 자동 할당)
+ *   2) bdev_open으로 backing bdev 핸들 획득 (write 가능)
+ *   3) bdev metadata, zone, csi 등 호환성 검증
+ *   4) ANA group 카운터 증가, transport에 NS 등록 통지
+ *   5) ptpl_file이 있으면 PR 상태 복원
+ *   6) NS를 모든 ctrlr에게 visible 설정 (no_auto_visible=false 가정)
+ *
+ * 사전 조건: subsystem이 INACTIVE 또는 PAUSED — ACTIVE 상태에선 거부.
+ *
+ * 호출 체인:
+ *   RPC subsystem_add_ns → [spdk_nvmf_subsystem_add_ns_ext] → spdk_bdev_open_ext_v2
+ *     → transport->ns_add (각 transport별) → nvmf_ctrlr_ns_set_visible
+ */
 uint32_t
 spdk_nvmf_subsystem_add_ns_ext(struct spdk_nvmf_subsystem *subsystem, const char *bdev_name,
 			       const struct spdk_nvmf_ns_opts *user_opts, size_t opts_size,
@@ -4260,6 +4607,30 @@ subsystem_listener_update_on_pg(struct spdk_io_channel_iter *i)
 	spdk_for_each_channel_continue(i, 0);
 }
 
+/*
+ * [한국어]
+ * spdk_nvmf_subsystem_set_ana_state - 특정 listener의 ANA 그룹 상태 변경 (멀티패스)
+ *
+ * @subsystem: 대상 subsystem
+ * @trid:      대상 listener의 transport id
+ * @ana_state: OPTIMIZED / NON_OPTIMIZED / INACCESSIBLE / PERSISTENT_LOSS / CHANGE
+ * @anagrpid:  변경할 ANA 그룹 id (0=모든 그룹)
+ * @cb_fn/cb_arg: 모든 poll group 통지가 끝나면 호출될 완료 콜백
+ *
+ * ANA(Asymmetric Namespace Access)는 NVMe-oF 스펙 1.1+에서 도입된 멀티패스
+ * 메커니즘이다. 호스트 측 multipath 드라이버는 각 path(=listener)의 ANA
+ * 상태를 보고 어느 path로 IO를 보낼지 결정한다 (예: OPTIMIZED 우선).
+ * 본 함수는 listener의 ana_state 배열을 업데이트하고, 모든 poll group의
+ * ctrlr에게 ANA Change AER(Async Event Request)을 발생시킨다.
+ *
+ * 실행 컨텍스트: subsystem->thread. spdk_for_each_channel로 모든 poll group
+ * 순회하며 비동기로 통지.
+ *
+ * 호출 체인:
+ *   RPC subsystem_listener_set_ana_state → [spdk_nvmf_subsystem_set_ana_state]
+ *     → spdk_for_each_channel → subsystem_listener_update_on_pg
+ *     → nvmf_ctrlr_async_event_ana_change_notice
+ */
 void
 spdk_nvmf_subsystem_set_ana_state(struct spdk_nvmf_subsystem *subsystem,
 				  const struct spdk_nvme_transport_id *trid,

@@ -5,24 +5,80 @@
  *   Copyright (c) 2022 Dell Inc, or its subsidiaries. All rights reserved.
  */
 
+/*
+ * [한국어 설명] bdev_nvme 사용자 RPC 핸들러 모음 (bdev_nvme_rpc.c)
+ *
+ * === 파일의 역할 ===
+ * 이 파일은 bdev_nvme 모듈의 외부 제어 인터페이스인 JSON-RPC 메서드 약 30개 이상을
+ * 등록한다. NVMe 컨트롤러 attach/detach, 멀티패스/페일오버 정책 변경, ANA 상태 조회,
+ * 핫플러그 on/off, NVMe-oF 디스커버리 시작/중지, mDNS 디스커버리, DH-CHAP 키 설정,
+ * 디스커버리 정보 조회 등 운영자가 SPDK NVMe 스택을 외부에서 제어할 때 사용하는
+ * 거의 모든 통로가 여기에 모여 있다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * 호출 체인:
+ *   외부 RPC 클라이언트 (scripts/rpc.py 등)
+ *     → SPDK JSON-RPC 서버 (lib/rpc, lib/jsonrpc)
+ *     → 본 파일의 rpc_bdev_nvme_*() 핸들러
+ *     → bdev_nvme.c의 spdk_bdev_nvme_*/bdev_nvme_*() 내부 함수 호출
+ *     → lib/nvme의 spdk_nvme_*() (probe/connect/admin/IO 명령)
+ *     → 또는 mDNS/디스커버리 모듈에 위임
+ * 실행 컨텍스트: SPDK app 스레드의 RPC 콜백. 비동기 작업은 cb로 늦게 응답 전송.
+ *
+ * === 타 모듈과의 연결 ===
+ * - 의존: bdev_nvme.h (모듈 내부 API 전체), spdk/rpc.h (RPC 등록/응답),
+ *         spdk/util.h, spdk/string.h, spdk/log.h, spdk/env.h,
+ *         spdk/nvme.h + spdk/nvme_spec.h (NVMe 스펙 enum 등),
+ *         spdk/bdev_module.h, spdk/config.h.
+ * - 의존받음: 별도 헤더 없음. SPDK_RPC_REGISTER가 RPC 메서드 테이블에 등록.
+ * - 데이터 흐름: 외부 JSON 요청 → 디코딩 → 내부 API 호출 → 응답 JSON 빌드.
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - rpc_bdev_nvme_set_options: 모듈 전역 옵션 (timeout, ana, retry, dhchap 등) 일괄 설정.
+ * - rpc_bdev_nvme_set_hotplug: 핫플러그 감지 활성화/주기 설정.
+ * - rpc_bdev_nvme_attach_controller / _detach_controller: NVMe 컨트롤러 attach/detach 진입점.
+ * - rpc_bdev_nvme_get_controllers: 등록된 컨트롤러 정보 조회.
+ * - rpc_bdev_nvme_apply_firmware: 펌웨어 업데이트 (Firmware Image Download + Commit).
+ * - rpc_bdev_nvme_reset_controller / _enable / _disable: reset/enable/disable.
+ * - rpc_bdev_nvme_set_multipath_policy / _set_preferred_path: 멀티패스 제어.
+ * - rpc_bdev_nvme_set_keys: DH-CHAP 키 설정.
+ * - rpc_bdev_nvme_start_discovery / _stop_discovery / _get_discovery_info: NVMe-oF 디스커버리.
+ * - rpc_bdev_nvme_start_mdns_discovery / _stop / _get_mdns_discovery_info: mDNS 디스커버리.
+ * - rpc_bdev_nvme_get_io_paths / _get_path_iostat / _get_transport_statistics: 운영 가시성.
+ * - 다양한 rpc_decode_*: 문자열↔enum 변환 (action_on_timeout, transport_type, ANA state 등).
+ *
+ * 이 파일은 매우 크므로(2770+ 라인), 본 주석화 작업에서는 4섹션 상단 블록과 핵심 함수
+ * 주석에 집중한다. 패턴은 모두 비슷: JSON 디코드 → 내부 API 호출 → bool/객체 응답.
+ */
+
 #include "spdk/stdinc.h"
 
-#include "bdev_nvme.h"
+#include "bdev_nvme.h"            /* [한국어] 모듈 내부 API. */
 
-#include "spdk/config.h"
+#include "spdk/config.h"          /* [한국어] SPDK_CONFIG_* 빌드 옵션. */
 
 #include "spdk/string.h"
-#include "spdk/rpc.h"
+#include "spdk/rpc.h"             /* [한국어] SPDK_RPC_REGISTER, JSON-RPC 응답. */
 #include "spdk/util.h"
 #include "spdk/env.h"
-#include "spdk/nvme.h"
-#include "spdk/nvme_spec.h"
+#include "spdk/nvme.h"            /* [한국어] lib/nvme 공개 API. */
+#include "spdk/nvme_spec.h"       /* [한국어] NVMe 스펙 enum/상수. */
 
 #include "spdk/log.h"
 #include "spdk/bdev_module.h"
 
+/* [한국어] DH-CHAP/TLS 관련 디버그 로그 1회 출력 가드 (전역). */
 static bool g_tls_log = false;
 
+/*
+ * [한국어]
+ * rpc_decode_action_on_timeout - "none"/"abort"/"reset" → enum 변환.
+ *
+ * NVMe IO 타임아웃 시 SPDK가 취할 동작:
+ *   - none: 그냥 로그만, IO는 계속 진행.
+ *   - abort: NVMe Abort 명령으로 해당 IO 취소.
+ *   - reset: 컨트롤러 reset.
+ */
 static int
 rpc_decode_action_on_timeout(const struct spdk_json_val *val, void *out)
 {
@@ -42,6 +98,14 @@ rpc_decode_action_on_timeout(const struct spdk_json_val *val, void *out)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * rpc_decode_digest - DH-CHAP digest 알고리즘 이름 1개를 비트 플래그로 추가.
+ * @val: JSON 문자열 ("sha256", "sha384", "sha512" 등 NVMe DH-CHAP 표준 이름).
+ * @out: uint32_t 비트마스크 (해당 알고리즘 비트가 set됨).
+ *
+ * lib/nvme이 알고리즘 이름→ID 매핑을 제공. ID는 비트 위치로 사용.
+ */
 static int
 rpc_decode_digest(const struct spdk_json_val *val, void *out)
 {
@@ -56,7 +120,7 @@ rpc_decode_digest(const struct spdk_json_val *val, void *out)
 
 	rc = spdk_nvme_dhchap_get_digest_id(digest);
 	if (rc >= 0) {
-		*flags |= SPDK_BIT(rc);
+		*flags |= SPDK_BIT(rc);   /* [한국어] ID 비트 설정. */
 		rc = 0;
 	}
 	free(digest);
@@ -64,17 +128,27 @@ rpc_decode_digest(const struct spdk_json_val *val, void *out)
 	return rc;
 }
 
+/*
+ * [한국어]
+ * rpc_decode_digest_array - JSON 배열의 각 digest를 비트 플래그로 누적.
+ * 배열 최대 32개. 결과: bitmask 1개.
+ */
 static int
 rpc_decode_digest_array(const struct spdk_json_val *val, void *out)
 {
 	uint32_t *flags = out;
 	size_t count;
 
-	*flags = 0;
+	*flags = 0;   /* [한국어] 누적 전 클리어. */
 
 	return spdk_json_decode_array(val, rpc_decode_digest, out, 32, &count, 0);
 }
 
+/*
+ * [한국어]
+ * rpc_decode_dhgroup - DH-CHAP DH 그룹 이름 1개를 비트 플래그로 추가 (digest와 패턴 동일).
+ * 예: "ffdhe2048", "ffdhe3072", "ffdhe4096" 등 RFC 7919 그룹.
+ */
 static int
 rpc_decode_dhgroup(const struct spdk_json_val *val, void *out)
 {
@@ -97,6 +171,10 @@ rpc_decode_dhgroup(const struct spdk_json_val *val, void *out)
 	return rc;
 }
 
+/*
+ * [한국어]
+ * rpc_decode_dhgroup_array - JSON 배열의 dhgroup들을 비트 플래그로 누적.
+ */
 static int
 rpc_decode_dhgroup_array(const struct spdk_json_val *val, void *out)
 {
@@ -143,6 +221,19 @@ static const struct spdk_json_object_decoder rpc_bdev_nvme_set_options_decoders[
 	{"enable_flush", offsetof(struct spdk_bdev_nvme_opts, enable_flush), spdk_json_decode_bool, true},
 };
 
+/*
+ * [한국어]
+ * rpc_bdev_nvme_set_options - "bdev_nvme_set_options" RPC: 모듈 전역 옵션 설정.
+ *
+ * 동작:
+ *   1) 현재 옵션을 default 또는 기존 값으로 채움 (spdk_bdev_nvme_get_opts).
+ *   2) 입력 JSON에 명시된 항목만 덮어씀 (모든 디코더 entry는 optional=true).
+ *   3) spdk_bdev_nvme_set_opts 적용. 컨트롤러가 이미 attach되어 있으면 -EPERM
+ *      (대부분 옵션은 attach 시점에 사용되므로 변경 불가).
+ *
+ * SPDK_RPC_STARTUP | SPDK_RPC_RUNTIME: 부팅 단계 + 런타임 모두에서 호출 가능
+ * (단 startup 단계에 호출하는 것이 권장 - 컨트롤러 attach 전).
+ */
 static void
 rpc_bdev_nvme_set_options(struct spdk_jsonrpc_request *request,
 			  const struct spdk_json_val *params)
@@ -150,6 +241,7 @@ rpc_bdev_nvme_set_options(struct spdk_jsonrpc_request *request,
 	struct spdk_bdev_nvme_opts opts;
 	int rc;
 
+	/* [한국어] 1단계: 현재 옵션을 일단 가져온다 (입력에 없는 필드는 그대로 유지하기 위함). */
 	spdk_bdev_nvme_get_opts(&opts, sizeof(opts));
 	if (params && spdk_json_decode_object(params, rpc_bdev_nvme_set_options_decoders,
 					      SPDK_COUNTOF(rpc_bdev_nvme_set_options_decoders),
@@ -160,6 +252,7 @@ rpc_bdev_nvme_set_options(struct spdk_jsonrpc_request *request,
 		return;
 	}
 
+	/* [한국어] 2단계: 옵션 적용. 일부 옵션은 컨트롤러 attach 후에는 변경 불가. */
 	rc = spdk_bdev_nvme_set_opts(&opts);
 	if (rc == -EPERM) {
 		spdk_jsonrpc_send_error_response(request, -EPERM,
@@ -175,16 +268,31 @@ rpc_bdev_nvme_set_options(struct spdk_jsonrpc_request *request,
 SPDK_RPC_REGISTER("bdev_nvme_set_options", rpc_bdev_nvme_set_options,
 		  SPDK_RPC_STARTUP | SPDK_RPC_RUNTIME)
 
+/*
+ * [한국어]
+ * struct rpc_bdev_nvme_hotplug - bdev_nvme_set_hotplug RPC 입력.
+ * JSON: {"enable": bool, "period_us": uint64?}.
+ */
 struct rpc_bdev_nvme_hotplug {
 	bool enabled;
+	/* [한국어] true면 핫플러그 폴링 활성화, false면 비활성화. */
 	uint64_t period_us;
+	/* [한국어] 폴링 주기 (마이크로초). 0이면 기본값. */
 };
 
+/* [한국어] 디코더 테이블. enable은 필수, period_us는 optional. */
 static const struct spdk_json_object_decoder rpc_bdev_nvme_set_hotplug_decoders[] = {
 	{"enable", offsetof(struct rpc_bdev_nvme_hotplug, enabled), spdk_json_decode_bool, false},
 	{"period_us", offsetof(struct rpc_bdev_nvme_hotplug, period_us), spdk_json_decode_uint64, true},
 };
 
+/*
+ * [한국어]
+ * rpc_bdev_nvme_set_hotplug - "bdev_nvme_set_hotplug" 핸들러.
+ *
+ * 활성화 시 SPDK는 PCIe 주기적 스캔으로 새 SSD 장착/탈착을 감지해 자동 attach/detach.
+ * NVMe-oF에서는 사용 안 함 (디스커버리/페일오버 메커니즘이 별개).
+ */
 static void
 rpc_bdev_nvme_set_hotplug(struct spdk_jsonrpc_request *request,
 			  const struct spdk_json_val *params)
@@ -199,6 +307,7 @@ rpc_bdev_nvme_set_hotplug(struct spdk_jsonrpc_request *request,
 		goto invalid;
 	}
 
+	/* [한국어] 내부 함수 호출 - 이 안에서 핫플러그 poller 등록/해제 처리. */
 	rc = bdev_nvme_set_hotplug(req.enabled, req.period_us);
 	if (rc) {
 		goto invalid;
@@ -211,6 +320,14 @@ invalid:
 }
 SPDK_RPC_REGISTER("bdev_nvme_set_hotplug", rpc_bdev_nvme_set_hotplug, SPDK_RPC_RUNTIME)
 
+/*
+ * [한국어]
+ * enum bdev_nvme_multipath_mode - attach 시 멀티패스 모드 선택용 enum.
+ *
+ * - FAILOVER: 같은 NQN 다중 trid 중 하나만 활성, 실패 시 전환 (active-passive).
+ * - MULTIPATH: 동시에 모든 path 활성 (active-active, RR/queue-depth 등 selector 사용).
+ * - DISABLE: 멀티패스 자체 비활성, 같은 NQN 다중 attach 거부.
+ */
 enum bdev_nvme_multipath_mode {
 	BDEV_NVME_MP_MODE_FAILOVER,
 	BDEV_NVME_MP_MODE_MULTIPATH,
@@ -371,6 +488,14 @@ rpc_bdev_nvme_attach_controller_examined(void *cb_ctx)
 	free_rpc_bdev_nvme_attach_controller_ctx(ctx);
 }
 
+/*
+ * [한국어]
+ * rpc_bdev_nvme_attach_controller_done - attach 비동기 완료 콜백.
+ *
+ * 모든 namespace populate가 끝나면 호출됨. 다음 단계로 spdk_bdev_wait_for_examine을
+ * 호출해 모든 등록된 examine 모듈(예: vbdev_lvol_examine 등)이 새 bdev들을 살펴볼
+ * 시간을 준 뒤 rpc_bdev_nvme_attach_controller_examined로 응답 전송.
+ */
 static void
 rpc_bdev_nvme_attach_controller_done(void *cb_ctx, size_t bdev_count, int rc)
 {
@@ -384,9 +509,28 @@ rpc_bdev_nvme_attach_controller_done(void *cb_ctx, size_t bdev_count, int rc)
 	}
 
 	ctx->bdev_count = bdev_count;
+	/* [한국어] examine 모듈들이 모두 끝나기를 기다린 후 응답.
+	 * 결과 names 배열이 examine 후 결정될 수 있음 (vbdev이 base bdev에 붙었을 때 등). */
 	spdk_bdev_wait_for_examine(rpc_bdev_nvme_attach_controller_examined, ctx);
 }
 
+/*
+ * [한국어]
+ * rpc_bdev_nvme_attach_controller - "bdev_nvme_attach_controller" RPC 진입점.
+ *
+ * 동작 단계 요약:
+ *   1) ctx 할당 + 기본 옵션 채움 (lib/nvme + bdev_nvme).
+ *   2) 입력 JSON 파싱.
+ *   3) trtype/traddr/trsvcid/adrfam/subnqn/hostnqn/hostaddr/hostsvcid를 spdk_nvme_transport_id로 변환.
+ *   4) 같은 이름의 컨트롤러가 이미 있으면 멀티패스/페일오버 정책에 따라 처리:
+ *      - DISABLE: 거부 (-EALREADY).
+ *      - FAILOVER/MULTIPATH: 같은 trid면 거부, subnqn/hostnqn 다르면 거부, 그 외 path 추가.
+ *   5) spdk_bdev_nvme_create() 호출 → lib/nvme의 spdk_nvme_connect_async 시작.
+ *   6) 결과는 비동기로 rpc_bdev_nvme_attach_controller_done 콜백.
+ *
+ * 응답: 생성된 bdev 이름들의 JSON 배열 (예: ["Nvme0n1", "Nvme0n2"]).
+ * 실행 컨텍스트: SPDK app 스레드.
+ */
 static void
 rpc_bdev_nvme_attach_controller(struct spdk_jsonrpc_request *request,
 				const struct spdk_json_val *params)
@@ -655,6 +799,13 @@ static const struct spdk_json_object_decoder rpc_bdev_nvme_get_controllers_decod
 	{"name", offsetof(struct rpc_bdev_nvme_get_controllers, name), spdk_json_decode_string, true},
 };
 
+/*
+ * [한국어]
+ * rpc_bdev_nvme_get_controllers - "bdev_nvme_get_controllers" RPC: 등록된 컨트롤러 정보 조회.
+ *
+ * 입력: {"name": "..."?} (optional, 없으면 전체 조회).
+ * 출력: 컨트롤러 정보 배열. 각 원소는 그룹 이름과 ctrlrs 배열 (멀티패스 경로별 컨트롤러).
+ */
 static void
 rpc_bdev_nvme_get_controllers(struct spdk_jsonrpc_request *request,
 			      const struct spdk_json_val *params)
@@ -734,6 +885,11 @@ static const struct spdk_json_object_decoder rpc_bdev_nvme_detach_controller_dec
 	{"hostsvcid", offsetof(struct rpc_bdev_nvme_detach_controller, hostsvcid), spdk_json_decode_string, true},
 };
 
+/*
+ * [한국어]
+ * rpc_bdev_nvme_detach_controller_done - detach 비동기 완료 콜백.
+ * 성공 시 bool true 응답, 실패 시 errno 응답.
+ */
 static void
 rpc_bdev_nvme_detach_controller_done(void *arg, int rc)
 {
@@ -746,6 +902,15 @@ rpc_bdev_nvme_detach_controller_done(void *arg, int rc)
 	}
 }
 
+/*
+ * [한국어]
+ * rpc_bdev_nvme_detach_controller - "bdev_nvme_detach_controller" RPC: 컨트롤러 detach.
+ *
+ * 인자에 따라 detach 범위가 달라진다:
+ *   - name만 지정 → 같은 이름의 모든 path detach.
+ *   - name + trid 지정 → 해당 path만 detach (멀티패스 중 한 경로 제거).
+ * 비동기 완료 후 rpc_bdev_nvme_detach_controller_done 호출.
+ */
 static void
 rpc_bdev_nvme_detach_controller(struct spdk_jsonrpc_request *request,
 				const struct spdk_json_val *params)
@@ -1316,6 +1481,15 @@ rpc_bdev_nvme_controller_op_cb(void *cb_arg, int rc)
 	}
 }
 
+/*
+ * [한국어]
+ * rpc_bdev_nvme_controller_op - reset/enable/disable RPC의 공통 본체.
+ *
+ * @op: NVME_CTRLR_OP_RESET / _ENABLE / _DISABLE 중 하나.
+ *
+ * cntlid가 0(또는 미지정)이면 그룹의 모든 컨트롤러에 대해 op를 실행 (멀티패스 일괄).
+ * cntlid가 지정되면 해당 cntlid 1개 컨트롤러만.
+ */
 static void
 rpc_bdev_nvme_controller_op(struct spdk_jsonrpc_request *request,
 			    const struct spdk_json_val *params,
@@ -1333,6 +1507,7 @@ rpc_bdev_nvme_controller_op(struct spdk_jsonrpc_request *request,
 		goto exit;
 	}
 
+	/* [한국어] 그룹 lookup. */
 	nbdev_ctrlr = nvme_bdev_ctrlr_get_by_name(req.name);
 	if (nbdev_ctrlr == NULL) {
 		SPDK_ERRLOG("Failed at NVMe bdev controller lookup\n");
@@ -1341,8 +1516,10 @@ rpc_bdev_nvme_controller_op(struct spdk_jsonrpc_request *request,
 	}
 
 	if (req.cntlid == 0) {
+		/* [한국어] 그룹 전체에 op 실행. */
 		nvme_bdev_ctrlr_op_rpc(nbdev_ctrlr, op, rpc_bdev_nvme_controller_op_cb, request);
 	} else {
+		/* [한국어] cntlid 지정 → 단일 컨트롤러에만. */
 		nvme_ctrlr = nvme_bdev_ctrlr_get_ctrlr_by_id(nbdev_ctrlr, req.cntlid);
 		if (nvme_ctrlr == NULL) {
 			SPDK_ERRLOG("Failed at NVMe controller lookup\n");
@@ -1776,6 +1953,14 @@ rpc_bdev_nvme_stop_discovery_done(void *cb_ctx)
 	free(ctx);
 }
 
+/*
+ * [한국어]
+ * rpc_bdev_nvme_stop_discovery - "bdev_nvme_stop_discovery" RPC: 진행 중인 디스커버리 중단.
+ *
+ * 디스커버리 컨트롤러로의 connect를 끊고 자동 attach 흐름을 정지한다.
+ * 이미 attach된 컨트롤러들은 그대로 유지 (수동 detach 필요).
+ * 비동기 완료 시 rpc_bdev_nvme_stop_discovery_done 호출.
+ */
 static void
 rpc_bdev_nvme_stop_discovery(struct spdk_jsonrpc_request *request,
 			     const struct spdk_json_val *params)
@@ -1814,6 +1999,11 @@ cleanup:
 SPDK_RPC_REGISTER("bdev_nvme_stop_discovery", rpc_bdev_nvme_stop_discovery,
 		  SPDK_RPC_RUNTIME)
 
+/*
+ * [한국어]
+ * rpc_bdev_nvme_get_discovery_info - "bdev_nvme_get_discovery_info" RPC.
+ * 활성 디스커버리 세션 정보를 JSON 배열로 출력 (bdev_nvme.c 내부 헬퍼에 위임).
+ */
 static void
 rpc_bdev_nvme_get_discovery_info(struct spdk_jsonrpc_request *request,
 				 const struct spdk_json_val *params)
@@ -2747,6 +2937,14 @@ rpc_bdev_nvme_set_keys_done(void *ctx, int status)
 	}
 }
 
+/*
+ * [한국어]
+ * rpc_bdev_nvme_set_keys - "bdev_nvme_set_keys" RPC: 컨트롤러의 DH-CHAP 키 갱신.
+ *
+ * 입력: {name, dhchap_key?, dhchap_ctrlr_key?}.
+ * NVMe over TCP/RDMA에서 호스트↔컨트롤러 인증 키를 동적으로 회전(rotation)할 때 사용.
+ * 비동기 완료 콜백: rpc_bdev_nvme_set_keys_done.
+ */
 static void
 rpc_bdev_nvme_set_keys(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
 {
@@ -2760,6 +2958,7 @@ rpc_bdev_nvme_set_keys(struct spdk_jsonrpc_request *request, const struct spdk_j
 		return;
 	}
 
+	/* [한국어] 내부 API에 위임. 비동기로 키 갱신 후 cb 호출. */
 	rc = bdev_nvme_set_keys(req.name, req.dhchap_key, req.dhchap_ctrlr_key,
 				rpc_bdev_nvme_set_keys_done, request);
 	if (rc != 0) {

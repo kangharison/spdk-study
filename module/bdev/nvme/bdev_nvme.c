@@ -5,32 +5,112 @@
  *   Copyright (c) 2022 Dell Inc, or its subsidiaries. All rights reserved.
  */
 
+/*
+ * [한국어 설명] bdev_nvme 모듈 본체 - SPDK NVMe bdev 구현 (bdev_nvme.c)
+ *
+ * === 파일의 역할 ===
+ * 이 파일은 SPDK의 bdev_nvme 모듈 (NVMe 컨트롤러를 SPDK bdev로 노출하는 모듈)의
+ * 핵심 구현이다. 9000줄 이상의 거대한 파일로, 다음과 같은 책임을 모두 다룬다:
+ *   1) NVMe 컨트롤러 attach/probe/connect/detach 라이프사이클 (PCIe + NVMe-oF).
+ *   2) namespace 발견과 SPDK bdev 등록 (멀티패스 그룹화 포함).
+ *   3) IO 경로: spdk_bdev_io를 받아 lib/nvme의 spdk_nvme_ns_cmd_*로 변환, qpair에 enqueue,
+ *      completion poll, IO 통계 수집.
+ *   4) 멀티패스/페일오버: 같은 NQN의 여러 path를 하나의 nvme_bdev로 묶고, 정책(active-passive,
+ *      active-active+RR, ANA, queue-depth)에 따라 path 선택. ANA log 처리, AEN 핸들링.
+ *   5) reset/enable/disable/failover 컨트롤러 op 비동기 시퀀스.
+ *   6) NVMe-oF Discovery 자동 attach 흐름 (CDC 폴링).
+ *   7) 핫플러그 PCIe 감지.
+ *   8) DH-CHAP/PSK 키 관리 (TLS/인증).
+ *   9) write_config_json (save_config) 직렬화.
+ *  10) IO 채널 라이프사이클 (per-thread io_path/qpair 캐시).
+ *
+ * 파일 상단의 매크로들(NVME_CTRLR_LOG_FMT, NVME_*_LOG 매크로)은 컨트롤러/qpair/ns의
+ * 식별자(SUBNQN, traddr, cntlid, qid, nsid 등)를 자동으로 로그에 포함시키기 위한
+ * 헬퍼다. 모든 로그 메시지가 어떤 컨트롤러/경로/namespace에 대한 것인지 추적 가능.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * 이 파일은 SPDK의 4-레이어 NVMe 스택 가운데 가장 가운데 층에 위치한다:
+ *   [SPDK bdev 코어 (lib/bdev)]
+ *         ↑↓ fn_table 콜백
+ *   [bdev_nvme 모듈 (이 파일)]      ← 사용자 IO ↔ NVMe 명령 변환
+ *         ↑↓ spdk_nvme_*() API
+ *   [lib/nvme NVMe 드라이버]        ← SQ/CQ doorbell, PRP/SGL, fabrics transport
+ *         ↑↓ MMIO/TCP/RDMA
+ *   [디바이스 (NVMe SSD 또는 NVMe-oF target)]
+ *
+ * 호출 체인 (대표 IO 경로):
+ *   사용자 spdk_bdev_read(bdev_io)
+ *     → bdev 코어가 fn_table::submit_request 호출
+ *     → bdev_nvme_submit_request (이 파일)
+ *     → bdev_nvme_get_io_path (멀티패스 정책으로 path 선택)
+ *     → bdev_nvme_readv (lib/nvme의 spdk_nvme_ns_cmd_readv 호출)
+ *     → SQ doorbell write → 디바이스
+ *     → 디바이스가 CQE 작성, MSI/MSI-X 또는 polled CQ 감지
+ *     → bdev_nvme_poll 또는 nvme_poll_group_process_completions
+ *     → bdev_nvme_readv_done (lib/nvme이 호출하는 완료 콜백)
+ *     → spdk_bdev_io_complete_nvme_status (bdev 코어로 완료 보고)
+ *     → 사용자 콜백 호출.
+ *
+ * 호출 체인 (attach):
+ *   bdev_nvme_attach_controller RPC → spdk_bdev_nvme_create
+ *     → spdk_nvme_connect_async → 비동기 probe poller
+ *     → attach_cb → namespace 순회 → nvme_bdev 생성 → spdk_bdev_register.
+ *
+ * === 타 모듈과의 연결 ===
+ * - 의존: lib/nvme (spdk_nvme_*), lib/bdev (spdk_bdev_*), lib/thread (poller, msg),
+ *         lib/accel (CRC32C/Compare 가속), lib/keyring (DH-CHAP 키), lib/opal (SED),
+ *         lib/util (uuid, string).
+ * - 의존받음: bdev_nvme_rpc.c (RPC), nvme_rpc.c (raw cmd RPC), bdev_nvme_cuse_rpc.c (CUSE),
+ *             bdev_mdns_client.c (mDNS), vbdev_opal.c (Opal 보호 vbdev),
+ *             외부 SPDK bdev 유저 (lib/bdev → fn_table 콜백).
+ * - 데이터 흐름: 사용자 IO → bdev_io → io_path 선택 → lib/nvme qpair → 디바이스 → CQE →
+ *               poll → completion cb → bdev_io_complete.
+ * - 공유 상태: g_nvme_bdev_ctrlrs (전역 그룹 리스트, app 스레드 변경),
+ *             각 nvme_ctrlr/nvme_bdev (mutex 보호 일부 필드),
+ *             채널별 io_path 캐시 (해당 스레드에서만 접근, lockless).
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - bdev_nvme_submit_request: bdev fn_table::submit_request 진입점.
+ * - bdev_nvme_get_io_path: 멀티패스 정책으로 path 선택.
+ * - bdev_nvme_create / bdev_nvme_delete: attach/detach 진입점.
+ * - bdev_nvme_reset_ctrlr / bdev_nvme_failover_ctrlr: 컨트롤러 op 본체.
+ * - bdev_nvme_poll / bdev_nvme_poll_adminq: completion 폴링 poller.
+ * - nvme_bdev_create / nvme_bdev_destruct: SPDK bdev 등록/해제.
+ * - bdev_nvme_create_qpair / bdev_nvme_disconnect_qpair: IO qpair 라이프사이클.
+ * - bdev_nvme_attach_controller_op_cb 및 다양한 비동기 콜백 체인.
+ *
+ * 본 파일이 너무 커서(9000+ 라인) 본 주석화 작업에서는 4섹션 상단 블록(이 영역) +
+ * 핵심 구조체 §4 + 공개 API §2 헤더 + 핵심 인라인만 추가한다. 헤더 파일
+ * (bdev_nvme.h)에서 이미 모든 구조체에 §4 주석을 달았으므로 본 파일에서는
+ * 함수 단위 주석에 집중한다.
+ */
+
 #include "spdk/stdinc.h"
 
-#include "bdev_nvme.h"
+#include "bdev_nvme.h"             /* [한국어] 모듈 내부 자료구조와 API 선언. */
 
-#include "spdk/accel.h"
-#include "spdk/config.h"
-#include "spdk/endian.h"
-#include "spdk/bdev.h"
-#include "spdk/json.h"
-#include "spdk/keyring.h"
-#include "spdk/likely.h"
-#include "spdk/nvme.h"
-#include "spdk/nvme_ocssd.h"
-#include "spdk/nvme_zns.h"
-#include "spdk/opal.h"
-#include "spdk/thread.h"
-#include "spdk/trace.h"
-#include "spdk/string.h"
-#include "spdk/util.h"
-#include "spdk/uuid.h"
+#include "spdk/accel.h"           /* [한국어] CRC32C, compare 등 가속 (Acceleration framework). */
+#include "spdk/config.h"          /* [한국어] SPDK_CONFIG_* 빌드 옵션. */
+#include "spdk/endian.h"          /* [한국어] big/little endian 변환 헬퍼. */
+#include "spdk/bdev.h"            /* [한국어] bdev 코어 API. */
+#include "spdk/json.h"            /* [한국어] JSON write context (save_config 등). */
+#include "spdk/keyring.h"         /* [한국어] DH-CHAP/PSK 키 매니저. */
+#include "spdk/likely.h"          /* [한국어] likely/unlikely 분기 힌트. */
+#include "spdk/nvme.h"            /* [한국어] lib/nvme 공개 API. */
+#include "spdk/nvme_ocssd.h"      /* [한국어] OpenChannel SSD 확장. */
+#include "spdk/nvme_zns.h"        /* [한국어] Zoned Namespace (ZNS) 확장. */
+#include "spdk/opal.h"            /* [한국어] TCG Opal SED API. */
+#include "spdk/thread.h"          /* [한국어] poller, message, channel API. */
+#include "spdk/trace.h"           /* [한국어] SPDK trace framework. */
+#include "spdk/string.h"          /* [한국어] spdk_strerror 등. */
+#include "spdk/util.h"            /* [한국어] SPDK_COUNTOF 등 매크로. */
+#include "spdk/uuid.h"            /* [한국어] UUID 생성/비교. */
 
-#include "spdk/bdev_module.h"
+#include "spdk/bdev_module.h"     /* [한국어] bdev 모듈 등록 매크로. */
 #include "spdk/log.h"
 
-#include "spdk_internal/usdt.h"
-#include "spdk_internal/trace_defs.h"
+#include "spdk_internal/usdt.h"        /* [한국어] USDT trace probes (DTrace, eBPF). */
+#include "spdk_internal/trace_defs.h"  /* [한국어] 모듈 trace 정의. */
 
 #define NVME_CTRLR_LOG_FMT "%s%s%s:%s,cntlid:%u"
 #define NVME_CTRLR_LOG_ARGS(nvme_ctrlr) \
@@ -178,70 +258,114 @@ static struct nvme_ctrlr *null_ctrlr;
 
 static int bdev_nvme_config_json(struct spdk_json_write_ctx *w);
 
+/*
+ * [한국어]
+ * struct nvme_bdev_io - bdev_io의 driver_ctx로 임베드되는 bdev_nvme 측 컨텍스트.
+ *
+ * SPDK bdev 코어가 spdk_bdev_io 끝에 (모듈이 알린 get_ctx_size 만큼) 추가 공간을
+ * 할당하고 driver_ctx로 노출. bdev_nvme는 그 공간에 이 구조체를 두어 IO 진행 중에
+ * 필요한 모든 상태(iov 위치, retry, fused cmd 상태, NVMe CPL 사본 등)를 보관한다.
+ * 한 IO당 1개 인스턴스, IO 발행 시 0-init되어 사용.
+ */
 struct nvme_bdev_io {
 	/** array of iovecs to transfer. */
 	struct iovec *iovs;
+	/* [한국어] 사용자가 전달한 데이터 iovec 배열 포인터.
+	 * 설정자: bdev_nvme_submit_request가 bdev_io에서 추출.
+	 * 읽는 자: NVMe 명령 발행 시 SGL 변환 헬퍼. */
 
 	/** Number of iovecs in iovs array. */
 	int iovcnt;
+	/* [한국어] iovs 원소 개수. */
 
 	/** Current iovec position. */
 	int iovpos;
+	/* [한국어] 현재 처리 중인 iovec 인덱스 (multi-vector NVMe 발행 시 진행 추적). */
 
 	/** Offset in current iovec. */
 	uint32_t iov_offset;
+	/* [한국어] iovs[iovpos] 내 바이트 오프셋. */
 
 	/** Offset in current iovec. */
 	uint32_t fused_iov_offset;
+	/* [한국어] fused command(예: Compare-and-Write)에서 두 번째 op의 iov 오프셋. */
 
 	/** array of iovecs to transfer. */
 	struct iovec *fused_iovs;
+	/* [한국어] fused command의 두 번째 op용 iovec 배열. */
 
 	/** Number of iovecs in iovs array. */
 	int fused_iovcnt;
+	/* [한국어] fused_iovs 원소 개수. */
 
 	/** Current iovec position. */
 	int fused_iovpos;
+	/* [한국어] fused_iovs 진행 인덱스. */
 
 	/** I/O path the current I/O or admin passthrough is submitted on, or the I/O path
 	 *  being reset in a reset I/O.
 	 */
 	struct nvme_io_path *io_path;
+	/* [한국어] 이 IO가 발행된 path (멀티패스 중 어느 컨트롤러/qpair인지).
+	 * Reset IO의 경우엔 reset 대상 path. completion 처리에서 path별 통계 갱신에 사용. */
 
 	/** Saved status for admin passthru completion event, PI error verification, or intermediate compare-and-write status */
 	struct spdk_nvme_cpl cpl;
+	/* [한국어] 디바이스가 반환한 16바이트 CPL 사본.
+	 * Admin passthrough 응답을 사용자에게 돌려주거나 fused 중간 상태 저장 등에 사용. */
 
 	/** Extended IO opts passed by the user to bdev layer and mapped to NVME format */
 	struct spdk_nvme_ns_cmd_ext_io_opts ext_opts;
+	/* [한국어] 사용자가 전달한 확장 IO 옵션 (DIF/DIX, namespace metadata 등)을
+	 * lib/nvme 형식으로 매핑한 구조체. */
 
 	/** Keeps track if first of fused commands was submitted */
 	bool first_fused_submitted;
+	/* [한국어] Compare-and-Write의 첫 op(Compare)이 발행되었는가? */
 
 	/** Keeps track if first of fused commands was completed */
 	bool first_fused_completed;
+	/* [한국어] 첫 op이 완료되었는가? completion 시 두 번째 op로 진행 결정. */
 
 	/* How many times the current I/O was retried. */
 	int32_t retry_count;
+	/* [한국어] 일시적 실패(qpair busy, ANS 변경 등)로 재시도된 횟수.
+	 * bdev_retry_count 옵션 초과 시 IO 영구 실패로 보고. */
 
 	/** Expiration value in ticks to retry the current I/O. */
 	uint64_t retry_ticks;
+	/* [한국어] 다음 재시도 가능 시각 (TSC). retry_io_poller가 이 값 이상이 되면 재발행. */
 
 	/** Temporary pointer to zone report buffer */
 	struct spdk_nvme_zns_zone_report *zone_report_buf;
+	/* [한국어] ZNS Zone Report 명령의 응답 버퍼 임시 포인터. */
 
 	/** Keep track of how many zones that have been copied to the spdk_bdev_zone_info struct */
 	uint64_t handled_zones;
+	/* [한국어] Zone Report 결과를 사용자 형식으로 복사한 zone 개수 (멀티 zone 처리). */
 
 	/* Current tsc at submit time. */
 	uint64_t submit_tsc;
+	/* [한국어] IO 발행 시점 TSC. timeout 비교, latency 통계에 사용. */
 
 	/* Used to put nvme_bdev_io into the list */
 	TAILQ_ENTRY(nvme_bdev_io) retry_link;
+	/* [한국어] retry_io_list 또는 pending_resets 큐의 노드. */
 };
 
+/*
+ * [한국어]
+ * struct nvme_probe_skip_entry - 핫플러그 감지 시 무시할 컨트롤러 trid.
+ *
+ * 사용자가 RPC로 detach한 컨트롤러를 핫플러그 monitor가 다시 자동 attach 하지 않도록
+ * skip list에 등록. PCIe NVMe 환경에서 detach 후 디바이스가 그대로 꽂혀 있어도
+ * 자동 재attach를 막는다.
+ */
 struct nvme_probe_skip_entry {
 	struct spdk_nvme_transport_id		trid;
+	/* [한국어] skip 대상 컨트롤러의 trid. */
 	TAILQ_ENTRY(nvme_probe_skip_entry)	tailq;
+	/* [한국어] g_skipped_nvme_ctrlrs 리스트 노드. */
 };
 
 typedef void (*nvme_ctrlr_put_ref_cb)(struct nvme_ctrlr *nvme_ctrlr);
@@ -361,14 +485,29 @@ static int nvme_ctrlr_read_ana_log_page(struct nvme_ctrlr *nvme_ctrlr);
 static void nvme_ns_free(struct nvme_ns *ns);
 static void nvme_ns_delete(struct nvme_ns *ns);
 
+/*
+ * [한국어]
+ * nvme_ns_cmp - RB-tree 비교 함수 (key: nsid).
+ * 트리는 nvme_ctrlr::namespaces. RB_FIND/RB_INSERT가 이 함수로 정렬.
+ */
 static int
 nvme_ns_cmp(struct nvme_ns *ns1, struct nvme_ns *ns2)
 {
 	return ns1->id < ns2->id ? -1 : ns1->id > ns2->id;
 }
 
+/* [한국어] RB-tree 매크로 정의: nvme_ns_tree 타입에 nvme_ns의 node 멤버를 사용해
+ * nvme_ns_cmp로 정렬되는 정적(static) 함수들 (RB_FIND/INSERT/REMOVE 등)을 생성. */
 RB_GENERATE_STATIC(nvme_ns_tree, nvme_ns, node, nvme_ns_cmp);
 
+/*
+ * [한국어]
+ * bdev_nvme_get_io_qpair - bdev_nvme.h §2 참조. 채널 컨텍스트에서 lib/nvme qpair 추출.
+ *
+ * spdk_get_io_channel(nvme_ctrlr) → 채널 핸들 → spdk_io_channel_get_ctx로 우리의
+ * nvme_ctrlr_channel 구조체 → 그 안의 qpair → spdk_nvme_qpair * 반환.
+ * NVMe raw cmd passthrough 등 외부에서 qpair에 직접 명령 발행할 때 사용.
+ */
 struct spdk_nvme_qpair *
 bdev_nvme_get_io_qpair(struct spdk_io_channel *ctrlr_io_ch)
 {
@@ -381,12 +520,26 @@ bdev_nvme_get_io_qpair(struct spdk_io_channel *ctrlr_io_ch)
 	return ctrlr_ch->qpair->qpair;
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_get_ctx_size - SPDK bdev 모듈 콜백: bdev_io::driver_ctx 크기 알림.
+ * 반환값만큼의 공간이 자동 할당되어 nvme_bdev_io로 사용된다.
+ */
 static int
 bdev_nvme_get_ctx_size(void)
 {
 	return sizeof(struct nvme_bdev_io);
 }
 
+/*
+ * [한국어] bdev_nvme SPDK bdev 모듈 등록 정보.
+ *
+ * - name: 모듈 식별자.
+ * - async_fini: true → fini가 비동기 (모든 컨트롤러 detach 완료까지 대기).
+ * - module_init/fini: subsystem init/fini 콜백.
+ * - config_json: save_config 시 호출 (모든 attach 명령을 다시 만들어주는 JSON 출력).
+ * - get_ctx_size: driver_ctx 크기 보고.
+ */
 static struct spdk_bdev_module nvme_if = {
 	.name = "nvme",
 	.async_fini = true,
@@ -397,10 +550,21 @@ static struct spdk_bdev_module nvme_if = {
 
 };
 SPDK_BDEV_MODULE_REGISTER(nvme, &nvme_if)
+/* [한국어] ↑ SPDK bdev 시스템에 "nvme" 모듈을 컴파일 타임 등록. 부팅 시 module_init 호출. */
 
+/* [한국어] 모든 nvme_bdev_ctrlr (=멀티패스 그룹)의 전역 헤드.
+ * 설정자: bdev_nvme_create/_delete (app 스레드).
+ * 읽는 자: 모든 lookup, save_config, RPC 응답.
+ * 동기화: app 스레드 외 접근 금지. */
 struct nvme_bdev_ctrlrs g_nvme_bdev_ctrlrs = TAILQ_HEAD_INITIALIZER(g_nvme_bdev_ctrlrs);
+/* [한국어] 모듈 fini가 진행 중인가? true이면 새 attach/등록 거부. */
 bool g_bdev_nvme_module_finish;
 
+/*
+ * [한국어]
+ * nvme_bdev_ctrlr_get_by_name - bdev_nvme.h §2 참조. 이름으로 멀티패스 그룹 lookup.
+ * 컨텍스트: app 스레드 (전역 리스트 접근).
+ */
 struct nvme_bdev_ctrlr *
 nvme_bdev_ctrlr_get_by_name(const char *name)
 {
@@ -433,6 +597,11 @@ nvme_bdev_ctrlr_get_ctrlr(struct nvme_bdev_ctrlr *nbdev_ctrlr,
 	return nvme_ctrlr;
 }
 
+/*
+ * [한국어]
+ * nvme_bdev_ctrlr_get_ctrlr_by_id - bdev_nvme.h §2 참조.
+ * cntlid는 NVMe Identify Controller로부터 얻는 값. 멀티패스 그룹 내에서 cntlid는 유일.
+ */
 struct nvme_ctrlr *
 nvme_bdev_ctrlr_get_ctrlr_by_id(struct nvme_bdev_ctrlr *nbdev_ctrlr,
 				uint16_t cntlid)
@@ -466,6 +635,13 @@ nvme_bdev_ctrlr_get_bdev(struct nvme_bdev_ctrlr *nbdev_ctrlr, uint32_t nsid)
 	return nbdev;
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_get_ns - bdev_nvme.h §2 참조. nsid로 namespace 조회 (RB-tree, O(log n)).
+ *
+ * 임시 ns 변수에 id만 채워서 RB_FIND의 키로 사용 (red-black 비교 함수가 id 비교).
+ * app 스레드 외 호출 금지 (assert).
+ */
 struct nvme_ns *
 nvme_ctrlr_get_ns(struct nvme_ctrlr *nvme_ctrlr, uint32_t nsid)
 {
@@ -496,6 +672,13 @@ nvme_ctrlr_get(const struct spdk_nvme_transport_id *trid, const char *hostnqn)
 	return nvme_ctrlr;
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_get_by_name - bdev_nvme.h §2 참조. 이름으로 컨트롤러 lookup.
+ *
+ * 멀티패스 그룹의 첫 컨트롤러를 반환 (단일 컨트롤러이면 그 컨트롤러).
+ * 컨텍스트: app 스레드.
+ */
 struct nvme_ctrlr *
 nvme_ctrlr_get_by_name(const char *name)
 {
@@ -516,6 +699,13 @@ nvme_ctrlr_get_by_name(const char *name)
 	return nvme_ctrlr;
 }
 
+/*
+ * [한국어]
+ * nvme_bdev_ctrlr_for_each - bdev_nvme.h §2 참조. 모든 nvme_bdev_ctrlr 순회.
+ *
+ * 단순 동기 순회 (각 ctrlr에 대해 fn 호출). RPC bdev_nvme_get_controllers 등에서 사용.
+ * 컨텍스트: app 스레드 (전역 리스트).
+ */
 void
 nvme_bdev_ctrlr_for_each(nvme_bdev_ctrlr_for_each_fn fn, void *ctx)
 {
@@ -528,13 +718,27 @@ nvme_bdev_ctrlr_for_each(nvme_bdev_ctrlr_for_each_fn fn, void *ctx)
 	}
 }
 
+/*
+ * [한국어]
+ * struct nvme_ctrlr_channel_iter - for_each_channel iterator의 사용자 코드 측 컨텍스트.
+ * 사용자 콜백(fn)/완료 콜백(cpl)/SPDK iter 핸들/사용자 ctx를 묶음.
+ */
 struct nvme_ctrlr_channel_iter {
 	nvme_ctrlr_for_each_channel_msg fn;
+	/* [한국어] 각 채널에서 호출될 사용자 콜백. */
 	nvme_ctrlr_for_each_channel_done cpl;
+	/* [한국어] 모든 채널 처리 완료 후 1회 호출되는 사용자 콜백. */
 	struct spdk_io_channel_iter *i;
+	/* [한국어] SPDK 코어가 만든 iterator 핸들. continue/get_*에 인자로 사용. */
 	void *ctx;
+	/* [한국어] 사용자 컨텍스트 (fn/cpl 모두에 전달됨). */
 };
 
+/*
+ * [한국어]
+ * nvme_ctrlr_for_each_channel_continue - bdev_nvme.h §2 참조.
+ * 사용자 fn이 채널 처리 후 다음으로 진행하라고 알리는 헬퍼.
+ */
 void
 nvme_ctrlr_for_each_channel_continue(struct nvme_ctrlr_channel_iter *iter, int status)
 {
@@ -565,6 +769,15 @@ nvme_ctrlr_each_channel_cpl(struct spdk_io_channel_iter *i, int status)
 	free(iter);
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_for_each_channel - bdev_nvme.h §2 참조. 모든 SPDK 스레드의 ctrlr 채널 순회.
+ *
+ * SPDK 코어의 spdk_for_each_channel을 감싸고, 우리 측 iter 컨텍스트를 묶어서 전달.
+ * 호출자: reset, qpair disconnect, ANA log 갱신 등 모든 채널이 동시에 처리해야 하는 작업.
+ * 동작: iter 할당 → spdk_for_each_channel 호출 → 각 채널 스레드에서 our_msg 호출 →
+ *        msg 콜백이 fn을 호출, 사용자가 작업 후 _continue 호출 → 다음 채널 → 모두 끝나면 cpl.
+ */
 void
 nvme_ctrlr_for_each_channel(struct nvme_ctrlr *nvme_ctrlr,
 			    nvme_ctrlr_for_each_channel_msg fn, void *ctx,
@@ -589,6 +802,11 @@ nvme_ctrlr_for_each_channel(struct nvme_ctrlr *nvme_ctrlr,
 			      iter, nvme_ctrlr_each_channel_cpl);
 }
 
+/*
+ * [한국어]
+ * struct nvme_bdev_channel_iter - bdev 채널 for_each iterator 컨텍스트.
+ * nvme_ctrlr_channel_iter와 동일 패턴. nvme_bdev 단위.
+ */
 struct nvme_bdev_channel_iter {
 	nvme_bdev_for_each_channel_msg fn;
 	nvme_bdev_for_each_channel_done cpl;
@@ -596,6 +814,7 @@ struct nvme_bdev_channel_iter {
 	void *ctx;
 };
 
+/* [한국어] bdev 채널 순회 진행 헬퍼 (bdev_nvme.h §2 참조). */
 void
 nvme_bdev_for_each_channel_continue(struct nvme_bdev_channel_iter *iter, int status)
 {
@@ -626,6 +845,13 @@ nvme_bdev_each_channel_cpl(struct spdk_io_channel_iter *i, int status)
 	free(iter);
 }
 
+/*
+ * [한국어]
+ * nvme_bdev_for_each_channel - bdev_nvme.h §2 참조. 모든 스레드의 nvme_bdev 채널 순회.
+ *
+ * nvme_ctrlr 버전과 동일 패턴이지만 nvme_bdev에 대해 동작. 멀티패스 정책 변경,
+ * io_path 캐시 무효화 등 bdev 단위 작업에 사용.
+ */
 void
 nvme_bdev_for_each_channel(struct nvme_bdev *nbdev,
 			   nvme_bdev_for_each_channel_msg fn, void *ctx,
@@ -650,6 +876,12 @@ nvme_bdev_for_each_channel(struct nvme_bdev *nbdev,
 			      nvme_bdev_each_channel_cpl);
 }
 
+/*
+ * [한국어]
+ * nvme_bdev_dump_trid_json - bdev_nvme.h §2 참조.
+ * trid의 모든 비어있지 않은 필드(trtype/adrfam/traddr/trsvcid/subnqn)를 JSON으로 출력.
+ * RPC 응답에서 컨트롤러 정보의 trid 부분 직렬화에 사용.
+ */
 void
 nvme_bdev_dump_trid_json(const struct spdk_nvme_transport_id *trid, struct spdk_json_write_ctx *w)
 {
@@ -2904,6 +3136,13 @@ nvme_ctrlr_op_rpc_complete(void *cb_arg, int rc)
 	free(ctx);
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_op_rpc - bdev_nvme.h §2 참조. 단일 컨트롤러에 op(reset/enable/disable) 실행.
+ *
+ * RPC 핸들러가 직접 호출하는 진입점. ctx를 힙에 만들고 nvme_ctrlr_op로 비동기 시퀀스 시작,
+ * 완료 시 cb_fn(cb_arg, rc)로 호출자에게 결과 전달. -EALREADY는 0(no-op 성공)으로 매핑.
+ */
 void
 nvme_ctrlr_op_rpc(struct nvme_ctrlr *nvme_ctrlr, enum nvme_ctrlr_op op,
 		  bdev_nvme_ctrlr_op_cb cb_fn, void *cb_arg)
@@ -2980,6 +3219,16 @@ nvme_bdev_ctrlr_op_rpc_continue(void *cb_arg, int rc)
 	spdk_thread_send_msg(spdk_thread_get_app_thread(), _nvme_bdev_ctrlr_op_rpc_continue, ctx);
 }
 
+/*
+ * [한국어]
+ * nvme_bdev_ctrlr_op_rpc - bdev_nvme.h §2 참조. 멀티패스 그룹 내 모든 컨트롤러에 op 실행.
+ *
+ * 동작:
+ *   1) ctx 할당, op/cb_fn/cb_arg 채움.
+ *   2) 그룹의 첫 컨트롤러부터 nvme_ctrlr_op 시작 (continue 콜백으로 다음 컨트롤러로 진행).
+ *   3) 모든 컨트롤러를 순차적으로 처리한 뒤 cb_fn 호출.
+ * 도중 에러가 나면 즉시 중단하고 그 rc를 cb로 보고. 컨텍스트: app 스레드 강제.
+ */
 void
 nvme_bdev_ctrlr_op_rpc(struct nvme_bdev_ctrlr *nbdev_ctrlr, enum nvme_ctrlr_op op,
 		       bdev_nvme_ctrlr_op_cb cb_fn, void *cb_arg)
@@ -4007,6 +4256,14 @@ nvme_ctrlr_get_state_str(struct nvme_ctrlr *nvme_ctrlr)
 	}
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_info_json - bdev_nvme.h §2 참조. nvme_ctrlr 정보를 JSON 객체로 직렬화.
+ *
+ * 출력 필드: state(deleting/failed/resetting/disabled/enabled), cuse_device(빌드 옵션 시),
+ * trid (모든 path_id), hostnqn, numa_id, cntlid 등.
+ * RPC bdev_nvme_get_controllers의 응답 빌드에서 호출.
+ */
 void
 nvme_ctrlr_info_json(struct spdk_json_write_ctx *w, struct nvme_ctrlr *nvme_ctrlr)
 {
@@ -5484,6 +5741,16 @@ bdev_nvme_set_preferred_ns(struct nvme_bdev *nbdev, uint16_t cntlid)
  * NVMe bdev channel may be acquired after completing this function. move the
  * matched namespace to the head of the namespace list for the NVMe bdev too.
  */
+/*
+ * [한국어]
+ * bdev_nvme_set_preferred_path - bdev_nvme.h §2 참조. cntlid가 가리키는 컨트롤러를 우선 경로로 설정.
+ *
+ * 동작:
+ *   1) bdev open → 그 nvme_bdev에서 cntlid 매치 namespace를 nvme_ns_list 맨 앞으로 이동.
+ *   2) 모든 채널에 메시지를 보내 io_path_list에서도 같은 path를 맨 앞으로 + current_io_path 클리어.
+ *   3) 다음 IO부터 새 preferred path가 사용됨.
+ * Failover 모드는 미지원 (영문 주석 참조). 컨텍스트: app 스레드 강제.
+ */
 void
 bdev_nvme_set_preferred_path(const char *name, uint16_t cntlid,
 			     bdev_nvme_set_preferred_path_cb cb_fn, void *cb_arg)
@@ -6418,6 +6685,15 @@ spdk_bdev_nvme_set_opts(const struct spdk_bdev_nvme_opts *opts)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_set_hotplug - bdev_nvme.h §2 참조. PCIe 핫플러그 폴링 활성화/비활성화.
+ *
+ * - enabled=true: bdev_nvme_hotplug poller 등록 (period_us마다 PCIe 스캔으로 새 SSD 감지).
+ * - enabled=false: 같은 period로 bdev_nvme_remove_poller만 동작 (제거 처리).
+ * Primary process만 hotplug enable 가능 (DPDK secondary는 PCIe 점유 못 함 → -EPERM).
+ * 컨텍스트: app 스레드 강제.
+ */
 int
 bdev_nvme_set_hotplug(bool enabled, uint64_t period_us)
 {
@@ -7700,6 +7976,17 @@ discovery_poller(void *arg)
 	return SPDK_POLLER_BUSY;
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_start_discovery - bdev_nvme.h §2 참조. NVMe-oF 디스커버리 세션 시작.
+ *
+ * 동작:
+ *   1) trid->subnqn에 표준 디스커버리 NQN(SPDK_NVMF_DISCOVERY_NQN) 강제.
+ *   2) 같은 base_name이나 같은 trid가 이미 활성이면 -EEXIST.
+ *   3) 새 discovery_ctx 할당, drv/bdev opts 사본, hostnqn strdup, entry_ctx 생성.
+ *   4) 1초 주기 discovery_poller 등록 (Discovery Log Page 폴링하며 새 NVM 서브시스템 자동 attach).
+ * 컨텍스트: app 스레드 강제.
+ */
 int
 bdev_nvme_start_discovery(struct spdk_nvme_transport_id *trid,
 			  const char *base_name,
@@ -7782,6 +8069,14 @@ bdev_nvme_start_discovery(struct spdk_nvme_transport_id *trid,
 	return 0;
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_stop_discovery - bdev_nvme.h §2 참조. 진행 중인 디스커버리 세션 중단.
+ *
+ * 이름으로 ctx lookup → stop_discovery에 위임 (디스커버리 컨트롤러 detach 비동기 시퀀스).
+ * 이미 stop 중이거나 초기화 중 에러 상태면 -EALREADY.
+ * 디스커버리로 attach된 컨트롤러들은 그대로 유지 (별도 detach 필요).
+ */
 int
 bdev_nvme_stop_discovery(const char *name, spdk_bdev_nvme_stop_discovery_fn cb_fn, void *cb_ctx)
 {
@@ -9191,6 +9486,13 @@ bdev_nvme_config_json(struct spdk_json_write_ctx *w)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_get_ctrlr - bdev_nvme.h §2 참조. spdk_bdev * → spdk_nvme_ctrlr *.
+ *
+ * 외부 모듈(예: vbdev_opal)이 NVMe Identify 같은 정보를 직접 조회하기 위해 사용.
+ * bdev이 nvme bdev이 아니면 NULL. 멀티패스의 경우 첫 path의 컨트롤러를 반환.
+ */
 struct spdk_nvme_ctrlr *
 bdev_nvme_get_ctrlr(struct spdk_bdev *bdev)
 {
@@ -9400,6 +9702,17 @@ bdev_nvme_authenticate_ctrlr(struct bdev_nvme_set_keys_ctx *ctx)
 	}
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_set_keys - bdev_nvme.h §2 참조. 그룹 내 모든 컨트롤러의 DH-CHAP 키 갱신.
+ *
+ * 동작:
+ *   1) ctx 할당, 키 매니저(spdk_keyring)에서 dhchap_key/dhchap_ctrlr_key를 lookup해 ref 보유.
+ *   2) 그룹의 첫 컨트롤러부터 bdev_nvme_authenticate_ctrlr 시작.
+ *      각 컨트롤러에 대해 lib/nvme의 DH-CHAP 재인증 시퀀스 실행.
+ *   3) 모든 컨트롤러 인증 완료 후 cb_fn 호출.
+ * 비동기 함수: 반환값은 시작 결과만, 최종 결과는 cb로 전달.
+ */
 int
 bdev_nvme_set_keys(const char *name, const char *dhchap_key, const char *dhchap_ctrlr_key,
 		   bdev_nvme_set_keys_cb cb_fn, void *cb_ctx)
@@ -9454,6 +9767,14 @@ bdev_nvme_set_keys(const char *name, const char *dhchap_key, const char *dhchap_
 	return 0;
 }
 
+/*
+ * [한국어]
+ * nvme_io_path_info_json - bdev_nvme.h §2 참조. io_path의 정보를 JSON으로 직렬화.
+ *
+ * 출력 필드: bdev_name, cntlid, current(현재 활성 path 여부), connected, accessible,
+ *           ANA state, trid, hostnqn, stat (있을 때), 등.
+ * RPC bdev_nvme_get_io_paths의 응답 빌드에서 호출.
+ */
 void
 nvme_io_path_info_json(struct spdk_json_write_ctx *w, struct nvme_io_path *io_path)
 {
@@ -9490,6 +9811,13 @@ nvme_io_path_info_json(struct spdk_json_write_ctx *w, struct nvme_io_path *io_pa
 	spdk_json_write_object_end(w);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_get_discovery_info - bdev_nvme.h §2 참조. 디스커버리 세션 정보 JSON 출력.
+ *
+ * 출력 형식: 배열의 각 원소는 {name, trid, referrals: [{trid: ...}]}.
+ * referrals는 디스커버리 컨트롤러를 통해 발견된 NVM 서브시스템 trid들.
+ */
 void
 bdev_nvme_get_discovery_info(struct spdk_json_write_ctx *w)
 {

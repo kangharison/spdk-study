@@ -4,6 +4,74 @@
  *   Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  */
 
+/*
+ * [한국어 설명] NVMe-oF Target JSON-RPC 핸들러 (nvmf_rpc.c)
+ *
+ * === 파일의 역할 ===
+ * 본 파일은 SPDK NVMe-oF Target을 외부에서 제어하기 위한 JSON-RPC 핸들러를
+ * 등록한다. nvmf_create_target/nvmf_create_subsystem/nvmf_subsystem_add_listener/
+ * nvmf_subsystem_add_ns/nvmf_subsystem_add_host/nvmf_create_transport 등 RPC
+ * 명령을 받으면 JSON 파라미터를 디코드한 뒤 lib/nvmf의 내부 API
+ * (spdk_nvmf_subsystem_*, spdk_nvmf_tgt_*, spdk_nvmf_transport_*)를 호출하여
+ * NVMe-oF target의 설정을 변경한다. 모든 핸들러는 SPDK_RPC_REGISTER 매크로로
+ * RPC server에 등록되며, 응답은 spdk_jsonrpc_send_bool_response/
+ * begin_result/end_result API로 전송한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * 호출 체인:
+ *   외부 (rpc.py / spdk_top / 사용자 스크립트)
+ *     → /var/tmp/spdk.sock UNIX 도메인 소켓
+ *     → lib/jsonrpc 서버 → spdk_jsonrpc_server_handle_request
+ *     → 본 파일의 rpc_nvmf_*() 핸들러
+ *     → spdk_nvmf_subsystem_pause()/resume() (subsystem state machine)
+ *     → spdk_nvmf_subsystem_add_ns/listener/host (실제 변경)
+ *     → 콜백으로 RPC 응답 송신
+ * 실행 컨텍스트:
+ *   RPC 핸들러는 SPDK가 RPC를 처리하기 위해 지정한 SPDK thread (보통 master
+ *   reactor thread)에서 호출된다. subsystem state 변경은 비동기로 진행되므로
+ *   대부분의 핸들러는 "context 객체를 calloc하여 콜백 체인으로 전달"하는 패턴을 사용.
+ *   subsystem_pause(...) → cb (paused) → 실제 변경 → subsystem_resume(...) → cb (resumed)
+ *   → spdk_jsonrpc_send_bool_response() 가 일반적 흐름이다.
+ *
+ * === 타 모듈과의 연결 ===
+ * - lib/nvmf/subsystem.c: spdk_nvmf_subsystem_create/destroy/add_ns/add_host/
+ *   pause/resume 등 핵심 subsystem 라이프사이클 API. 본 파일은 이들의 wrapper.
+ * - lib/nvmf/nvmf.c: spdk_nvmf_tgt_create/find_subsystem 등 target/subsystem
+ *   레지스트리 API.
+ * - lib/nvmf/transport.c, rdma.c, tcp.c: spdk_nvmf_transport_create/listen 등.
+ * - lib/jsonrpc: spdk_jsonrpc_request, spdk_json_decode_object 등 JSON 디코딩.
+ * - lib/nvmf/auth.c: nvmf_qpair_auth_dump (qpairs 조회 시 인증 상태 표시).
+ * - lib/nvmf/mdns_server.c: nvmf_publish_mdns_prr / nvmf_tgt_stop_mdns_prr.
+ * - lib/keyring: spdk_keyring_get_key/put_key (DH-HMAC-CHAP 키 참조).
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - rpc_nvmf_get_subsystems / dump_nvmf_subsystem: 모든 subsystem을 JSON 배열로 출력.
+ * - rpc_nvmf_create_subsystem: NQN/SN/MN/cntlid 범위/passthrough/ana_reporting 옵션으로
+ *   새 subsystem을 만들고 spdk_nvmf_subsystem_start로 활성화.
+ * - rpc_nvmf_delete_subsystem: subsystem_stop → remove_listeners → destroy.
+ * - rpc_nvmf_subsystem_add_listener / nvmf_rpc_listen_paused: subsystem을 pause한 뒤
+ *   spdk_nvmf_tgt_listen_ext + spdk_nvmf_subsystem_add_listener_ext를 수행. ANA state
+ *   초기값(ana_state) 설정도 가능.
+ * - rpc_nvmf_subsystem_remove_listener: subsystem_pause → remove_listener →
+ *   transport_stop_listen_async → resume.
+ * - rpc_nvmf_subsystem_add_ns / nvmf_rpc_ns_paused: bdev_name으로 NS 추가.
+ *   nguid/eui64/uuid/anagrpid/no_auto_visible/hide_metadata 옵션 처리.
+ * - rpc_nvmf_subsystem_remove_ns: NSID 기반 NS 제거.
+ * - rpc_nvmf_ns_add_host / rpc_nvmf_ns_remove_host: NS 가시성(visible) 설정.
+ * - rpc_nvmf_subsystem_add_host / set_keys / remove_host / allow_any_host:
+ *   호스트 ACL 및 DH-HMAC-CHAP 키 설정.
+ * - rpc_nvmf_create_target / delete_target / get_targets: tgt 객체 라이프사이클.
+ * - rpc_nvmf_create_transport / get_transports: transport 등록 및 옵션 디코드
+ *   (max_io_qpairs_per_ctrlr, in_capsule_data_size, max_io_size, kas, masked_oncs 등).
+ * - rpc_nvmf_get_stats: per-poll-group I/O 통계 dump (spdk_for_each_channel 순회).
+ * - rpc_nvmf_subsystem_get_controllers / get_qpairs / get_listeners: subsystem을
+ *   pause한 상태로 ctrlr/qpair/listener 목록을 출력 (paused 동안만 일관성 보장).
+ * - rpc_nvmf_publish/stop_mdns_prr: mDNS 기반 NVMe-oF discovery 광고 on/off.
+ * - 핵심 ctx 구조체들(struct nvmf_rpc_listener_ctx / nvmf_rpc_ns_ctx /
+ *   nvmf_rpc_host_ctx / nvmf_rpc_create_transport_ctx 등)은 비동기 콜백 체인을
+ *   따라가는 동안 RPC 요청 + 디코드된 파라미터를 들고 다니는 컨텍스트이다.
+ */
+
 #include "spdk/bdev.h"
 #include "spdk/log.h"
 #include "spdk/rpc.h"
@@ -145,9 +213,17 @@ decode_ns_eui64(const struct spdk_json_val *val, void *out)
 	return rc;
 }
 
+/* [한국어] nvmf_get_subsystems RPC의 입력 JSON을 디코드하는 구조체.
+ * JSON 예: {"nqn": "nqn.2016-06.io.spdk:cnode1", "tgt_name": "nvmf_tgt"}
+ * 두 필드 모두 optional이며, NULL이면 모든 subsystem (그리고 default tgt)이 대상. */
 struct rpc_get_subsystem {
 	char *nqn;
+	/* [한국어] 조회할 subsystem NQN 문자열. NULL이면 모든 subsystem 출력.
+	 * 설정자: spdk_json_decode_string. 읽는 자: rpc_nvmf_get_subsystems(). free: 함수 끝. */
+
 	char *tgt_name;
+	/* [한국어] target 이름 (NVMe-oF target은 다중 인스턴스 가능). NULL이면 default tgt.
+	 * 설정자: spdk_json_decode_string. 읽는 자: spdk_nvmf_get_tgt(). free: 함수 끝. */
 };
 
 static const struct spdk_json_object_decoder rpc_nvmf_get_subsystems_decoders[] = {
@@ -261,6 +337,24 @@ dump_nvmf_subsystem(struct spdk_json_write_ctx *w, struct spdk_nvmf_subsystem *s
 	spdk_json_write_object_end(w);
 }
 
+/*
+ * [한국어]
+ * rpc_nvmf_get_subsystems - "nvmf_get_subsystems" RPC 핸들러
+ *
+ * @request: RPC 요청 객체. 응답 송신에 사용.
+ * @params: JSON 파라미터 (optional). nqn, tgt_name 두 필드를 디코드.
+ *
+ * 동작:
+ *  1) params 디코드 → req(nqn/tgt_name).
+ *  2) tgt 룩업 (없으면 INTERNAL_ERROR 응답).
+ *  3) nqn이 주어지면 해당 subsystem만, 아니면 tgt의 모든 subsystem을 dump.
+ *  4) dump_nvmf_subsystem()이 각 subsystem의 NQN/subtype/listeners/hosts/serial/
+ *     model/namespaces 등을 JSON으로 직렬화.
+ *
+ * 호출 컨텍스트: RPC 서버 스레드 (보통 master reactor). subsystem state를 변경하지
+ * 않으므로 pause 없이 곧장 읽는다 - 단 race로 인한 미세한 일관성 결여 가능.
+ * 호출자 → 본 함수 → dump_nvmf_subsystem → spdk_json_write_*. 응답은 동기적.
+ */
 static void
 rpc_nvmf_get_subsystems(struct spdk_jsonrpc_request *request,
 			const struct spdk_json_val *params)
@@ -319,20 +413,52 @@ rpc_nvmf_get_subsystems(struct spdk_jsonrpc_request *request,
 }
 SPDK_RPC_REGISTER("nvmf_get_subsystems", rpc_nvmf_get_subsystems, SPDK_RPC_RUNTIME)
 
+/* [한국어] nvmf_create_subsystem RPC의 입력 파라미터.
+ * JSON 예: {"nqn": "nqn.2016-06.io.spdk:cnode1", "serial_number": "SPDK00001",
+ *           "model_number": "SPDK_Controller", "max_namespaces": 32,
+ *           "allow_any_host": false, "ana_reporting": true,
+ *           "min_cntlid": 1, "max_cntlid": 0xffef, "passthrough": false} */
 struct rpc_subsystem_create {
 	char *nqn;
+	/* [한국어] 새 subsystem의 NVMe Qualified Name. 호스트가 Connect 시 매칭하는 키.
+	 * 형식: nqn.YYYY-MM.<reverse-domain>:<unique> (NVMe 1.4 Section 7.9). */
+
 	char *serial_number;
+	/* [한국어] Identify Controller의 SN(Serial Number) 20바이트. NULL이면 기본값. */
+
 	char *model_number;
+	/* [한국어] Identify Controller의 MN(Model Number) 40바이트. NULL이면 기본값. */
+
 	char *tgt_name;
+	/* [한국어] 부속할 target 이름. NULL이면 default tgt. */
+
 	uint32_t max_namespaces;
+	/* [한국어] 이 subsystem이 보유할 수 있는 최대 NS 개수. 0이면 라이브러리 기본값. */
+
 	bool allow_any_host;
+	/* [한국어] true면 호스트 ACL을 비우고 모든 호스트 접속 허용. secure_channel과 호환 안 됨. */
+
 	bool ana_reporting;
+	/* [한국어] true면 Asymmetric Namespace Access (NVMe 1.4) 보고 활성화 - Identify
+	 * Controller에서 cmic.anars=1, anatt 등이 보고되고 ANA log page 지원됨. */
+
 	uint16_t min_cntlid;
+	/* [한국어] 동적 cntlid 할당 시 사용할 [min, max] 범위 하한. */
+
 	uint16_t max_cntlid;
+	/* [한국어] cntlid 상한. 0xFFFF는 reserved (호스트의 dynamic 요청 표시). */
+
 	uint64_t max_discard_size_kib;
+	/* [한국어] DSM(Dataset Management) deallocate의 최대 크기 (KiB). cdata.dmrsl로 보고. */
+
 	uint64_t max_write_zeroes_size_kib;
+	/* [한국어] Write Zeroes 명령 최대 크기 (KiB). 4 정렬 + 2의 거듭제곱 요구. cdata.wzsl로 보고. */
+
 	bool passthrough;
+	/* [한국어] true면 사용자 정의 admin 명령을 첫 NS의 bdev_nvme로 우회. */
+
 	bool enable_nssr;
+	/* [한국어] true면 NVM Subsystem Reset(NSSR) 지원. CC.NSSR=4E564D65h ("NVMe") 시 reset. */
 };
 
 static const struct spdk_json_object_decoder rpc_nvmf_create_subsystem_decoders[] = {
@@ -367,6 +493,28 @@ rpc_nvmf_subsystem_started(struct spdk_nvmf_subsystem *subsystem,
 	}
 }
 
+/*
+ * [한국어]
+ * rpc_nvmf_create_subsystem - "nvmf_create_subsystem" RPC 핸들러
+ *
+ * @request: RPC 요청. 응답은 spdk_nvmf_subsystem_start 콜백에서 송신.
+ * @params: JSON. nqn(필수) + serial_number/model_number/tgt_name/max_namespaces/
+ *          allow_any_host/ana_reporting/min_cntlid/max_cntlid/passthrough/
+ *          enable_nssr (모두 optional).
+ *
+ * 단계:
+ *  1) req calloc + 기본 cntlid range 설정 (NVMF_MIN/MAX_CNTLID).
+ *  2) JSON decode → req.
+ *  3) tgt 룩업, spdk_nvmf_subsystem_create(NQN, NVMe subtype) 호출.
+ *  4) SN/MN/allow_any_host/ana_reporting/cntlid_range/discard/write_zeroes/
+ *     passthrough/nssr 적용.
+ *  5) spdk_nvmf_subsystem_start로 INACTIVE → ACTIVE 전환 (비동기, 콜백 =
+ *     rpc_nvmf_subsystem_started).
+ *  6) cleanup 라벨에서 임시 문자열들 free. 실패 시 destroy.
+ *
+ * 호출자 → spdk_nvmf_subsystem_start → 내부 콜백 → rpc_nvmf_subsystem_started
+ *   → spdk_jsonrpc_send_bool_response.
+ */
 static void
 rpc_nvmf_create_subsystem(struct spdk_jsonrpc_request *request,
 			  const struct spdk_json_val *params)
@@ -527,6 +675,18 @@ static const struct spdk_json_object_decoder rpc_nvmf_delete_subsystem_decoders[
 	{"tgt_name", offsetof(struct rpc_delete_subsystem, tgt_name), spdk_json_decode_string, true},
 };
 
+/*
+ * [한국어]
+ * rpc_nvmf_delete_subsystem - "nvmf_delete_subsystem" RPC 핸들러
+ *
+ * @request: RPC 요청.
+ * @params: JSON. nqn(필수), tgt_name(optional).
+ *
+ * subsystem을 stop → listener 제거 → destroy 순으로 비동기 정리.
+ * spdk_nvmf_subsystem_stop가 -EBUSY를 반환하면 다른 state change가 진행 중인 경우.
+ * 콜백 체인: subsystem_stop → rpc_nvmf_subsystem_stopped (listeners 제거 →
+ *           subsystem_destroy → rpc_nvmf_subsystem_destroy_complete_cb → bool_response).
+ */
 static void
 rpc_nvmf_delete_subsystem(struct spdk_jsonrpc_request *request,
 			  const struct spdk_json_val *params)
@@ -584,11 +744,22 @@ invalid_custom_response:
 }
 SPDK_RPC_REGISTER("nvmf_delete_subsystem", rpc_nvmf_delete_subsystem, SPDK_RPC_RUNTIME)
 
+/* [한국어] listen_address JSON 객체의 디코드 구조체.
+ * 형식: {"trtype": "TCP"|"RDMA"|"FC", "adrfam": "IPv4"|"IPv6"|...,
+ *        "traddr": "192.168.1.10", "trsvcid": "4420"}
+ * NVMe-oF 스펙의 TRID(Transport ID) 4종 필드에 대응. */
 struct rpc_listen_address {
 	char *trtype;
+	/* [한국어] Transport Type 문자열. SPDK의 TCP/RDMA/FC/PCIE/VFIO_USER 등. */
+
 	char *adrfam;
+	/* [한국어] Address Family. IPv4/IPv6/IB/FC. NULL이면 IPv4 기본. */
+
 	char *traddr;
+	/* [한국어] Transport Address (호스트가 접속할 주소). 필수. IP 주소 또는 FC WWN 등. */
+
 	char *trsvcid;
+	/* [한국어] Transport Service ID (TCP/RDMA의 경우 포트 번호). NULL 가능. */
 };
 
 static const struct spdk_json_object_decoder rpc_nvmf_listen_address_decoders[] = {
@@ -616,35 +787,70 @@ free_rpc_listen_address(struct rpc_listen_address *r)
 	free(r->trsvcid);
 }
 
+/* [한국어] listener 관련 RPC가 공통으로 사용하는 op 분기. nvmf_rpc_listen_paused
+ * 콜백에서 ctx->op로 분기하여 add/remove/set_ana_state 중 하나를 수행한다. */
 enum nvmf_rpc_listen_op {
-	NVMF_RPC_LISTEN_ADD,
-	NVMF_RPC_LISTEN_REMOVE,
-	NVMF_RPC_LISTEN_SET_ANA_STATE,
+	NVMF_RPC_LISTEN_ADD,            /* [한국어] subsystem에 새 listener를 추가 */
+	NVMF_RPC_LISTEN_REMOVE,         /* [한국어] 기존 listener 제거 */
+	NVMF_RPC_LISTEN_SET_ANA_STATE,  /* [한국어] listener의 ANA state 변경 */
 };
 
+/* [한국어] listener 변경 RPC의 비동기 콜백 체인을 따라가는 컨텍스트 객체.
+ * subsystem은 변경 전 pause되어야 하므로 (active 상태에서 listener 변경 불가)
+ * pause → 작업 → resume → response 의 4단계 콜백이 필요하며 본 ctx가 이 동안
+ * 살아 있어야 한다. */
 struct nvmf_rpc_listener_ctx {
 	char				*nqn;
+	/* [한국어] 대상 subsystem NQN. JSON에서 디코드된 문자열, 함수 끝에서 free. */
+
 	char				*tgt_name;
+	/* [한국어] 대상 target 이름. NULL이면 default tgt. */
+
 	struct spdk_nvmf_tgt		*tgt;
+	/* [한국어] tgt_name 룩업 결과. 콜백 체인 동안 유지. */
+
 	struct spdk_nvmf_transport	*transport;
+	/* [한국어] (REMOVE op에서) listener의 trtype에 대응하는 transport. stop_listen_async에 전달. */
+
 	struct spdk_nvmf_subsystem	*subsystem;
+	/* [한국어] 대상 subsystem 포인터. pause/resume 호출 대상. */
+
 	struct rpc_listen_address	address;
+	/* [한국어] JSON에서 디코드된 listen_address 필드 (trtype/adrfam/traddr/trsvcid). */
+
 	char				*ana_state_str;
+	/* [한국어] (SET_ANA_STATE op에서) "optimized"/"non_optimized"/"inaccessible" 중 하나. */
+
 	enum spdk_nvme_ana_state	ana_state;
+	/* [한국어] 위 문자열을 enum으로 파싱한 값. ANA log page에 보고된다. */
+
 	uint32_t			anagrpid;
+	/* [한국어] (SET_ANA_STATE op에서) 변경할 ANA group ID. 0이면 모든 group. */
 
 	struct spdk_jsonrpc_request	*request;
+	/* [한국어] 응답을 송신할 RPC 요청 객체. 콜백 체인 마지막에 send_*_response. */
+
 	struct spdk_nvme_transport_id	trid;
+	/* [한국어] address를 변환한 NVMe Transport ID 구조체 (rpc_listen_address_to_trid). */
+
 	enum nvmf_rpc_listen_op		op;
+	/* [한국어] ADD/REMOVE/SET_ANA_STATE - nvmf_rpc_listen_paused에서 분기 키로 사용. */
+
 	bool				response_sent;
+	/* [한국어] 콜백 체인 도중 에러로 응답을 이미 보냈는지 표시. resume 콜백이 중복 응답을 막음. */
+
 	struct spdk_nvmf_listen_opts	opts;
+	/* [한국어] transport-specific 옵션 (secure_channel, sock_impl, transport_specific JSON 등). */
 
 	/* Hole at bytes 705-711 */
 	uint8_t reserved1[7];
+	/* [한국어] 다음 listener_opts 필드를 8-byte 정렬하기 위한 패딩. */
 
 	/* Additional options for listener creation.
 	 * Must be 8-byte aligned. */
 	struct spdk_nvmf_listener_opts	listener_opts;
+	/* [한국어] subsystem-specific listener 옵션 (secure_channel/ana_state/sock_impl).
+	 * spdk_nvmf_subsystem_listener_opts_init로 초기화 후 JSON 디코드. */
 };
 
 static const struct spdk_json_object_decoder rpc_nvmf_subsystem_add_listener_decoders[] = {
@@ -862,6 +1068,28 @@ rpc_listen_address_to_trid(const struct rpc_listen_address *address,
 	return 0;
 }
 
+/*
+ * [한국어]
+ * rpc_nvmf_subsystem_add_listener - "nvmf_subsystem_add_listener" RPC 핸들러
+ *
+ * @request: RPC 요청.
+ * @params: JSON. nqn(필수), listen_address(필수), tgt_name/secure_channel/ana_state/
+ *          sock_impl (optional). 추가로 transport-specific 필드는 params 그대로
+ *          opts.transport_specific으로 전달되어 transport가 자체 디코드.
+ *
+ * 흐름:
+ *   ctx calloc → JSON decode → tgt 룩업 → subsystem 룩업 →
+ *   address→trid 변환 → ANA state 파싱 → spdk_nvmf_subsystem_pause
+ *     → (콜백) nvmf_rpc_listen_paused (op=ADD)
+ *       → spdk_nvmf_tgt_listen_ext (transport에 listen socket 생성)
+ *       → spdk_nvmf_subsystem_add_listener_ext
+ *         → (콜백) nvmf_rpc_subsystem_listen
+ *           → spdk_nvmf_subsystem_resume
+ *             → (콜백) nvmf_rpc_listen_resumed → send_bool_response.
+ *
+ * 호출 컨텍스트: RPC 서버 스레드. 모든 콜백은 비동기 (다른 스레드에서 발화 가능).
+ * ctx는 콜백 체인 끝에서 nvmf_rpc_listener_ctx_free로 해제된다.
+ */
 static void
 rpc_nvmf_subsystem_add_listener(struct spdk_jsonrpc_request *request,
 				const struct spdk_json_val *params)
@@ -955,6 +1183,17 @@ static const struct spdk_json_object_decoder rpc_nvmf_subsystem_remove_listener_
 	{"tgt_name", offsetof(struct nvmf_rpc_listener_ctx, tgt_name), spdk_json_decode_string, true},
 };
 
+/*
+ * [한국어]
+ * rpc_nvmf_subsystem_remove_listener - "nvmf_subsystem_remove_listener" RPC
+ *
+ * @request: RPC 요청.
+ * @params: JSON. nqn(필수), listen_address(필수), tgt_name(optional).
+ *
+ * subsystem에서 listener를 제거하고 transport listen socket도 닫는다 (해당 trid에
+ * 더 이상 다른 subsystem이 접속하지 않을 경우). pause → remove_listener →
+ * transport_stop_listen_async → resume → bool_response.
+ */
 static void
 rpc_nvmf_subsystem_remove_listener(struct spdk_jsonrpc_request *request,
 				   const struct spdk_json_val *params)
@@ -1385,16 +1624,40 @@ rpc_nvmf_subsystem_listener_set_ana_state(struct spdk_jsonrpc_request *request,
 SPDK_RPC_REGISTER("nvmf_subsystem_listener_set_ana_state",
 		  rpc_nvmf_subsystem_listener_set_ana_state, SPDK_RPC_RUNTIME);
 
+/* [한국어] nvmf_subsystem_add_ns RPC의 "namespace" sub-object를 디코드한다.
+ * NS는 NVMe-oF에서 호스트가 보는 LBA 공간 단위이며, SPDK는 NS를 bdev로 백업한다.
+ * 즉 호스트의 LBA read/write → bdev I/O로 변환된다.
+ * JSON 예: {"bdev_name": "Malloc0", "nsid": 1, "nguid": "ABCD...",
+ *           "uuid": "...", "anagrpid": 1, "no_auto_visible": false} */
 struct nvmf_rpc_ns_params {
 	char *bdev_name;
+	/* [한국어] 이 NS의 백엔드 bdev 이름. NVMe Read/Write가 이 bdev로 라우팅됨. 필수. */
+
 	char *ptpl_file;
+	/* [한국어] PR(Persistent Reservation) Through Power Loss 상태 저장 파일 경로.
+	 * NULL이면 reservation persistence 비활성. */
+
 	uint32_t nsid;
+	/* [한국어] Namespace ID. 0이면 자동 할당 (subsystem이 다음 빈 ID 부여). */
+
 	char nguid[16];
+	/* [한국어] NS Globally Unique Identifier (NVMe 1.4 5.15.2.2). nguid_str을 hex 디코드한 16바이트.
+	 * 0이면 sentinel - Identify NS의 NGUID 필드에 보고하지 않음. */
+
 	char eui64[8];
+	/* [한국어] IEEE EUI-64 형식의 NS 고유 ID. 8바이트 hex. 0이면 미사용. */
+
 	struct spdk_uuid uuid;
+	/* [한국어] NS UUID. spdk_uuid_is_null이면 보고하지 않음. NS ID Descriptor에 포함. */
+
 	uint32_t anagrpid;
+	/* [한국어] 이 NS가 속할 ANA group ID. 같은 group의 NS는 동일 ana_state 공유. */
+
 	bool no_auto_visible;
+	/* [한국어] true면 NS를 자동으로 host에 visible하지 않음. nvmf_ns_add_host로 명시 부여 필요. */
+
 	bool hide_metadata;
+	/* [한국어] true면 metadata 영역(DIF/PI)을 호스트에 숨김 (insert/strip은 SPDK가 수행). */
 };
 
 static const struct spdk_json_object_decoder rpc_nvmf_namespace_decoders[] = {
@@ -1419,14 +1682,27 @@ decode_rpc_ns_params(const struct spdk_json_val *val, void *out)
 				       ns_params);
 }
 
+/* [한국어] nvmf_subsystem_add_ns의 비동기 콜백 컨텍스트.
+ * pause → add_ns → resume의 4단계를 거치므로 ctx가 그동안 살아 있어야 한다. */
 struct nvmf_rpc_ns_ctx {
 	char *nqn;
+	/* [한국어] 대상 subsystem NQN (필수). */
+
 	char *tgt_name;
+	/* [한국어] target 이름 (NULL이면 default). */
+
 	struct nvmf_rpc_ns_params ns_params;
+	/* [한국어] JSON에서 디코드된 namespace 옵션들 (위 구조체 참조). */
 
 	struct spdk_jsonrpc_request *request;
+	/* [한국어] 응답을 송신할 RPC 요청 객체. */
+
 	const struct spdk_json_val *params;
+	/* [한국어] 원본 JSON 파라미터. transport-specific 옵션을 NS 추가 시 ns_opts.transport_specific
+	 * 으로 그대로 전달해 transport가 자체 디코드하도록 하기 위함. */
+
 	bool response_sent;
+	/* [한국어] 콜백 도중 에러로 응답을 이미 보냈는지 표시 (resume 콜백 중복 응답 방지). */
 };
 
 static const struct spdk_json_object_decoder rpc_nvmf_subsystem_add_ns_decoders[] = {
@@ -1548,6 +1824,25 @@ resume:
 	}
 }
 
+/*
+ * [한국어]
+ * rpc_nvmf_subsystem_add_ns - "nvmf_subsystem_add_ns" RPC 핸들러
+ *
+ * @request: RPC 요청.
+ * @params: JSON. nqn(필수), namespace(필수, sub-object), tgt_name(optional).
+ *
+ * 흐름:
+ *   ctx calloc → JSON decode (relaxed: 알 수 없는 키 무시) → tgt 룩업 →
+ *   subsystem 룩업 → spdk_nvmf_subsystem_pause(nsid)
+ *     → (콜백) nvmf_rpc_ns_paused: ns_opts 채우고 spdk_nvmf_subsystem_add_ns_ext 호출
+ *       → (성공 시) nsid 저장, (실패 시) response_sent=true.
+ *       → spdk_nvmf_subsystem_resume
+ *         → (콜백) nvmf_rpc_ns_resumed: 성공이면 nsid를 응답 JSON으로 송신,
+ *            실패면 nvmf_rpc_ns_failback_resumed 경유 에러 응답.
+ *
+ * 즉, 호스트의 NVMe Read/Write가 들어가기 전에 SPDK는 ns->bdev 매핑을 확립.
+ * 이후 nvmf_ctrlr_process_io_cmd가 nsid를 통해 이 NS를 룩업한다.
+ */
 static void
 rpc_nvmf_subsystem_add_ns(struct spdk_jsonrpc_request *request,
 			  const struct spdk_json_val *params)
@@ -1781,6 +2076,16 @@ nvmf_rpc_remove_ns_paused(struct spdk_nvmf_subsystem *subsystem,
 	}
 }
 
+/*
+ * [한국어]
+ * rpc_nvmf_subsystem_remove_ns - "nvmf_subsystem_remove_ns" RPC 핸들러
+ *
+ * @request: RPC 요청.
+ * @params: JSON. nqn(필수), nsid(필수), tgt_name(optional).
+ *
+ * pause → spdk_nvmf_subsystem_remove_ns(nsid) → resume → bool_response 흐름.
+ * NS 제거 시 connected ctrlr들에는 NS Attribute Change AEN이 송신될 수 있다.
+ */
 static void
 rpc_nvmf_subsystem_remove_ns(struct spdk_jsonrpc_request *request,
 			     const struct spdk_json_val *params)
@@ -1968,14 +2273,34 @@ rpc_nvmf_ns_remove_host(struct spdk_jsonrpc_request *request,
 }
 SPDK_RPC_REGISTER("nvmf_ns_remove_host", rpc_nvmf_ns_remove_host, SPDK_RPC_RUNTIME)
 
+/* [한국어] 호스트 ACL/key 변경 RPC들이 공통으로 쓰는 컨텍스트.
+ * nvmf_subsystem_add_host / remove_host / set_keys / allow_any_host에서 사용.
+ * JSON 예: {"nqn": "...", "host": "nqn.2014-08.org.nvmexpress:uuid:abc",
+ *           "dhchap_key": "key0", "dhchap_ctrlr_key": "key1"} */
 struct nvmf_rpc_host_ctx {
 	struct spdk_jsonrpc_request *request;
+	/* [한국어] 응답 송신용 RPC 요청 객체. */
+
 	char *nqn;
+	/* [한국어] 대상 subsystem NQN. */
+
 	char *host;
+	/* [한국어] 추가/제거할 host NQN (호스트 측 NQN). */
+
 	char *tgt_name;
+	/* [한국어] target 이름 (NULL=default). */
+
 	char *dhchap_key;
+	/* [한국어] DH-HMAC-CHAP 인증 시 호스트→컨트롤러 challenge 응답 키 이름.
+	 * spdk_keyring_get_key로 keyring에서 룩업되어 spdk_key*에 변환됨. */
+
 	char *dhchap_ctrlr_key;
+	/* [한국어] DH-HMAC-CHAP 양방향 인증의 컨트롤러→호스트 응답 키 이름.
+	 * 양방향 인증을 원할 때만 지정. */
+
 	bool allow_any_host;
+	/* [한국어] (allow_any_host RPC에서) 호스트 ACL을 비활성화할지 여부.
+	 * true면 모든 호스트 connect 허용. */
 };
 
 static const struct spdk_json_object_decoder rpc_nvmf_subsystem_add_host_decoders[] = {
@@ -1996,6 +2321,21 @@ nvmf_rpc_host_ctx_free(struct nvmf_rpc_host_ctx *ctx)
 	free(ctx->dhchap_ctrlr_key);
 }
 
+/*
+ * [한국어]
+ * rpc_nvmf_subsystem_add_host - "nvmf_subsystem_add_host" RPC 핸들러
+ *
+ * @request: RPC 요청.
+ * @params: JSON. nqn(필수), host(필수), tgt_name/dhchap_key/dhchap_ctrlr_key (optional).
+ *
+ * subsystem의 host ACL에 호스트 NQN을 추가한다. 이후 그 host NQN을 가진
+ * Connect만 nvmf_qpair_access_allowed에서 통과한다 (allow_any_host=false인 경우).
+ * dhchap_key/dhchap_ctrlr_key가 주어지면 keyring에서 spdk_key*를 룩업하여
+ * spdk_nvmf_subsystem_add_host_ext 옵션으로 전달, DH-HMAC-CHAP 인증을 활성화.
+ *
+ * 본 RPC는 동기적으로 처리되어 즉시 spdk_jsonrpc_send_bool_response 응답.
+ * out 라벨에서 keyring put_key + ctx free 수행.
+ */
 static void
 rpc_nvmf_subsystem_add_host(struct spdk_jsonrpc_request *request,
 			    const struct spdk_json_val *params)
@@ -2338,6 +2678,18 @@ static const struct spdk_json_object_decoder rpc_nvmf_create_target_decoders[] =
 	{"discovery_filter", offsetof(struct nvmf_rpc_target_ctx, discovery_filter), decode_discovery_filter, true}
 };
 
+/*
+ * [한국어]
+ * rpc_nvmf_create_target - "nvmf_create_target" RPC (private 등록)
+ *
+ * @request: RPC 요청.
+ * @params: JSON. name(필수), max_subsystems/discovery_filter (optional).
+ *
+ * 새로운 NVMe-oF target 객체(spdk_nvmf_tgt)를 생성. 한 SPDK 프로세스 안에 여러 tgt가
+ * 공존할 수 있으며 각각 자체 subsystem/transport/listener를 갖는다. 같은 이름이
+ * 이미 있으면 거절. discovery_filter는 호스트가 Discovery Log Page를 받을 때 어떤
+ * 항목만 보일지 (transport 매칭, traddr 매칭, trsvcid 매칭 또는 match_any) 결정.
+ */
 static void
 rpc_nvmf_create_target(struct spdk_jsonrpc_request *request,
 		       const struct spdk_json_val *params)
@@ -2456,13 +2808,29 @@ rpc_nvmf_get_targets(struct spdk_jsonrpc_request *request,
 }
 /* private */ SPDK_RPC_REGISTER("nvmf_get_targets", rpc_nvmf_get_targets, SPDK_RPC_RUNTIME);
 
+/* [한국어] nvmf_create_transport RPC의 비동기 컨텍스트.
+ * transport 생성 → tgt_add_transport → (실패 시 destroy) 의 콜백 체인을 따라간다.
+ * transport는 한 tgt당 trtype별 하나만 존재한다 (TCP/RDMA/FC 각각). */
 struct nvmf_rpc_create_transport_ctx {
 	char				*trtype;
+	/* [한국어] "TCP"/"RDMA"/"FC" 등. transport opts 디코더의 trtype 분기 키. */
+
 	char				*tgt_name;
+	/* [한국어] 부착할 target 이름. NULL이면 default tgt. */
+
 	struct spdk_nvmf_transport_opts	opts;
+	/* [한국어] transport 생성 옵션 (max_queue_depth, max_io_qpairs_per_ctrlr,
+	 * in_capsule_data_size, max_io_size, kas, abort_timeout_sec, zcopy 등).
+	 * spdk_nvmf_transport_opts_init로 trtype별 기본값 채운 후 JSON으로 덮어쓴다. */
+
 	struct spdk_jsonrpc_request	*request;
+	/* [한국어] 응답 송신용 RPC 요청. */
+
 	struct spdk_nvmf_transport	*transport;
+	/* [한국어] 생성된 transport 객체 포인터. tgt_add_transport 실패 시 destroy 대상. */
+
 	int				status;
+	/* [한국어] tgt_add_transport 실패 코드. destroy 콜백에서 응답에 사용. */
 };
 
 /**
@@ -2636,6 +3004,27 @@ nvmf_rpc_create_transport_done(void *cb_arg, struct spdk_nvmf_transport *transpo
 				    nvmf_rpc_tgt_add_transport_done, ctx);
 }
 
+/*
+ * [한국어]
+ * rpc_nvmf_create_transport - "nvmf_create_transport" RPC 핸들러
+ *
+ * @request: RPC 요청.
+ * @params: JSON. trtype(필수), 그 외 transport_opts 모든 필드 (optional).
+ *
+ * 단계:
+ *  1) ctx calloc.
+ *  2) 1차 디코드 - trtype을 알아내기 위해 relaxed decode (다른 옵션은 무시될 수도).
+ *  3) tgt 룩업.
+ *  4) spdk_nvmf_transport_opts_init(trtype, opts) - trtype별 기본값 채움.
+ *  5) 2차 디코드 - 사용자가 준 옵션으로 기본값 덮어쓰기.
+ *  6) 같은 trtype의 transport가 이미 있으면 거절.
+ *  7) opts.transport_specific = params (transport가 자체 옵션 디코드)
+ *  8) spdk_nvmf_transport_create_async → 콜백 nvmf_rpc_create_transport_done
+ *     → spdk_nvmf_tgt_add_transport → 콜백 nvmf_rpc_tgt_add_transport_done
+ *     → send_bool_response.
+ *
+ * 결과: 호스트는 이제 해당 trtype/listen address로 Connect 가능.
+ */
 static void
 rpc_nvmf_create_transport(struct spdk_jsonrpc_request *request,
 			  const struct spdk_json_val *params)
@@ -2828,6 +3217,17 @@ _rpc_nvmf_get_stats(struct spdk_io_channel_iter *i)
 }
 
 
+/*
+ * [한국어]
+ * rpc_nvmf_get_stats - "nvmf_get_stats" RPC: poll group별 통계 dump
+ *
+ * @request: RPC 요청.
+ * @params: JSON. tgt_name(optional).
+ *
+ * tgt의 모든 IO channel(=각 reactor의 poll group)을 spdk_for_each_channel로 순회하며
+ * spdk_nvmf_poll_group_dump_stat을 호출. 결과는 {tick_rate, poll_groups: [...]} 형식.
+ * 각 group은 admin/io qpair 수, completed/current IO 카운터 등을 포함.
+ */
 static void
 rpc_nvmf_get_stats(struct spdk_jsonrpc_request *request,
 		   const struct spdk_json_val *params)
@@ -3137,6 +3537,21 @@ rpc_nvmf_get_listeners_paused(struct spdk_nvmf_subsystem *subsystem,
 	free_rpc_subsystem_query_ctx(ctx);
 }
 
+/*
+ * [한국어]
+ * _rpc_nvmf_subsystem_query - subsystem 조회 RPC들의 공통 헬퍼
+ *
+ * @request: RPC 요청.
+ * @params: JSON (nqn 필수).
+ * @cb_fn: pause 완료 시 호출될 콜백 (조회 작업의 본체).
+ *
+ * subsystem 조회는 일관성을 위해 pause 상태에서 수행한다. 본 함수는 ctx 생성,
+ * 디코드, tgt/subsystem 룩업 후 spdk_nvmf_subsystem_pause(0, cb_fn, ctx)만 수행한다.
+ * cb_fn에서 ctrlr/qpair/listener 목록을 dump한 뒤 spdk_nvmf_subsystem_resume.
+ *
+ * nvmf_subsystem_get_controllers, nvmf_subsystem_get_qpairs,
+ * nvmf_subsystem_get_listeners RPC가 본 함수를 공유한다.
+ */
 static void
 _rpc_nvmf_subsystem_query(struct spdk_jsonrpc_request *request,
 			  const struct spdk_json_val *params,
