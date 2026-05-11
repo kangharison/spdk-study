@@ -805,7 +805,7 @@ vhost_user_config_json(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx *
 	uint32_t iops_threshold;
 
 	vdev->backend->write_config_json(vdev, w);
-	/* [한국어] 백엔드별 RPC 직렬화 — vhost_create_*/scsi_target_add_lun 등 출력. */
+	/* [한국어] 백엔드별 RPC 직렬화 — vhost_create_xxx/scsi_target_add_lun 등 출력. */
 
 	spdk_vhost_get_coalescing(vdev, &delay_base_us, &iops_threshold);
 	/* [한국어] 현재 coalescing 값 조회. */

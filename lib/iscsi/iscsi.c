@@ -4,42 +4,130 @@
  *   All rights reserved.
  */
 
-#include "spdk/stdinc.h"
+/*
+ * [한국어 설명] iSCSI PDU 처리 코어 (iscsi.c)
+ *
+ * === 파일의 역할 ===
+ * iSCSI 프로토콜의 BHS(Basic Header Segment) / AHS(Additional Header Segment) /
+ * Header Digest / Data Segment / Data Digest 다섯 단계로 구성된 PDU 를
+ * 소켓에서 비동기적으로 받아 디코딩하고, opcode 별로 처리(login, text, scsi,
+ * scsi_dataout, nop_out, task_mgmt, logout, snack)한 뒤 응답 PDU 를 만들어 송신
+ * 큐에 넣는다. iSCSI 타깃의 "프로토콜 두뇌" 역할을 하며, lib/iscsi/conn.c 가
+ * 연결 라이프사이클/타이머/keepalive 를 담당하는 것과 짝을 이룬다.
+ * 추가로 CHAP 인증, ISID 추출, R2T 발급, 태스크 큐 관리, BHS 검증, Reject 송신,
+ * task management(LU/Target reset, ABORT TASK 등) 처리도 모두 포함한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * 호출 체인 (수신):
+ *   poll group thread (lib/iscsi/iscsi_subsystem.c::iscsi_poll_group_poll)
+ *     → spdk_sock_group_poll → iscsi_conn_sock_cb (lib/iscsi/conn.c)
+ *       → iscsi_handle_incoming_pdus()       ; 본 파일 — PDU 수신 FSM 루프
+ *         → iscsi_read_pdu()                 ; 한 PDU 5단계 수신
+ *           → iscsi_execute()                ; opcode 디스패치
+ *             → iscsi_op_login / op_text / op_scsi / op_scsi_dataout / ...
+ *               → iscsi_queue_task()         ; bdev I/O 제출 의뢰
+ *                 → spdk_scsi_dev_queue_task → bdev → completion → iscsi_task_cpl
+ *
+ * 호출 체인 (송신):
+ *   각 op_* 핸들러가 응답 PDU 빌드 후 iscsi_conn_write_pdu() 호출
+ *     → spdk_sock_writev_async → 완료 콜백 _iscsi_conn_pdu_write_done
+ *
+ * 실행 컨텍스트:
+ *   - 모든 PDU 처리/응답 송신은 conn 이 배정된 poll group 의 spdk_thread 에서만 수행.
+ *   - g_iscsi (글로벌 설정/리스트) 접근만 g_iscsi.mutex 로 보호.
+ *   - 인증/auth group, target/portal 메타데이터 조회는 RPC 와 동시 발생 가능 → 락 필요.
+ *
+ * === 타 모듈과의 연결 ===
+ * - lib/iscsi/conn.c       : 본 파일이 만든 응답을 conn write queue 로 push, recv 트리거 받음.
+ * - lib/iscsi/task.c       : iscsi_task_get/put/response (PDU↔task 매핑).
+ * - lib/iscsi/param.c      : login key/value 협상 (Authenticate/Operational/Negotiation).
+ * - lib/iscsi/tgt_node.c   : target name → spdk_iscsi_tgt_node 조회, ACL.
+ * - lib/iscsi/portal_grp.c : portal/portal_group lookup.
+ * - include/spdk/scsi.h    : spdk_scsi_dev/lun/task → SCSI Command 처리 위임.
+ * - include/spdk/bdev.h    : (간접) bdev I/O 제출 — SCSI layer 가 bdev 호출.
+ * - util/dif.c             : DIF/T10-PI 검증, CRC update.
+ * - util/crc32.c           : CRC32C 계산 (Header/Data Digest).
+ * - util/base64.c, md5.c   : CHAP 인증의 challenge/response 처리.
+ * - spdk_internal/sgl.h    : iovec scatter/gather 헬퍼.
+ *
+ * 핵심 공유 자료구조:
+ *   - g_iscsi (struct spdk_iscsi_globals) — 모든 portal/portal_group/initiator_group/target/
+ *     auth_group/poll_group 의 anchor + 전역 설정값. mutex 로 보호.
+ *   - struct spdk_iscsi_pdu  : 수신/송신 단위 (BHS+AHS+digest+data+iovec 모음).
+ *   - struct spdk_iscsi_sess : iSCSI 세션 (TSIH 단위 — MC/S 의 연결 묶음).
+ *   - struct spdk_iscsi_conn : 단일 TCP connection (CID 단위, conn.c 와 공유).
+ *   - struct spdk_iscsi_task : SCSI task 와 iSCSI ITT/TTT 의 짝.
+ *
+ * === 주요 함수/구조체 요약 ===
+ *  - iscsi_pdu_calc_header_digest()/data_digest() : CRC32C 계산.
+ *  - iscsi_build_iovs()                           : 송신 시 iovec 빌더.
+ *  - iscsi_free_sess()                            : 세션 free 진입점.
+ *  - iscsi_del_transfer_task()                    : R2T 큐에서 단일 태스크 제거.
+ *  - iscsi_clear_all_transfer_task()              : LUN 단위 R2T 일괄 정리.
+ *  - iscsi_task_response()                        : SCSI Response PDU + 필요 시 DataIN 송신.
+ *  - iscsi_queue_task()                           : SCSI task 를 bdev 로 제출.
+ *  - iscsi_task_mgmt_response()                   : Task Mgmt Response PDU 송신.
+ *  - iscsi_op_abort_task_set()                    : ABORT TASK SET 등 처리.
+ *  - iscsi_handle_incoming_pdus()                 : 본 파일의 메인 진입점 — 수신 FSM 루프.
+ *
+ *  - struct spdk_iscsi_globals (헤더 정의, 본 파일에서 인스턴스화) — 모든 글로벌 anchor.
+ */
 
-#include "spdk/base64.h"
-#include "spdk/crc32.h"
-#include "spdk/endian.h"
-#include "spdk/env.h"
-#include "spdk/likely.h"
-#include "spdk/trace.h"
-#include "spdk/sock.h"
-#include "spdk/string.h"
-#include "spdk/queue.h"
-#include "spdk/md5.h"
+#include "spdk/stdinc.h"                            /* [한국어] 표준 헤더 추상화 (errno, stdint, string 등). */
 
-#include "iscsi/iscsi.h"
-#include "iscsi/param.h"
-#include "iscsi/tgt_node.h"
-#include "iscsi/task.h"
-#include "iscsi/conn.h"
-#include "spdk/scsi.h"
-#include "spdk/bdev.h"
-#include "iscsi/portal_grp.h"
+#include "spdk/base64.h"                            /* [한국어] CHAP 인증의 base64 인코딩/디코딩 (RFC4648). */
+#include "spdk/crc32.h"                             /* [한국어] CRC32C (iSCSI Header/Data Digest, RFC3720 §10.2.3-4). */
+#include "spdk/endian.h"                            /* [한국어] from_be32/to_be32 (BHS 빅엔디안 필드 직렬화). */
+#include "spdk/env.h"                               /* [한국어] spdk_dma_malloc 등 (data segment 버퍼). */
+#include "spdk/likely.h"                            /* [한국어] branch hint. */
+#include "spdk/trace.h"                             /* [한국어] spdk_trace_record (PDU 단위 trace). */
+#include "spdk/sock.h"                              /* [한국어] sock recv/writev. */
+#include "spdk/string.h"                            /* [한국어] spdk_strerror, spdk_strcpy_pad 등. */
+#include "spdk/queue.h"                             /* [한국어] TAILQ 매크로. */
+#include "spdk/md5.h"                               /* [한국어] CHAP MD5 챌린지/응답 (RFC1994). */
 
-#include "spdk/log.h"
+#include "iscsi/iscsi.h"                            /* [한국어] iSCSI BHS 구조체, opcode 상수, internal API. */
+#include "iscsi/param.h"                            /* [한국어] iSCSI text key/value 협상 (RFC3720 §12). */
+#include "iscsi/tgt_node.h"                         /* [한국어] target node + ACL. */
+#include "iscsi/task.h"                             /* [한국어] iscsi_task_get/put/response. */
+#include "iscsi/conn.h"                             /* [한국어] connection 구조체 + write_pdu. */
+#include "spdk/scsi.h"                              /* [한국어] SCSI 명령/태스크 처리 (LUN, dev). */
+#include "spdk/bdev.h"                              /* [한국어] (간접) bdev I/O. */
+#include "iscsi/portal_grp.h"                       /* [한국어] portal_grp / initiator_grp 조회. */
 
-#include "spdk_internal/sgl.h"
+#include "spdk/log.h"                               /* [한국어] 로깅 매크로. */
 
+#include "spdk_internal/sgl.h"                      /* [한국어] iovec 분할 헬퍼 (spdk_iov_xfer). */
+
+/* [한국어] reject sense data, debug 출력 등 임시 문자열 버퍼 크기 — 1KB 면 BHS+AHS+digest 충분. */
 #define MAX_TMPBUF 1024
 
+/*
+ * [한국어]
+ * g_iscsi - iSCSI 서브시스템 전역 컨텍스트의 단일 인스턴스.
+ *   - mutex          : 아래 모든 리스트의 변경/순회 직렬화 락.
+ *                     설정자: 모든 RPC 핸들러, portal accept 경로.
+ *                     읽는 자: discovery 응답, login lookup, RPC list 응답.
+ *                     동기화: 항상 락 잡고 변경. 단일 conn 처리 경로(예: PDU 디스패치) 안에서
+ *                            짧게 잡고 빠르게 빠져나오는 패턴.
+ *   - portal_head    : 전역 spdk_iscsi_portal 리스트 (listening IP:port).
+ *                     동기화: g_iscsi.mutex.
+ *   - pg_head        : portal_group(PG, RFC3720 §3.4.2) 리스트.
+ *   - ig_head        : initiator_group(IG, ACL) 리스트.
+ *   - target_head    : target node 리스트.
+ *   - auth_group_head: CHAP auth group(account 묶음) 리스트.
+ *   - poll_group_head: spdk_iscsi_poll_group 리스트 — 코어별 폴링 단위.
+ *
+ * (구조체 본체 정의는 lib/iscsi/iscsi.h 에 있고, 본 파일에서는 인스턴스만 만든다.)
+ */
 struct spdk_iscsi_globals g_iscsi = {
-	.mutex = PTHREAD_MUTEX_INITIALIZER,
-	.portal_head = TAILQ_HEAD_INITIALIZER(g_iscsi.portal_head),
-	.pg_head = TAILQ_HEAD_INITIALIZER(g_iscsi.pg_head),
-	.ig_head = TAILQ_HEAD_INITIALIZER(g_iscsi.ig_head),
-	.target_head = TAILQ_HEAD_INITIALIZER(g_iscsi.target_head),
-	.auth_group_head = TAILQ_HEAD_INITIALIZER(g_iscsi.auth_group_head),
-	.poll_group_head = TAILQ_HEAD_INITIALIZER(g_iscsi.poll_group_head),
+	.mutex = PTHREAD_MUTEX_INITIALIZER,                    /* [한국어] 위 모든 리스트 보호용. */
+	.portal_head = TAILQ_HEAD_INITIALIZER(g_iscsi.portal_head), /* [한국어] portal 리스트 헤드 초기화. */
+	.pg_head = TAILQ_HEAD_INITIALIZER(g_iscsi.pg_head),    /* [한국어] portal_group 리스트. */
+	.ig_head = TAILQ_HEAD_INITIALIZER(g_iscsi.ig_head),    /* [한국어] initiator_group 리스트. */
+	.target_head = TAILQ_HEAD_INITIALIZER(g_iscsi.target_head), /* [한국어] target node 리스트. */
+	.auth_group_head = TAILQ_HEAD_INITIALIZER(g_iscsi.auth_group_head), /* [한국어] CHAP 그룹 리스트. */
+	.poll_group_head = TAILQ_HEAD_INITIALIZER(g_iscsi.poll_group_head), /* [한국어] poll group 리스트. */
 };
 
 #define MATCH_DIGEST_WORD(BUF, CRC32C) \
@@ -256,6 +344,19 @@ iscsi_reject(struct spdk_iscsi_conn *conn, struct spdk_iscsi_pdu *pdu,
 	return 0;
 }
 
+/*
+ * [한국어]
+ * iscsi_pdu_calc_header_digest - PDU 의 BHS+AHS 에 대한 CRC32C(Castagnoli) 헤더 다이제스트 계산.
+ *
+ * @pdu: 대상 PDU.
+ * @return: CRC32C 결과(상위 모든 비트 inverted; iSCSI 규약).
+ *
+ * RFC3720 §10.2.3 에 따라 BHS(48바이트) + AHS(있으면 4바이트 배수) 까지를 CRC32C 로 계산하고
+ * 마지막에 SPDK_CRC32C_XOR (0xFFFFFFFF) 와 XOR 하여 wire format 다이제스트를 만든다.
+ * BHS/AHS 는 모두 4바이트 정렬이라 패딩 불필요.
+ *
+ * 호출 위치: 송신 시 conn.c::iscsi_conn_write_pdu, 수신 시 본 파일의 verify 단계.
+ */
 uint32_t
 iscsi_pdu_calc_header_digest(struct spdk_iscsi_pdu *pdu)
 {
@@ -316,6 +417,18 @@ iscsi_pdu_calc_partial_data_digest_done(struct spdk_iscsi_pdu *pdu)
 	return crc32c ^ SPDK_CRC32C_XOR;
 }
 
+/*
+ * [한국어]
+ * iscsi_pdu_calc_data_digest - data segment + 4바이트 정렬 패딩에 대한 CRC32C 계산.
+ *
+ * @pdu: 대상 PDU.
+ * @return: 최종 CRC32C (XOR 0xFFFFFFFF 적용).
+ *
+ * RFC3720 §10.2.4. data_segment_len 이 4의 배수가 아니면 0 패딩 바이트도 CRC 에 포함.
+ * DIF strip/insert 모드인 경우 spdk_dif_update_crc32c 가 metadata 를 건너뛰며 계산.
+ *
+ * 호출 위치: 송신 시 conn.c::iscsi_conn_write_pdu, 수신 시 본 파일 PDU 검증.
+ */
 uint32_t
 iscsi_pdu_calc_data_digest(struct spdk_iscsi_pdu *pdu)
 {
@@ -425,6 +538,26 @@ _iscsi_sgl_append_with_md(struct spdk_iov_sgl *s,
 	return true;
 }
 
+/*
+ * [한국어]
+ * iscsi_build_iovs - 송신할 PDU 를 BHS/AHS/HeaderDigest/Data/DataDigest 순서의 iovec 으로 빌드.
+ *
+ * @conn:           대상 연결 (digest 옵션 참조).
+ * @iovs:           출력 iovec 배열.
+ * @iovcnt:         iovs 배열 크기.
+ * @pdu:            송신할 PDU.
+ * @_mapped_length: 빌드 결과 총 매핑 길이 (out 파라미터, 호출자가 송신 길이 추적).
+ * @return:         실제로 채워진 iovec 수.
+ *
+ * 단계별 어펜드:
+ *  1) BHS (48바이트, 항상)
+ *  2) AHS (있을 때, 4*total_ahs_len 바이트)
+ *  3) Header Digest (header_digest 활성 + Login Response 가 아님)
+ *  4) Data Segment (DIF 모드면 metadata interleave 포함)
+ *  5) Data Digest (data_digest 활성 + data 있음)
+ *
+ * 호출 위치: conn.c::iscsi_conn_write_pdu 가 spdk_sock_writev_async 직전에 1회 호출.
+ */
 int
 iscsi_build_iovs(struct spdk_iscsi_conn *conn, struct iovec *iovs, int iovcnt,
 		 struct spdk_iscsi_pdu *pdu, uint32_t *_mapped_length)
@@ -495,6 +628,20 @@ end:
 	return iovcnt - sgl.iovcnt;
 }
 
+/*
+ * [한국어]
+ * iscsi_free_sess - iSCSI 세션의 모든 자원 해제 후 mempool 로 반환.
+ *
+ * @sess: 해제할 세션 (NULL 안전).
+ *
+ * 세션의 마지막 connection 이 사라질 때 conn.c::iscsi_conn_free() 에서 호출된다.
+ * params 키-값 리스트, conns 배열, SCSI initiator port 모두 해제하고
+ * 마지막에 g_iscsi.session_pool (DPDK rte_mempool) 로 객체를 반환한다.
+ *
+ * 호출 컨텍스트:
+ *   - conn.c::iscsi_conn_free() 안에서 g_conns_mutex 를 잡은 채 호출.
+ *   - 같은 세션의 모든 conn 이 sess->connections == 0 가 되어야만 호출됨.
+ */
 void
 iscsi_free_sess(struct spdk_iscsi_sess *sess)
 {
@@ -502,13 +649,13 @@ iscsi_free_sess(struct spdk_iscsi_sess *sess)
 		return;
 	}
 
-	sess->tag = 0;
-	sess->target = NULL;
+	sess->tag = 0;                                 /* [한국어] portal group tag 클리어. */
+	sess->target = NULL;                           /* [한국어] target 참조 끊기. */
 	sess->session_type = SESSION_TYPE_INVALID;
-	iscsi_param_free(sess->params);
-	free(sess->conns);
-	spdk_scsi_port_free(&sess->initiator_port);
-	spdk_mempool_put(g_iscsi.session_pool, (void *)sess);
+	iscsi_param_free(sess->params);                /* [한국어] login 협상 결과 키-값 리스트 해제. */
+	free(sess->conns);                             /* [한국어] MC/S conn 포인터 배열 해제. */
+	spdk_scsi_port_free(&sess->initiator_port);    /* [한국어] SCSI initiator port (이름 매핑 객체) 해제. */
+	spdk_mempool_put(g_iscsi.session_pool, (void *)sess); /* [한국어] mempool 로 객체 반환 (DPDK rte_mempool 기반). */
 }
 
 static int
@@ -2802,6 +2949,19 @@ start_queued_transfer_tasks(struct spdk_iscsi_conn *conn)
 	}
 }
 
+/*
+ * [한국어]
+ * iscsi_del_transfer_task - active_r2t_tasks 에서 ITT 매칭 태스크를 제거하고 슬롯 회수.
+ *
+ * @conn:     대상 연결.
+ * @task_tag: ITT(Initiator Task Tag) - SCSI Command 의 식별자.
+ * @return:   true=발견 및 제거, false=찾지 못함.
+ *
+ * write 의 SCSI Response 송신 직전 호출되어, 활성 R2T 슬롯과 data_out 카운터를 비운다.
+ * 슬롯이 비면 큐된 다음 R2T 태스크의 처리(start_queued_transfer_tasks)를 시도.
+ *
+ * 호출 위치: process_non_read_task_completion 등.
+ */
 bool
 iscsi_del_transfer_task(struct spdk_iscsi_conn *conn, uint32_t task_tag)
 {
@@ -2827,6 +2987,21 @@ iscsi_del_transfer_task(struct spdk_iscsi_conn *conn, uint32_t task_tag)
 	return false;
 }
 
+/*
+ * [한국어]
+ * iscsi_clear_all_transfer_task - LUN/PDU 기준으로 활성/큐된 R2T 태스크 일괄 정리.
+ *
+ * @conn: 대상 연결.
+ * @lun:  대상 LUN (NULL=전체).
+ * @pdu:  기준 PDU (NULL=전체, 지정 시 자기보다 CmdSN 작은 것만).
+ *
+ * 사용처:
+ *   - LUN 핫리무브 (해당 LUN 의 R2T 모두 cancel + null LUN 응답).
+ *   - 연결 종료 시 (conn.c::_iscsi_conn_destruct → lun=NULL,pdu=NULL).
+ *   - LU/Target Reset task management (cmd_sn 비교로 이전 명령만 abort).
+ *
+ * 정리 후 start_queued_transfer_tasks 를 호출해 대기 큐의 다음 작업을 진행시킨다.
+ */
 void
 iscsi_clear_all_transfer_task(struct spdk_iscsi_conn *conn,
 			      struct spdk_scsi_lun *lun,
@@ -3091,6 +3266,24 @@ iscsi_transfer_in(struct spdk_iscsi_conn *conn, struct spdk_iscsi_task *task)
 	return sent_status;
 }
 
+/*
+ * [한국어]
+ * iscsi_task_response - SCSI Response PDU 빌드 + 송신.
+ *
+ * @conn: 대상 연결.
+ * @task: 완료된 task (subtask 가능 — primary 추적함).
+ *
+ * 동작:
+ *  - read 라면 먼저 iscsi_transfer_in() 으로 DataIN PDU 들을 보내고, S=1 로 마지막 DataIN 에
+ *    SCSI status 를 piggyback 한 경우 별도 SCSI Response 송신은 생략.
+ *  - 그 외 경우 SCSI Response PDU 빌드:
+ *      * Sense 데이터(있으면) data segment 에 포함.
+ *      * Overflow/Underflow 비트 + residual count.
+ *      * StatSN 증가, ExpCmdSN/MaxCmdSN 직렬화.
+ *      * iscsi_conn_write_pdu 로 송신 큐 push.
+ *
+ * 호출 위치: process_(read|non_read)_task_completion 등.
+ */
 void
 iscsi_task_response(struct spdk_iscsi_conn *conn,
 		    struct spdk_iscsi_task *task)
@@ -3221,13 +3414,27 @@ iscsi_compare_pdu_bhs_within_existed_r2t_tasks(struct spdk_iscsi_conn *conn,
 	return false;
 }
 
+/*
+ * [한국어]
+ * iscsi_queue_task - SCSI task 를 SCSI 디바이스(LUN)에 제출하여 bdev 까지 전달.
+ *
+ * @conn: 대상 연결.
+ * @task: 제출할 task (CDB/buffer 셋팅 완료 상태).
+ *
+ * spdk_scsi_dev_queue_task() 가 LUN 의 io_channel 큐에 태스크를 넣고, 곧 bdev 모듈로 전달된다.
+ * 완료 시 task->cb_fn(=iscsi_task_cpl) 이 conn 의 owning thread 에서 호출되어
+ * SCSI Response/DataIN PDU 송신 경로로 진입.
+ *
+ * 호출 위치:
+ *   iscsi_pdu_payload_op_scsi_read/write, op_scsi_dataout, queued_datain_tasks 진행 등.
+ */
 void
 iscsi_queue_task(struct spdk_iscsi_conn *conn, struct spdk_iscsi_task *task)
 {
 	spdk_trace_record(TRACE_ISCSI_TASK_QUEUE, conn->trace_id, task->scsi.length,
-			  (uintptr_t)task, (uintptr_t)task->pdu);
-	task->is_queued = true;
-	spdk_scsi_dev_queue_task(conn->dev, &task->scsi);
+			  (uintptr_t)task, (uintptr_t)task->pdu); /* [한국어] trace 기록 (PDU↔task 관계). */
+	task->is_queued = true;                          /* [한국어] bdev 큐 적재 표시 — abort 시 처리 분기에 사용. */
+	spdk_scsi_dev_queue_task(conn->dev, &task->scsi); /* [한국어] SCSI 레이어로 위임 → bdev I/O. */
 }
 
 static int
@@ -3486,6 +3693,18 @@ iscsi_pdu_payload_op_scsi(struct spdk_iscsi_conn *conn, struct spdk_iscsi_pdu *p
 	return SPDK_ISCSI_CONNECTION_FATAL;
 }
 
+/*
+ * [한국어]
+ * iscsi_task_mgmt_response - SCSI Task Management Response PDU 빌드 + 송신.
+ *
+ * @conn: 대상 연결.
+ * @task: 완료된 task management task (ABORT TASK / ABORT TASK SET / LU RESET 등).
+ *
+ * SCSI 측 응답 코드(scsi.response)를 iSCSI Task Function Response 코드로 매핑하여 송신.
+ * pdu==NULL 인 경우는 internal cleanup task (예: LUN close 시 자동 생성)이므로 응답 안 보냄.
+ *
+ * RFC3720 §10.6 (Task Management Function Response).
+ */
 void
 iscsi_task_mgmt_response(struct spdk_iscsi_conn *conn,
 			 struct spdk_iscsi_task *task)
@@ -3600,6 +3819,21 @@ _iscsi_op_abort_task_set(void *arg)
 	return SPDK_POLLER_BUSY;
 }
 
+/*
+ * [한국어]
+ * iscsi_op_abort_task_set - ABORT TASK SET / LU RESET / TARGET RESET 등의 비동기 처리 시작.
+ *
+ * @task:     task management task (응답 콜백 = iscsi_task_mgmt_cpl 미리 설정).
+ * @function: SCSI task management function 코드 (SPDK_SCSI_TASK_FUNC_*).
+ *
+ * 처리 흐름:
+ *   1) function 저장.
+ *   2) 10us 주기 폴러 등록 → _iscsi_op_abort_task_set 가
+ *      iscsi_conn_abort_queued_datain_tasks 가 잔여 분할 read 를 모두 처리할 때까지 폴링,
+ *      모두 정리되면 SCSI 디바이스 큐로 task management 제출 + 폴러 해제.
+ *
+ * 호출 위치: iscsi_pdu_hdr_op_task() 의 case ISCSI_TASK_FUNC_ABORT_TASK_SET 등.
+ */
 void
 iscsi_op_abort_task_set(struct spdk_iscsi_task *task, uint8_t function)
 {
@@ -4886,26 +5120,47 @@ iscsi_read_pdu(struct spdk_iscsi_conn *conn)
 	return 0;
 }
 
+/* [한국어] 한 번의 sock_cb 진입에서 처리할 최대 PDU 수 — 다른 conn 의 starvation 방지를 위해 16 개로 제한. */
 #define GET_PDU_LOOP_COUNT	16
 
+/*
+ * [한국어]
+ * iscsi_handle_incoming_pdus - 본 파일의 메인 진입점. PDU 들을 batch 로 디코딩/처리.
+ *
+ * @conn: 대상 연결.
+ * @return: 처리한 PDU 수 (>=0), 또는 음수 = 치명적 에러(SPDK_ISCSI_CONNECTION_FATAL).
+ *
+ * conn.c::iscsi_conn_sock_cb 가 sock readable 이벤트마다 호출. 한 번에 최대 16 개 PDU 까지 처리하고,
+ * 부분 수신(rc==0) 이거나 conn 이 stopped 되면 즉시 반환하여 다른 conn 에 양보한다.
+ *
+ * 내부적으로 iscsi_read_pdu() 가 한 PDU 의 5단계 수신 FSM(BHS → AHS → HeaderDigest →
+ * Data → DataDigest)을 실행하며, 완료된 PDU 는 iscsi_pdu_hdr_handle / payload_handle
+ * 가 opcode 별 핸들러로 디스패치한다.
+ *
+ * 호출 체인:
+ *   sock_group epoll → iscsi_conn_sock_cb → iscsi_handle_incoming_pdus
+ *     → iscsi_read_pdu (FSM 진행)
+ *       → iscsi_pdu_hdr_handle / iscsi_pdu_payload_handle
+ *         → iscsi_pdu_hdr_op_* / payload_op_* (login/text/scsi/dataout/nop/task/logout/snack)
+ */
 int
 iscsi_handle_incoming_pdus(struct spdk_iscsi_conn *conn)
 {
-	int i, rc;
+	int i, rc;                                       /* [한국어] 처리 카운트 / 에러 코드. */
 
 	/* Read new PDUs from network */
 	for (i = 0; i < GET_PDU_LOOP_COUNT; i++) {
-		rc = iscsi_read_pdu(conn);
+		rc = iscsi_read_pdu(conn);              /* [한국어] PDU 한 개 처리 시도 (FSM 진행). */
 		if (rc == 0) {
-			break;
+			break;                          /* [한국어] socket buffer 비었음 (EAGAIN) — 다음 epoll 이벤트 대기. */
 		} else if (rc < 0) {
-			return rc;
+			return rc;                      /* [한국어] FATAL — 호출자 (sock_cb) 가 EXITING 전이. */
 		}
 
 		if (conn->is_stopped) {
-			break;
+			break;                          /* [한국어] 도중 sock_group 에서 빠진 경우 즉시 중단. */
 		}
 	}
 
-	return i;
+	return i;                                       /* [한국어] 처리한 PDU 수 (통계용). */
 }

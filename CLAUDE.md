@@ -116,9 +116,21 @@ SPDK 코드의 특성상, 주석에 다음 사항을 반드시 포함한다:
 
 ## 주석 작업 진행 현황
 
-### 완료 (0 파일)
+### 완료 (10 파일)
 
-(아직 시작하지 않음)
+- `lib/blob/blobstore.c` (10402 라인) — 4섹션 상단 블록 + 모든 공개 API(spdk_*) §2 함수 헤더
+  + 핵심 함수(spdk_bs_init/load/unload/destroy/create_blob/open_blob/close/io_*) 인라인 주석.
+  static helper 일부(blob_id_cmp, blob_verify_md_op, bs_claim/release_md_page,
+  bs_claim/release_cluster, blob_insert_cluster, bs_allocate_cluster 등)에 §2 주석.
+- `lib/ftl/nvc/ftl_nvc_dev.c` (73 라인) — 4섹션 상단 + 모든 함수 §2 + 라인 인라인 + 구조체 §4.
+- `lib/ftl/nvc/ftl_nvc_dev.h` (184 라인) — 4섹션 상단 + 모든 ops 멤버 §4 + 매크로 인라인.
+- `lib/ftl/nvc/ftl_nvc_bdev_common.c` (94 라인) — 전부 완비.
+- `lib/ftl/nvc/ftl_nvc_bdev_common.h` (21 라인) — 전부 완비.
+- `lib/ftl/nvc/ftl_nvc_bdev_non_vss.c` (243 라인) — 전부 완비.
+- `lib/ftl/nvc/ftl_nvc_bdev_vss.c` (227 라인) — 전부 완비.
+- `lib/ftl/upgrade/ftl_band_upgrade.c` (168 라인) — 전부 완비.
+- `lib/ftl/upgrade/ftl_chunk_upgrade.c` (149 라인) — 전부 완비.
+- `lib/ftl/upgrade/ftl_layout_upgrade.c` (355 라인) — 전부 완비.
 
 ### 미완료 (우선순위 순)
 

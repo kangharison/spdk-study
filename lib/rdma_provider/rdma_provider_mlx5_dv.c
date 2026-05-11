@@ -184,7 +184,7 @@ rdma_mlx5_dv_init_qpair(struct spdk_rdma_mlx5_dv_qp *mlx5_qp)
 	}
 
 	rc = ibv_modify_qp(mlx5_qp->common.qp, &qp_attr, qp_attr_mask);
-	/* [한국어] RTS 진입 — 송신 가능 상태. 이후 ibv_wr_*/ibv_post_send가 정상 동작. */
+	/* [한국어] RTS 진입 — 송신 가능 상태. 이후 ibv_wr_xxx/ibv_post_send가 정상 동작. */
 	if (rc) {
 		SPDK_ERRLOG("ibv_modify_qp(IBV_QPS_RTS) failed, rc %d\n", rc);
 	}

@@ -4,47 +4,159 @@
  *   Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  */
 
-#include "spdk/stdinc.h"
+/*
+ * [한국어 설명] SPDK Blobstore 코어 구현 (blobstore.c)
+ *
+ * === 파일의 역할 ===
+ * SPDK Blobstore — "blob"(가변 크기 객체)을 cluster 단위로 묶어 보관하는 객체 저장소 —
+ * 의 핵심 로직 전부가 이 한 파일에 들어 있다. 기능적으로 다음을 모두 책임진다:
+ *   1) 저장소 lifecycle: spdk_bs_init / load / unload / destroy / grow (super block,
+ *      메타데이터 페이지, used_md/clusters/blobids 비트맵 등 영속 자료구조 관리).
+ *   2) Blob lifecycle:   create / open / close / delete / resize / sync / set_super.
+ *   3) Blob I/O:        read / write / readv / writev / unmap / write_zeroes
+ *      (thick provision / thin provision / COW / snapshot / clone / esnap 경로 분기).
+ *   4) Snapshot/Clone/Esnap: create_snapshot / create_clone / inflate / decouple_parent /
+ *      shallow_copy / set_parent / set_external_parent.
+ *   5) Extended attributes(xattr) — 내부/외부 attr 모두.
+ *   6) Iteration: spdk_bs_iter_first / spdk_bs_iter_next 로 모든 blob 순회.
+ *   7) 비동기 작업 시퀀스/배치(spdk_bs_sequence_t / spdk_bs_batch_t)를 통한 callback chain.
+ *   8) Cluster 할당/해제, md page 할당/해제, used_* 비트맵 갱신과 superblock 영속화.
+ *
+ * 영속 레이아웃 개요 (bs_dev 위에서):
+ *   [super block (1 page)]
+ *   [used_md   bitmap]   - 어떤 md page가 사용 중인지
+ *   [used_clusters bitmap] - 어떤 cluster가 사용 중인지
+ *   [used_blobids bitmap]  - 어떤 blob id가 사용 중인지
+ *   [md pages …]          - 각 blob의 descriptor chain (XATTR, EXTENT_RLE, EXTENT_PAGE, FLAGS)
+ *   [cluster data …]      - 실제 사용자 데이터 (io_unit/cluster 단위)
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * Blobstore는 SPDK 스토리지 스택의 "객체 저장소" 레이어이며 위/아래로 다음과 연결된다:
+ *
+ *   [lvol / vbdev_lvol / blobfs / 사용자 앱]
+ *        ↓ public API (include/spdk/blob.h)
+ *   [blobstore.c (이 파일) — 메타·IO·callback chain]
+ *        ↓ blob_bs_dev I/O (request_set/sequence/batch)
+ *   [bs_dev abstraction (struct spdk_bs_dev)]
+ *        ↓
+ *   [bdev / aio / malloc / nvme bs_dev 구현 (module/blob/bdev/blob_bdev.c 등)]
+ *        ↓
+ *   [bdev layer → NVMe 드라이버 → 물리 매체]
+ *
+ * SPDK 스레드 모델: blobstore는 "md_thread"(메타 갱신 전담)와 "user thread"(IO 발사) 사이의
+ * 협동을 메시지 패스(spdk_thread_send_msg)로 구현한다. cluster insert/free 같은 메타 변경은
+ * 항상 md_thread로 우회되며, IO 핫 패스는 user 스레드에서 가능한 한 자체 처리한다.
+ *
+ * === 타 모듈과의 연결 ===
+ * - include/spdk/blob.h          : 공개 API (spdk_bs_*, spdk_blob_*)
+ * - lib/blob/blobstore.h         : 내부 자료구조 (struct spdk_blob, spdk_blob_store, etc.)
+ * - lib/blob/request.c           : spdk_bs_sequence_t / spdk_bs_batch_t / request_set
+ * - lib/blob/blob_bs_dev.c       : blob을 backing device로 노출 (snapshot 체인)
+ * - lib/blob/zeroes.c            : zero-fill bs_dev (없는 cluster read 처리)
+ * - module/blob/bdev/blob_bdev.c : 일반 bdev을 bs_dev로 감싸는 어댑터
+ * - include/spdk_internal/trace_defs.h : tracepoint id (OWNER_BLOB 등)
+ *
+ * 데이터 흐름 (사용자 write 한 건 기준):
+ *   spdk_blob_io_write → blob_request_submit_op → blob_request_submit_op_split
+ *     → COW가 필요한 cluster면 bs_allocate_and_copy_cluster (md_thread로 RPC)
+ *         → bs_user_op_queue/resume + spdk_bs_sequence_*
+ *     → spdk_bs_sequence_*_writev(seq, io_unit_lba, …) → bs_dev->writev
+ *     → completion → callback chain → user cb_fn
+ *
+ * === 주요 함수/구조체 요약 ===
+ * Lifecycle:
+ *   - spdk_bs_init            : super 새로 만들고 비트맵·메타 초기화 (전형적 흐름)
+ *   - spdk_bs_load            : 디스크 super 읽고 used_md/clusters/blobids 복원
+ *   - spdk_bs_unload          : 더티 영속화 후 정리
+ *   - spdk_bs_destroy         : super 무효화 후 해제 (load 불가능 상태로)
+ *   - spdk_bs_grow_live / spdk_bs_grow : 백엔드 확장 반영
+ *
+ * Blob lifecycle:
+ *   - spdk_bs_create_blob(_ext) : 빈 blob 할당 + md 초기화
+ *   - spdk_bs_open_blob(_ext)   : id로 blob을 열어 핸들 획득
+ *   - spdk_blob_close           : ref 감소, 0이면 메타 sync 후 자원 회수
+ *   - spdk_bs_delete_blob       : 의존성 해제 후 영구 삭제
+ *   - spdk_blob_resize          : cluster 수 변경 (thin: 가상 크기만, thick: 즉시 할당)
+ *   - spdk_blob_sync_md         : 인메모리 메타 → 디스크
+ *
+ * Snapshot/Clone:
+ *   - spdk_bs_create_snapshot   : blob을 read-only 스냅샷으로 분기
+ *   - spdk_bs_create_clone      : 스냅샷에서 새 thin clone 생성
+ *   - spdk_bs_inflate_blob      : thin → thick (모든 unallocated cluster를 채움)
+ *   - spdk_bs_blob_decouple_parent : 부모와의 의존 끊기 (parent의 데이터를 모두 복사)
+ *   - spdk_bs_blob_shallow_copy  : 활용 중인 cluster만 다른 bs_dev로 복사
+ *   - spdk_bs_blob_set_parent / _set_external_parent : 부모 재지정 (esnap 포함)
+ *
+ * I/O:
+ *   - spdk_blob_io_read/write    : 1 io 한 건
+ *   - spdk_blob_io_readv/writev  : iovec 다건
+ *   - spdk_blob_io_readv_ext/writev_ext : ext_opts(메타) 동반
+ *   - spdk_blob_io_unmap / write_zeroes : 영역 무효화 / 0 채움
+ *
+ * 내부 콜백 사이클의 대표 자료구조:
+ *   - struct spdk_blob_store     : 저장소 전체 상태 (super, 비트맵, md_thread, blob 리스트)
+ *   - struct spdk_blob           : 단일 blob 메타 (id, ref, active/clean, cluster 배열)
+ *   - struct spdk_blob_md_page   : 디스크 영속 메타 페이지 (descriptor chain)
+ *   - struct spdk_bs_channel     : per-thread IO 채널 (bs_dev channel + queued ops)
+ *   - struct spdk_blob_persist_ctx, spdk_blob_load_ctx, spdk_bs_load_ctx : 비동기 단계 컨텍스트
+ *   - struct spdk_clone_snapshot_ctx, delete_snapshot_ctx, set_parent_ctx 등 : 작업별 ctx
+ *
+ * Esnap (External snapshot):
+ *   - 외부 bs_dev을 부모로 갖는 clone — 부모는 blobstore에 없을 수 있음 (read-only)
+ *   - blob_esnap_channel: 스레드/blob 단위 IO 채널 캐시 (RB tree)
+ *   - 관련 함수: blob_esnap_destroy_bs_dev_channels, spdk_blob_set_esnap_bs_dev …
+ */
 
-#include "spdk/blob.h"
-#include "spdk/crc32.h"
-#include "spdk/env.h"
-#include "spdk/queue.h"
-#include "spdk/thread.h"
-#include "spdk/bit_array.h"
-#include "spdk/bit_pool.h"
-#include "spdk/likely.h"
-#include "spdk/util.h"
-#include "spdk/string.h"
-#include "spdk/trace.h"
+#include "spdk/stdinc.h"          /* [한국어] 표준 라이브러리 묶음 (string, stdint, …) */
 
-#include "spdk_internal/assert.h"
-#include "spdk_internal/trace_defs.h"
-#include "spdk/log.h"
+#include "spdk/blob.h"            /* [한국어] 공개 Blobstore API 정의 */
+#include "spdk/crc32.h"           /* [한국어] md page CRC 검증/생성 */
+#include "spdk/env.h"             /* [한국어] DPDK 추상화 — DMA-가능 메모리 할당 (spdk_zmalloc 등) */
+#include "spdk/queue.h"           /* [한국어] TAILQ_x/RB_x 매크로 — blob list, esnap tree 등 */
+#include "spdk/thread.h"          /* [한국어] spdk_thread/poller/send_msg — md_thread 우회에 사용 */
+#include "spdk/bit_array.h"       /* [한국어] 비트 배열 — used_md/used_blobids 비트맵 */
+#include "spdk/bit_pool.h"        /* [한국어] 비트 풀 — used_clusters 풀 (할당/회수) */
+#include "spdk/likely.h"          /* [한국어] spdk_likely/unlikely (브랜치 힌트) */
+#include "spdk/util.h"            /* [한국어] SPDK_CONTAINEROF, alignment 매크로 등 */
+#include "spdk/string.h"          /* [한국어] 문자열 헬퍼 (spdk_strerror 등) */
+#include "spdk/trace.h"           /* [한국어] tracepoint 기록 — TRACE_BLOB_REQ_*等 */
 
-#include "blobstore.h"
+#include "spdk_internal/assert.h" /* [한국어] SPDK 내부 assert (release 모드에서도 유지) */
+#include "spdk_internal/trace_defs.h" /* [한국어] OWNER_BLOB / TRACE_BLOB_* id 정의 */
+#include "spdk/log.h"             /* [한국어] SPDK 로그 매크로 */
 
-#define BLOB_CRC32C_INITIAL    0xffffffffUL
+#include "blobstore.h"            /* [한국어] 내부 구조체/매크로 — spdk_blob_store 등 */
 
-static int bs_register_md_thread(struct spdk_blob_store *bs);
-static int bs_unregister_md_thread(struct spdk_blob_store *bs);
-static void blob_close_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno);
+#define BLOB_CRC32C_INITIAL    0xffffffffUL  /* [한국어] md page CRC32C 초기값 (RFC 3720 표준) */
+
+/* [한국어] 다음 forward declaration 묶음은 콜백 체인이 서로를 참조해야 하므로
+ * 정의 순서와 무관하게 미리 선언해 둔다. 모두 같은 파일 내 static 함수다. */
+static int bs_register_md_thread(struct spdk_blob_store *bs);     /* [한국어] md_thread 핸들 캐시 */
+static int bs_unregister_md_thread(struct spdk_blob_store *bs);   /* [한국어] 위 해제 */
+static void blob_close_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno); /* [한국어] close 시퀀스 완료 콜백 */
+/* [한국어] cluster 할당/해제는 메타 변경이라 항상 md_thread에서만 수행한다 (lockless 보장).
+ * IO 스레드가 새 cluster가 필요해지면 spdk_thread_send_msg로 md_thread에 위임한다. */
 static void blob_insert_cluster_on_md_thread(struct spdk_blob *blob, uint32_t cluster_num,
 		uint64_t cluster, uint32_t extent, struct spdk_blob_md_page *page,
 		spdk_blob_op_complete cb_fn, void *cb_arg);
 static void blob_free_cluster_on_md_thread(struct spdk_blob *blob, uint32_t cluster_num,
 		uint32_t extent_page, struct spdk_blob_md_page *page, spdk_blob_op_complete cb_fn, void *cb_arg);
 
+/* [한국어] xattr 핵심 헬퍼 — internal/external 구분으로 두 종류의 xattr 모두 처리.
+ * internal=true는 사용자에게 보이지 않는 SPDK 내부 메타 (snapshot 부모 id 등). */
 static int blob_set_xattr(struct spdk_blob *blob, const char *name, const void *value,
 			  uint16_t value_len, bool internal);
 static int blob_get_xattr_value(struct spdk_blob *blob, const char *name,
 				const void **value, size_t *value_len, bool internal);
 static int blob_remove_xattr(struct spdk_blob *blob, const char *name, bool internal);
 
+/* [한국어] EXTENT_PAGE 단위(많은 cluster 매핑) 메타를 디스크에 쓰는 헬퍼. */
 static void blob_write_extent_page(struct spdk_blob *blob, uint32_t extent, uint64_t cluster_num,
 				   struct spdk_blob_md_page *page, spdk_blob_op_complete cb_fn, void *cb_arg);
+/* [한국어] blob에 진행 중인 IO를 잠시 멈춰 메타 변경(snapshot 분기 등)을 안전히 수행. */
 static void blob_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 
+/* [한국어] shallow copy 루프 — 다음 할당된 cluster를 찾아 대상 bs_dev로 복사 진행. */
 static void bs_shallow_copy_cluster_find_next(void *cb_arg);
 
 /*
@@ -53,26 +165,55 @@ static void bs_shallow_copy_cluster_find_next(void *cb_arg);
  * channel is destroyed, all the channels in the tree are destroyed.
  */
 
+/* [한국어] Esnap 채널 캐시 노드.
+ * 외부 snapshot(다른 bs_dev이 부모)을 가진 blob은 IO마다 부모 bs_dev에 채널이 필요한데,
+ * 매번 만들면 비싸므로 (thread, blob_id) 단위로 한 번 만든 채널을 RB tree에 캐시한다. */
 struct blob_esnap_channel {
 	RB_ENTRY(blob_esnap_channel)	node;
+	/* [한국어] RB tree 링크 — blob_esnap_channel_tree에 매달림. */
+
 	spdk_blob_id			blob_id;
+	/* [한국어] 키 — 어느 esnap clone blob에 대한 채널인지 식별. */
+
 	struct spdk_io_channel		*channel;
+	/* [한국어] 부모 bs_dev에 연결된 io channel. */
 };
 
+/* [한국어] esnap 채널 관련 정적 함수들. RB tree 비교자/파괴자/콜백 구현은 아래쪽 정의 참조. */
 static int blob_esnap_channel_compare(struct blob_esnap_channel *c1, struct blob_esnap_channel *c2);
 static void blob_esnap_destroy_bs_dev_channels(struct spdk_blob *blob, bool abort_io,
 		spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
 static void blob_esnap_destroy_bs_channel(struct spdk_bs_channel *ch);
 static void blob_set_back_bs_dev_frozen(void *_ctx, int bserrno);
+/* [한국어] esnap 채널 tree의 RB 매크로 코드 생성 (insert/find/remove 등). */
 RB_GENERATE_STATIC(blob_esnap_channel_tree, blob_esnap_channel, node, blob_esnap_channel_compare)
 
+/*
+ * [한국어]
+ * blob_is_esnap_clone - blob이 외부 snapshot(esnap)의 clone 인지 검사 (inline)
+ *
+ * @blob: 검사 대상 (NULL 금지)
+ * @return: invalid_flags에 SPDK_BLOB_EXTERNAL_SNAPSHOT 비트가 켜져 있으면 true
+ *
+ * Esnap clone은 부모가 다른 bs_dev(예: 별도 lvol/snapshot 외부 데이터)에 있으므로
+ * read 시 부모 bs_dev로 분기한다. invalid_flags = "예전 SPDK가 알 수 없으면 깨어 있는
+ * blob을 망가뜨릴 수 있으므로 무시하지 말고 거부하라"는 영속 플래그.
+ */
 static inline bool
 blob_is_esnap_clone(const struct spdk_blob *blob)
 {
-	assert(blob != NULL);
-	return !!(blob->invalid_flags & SPDK_BLOB_EXTERNAL_SNAPSHOT);
+	assert(blob != NULL);                              /* [한국어] NULL 방어 (호출자 계약) */
+	return !!(blob->invalid_flags & SPDK_BLOB_EXTERNAL_SNAPSHOT); /* [한국어] !! 로 0/1 정규화 */
 }
 
+/*
+ * [한국어]
+ * blob_id_cmp - blob id 비교자 (RB tree key 함수)
+ *
+ * @return: -1/0/+1 (id1 < id2 / 동일 / id1 > id2)
+ *
+ * spdk_blob_tree (열린 blob들을 id로 정렬해 빠르게 찾는 RB tree) 의 비교 함수.
+ */
 static int
 blob_id_cmp(struct spdk_blob *blob1, struct spdk_blob *blob2)
 {
@@ -80,16 +221,36 @@ blob_id_cmp(struct spdk_blob *blob1, struct spdk_blob *blob2)
 	return (blob1->id < blob2->id ? -1 : blob1->id > blob2->id);
 }
 
+/* [한국어] 열린 blob의 RB tree (key=blob->id, link=spdk_blob::link).
+ * RB_GENERATE_STATIC: insert/find/remove 함수를 컴파일 타임에 생성. */
 RB_GENERATE_STATIC(spdk_blob_tree, spdk_blob, link, blob_id_cmp);
 
+/*
+ * [한국어]
+ * blob_verify_md_op - 메타 변경 작업이 md_thread에서 호출되는지 단언
+ *
+ * 모든 메타 변경 함수의 진입부에서 호출되어 thread affinity를 강제한다.
+ * Lockless 메타 자료구조의 핵심 전제 — md_thread만 메타를 수정한다.
+ */
 static void
 blob_verify_md_op(struct spdk_blob *blob)
 {
 	assert(blob != NULL);
-	assert(spdk_get_thread() == blob->bs->md_thread);
-	assert(blob->state != SPDK_BLOB_STATE_LOADING);
+	assert(spdk_get_thread() == blob->bs->md_thread); /* [한국어] 현재 스레드가 md_thread인지 검증 */
+	assert(blob->state != SPDK_BLOB_STATE_LOADING);   /* [한국어] LOADING 중에는 메타 조작 금지 */
 }
 
+/*
+ * [한국어]
+ * bs_get_snapshot_entry - 주어진 blobid에 해당하는 snapshot 항목 검색
+ *
+ * @bs:     blobstore
+ * @blobid: snapshot 후보 blob id
+ * @return: 매칭되는 snapshot list 항목, 없으면 NULL
+ *
+ * snapshots 리스트는 "스냅샷 blob → 그를 부모로 가진 clone들"을 매다는 자료구조.
+ * 새 clone 등록 / clone 삭제 시 부모 검색에 사용.
+ */
 static struct spdk_blob_list *
 bs_get_snapshot_entry(struct spdk_blob_store *bs, spdk_blob_id blobid)
 {
@@ -104,121 +265,182 @@ bs_get_snapshot_entry(struct spdk_blob_store *bs, spdk_blob_id blobid)
 	return snapshot_entry;
 }
 
+/*
+ * [한국어]
+ * bs_claim_md_page - md page 한 장을 used 비트맵에 표시 (할당 마킹)
+ *
+ * used_lock(spin) 보호 하에서 호출되어야 함. 동일 페이지 이중 할당은 assert로 보호.
+ */
 static void
 bs_claim_md_page(struct spdk_blob_store *bs, uint32_t page)
 {
-	assert(spdk_spin_held(&bs->used_lock));
-	assert(page < spdk_bit_array_capacity(bs->used_md_pages));
-	assert(spdk_bit_array_get(bs->used_md_pages, page) == false);
+	assert(spdk_spin_held(&bs->used_lock));            /* [한국어] 호출자가 used_lock을 잡고 있어야 함 */
+	assert(page < spdk_bit_array_capacity(bs->used_md_pages)); /* [한국어] 인덱스 범위 검증 */
+	assert(spdk_bit_array_get(bs->used_md_pages, page) == false); /* [한국어] 이중 할당 금지 */
 
-	spdk_bit_array_set(bs->used_md_pages, page);
+	spdk_bit_array_set(bs->used_md_pages, page);       /* [한국어] used 비트 ON */
 }
 
+/*
+ * [한국어]
+ * bs_release_md_page - md page 사용 해제 (used 비트 OFF)
+ */
 static void
 bs_release_md_page(struct spdk_blob_store *bs, uint32_t page)
 {
-	assert(spdk_spin_held(&bs->used_lock));
+	assert(spdk_spin_held(&bs->used_lock));            /* [한국어] 락 보유 검증 */
 	assert(page < spdk_bit_array_capacity(bs->used_md_pages));
-	assert(spdk_bit_array_get(bs->used_md_pages, page) == true);
+	assert(spdk_bit_array_get(bs->used_md_pages, page) == true); /* [한국어] 이미 비어 있으면 버그 */
 
-	spdk_bit_array_clear(bs->used_md_pages, page);
+	spdk_bit_array_clear(bs->used_md_pages, page);     /* [한국어] used 비트 OFF */
 }
 
+/*
+ * [한국어]
+ * bs_claim_cluster - 자유 cluster 한 개를 비트풀에서 빼서 반환
+ *
+ * @return: 할당된 cluster 인덱스, 자원 없으면 UINT32_MAX
+ *
+ * cluster는 blob의 데이터 단위(여러 io_unit/page를 묶은 큰 블록 — 보통 1 MiB).
+ * spdk_bit_pool은 bit_array의 효율적인 wrapper로 first-fit 검색을 제공.
+ */
 static uint32_t
 bs_claim_cluster(struct spdk_blob_store *bs)
 {
-	uint32_t cluster_num;
+	uint32_t cluster_num;                              /* [한국어] 할당 결과 */
 
 	assert(spdk_spin_held(&bs->used_lock));
 
-	cluster_num = spdk_bit_pool_allocate_bit(bs->used_clusters);
+	cluster_num = spdk_bit_pool_allocate_bit(bs->used_clusters); /* [한국어] 자유 비트 1개 획득 */
 	if (cluster_num == UINT32_MAX) {
-		return UINT32_MAX;
+		return UINT32_MAX;                         /* [한국어] 가용 cluster 없음 */
 	}
 
 	SPDK_DEBUGLOG(blob, "Claiming cluster %u\n", cluster_num);
-	bs->num_free_clusters--;
+	bs->num_free_clusters--;                           /* [한국어] 카운터 동기화 */
 
 	return cluster_num;
 }
 
+/*
+ * [한국어]
+ * bs_release_cluster - cluster 사용 해제 (비트풀에 반환)
+ */
 static void
 bs_release_cluster(struct spdk_blob_store *bs, uint32_t cluster_num)
 {
 	assert(spdk_spin_held(&bs->used_lock));
 	assert(cluster_num < spdk_bit_pool_capacity(bs->used_clusters));
-	assert(spdk_bit_pool_is_allocated(bs->used_clusters, cluster_num) == true);
-	assert(bs->num_free_clusters < bs->total_clusters);
+	assert(spdk_bit_pool_is_allocated(bs->used_clusters, cluster_num) == true); /* [한국어] 이미 풀린 비트 다시 풀기 금지 */
+	assert(bs->num_free_clusters < bs->total_clusters); /* [한국어] 음수 방지 */
 
 	SPDK_DEBUGLOG(blob, "Releasing cluster %u\n", cluster_num);
 
-	spdk_bit_pool_free_bit(bs->used_clusters, cluster_num);
-	bs->num_free_clusters++;
+	spdk_bit_pool_free_bit(bs->used_clusters, cluster_num); /* [한국어] 비트 OFF */
+	bs->num_free_clusters++;                           /* [한국어] 카운터 동기화 */
 }
 
+/*
+ * [한국어]
+ * blob_insert_cluster - blob의 logical cluster 슬롯에 physical cluster LBA 매핑
+ *
+ * @blob:        대상 blob (md_thread 소유)
+ * @cluster_num: blob 내 logical cluster 번호 (0..num_clusters-1)
+ * @cluster:     bs 단위의 physical cluster 인덱스
+ * @return: 0 성공, -EEXIST 이미 매핑된 슬롯
+ *
+ * thin provision일 때 빈 cluster_num 슬롯에 처음으로 데이터가 쓰이면 호출되어
+ * "이 logical cluster는 이제 이 physical cluster"라는 매핑을 만든다.
+ */
 static int
 blob_insert_cluster(struct spdk_blob *blob, uint32_t cluster_num, uint64_t cluster)
 {
-	uint64_t *cluster_lba = &blob->active.clusters[cluster_num];
+	uint64_t *cluster_lba = &blob->active.clusters[cluster_num]; /* [한국어] active 매핑 슬롯 */
 
-	blob_verify_md_op(blob);
+	blob_verify_md_op(blob);                           /* [한국어] md_thread 검증 */
 
 	if (*cluster_lba != 0) {
-		return -EEXIST;
+		return -EEXIST;                            /* [한국어] 이미 매핑됨 — 호출자 버그 */
 	}
 
-	*cluster_lba = bs_cluster_to_lba(blob->bs, cluster);
-	blob->active.num_allocated_clusters++;
+	*cluster_lba = bs_cluster_to_lba(blob->bs, cluster); /* [한국어] cluster 인덱스 → LBA 변환 */
+	blob->active.num_allocated_clusters++;             /* [한국어] 할당 cluster 수 증가 */
 
 	return 0;
 }
 
+/*
+ * [한국어]
+ * bs_allocate_cluster - 새 cluster 한 개와 (필요 시) extent page 한 개를 한 번에 할당
+ *
+ * @blob:               대상 blob (md_thread)
+ * @cluster_num:        blob 내 logical cluster 번호
+ * @cluster:            (out) 할당된 physical cluster 인덱스
+ * @lowest_free_md_page:(in/out) 검색 시작 위치 / 결과 페이지 번호
+ * @update_map:         true면 즉시 blob 매핑까지 갱신 (false면 caller가 나중에)
+ * @return: 0 성공, -ENOSPC 자원 부족
+ *
+ * use_extent_table=true 인 blob은 cluster 매핑을 EXTENT_PAGE로 외부화하는 새 포맷이며,
+ * 이 경우 cluster를 할당할 때 그 cluster를 가리킬 extent page도 같이 할당한다.
+ * 실패 시 이미 잡은 cluster를 풀어 atomicity를 보장한다.
+ *
+ * 호출 체인:
+ *   blob_persist / blob_insert_cluster_msg → bs_allocate_cluster
+ *     → bs_claim_cluster + (선택) bs_claim_md_page + (선택) blob_insert_cluster
+ */
 static int
 bs_allocate_cluster(struct spdk_blob *blob, uint32_t cluster_num,
 		    uint64_t *cluster, uint32_t *lowest_free_md_page, bool update_map)
 {
-	uint32_t *extent_page = 0;
+	uint32_t *extent_page = 0;                         /* [한국어] extent_page 슬롯 포인터 */
 
-	assert(spdk_spin_held(&blob->bs->used_lock));
+	assert(spdk_spin_held(&blob->bs->used_lock));      /* [한국어] used_lock 보유 검증 */
 
-	*cluster = bs_claim_cluster(blob->bs);
+	*cluster = bs_claim_cluster(blob->bs);             /* [한국어] 자유 cluster 1개 획득 */
 	if (*cluster == UINT32_MAX) {
 		/* No more free clusters. Cannot satisfy the request */
 		return -ENOSPC;
 	}
 
-	if (blob->use_extent_table) {
-		extent_page = bs_cluster_to_extent_page(blob, cluster_num);
-		if (*extent_page == 0) {
+	if (blob->use_extent_table) {                      /* [한국어] 새 EXTENT_TABLE 포맷 분기 */
+		extent_page = bs_cluster_to_extent_page(blob, cluster_num); /* [한국어] 이 cluster를 가리킬 extent page 슬롯 */
+		if (*extent_page == 0) {                   /* [한국어] 아직 extent page 미할당 */
 			/* Extent page shall never occupy md_page so start the search from 1 */
 			if (*lowest_free_md_page == 0) {
-				*lowest_free_md_page = 1;
+				*lowest_free_md_page = 1;  /* [한국어] page 0은 super 영역이라 제외 */
 			}
 			/* No extent_page is allocated for the cluster */
+			/* [한국어] used_md_pages에서 lowest_free 인덱스부터 빈 슬롯 검색. */
 			*lowest_free_md_page = spdk_bit_array_find_first_clear(blob->bs->used_md_pages,
 					       *lowest_free_md_page);
 			if (*lowest_free_md_page == UINT32_MAX) {
 				/* No more free md pages. Cannot satisfy the request */
-				bs_release_cluster(blob->bs, *cluster);
+				bs_release_cluster(blob->bs, *cluster); /* [한국어] cluster 롤백 */
 				return -ENOSPC;
 			}
-			bs_claim_md_page(blob->bs, *lowest_free_md_page);
+			bs_claim_md_page(blob->bs, *lowest_free_md_page); /* [한국어] extent page 자리 마킹 */
 		}
 	}
 
 	SPDK_DEBUGLOG(blob, "Claiming cluster %" PRIu64 " for blob 0x%" PRIx64 "\n", *cluster,
 		      blob->id);
 
-	if (update_map) {
+	if (update_map) {                                  /* [한국어] 즉시 blob 매핑 반영 옵션 */
 		blob_insert_cluster(blob, cluster_num, *cluster);
 		if (blob->use_extent_table && *extent_page == 0) {
-			*extent_page = *lowest_free_md_page;
+			*extent_page = *lowest_free_md_page; /* [한국어] extent page 슬롯에 페이지 번호 기록 */
 		}
 	}
 
 	return 0;
 }
 
+/*
+ * [한국어]
+ * blob_xattrs_init - xattr 옵션 구조체를 빈 상태로 초기화
+ *
+ * spdk_blob_opts_init이 호출 — opts.xattrs 의 모든 필드를 0/NULL로 세팅.
+ */
 static void
 blob_xattrs_init(struct spdk_blob_xattr_opts *xattrs)
 {
@@ -228,21 +450,33 @@ blob_xattrs_init(struct spdk_blob_xattr_opts *xattrs)
 	xattrs->get_value = NULL;
 }
 
+/*
+ * [한국어]
+ * spdk_blob_opts_init - blob 생성 옵션 구조체를 안전한 디폴트로 초기화 (공개 API)
+ *
+ * @opts:      초기화할 옵션 객체
+ * @opts_size: 호출자가 인식하는 구조체 크기 (forward-compat)
+ *
+ * SPDK는 외부 ABI 호환성을 위해 "구조체 크기"를 함께 받는 패턴을 쓴다.
+ * - 호출자가 아는 크기(opts_size)만큼 0으로 초기화하고 새 필드는 호출자가 모르는 자리에
+ *   있을 수 있으므로 SET_FIELD 매크로(FIELD_OK 검사)로 부분적으로 채운다.
+ * 이 패턴 덕분에 SDK 업데이트 시 기존 호출자 바이너리가 깨지지 않는다.
+ */
 void
 spdk_blob_opts_init(struct spdk_blob_opts *opts, size_t opts_size)
 {
-	if (!opts) {
+	if (!opts) {                                       /* [한국어] NULL 검사 */
 		SPDK_ERRLOG("opts should not be NULL\n");
 		return;
 	}
 
-	if (!opts_size) {
+	if (!opts_size) {                                  /* [한국어] 0 크기는 의미 없음 */
 		SPDK_ERRLOG("opts_size should not be zero value\n");
 		return;
 	}
 
-	memset(opts, 0, opts_size);
-	opts->opts_size = opts_size;
+	memset(opts, 0, opts_size);                        /* [한국어] 호출자 인식 범위 zero-init */
+	opts->opts_size = opts_size;                       /* [한국어] 라이브러리가 어느 부분 신뢰할지 기록 */
 
 #define FIELD_OK(field) \
         offsetof(struct spdk_blob_opts, field) + sizeof(opts->field) <= opts_size
@@ -266,6 +500,13 @@ spdk_blob_opts_init(struct spdk_blob_opts *opts, size_t opts_size)
 #undef SET_FIELD
 }
 
+/*
+ * [한국어]
+ * spdk_blob_open_opts_init - blob open 옵션 구조체 디폴트 초기화 (공개 API)
+ *
+ * spdk_blob_opts_init과 동일한 forward-compat 패턴. open 시에는 보통 clear_method 만
+ * 의미가 있다.
+ */
 void
 spdk_blob_open_opts_init(struct spdk_blob_open_opts *opts, size_t opts_size)
 {
@@ -3117,6 +3358,16 @@ blob_request_submit_op_split(struct spdk_io_channel *ch, struct spdk_blob *blob,
 	blob_request_submit_op_split_next(ctx, 0);
 }
 
+/*
+ * [한국어]
+ * spdk_free_cluster_unmap_complete - cluster unmap IO 완료 콜백 (static)
+ *
+ * unmap이 성공해서 backing dev에 cluster 영역이 invalid화된 다음, md_thread로
+ * 메시지를 보내 메타에서도 그 cluster를 free 시킨다 (used_clusters 비트 OFF).
+ * 비트맵 갱신을 IO 스레드가 직접 하지 않는 이유: 메타 자료구조는 md_thread 단독 소유.
+ *
+ * (이름은 공개 prefix이지만 static — 과거 호환성 잔재로 보임.)
+ */
 static void
 spdk_free_cluster_unmap_complete(void *cb_arg, int bserrno)
 {
@@ -3822,6 +4073,18 @@ bs_free(struct spdk_blob_store *bs)
 	spdk_io_device_unregister(bs, bs_dev_destroy);
 }
 
+/*
+ * [한국어]
+ * spdk_bs_opts_init - blobstore init/load/grow 옵션 구조체를 디폴트로 초기화 (공개 API)
+ *
+ * @opts:      초기화할 옵션
+ * @opts_size: 호출자가 인식하는 구조체 크기 (forward-compat)
+ *
+ * 디폴트 값:
+ *   cluster_sz = 1 MiB, num_md_pages = SPDK_BLOB_OPTS_NUM_MD_PAGES,
+ *   max_md_ops/max_channel_ops 각각 SPDK_BLOB_OPTS_*, clear_method = UNMAP,
+ *   bstype = 모두 0, force_recover = false, esnap_bs_dev_create = NULL.
+ */
 void
 spdk_bs_opts_init(struct spdk_bs_opts *opts, size_t opts_size)
 {
@@ -5073,26 +5336,53 @@ bs_opts_copy(struct spdk_bs_opts *src, struct spdk_bs_opts *dst)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * spdk_bs_load - 기존 blobstore가 들어 있는 bs_dev를 읽어 in-memory 핸들 복원 (공개 API)
+ *
+ * @dev:    blobstore가 이미 기록된 backing bs_dev
+ * @o:      옵션 (NULL=디폴트, max_md_ops/max_channel_ops 등)
+ * @cb_fn:  완료 콜백 (cb_arg, bs, bserrno)
+ *
+ * 동작 단계:
+ * 1) phys_blocklen / blocklen 정합성 검사
+ * 2) 옵션 복사·검증 (max_md_ops != 0, max_channel_ops != 0)
+ * 3) bs_alloc — 빈 spdk_blob_store 본체 할당
+ * 4) bs_sequence_start_bs로 시퀀스 시작
+ * 5) bs_sequence_read_dev로 super block(page 0) 읽기 시작 → bs_load_super_cpl로 콜백 체인:
+ *    - super 검증 (signature/CRC/version)
+ *    - clean=0이거나 force_recover면 replay 모드 → md page 전체 read 후 used 비트맵 재구성
+ *    - clean=1이면 used_md/cluster/blobid mask들을 직접 read해 비트맵 즉시 복원
+ *    - 마지막에 super.clean=0 재기록(다음 unload 때 1로 다시 mark)
+ *    - cb_fn(cb_arg, bs, 0) 호출
+ *
+ * Esnap 지원: 옵션의 esnap_bs_dev_create 콜백이 등록되어 있으면 esnap clone을 만났을 때
+ * 부모 bs_dev를 만들어 달라는 요청을 한다.
+ *
+ * 호출 체인:
+ *   사용자 → spdk_bs_load → bs_alloc → bs_sequence_start_bs → bs_sequence_read_dev(super)
+ *     → bs_load_super_cpl → (clean ? bs_load_replay_md : 직접 mask 읽기) → cb_fn
+ */
 void
 spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	     spdk_bs_op_with_handle_complete cb_fn, void *cb_arg)
 {
-	struct spdk_blob_store	*bs;
-	struct spdk_bs_cpl	cpl;
-	struct spdk_bs_load_ctx *ctx;
-	struct spdk_bs_opts	opts = {};
+	struct spdk_blob_store	*bs;                       /* [한국어] 복원할 blobstore 핸들 */
+	struct spdk_bs_cpl	cpl;                       /* [한국어] 시퀀스 완료 통보 */
+	struct spdk_bs_load_ctx *ctx;                      /* [한국어] load 콜백 체인 컨텍스트 */
+	struct spdk_bs_opts	opts = {};                 /* [한국어] 정규화된 옵션 */
 	int err;
 
 	SPDK_DEBUGLOG(blob, "Loading blobstore from dev %p\n", dev);
 
-	if ((dev->phys_blocklen % dev->blocklen) != 0) {
+	if ((dev->phys_blocklen % dev->blocklen) != 0) {   /* [한국어] block length 정합성 */
 		SPDK_DEBUGLOG(blob, "unsupported dev block length of %d\n", dev->blocklen);
 		dev->destroy(dev);
 		cb_fn(cb_arg, NULL, -EINVAL);
 		return;
 	}
 
-	spdk_bs_opts_init(&opts, sizeof(opts));
+	spdk_bs_opts_init(&opts, sizeof(opts));            /* [한국어] 디폴트 채움 */
 	if (o) {
 		if (bs_opts_copy(o, &opts)) {
 			dev->destroy(dev);
@@ -5101,25 +5391,25 @@ spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 		}
 	}
 
-	if (opts.max_md_ops == 0 || opts.max_channel_ops == 0) {
+	if (opts.max_md_ops == 0 || opts.max_channel_ops == 0) { /* [한국어] 0이면 큐 사이즈 비정상 */
 		dev->destroy(dev);
 		cb_fn(cb_arg, NULL, -EINVAL);
 		return;
 	}
 
-	err = bs_alloc(dev, &opts, &bs, &ctx);
+	err = bs_alloc(dev, &opts, &bs, &ctx);             /* [한국어] bs/super/ctx 할당 */
 	if (err) {
 		dev->destroy(dev);
 		cb_fn(cb_arg, NULL, err);
 		return;
 	}
 
-	cpl.type = SPDK_BS_CPL_TYPE_BS_HANDLE;
+	cpl.type = SPDK_BS_CPL_TYPE_BS_HANDLE;             /* [한국어] 완료 시 bs 핸들을 반환 */
 	cpl.u.bs_handle.cb_fn = cb_fn;
 	cpl.u.bs_handle.cb_arg = cb_arg;
 	cpl.u.bs_handle.bs = bs;
 
-	ctx->seq = bs_sequence_start_bs(bs->md_channel, &cpl);
+	ctx->seq = bs_sequence_start_bs(bs->md_channel, &cpl); /* [한국어] 시퀀스 시작 */
 	if (!ctx->seq) {
 		spdk_free(ctx->super);
 		free(ctx);
@@ -5129,6 +5419,7 @@ spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	}
 
 	/* Read the super block */
+	/* [한국어] super block(page 0)을 디스크에서 읽어 와 bs_load_super_cpl 콜백으로 검증 시작. */
 	bs_sequence_read_dev(ctx->seq, ctx->super, bs_page_to_lba(bs, 0),
 			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
 			     bs_load_super_cpl, ctx);
@@ -5472,6 +5763,18 @@ bs_dump_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	bs_load_read_used_pages(ctx);
 }
 
+/*
+ * [한국어]
+ * spdk_bs_dump - bs_dev에 들어 있는 blobstore의 메타를 텍스트로 덤프 (공개 API)
+ *
+ * @dev:           읽을 backing bs_dev (load와 마찬가지로 소유권 인계)
+ * @fp:            출력할 FILE*
+ * @print_xattr_fn:사용자 xattr 출력 콜백 (NULL 가능)
+ *
+ * 디버깅/포렌식 도구 — super block, used 비트맵, 모든 md page descriptor를 사람이 읽을
+ * 수 있는 형식으로 출력한다. 실제 IO는 발생하지 않으며 (read만), bs는 fully load되지
+ * 않는다 (dumping 플래그가 true).
+ */
 void
 spdk_bs_dump(struct spdk_bs_dev *dev, FILE *fp, spdk_bs_dump_print_xattr print_xattr_fn,
 	     spdk_bs_op_complete cb_fn, void *cb_arg)
@@ -5543,55 +5846,90 @@ bs_init_trim_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 			      bs_init_persist_super_cpl, ctx);
 }
 
+/*
+ * [한국어]
+ * spdk_bs_init - 빈 bs_dev 위에 새 blobstore를 만들어 핸들을 비동기 반환 (공개 API)
+ *
+ * @dev:    아래에 깔린 bs_dev (수명은 unload까지 blobstore가 인계받음)
+ * @o:      옵션 (NULL이면 디폴트). cluster_size, io_unit_size 등.
+ * @cb_fn:  완료 콜백 — (cb_arg, struct spdk_blob_store *bs, int bserrno)
+ * @cb_arg: 콜백 인자
+ *
+ * 동작 단계:
+ * 1) phys_blocklen / blocklen 정합성 검사
+ * 2) 옵션 복사·검증 (bs_opts_copy / bs_opts_verify)
+ * 3) bs_alloc — spdk_blob_store 본체와 super page 컨텍스트 할당
+ * 4) used_md / used_blobids / open_blobids 비트 배열을 md_len 크기로 확장
+ * 5) super block 영속 필드 채움 (signature, version, sizes, bstype …)
+ * 6) 메타 영역 layout 계산:
+ *    - super(1 page) + used_page_mask + used_cluster_mask + used_blobid_mask + md_pages
+ *    - 향후 grow를 대비해 used_cluster_mask_len의 최댓값(= md_len 기준)으로 예약
+ * 7) 메타 영역에 해당하는 cluster를 used 비트맵에 미리 점유
+ * 8) bs_sequence_start_bs로 비동기 시퀀스 시작:
+ *    - batch.write_zeroes(0, num_md_lba)        : 메타 영역 zero
+ *    - clear_method 따라 데이터 영역 trim/zero/none
+ *    - 완료 시 bs_init_trim_cpl → super write → bs_init_persist_super_cpl
+ *    - 마지막에 ctx->bs를 콜백으로 반환
+ *
+ * 실행 컨텍스트: 호출 스레드 — 이 함수는 동기적으로 시작만 하고 콜백은 md 채널 스레드에서.
+ * 모든 실패 경로에서 dev->destroy(dev) 호출로 backing dev 소유권을 넘겨받았음을 처리.
+ *
+ * 호출 체인:
+ *   사용자 → spdk_bs_init
+ *     → bs_alloc → bs_sequence_start_bs → batch.write_zeroes → bs_init_trim_cpl
+ *     → bs_sequence_write_dev(super) → bs_init_persist_super_cpl
+ *     → spdk_bit_pool_create_from_array(used_clusters) + cb_fn(..., bs, 0)
+ */
 void
 spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	     spdk_bs_op_with_handle_complete cb_fn, void *cb_arg)
 {
-	struct spdk_bs_load_ctx *ctx;
-	struct spdk_blob_store	*bs;
-	struct spdk_bs_cpl	cpl;
-	spdk_bs_sequence_t	*seq;
-	spdk_bs_batch_t		*batch;
-	uint64_t		num_md_lba;
-	uint64_t		num_md_pages;
-	uint64_t		num_md_clusters;
-	uint64_t		max_used_cluster_mask_len;
+	struct spdk_bs_load_ctx *ctx;                      /* [한국어] init 콜백 체인 컨텍스트 */
+	struct spdk_blob_store	*bs;                       /* [한국어] 새로 만들 blobstore 핸들 */
+	struct spdk_bs_cpl	cpl;                       /* [한국어] sequence 완료 통보 */
+	spdk_bs_sequence_t	*seq;                      /* [한국어] 비동기 시퀀스 */
+	spdk_bs_batch_t		*batch;                    /* [한국어] 메타 zero/trim 배치 */
+	uint64_t		num_md_lba;                /* [한국어] 메타 전체 LBA 수 */
+	uint64_t		num_md_pages;              /* [한국어] 메타 영역 page 수 누적 */
+	uint64_t		num_md_clusters;           /* [한국어] 메타 영역 cluster 수 */
+	uint64_t		max_used_cluster_mask_len; /* [한국어] grow 대비 mask 최대 길이 */
 	uint32_t		i;
-	struct spdk_bs_opts	opts = {};
+	struct spdk_bs_opts	opts = {};                 /* [한국어] 정규화된 옵션 사본 */
 	int			rc;
-	uint64_t		lba, lba_count;
+	uint64_t		lba, lba_count;            /* [한국어] 데이터 영역 trim/zero 범위 */
 
 	SPDK_DEBUGLOG(blob, "Initializing blobstore on dev %p\n", dev);
-	if ((dev->phys_blocklen % dev->blocklen) != 0) {
+	if ((dev->phys_blocklen % dev->blocklen) != 0) {   /* [한국어] phys_blocklen이 logical의 배수여야 함 */
 		SPDK_ERRLOG("unsupported dev block length of %d\n",
 			    dev->blocklen);
-		dev->destroy(dev);
+		dev->destroy(dev);                         /* [한국어] 실패 시 backing dev 정리 */
 		cb_fn(cb_arg, NULL, -EINVAL);
 		return;
 	}
 
-	spdk_bs_opts_init(&opts, sizeof(opts));
+	spdk_bs_opts_init(&opts, sizeof(opts));            /* [한국어] 디폴트 채움 */
 	if (o) {
-		if (bs_opts_copy(o, &opts)) {
+		if (bs_opts_copy(o, &opts)) {              /* [한국어] forward-compat 복사 */
 			dev->destroy(dev);
 			cb_fn(cb_arg, NULL, -EINVAL);
 			return;
 		}
 	}
 
-	if (bs_opts_verify(&opts) != 0) {
+	if (bs_opts_verify(&opts) != 0) {                  /* [한국어] 옵션 무결성 검증 */
 		dev->destroy(dev);
 		cb_fn(cb_arg, NULL, -EINVAL);
 		return;
 	}
 
-	rc = bs_alloc(dev, &opts, &bs, &ctx);
+	rc = bs_alloc(dev, &opts, &bs, &ctx);              /* [한국어] bs/ctx/super 메모리 할당 */
 	if (rc) {
 		dev->destroy(dev);
 		cb_fn(cb_arg, NULL, rc);
 		return;
 	}
 
+	/* [한국어] num_md_pages 디폴트는 cluster당 1 페이지 — 단순한 over-alloc 휴리스틱. */
 	if (opts.num_md_pages == SPDK_BLOB_OPTS_NUM_MD_PAGES) {
 		/* By default, allocate 1 page per cluster.
 		 * Technically, this over-allocates metadata
@@ -5603,7 +5941,7 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	} else {
 		bs->md_len = opts.num_md_pages;
 	}
-	rc = spdk_bit_array_resize(&bs->used_md_pages, bs->md_len);
+	rc = spdk_bit_array_resize(&bs->used_md_pages, bs->md_len); /* [한국어] used_md 비트맵 사이즈 */
 	if (rc < 0) {
 		spdk_free(ctx->super);
 		free(ctx);
@@ -5612,7 +5950,7 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 		return;
 	}
 
-	rc = spdk_bit_array_resize(&bs->used_blobids, bs->md_len);
+	rc = spdk_bit_array_resize(&bs->used_blobids, bs->md_len); /* [한국어] used_blobid 비트맵 사이즈 */
 	if (rc < 0) {
 		spdk_free(ctx->super);
 		free(ctx);
@@ -5621,7 +5959,7 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 		return;
 	}
 
-	rc = spdk_bit_array_resize(&bs->open_blobids, bs->md_len);
+	rc = spdk_bit_array_resize(&bs->open_blobids, bs->md_len); /* [한국어] open 중인 blobid 추적용 */
 	if (rc < 0) {
 		spdk_free(ctx->super);
 		free(ctx);
@@ -5630,27 +5968,29 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 		return;
 	}
 
+	/* [한국어] super block 영속 필드 채움 — 이 모든 값이 디스크에 그대로 기록된다. */
 	memcpy(ctx->super->signature, SPDK_BS_SUPER_BLOCK_SIG,
-	       sizeof(ctx->super->signature));
-	ctx->super->version = SPDK_BS_VERSION;
+	       sizeof(ctx->super->signature));            /* [한국어] "SPDKBLOB" 매직 시그니처 */
+	ctx->super->version = SPDK_BS_VERSION;             /* [한국어] 디스크 포맷 버전 */
 	ctx->super->length = sizeof(*ctx->super);
-	ctx->super->super_blob = bs->super_blob;
-	ctx->super->clean = 0;
+	ctx->super->super_blob = bs->super_blob;           /* [한국어] super blob id (없으면 INVALID) */
+	ctx->super->clean = 0;                             /* [한국어] 마운트 동안 dirty=0이면 unload 시 1로 */
 	ctx->super->cluster_size = bs->cluster_sz;
 	ctx->super->io_unit_size = bs->io_unit_size;
 	ctx->super->md_page_size = bs->md_page_size;
-	memcpy(&ctx->super->bstype, &bs->bstype, sizeof(bs->bstype));
+	memcpy(&ctx->super->bstype, &bs->bstype, sizeof(bs->bstype)); /* [한국어] 사용자 식별 태그 */
 
 	/* Calculate how many pages the metadata consumes at the front
 	 * of the disk.
 	 */
 
 	/* The super block uses 1 page */
-	num_md_pages = 1;
+	num_md_pages = 1;                                  /* [한국어] super는 page 0 */
 
 	/* The used_md_pages mask requires 1 bit per metadata page, rounded
 	 * up to the nearest page, plus a header.
 	 */
+	/* [한국어] used_md mask 영역: header + ceil(md_len/8) 바이트 → page 단위 올림. */
 	ctx->super->used_page_mask_start = num_md_pages;
 	ctx->super->used_page_mask_len = spdk_divide_round_up(sizeof(struct spdk_bs_md_mask) +
 					 spdk_divide_round_up(bs->md_len, 8),
@@ -5660,6 +6000,7 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	/* The used_clusters mask requires 1 bit per cluster, rounded
 	 * up to the nearest page, plus a header.
 	 */
+	/* [한국어] used_clusters mask: cluster당 1비트. */
 	ctx->super->used_cluster_mask_start = num_md_pages;
 	ctx->super->used_cluster_mask_len = spdk_divide_round_up(sizeof(struct spdk_bs_md_mask) +
 					    spdk_divide_round_up(bs->total_clusters, 8),
@@ -5668,6 +6009,7 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	 * Here we calculate the max clusters we can support according to the
 	 * num_md_pages (bs->md_len).
 	 */
+	/* [한국어] grow 시 cluster 수가 md_len까지 늘어날 수 있다고 가정하고 mask 영역을 미리 예약. */
 	max_used_cluster_mask_len = spdk_divide_round_up(sizeof(struct spdk_bs_md_mask) +
 				    spdk_divide_round_up(bs->md_len, 8),
 				    ctx->super->md_page_size);
@@ -5678,6 +6020,7 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	/* The used_blobids mask requires 1 bit per metadata page, rounded
 	 * up to the nearest page, plus a header.
 	 */
+	/* [한국어] used_blobids mask: blob id 후보당 1비트(=md page 하나당). */
 	ctx->super->used_blobid_mask_start = num_md_pages;
 	ctx->super->used_blobid_mask_len = spdk_divide_round_up(sizeof(struct spdk_bs_md_mask) +
 					   spdk_divide_round_up(bs->md_len, 8),
@@ -5685,18 +6028,19 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	num_md_pages += ctx->super->used_blobid_mask_len;
 
 	/* The metadata region size was chosen above */
+	/* [한국어] 마지막으로 실제 md page 영역 (각 blob의 descriptor chain 보관). */
 	ctx->super->md_start = bs->md_start = num_md_pages;
 	ctx->super->md_len = bs->md_len;
 	num_md_pages += bs->md_len;
 
-	num_md_lba = bs_page_to_lba(bs, num_md_pages);
+	num_md_lba = bs_page_to_lba(bs, num_md_pages);     /* [한국어] page → LBA 변환 (zero/trim 범위) */
 
-	ctx->super->size = dev->blockcnt * dev->blocklen;
+	ctx->super->size = dev->blockcnt * dev->blocklen;  /* [한국어] 전체 용량 (bytes) */
 
-	ctx->super->crc = blob_md_page_calc_crc(ctx->super);
+	ctx->super->crc = blob_md_page_calc_crc(ctx->super); /* [한국어] super CRC32C 계산 */
 
-	num_md_clusters = spdk_divide_round_up(num_md_pages, bs->pages_per_cluster);
-	if (num_md_clusters > bs->total_clusters) {
+	num_md_clusters = spdk_divide_round_up(num_md_pages, bs->pages_per_cluster); /* [한국어] 메타가 차지할 cluster 수 */
+	if (num_md_clusters > bs->total_clusters) {        /* [한국어] 메타가 디스크보다 크면 거부 */
 		SPDK_ERRLOG("Blobstore metadata cannot use more clusters than is available, "
 			    "please decrease number of pages reserved for metadata "
 			    "or increase cluster size.\n");
@@ -5708,19 +6052,20 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 		return;
 	}
 	/* Claim all of the clusters used by the metadata */
+	/* [한국어] 메타 영역에 해당하는 cluster들을 처음부터 used로 마킹. */
 	for (i = 0; i < num_md_clusters; i++) {
 		spdk_bit_array_set(ctx->used_clusters, i);
 	}
 
-	bs->num_free_clusters -= num_md_clusters;
-	bs->total_data_clusters = bs->num_free_clusters;
+	bs->num_free_clusters -= num_md_clusters;          /* [한국어] 사용 가능 cluster 수 차감 */
+	bs->total_data_clusters = bs->num_free_clusters;   /* [한국어] 데이터에 쓸 수 있는 총합 */
 
-	cpl.type = SPDK_BS_CPL_TYPE_BS_HANDLE;
+	cpl.type = SPDK_BS_CPL_TYPE_BS_HANDLE;             /* [한국어] 완료 시 bs 핸들을 사용자에게 전달 */
 	cpl.u.bs_handle.cb_fn = cb_fn;
 	cpl.u.bs_handle.cb_arg = cb_arg;
 	cpl.u.bs_handle.bs = bs;
 
-	seq = bs_sequence_start_bs(bs->md_channel, &cpl);
+	seq = bs_sequence_start_bs(bs->md_channel, &cpl);  /* [한국어] 비동기 시퀀스 시작 */
 	if (!seq) {
 		spdk_free(ctx->super);
 		free(ctx);
@@ -5729,28 +6074,28 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 		return;
 	}
 
-	batch = bs_sequence_to_batch(seq, bs_init_trim_cpl, ctx);
+	batch = bs_sequence_to_batch(seq, bs_init_trim_cpl, ctx); /* [한국어] 배치로 zero/trim 묶음 발사 */
 
 	/* Clear metadata space */
-	bs_batch_write_zeroes_dev(batch, 0, num_md_lba);
+	bs_batch_write_zeroes_dev(batch, 0, num_md_lba);   /* [한국어] 메타 영역 0으로 초기화 (확정성 보장) */
 
-	lba = num_md_lba;
-	lba_count = ctx->bs->dev->blockcnt - lba;
-	switch (opts.clear_method) {
+	lba = num_md_lba;                                  /* [한국어] 데이터 영역 시작 */
+	lba_count = ctx->bs->dev->blockcnt - lba;          /* [한국어] 데이터 영역 길이 */
+	switch (opts.clear_method) {                       /* [한국어] 사용자가 요청한 clear 정책 */
 	case BS_CLEAR_WITH_UNMAP:
 		/* Trim data clusters */
-		bs_batch_unmap_dev(batch, lba, lba_count);
+		bs_batch_unmap_dev(batch, lba, lba_count); /* [한국어] NVMe Deallocate / SATA TRIM */
 		break;
 	case BS_CLEAR_WITH_WRITE_ZEROES:
 		/* Write_zeroes to data clusters */
-		bs_batch_write_zeroes_dev(batch, lba, lba_count);
+		bs_batch_write_zeroes_dev(batch, lba, lba_count); /* [한국어] 명시적 0 쓰기 */
 		break;
 	case BS_CLEAR_WITH_NONE:
 	default:
-		break;
+		break;                                     /* [한국어] 아무 것도 하지 않음 (기존 데이터 유지) */
 	}
 
-	bs_batch_close(batch);
+	bs_batch_close(batch);                             /* [한국어] 배치 종료 → 모두 끝나면 bs_init_trim_cpl */
 }
 
 /* END spdk_bs_init */
@@ -5782,6 +6127,18 @@ bs_destroy_trim_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	bs_free(bs);
 }
 
+/*
+ * [한국어]
+ * spdk_bs_destroy - blobstore를 영구 파괴 (super block 0으로 덮어쓰기) (공개 API)
+ *
+ * @bs:     파괴할 blobstore
+ * @cb_fn:  완료 콜백
+ *
+ * spdk_bs_unload와 달리 영속 데이터를 보존하지 않는다 — super block을 0으로 덮어써
+ * 다음 spdk_bs_load 가 실패하도록 하고 in-memory 자원을 해제한다.
+ *
+ * 사전 조건: 모든 blob close 필요. open이면 -EBUSY 반환.
+ */
 void
 spdk_bs_destroy(struct spdk_blob_store *bs, spdk_bs_op_complete cb_fn,
 		void *cb_arg)
@@ -5792,7 +6149,7 @@ spdk_bs_destroy(struct spdk_blob_store *bs, spdk_bs_op_complete cb_fn,
 
 	SPDK_DEBUGLOG(blob, "Destroying blobstore\n");
 
-	if (!RB_EMPTY(&bs->open_blobs)) {
+	if (!RB_EMPTY(&bs->open_blobs)) {                  /* [한국어] open blob이 남아 있으면 거부 */
 		SPDK_ERRLOG("Blobstore still has open blobs\n");
 		cb_fn(cb_arg, -EBUSY);
 		return;
@@ -5818,6 +6175,8 @@ spdk_bs_destroy(struct spdk_blob_store *bs, spdk_bs_op_complete cb_fn,
 	}
 
 	/* Write zeroes to the super block */
+	/* [한국어] super 영역에 0 쓰기 — 시그니처가 깨져 다음 load가 실패한다.
+	 * 완료 시 bs_destroy_trim_cpl이 bs_free까지 호출해 in-memory도 정리. */
 	bs_sequence_write_zeroes_dev(seq,
 				     bs_page_to_lba(bs, 0),
 				     bs_byte_to_lba(bs, sizeof(struct spdk_bs_super_block)),
@@ -5936,6 +6295,27 @@ bs_unload_read_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	bs_write_used_md(seq, cb_arg, bs_unload_write_used_pages_cpl);
 }
 
+/*
+ * [한국어]
+ * spdk_bs_unload - blobstore를 깨끗하게 영속화하고 메모리 자원 해제 (공개 API)
+ *
+ * @bs:     unload할 blobstore (호출 후에는 사용 금지)
+ * @cb_fn:  완료 콜백 (cb_arg, bserrno)
+ *
+ * 사전 조건:
+ * - 모든 blob이 close된 상태여야 함 (open_blobs RB tree empty). 안 그러면 -EBUSY.
+ * - esnap 채널 정리가 진행 중이면 정리 완료 후 자동 재시도하도록 콜백을 저장하고 반환.
+ *
+ * 동작 단계:
+ * 1) ctx + DMA-가능 super 버퍼 할당
+ * 2) bs_sequence_start_bs로 시퀀스 시작
+ * 3) super를 다시 read (bs_unload_read_super_cpl)
+ * 4) bs_super_validate 후 비트맵 영속화 체인:
+ *    used_md → used_blobids → used_clusters → super.clean=1 재기록 → bs_free
+ *
+ * Esnap 처리: bs->esnap_channels_unloading > 0 이면 채널 파괴가 끝날 때까지 대기.
+ * 그 사이에 두 번 호출되면 -EBUSY로 거부.
+ */
 void
 spdk_bs_unload(struct spdk_blob_store *bs, spdk_bs_op_complete cb_fn, void *cb_arg)
 {
@@ -5948,19 +6328,19 @@ spdk_bs_unload(struct spdk_blob_store *bs, spdk_bs_op_complete cb_fn, void *cb_a
 	 * If external snapshot channels are being destroyed while the blobstore is unloaded, the
 	 * unload is deferred until after the channel destruction completes.
 	 */
-	if (bs->esnap_channels_unloading != 0) {
-		if (bs->esnap_unload_cb_fn != NULL) {
+	if (bs->esnap_channels_unloading != 0) {           /* [한국어] esnap 채널 정리 중 — unload 지연 */
+		if (bs->esnap_unload_cb_fn != NULL) {      /* [한국어] 이미 한 번 deferred 됐으면 거부 */
 			SPDK_ERRLOG("Blobstore unload in progress\n");
 			cb_fn(cb_arg, -EBUSY);
 			return;
 		}
 		SPDK_DEBUGLOG(blob_esnap, "Blobstore unload deferred: %" PRIu32
 			      " esnap clones are unloading\n", bs->esnap_channels_unloading);
-		bs->esnap_unload_cb_fn = cb_fn;
+		bs->esnap_unload_cb_fn = cb_fn;            /* [한국어] 정리 완료 시 자동 호출되도록 보관 */
 		bs->esnap_unload_cb_arg = cb_arg;
 		return;
 	}
-	if (bs->esnap_unload_cb_fn != NULL) {
+	if (bs->esnap_unload_cb_fn != NULL) {              /* [한국어] deferred 호출이 다시 진입한 경우 정리 */
 		SPDK_DEBUGLOG(blob_esnap, "Blobstore deferred unload progressing\n");
 		assert(bs->esnap_unload_cb_fn == cb_fn);
 		assert(bs->esnap_unload_cb_arg == cb_arg);
@@ -5968,13 +6348,13 @@ spdk_bs_unload(struct spdk_blob_store *bs, spdk_bs_op_complete cb_fn, void *cb_a
 		bs->esnap_unload_cb_arg = NULL;
 	}
 
-	if (!RB_EMPTY(&bs->open_blobs)) {
+	if (!RB_EMPTY(&bs->open_blobs)) {                  /* [한국어] 열린 blob 있으면 거부 — 사용자 정리 의무 */
 		SPDK_ERRLOG("Blobstore still has open blobs\n");
 		cb_fn(cb_arg, -EBUSY);
 		return;
 	}
 
-	ctx = calloc(1, sizeof(*ctx));
+	ctx = calloc(1, sizeof(*ctx));                     /* [한국어] 콜백 체인 컨텍스트 */
 	if (!ctx) {
 		cb_fn(cb_arg, -ENOMEM);
 		return;
@@ -5982,6 +6362,7 @@ spdk_bs_unload(struct spdk_blob_store *bs, spdk_bs_op_complete cb_fn, void *cb_a
 
 	ctx->bs = bs;
 
+	/* [한국어] super 페이지 — DMA 가능 메모리(zmalloc with 4KB align). */
 	ctx->super = spdk_zmalloc(sizeof(*ctx->super), 0x1000, NULL,
 				  SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
 	if (!ctx->super) {
@@ -5990,7 +6371,7 @@ spdk_bs_unload(struct spdk_blob_store *bs, spdk_bs_op_complete cb_fn, void *cb_a
 		return;
 	}
 
-	cpl.type = SPDK_BS_CPL_TYPE_BS_BASIC;
+	cpl.type = SPDK_BS_CPL_TYPE_BS_BASIC;              /* [한국어] basic = 단순 errno만 반환 */
 	cpl.u.bs_basic.cb_fn = cb_fn;
 	cpl.u.bs_basic.cb_arg = cb_arg;
 
@@ -6003,6 +6384,7 @@ spdk_bs_unload(struct spdk_blob_store *bs, spdk_bs_op_complete cb_fn, void *cb_a
 	}
 
 	/* Read super block */
+	/* [한국어] 현재 디스크 super를 읽어 와 검증 후 비트맵들을 차례로 기록한다. */
 	bs_sequence_read_dev(ctx->seq, ctx->super, bs_page_to_lba(bs, 0),
 			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
 			     bs_unload_read_super_cpl, ctx);
@@ -6059,6 +6441,15 @@ bs_set_super_read_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	bs_write_super(seq, ctx->bs, ctx->super, bs_set_super_write_cpl, ctx);
 }
 
+/*
+ * [한국어]
+ * spdk_bs_set_super - 사용자 진입점 blob을 super_blob으로 등록 (공개 API)
+ *
+ * @blobid: 진입점이 될 blob id (이미 존재해야 함)
+ *
+ * 디스크 super block에 super_blob 필드를 갱신해 다음 load 시에도 보존된다.
+ * 동작: super read → in-memory super 갱신 → super write → 콜백.
+ */
 void
 spdk_bs_set_super(struct spdk_blob_store *bs, spdk_blob_id blobid,
 		  spdk_bs_op_complete cb_fn, void *cb_arg)
@@ -6107,6 +6498,13 @@ spdk_bs_set_super(struct spdk_blob_store *bs, spdk_blob_id blobid,
 
 /* END spdk_bs_set_super */
 
+/*
+ * [한국어]
+ * spdk_bs_get_super - 등록된 super blob의 id를 즉시 반환 (공개 API)
+ *
+ * super blob은 사용자가 "이 blobstore의 진입점"으로 지정해 둔 특별한 blob.
+ * spdk_bs_set_super로 미리 등록되지 않았으면 -ENOENT.
+ */
 void
 spdk_bs_get_super(struct spdk_blob_store *bs,
 		  spdk_blob_op_with_id_complete cb_fn, void *cb_arg)
@@ -6118,18 +6516,27 @@ spdk_bs_get_super(struct spdk_blob_store *bs,
 	}
 }
 
+/* [한국어] cluster 크기 (bytes) — 동기 단순 getter. */
 uint64_t
 spdk_bs_get_cluster_size(struct spdk_blob_store *bs)
 {
 	return bs->cluster_sz;
 }
 
+/* [한국어] md page 크기 (bytes) — 보통 4 KiB. */
 uint64_t
 spdk_bs_get_page_size(struct spdk_blob_store *bs)
 {
 	return bs->md_page_size;
 }
 
+/*
+ * [한국어]
+ * spdk_bs_get_max_growable_size - grow 시 도달 가능한 최대 크기(bytes) 계산 (공개 API)
+ *
+ * spdk_bs_init 시점에 used_cluster_mask 영역을 max_used_cluster_mask_len 만큼 미리
+ * 예약했으므로, 그 mask가 표현 가능한 cluster 수의 상한을 역산해 돌려준다.
+ */
 uint64_t
 spdk_bs_get_max_growable_size(struct spdk_blob_store *bs)
 {
@@ -6148,24 +6555,34 @@ spdk_bs_get_max_growable_size(struct spdk_blob_store *bs)
 	return max_number_of_clusters * bs->cluster_sz;
 }
 
+/* [한국어] io_unit 크기 (bytes) — 가장 작은 IO 정렬 단위. */
 uint64_t
 spdk_bs_get_io_unit_size(struct spdk_blob_store *bs)
 {
 	return bs->io_unit_size;
 }
 
+/* [한국어] 현재 free cluster 수 (실시간). 사용자 IO와 race 가능 — 단순 통계 용도. */
 uint64_t
 spdk_bs_free_cluster_count(struct spdk_blob_store *bs)
 {
 	return bs->num_free_clusters;
 }
 
+/* [한국어] 데이터에 사용 가능한 총 cluster 수 (메타 영역 제외). */
 uint64_t
 spdk_bs_total_data_cluster_count(struct spdk_blob_store *bs)
 {
 	return bs->total_data_clusters;
 }
 
+/*
+ * [한국어]
+ * bs_register_md_thread - 메타 IO 전용 채널을 잡고 md_thread 사용 준비 완료 (static)
+ *
+ * spdk_bs_init/load의 콜백 체인 후반에 호출되어 bs->md_channel을 채운다.
+ * 채널은 thread-local이라 호출 시점의 thread가 곧 md_thread가 된다.
+ */
 static int
 bs_register_md_thread(struct spdk_blob_store *bs)
 {
@@ -6178,6 +6595,7 @@ bs_register_md_thread(struct spdk_blob_store *bs)
 	return 0;
 }
 
+/* [한국어] bs_register_md_thread의 역동작 — md 채널 ref 감소. */
 static int
 bs_unregister_md_thread(struct spdk_blob_store *bs)
 {
@@ -6186,6 +6604,7 @@ bs_unregister_md_thread(struct spdk_blob_store *bs)
 	return 0;
 }
 
+/* [한국어] blob의 id 반환 — 단순 getter (lockless 안전). */
 spdk_blob_id
 spdk_blob_get_id(struct spdk_blob *blob)
 {
@@ -6194,6 +6613,13 @@ spdk_blob_get_id(struct spdk_blob *blob)
 	return blob->id;
 }
 
+/*
+ * [한국어]
+ * spdk_blob_get_num_io_units - blob의 논리 크기를 io_unit 단위로 반환 (공개 API)
+ *
+ * 사용자에게 "이 blob의 size를 io_unit 단위로" 알리는 함수.
+ * thin blob에서도 active.num_clusters 기반 — 실제 할당량이 아니라 가상 크기.
+ */
 uint64_t
 spdk_blob_get_num_io_units(struct spdk_blob *blob)
 {
@@ -6202,6 +6628,7 @@ spdk_blob_get_num_io_units(struct spdk_blob *blob)
 	return bs_cluster_to_io_unit(blob->bs, blob->active.num_clusters);
 }
 
+/* [한국어] blob의 가상 cluster 수 (resize 가능). */
 uint64_t
 spdk_blob_get_num_clusters(struct spdk_blob *blob)
 {
@@ -6210,6 +6637,7 @@ spdk_blob_get_num_clusters(struct spdk_blob *blob)
 	return blob->active.num_clusters;
 }
 
+/* [한국어] thin blob에서 실제로 cluster가 할당된 수 (가상 num_clusters와 다름). */
 uint64_t
 spdk_blob_get_num_allocated_clusters(struct spdk_blob *blob)
 {
@@ -6218,6 +6646,13 @@ spdk_blob_get_num_allocated_clusters(struct spdk_blob *blob)
 	return blob->active.num_allocated_clusters;
 }
 
+/*
+ * [한국어]
+ * blob_find_io_unit - offset 이후 처음으로 is_allocated 상태가 매칭되는 io_unit 찾기 (static)
+ *
+ * thin blob의 cluster 단위로 점프하며 검색 — 할당/미할당은 cluster 단위로 결정되므로
+ * cluster boundary 단위로 건너뛰면 충분하다.
+ */
 static uint64_t
 blob_find_io_unit(struct spdk_blob *blob, uint64_t offset, bool is_allocated)
 {
@@ -6228,18 +6663,28 @@ blob_find_io_unit(struct spdk_blob *blob, uint64_t offset, bool is_allocated)
 			return offset;
 		}
 
-		offset += bs_num_io_units_to_cluster_boundary(blob, offset);
+		offset += bs_num_io_units_to_cluster_boundary(blob, offset); /* [한국어] 다음 cluster 경계로 점프 */
 	}
 
-	return UINT64_MAX;
+	return UINT64_MAX;                                 /* [한국어] 끝까지 못 찾음 */
 }
 
+/*
+ * [한국어]
+ * spdk_blob_get_next_allocated_io_unit - thin blob에서 다음 할당된 io_unit 찾기 (공개 API)
+ *
+ * shallow_copy/dump 등에서 "건너뛸 수 있는 hole"을 빠르게 탐색할 때 사용.
+ */
 uint64_t
 spdk_blob_get_next_allocated_io_unit(struct spdk_blob *blob, uint64_t offset)
 {
 	return blob_find_io_unit(blob, offset, true);
 }
 
+/*
+ * [한국어]
+ * spdk_blob_get_next_unallocated_io_unit - 다음 미할당 io_unit 찾기 (공개 API)
+ */
 uint64_t
 spdk_blob_get_next_unallocated_io_unit(struct spdk_blob *blob, uint64_t offset)
 {
@@ -6440,18 +6885,34 @@ error:
 	cb_fn(cb_arg, 0, rc);
 }
 
+/*
+ * [한국어]
+ * spdk_bs_create_blob - 옵션 없이 빈 blob 생성 (공개 API)
+ *
+ * 디폴트 옵션(0 cluster, thick=false, use_extent_table=true)으로 새 blob을 만든다.
+ * 비동기 콜백으로 spdk_blob_id를 돌려준다.
+ */
 void
 spdk_bs_create_blob(struct spdk_blob_store *bs,
 		    spdk_blob_op_with_id_complete cb_fn, void *cb_arg)
 {
-	bs_create_blob(bs, NULL, NULL, cb_fn, cb_arg);
+	bs_create_blob(bs, NULL, NULL, cb_fn, cb_arg);     /* [한국어] opts/xattrs NULL → bs_create_blob 디폴트 사용 */
 }
 
+/*
+ * [한국어]
+ * spdk_bs_create_blob_ext - 사용자 옵션과 함께 blob 생성 (공개 API)
+ *
+ * @opts: num_clusters, thin_provision, clear_method, xattrs 등 사용자 정의 옵션
+ *
+ * 내부 xattr는 사용하지 않는 외부 호출자 전용 진입점. snapshot/clone 같은 SPDK 내부
+ * 흐름은 bs_create_blob을 internal_xattrs와 함께 직접 호출한다.
+ */
 void
 spdk_bs_create_blob_ext(struct spdk_blob_store *bs, const struct spdk_blob_opts *opts,
 			spdk_blob_op_with_id_complete cb_fn, void *cb_arg)
 {
-	bs_create_blob(bs, opts, NULL, cb_fn, cb_arg);
+	bs_create_blob(bs, opts, NULL, cb_fn, cb_arg);     /* [한국어] internal_xattrs는 NULL */
 }
 
 /* END spdk_bs_create_blob */
@@ -6900,11 +7361,32 @@ bs_snapshot_origblob_open_cpl(void *cb_arg, struct spdk_blob *_blob, int bserrno
 }
 
 void
+/*
+ * [한국어]
+ * spdk_bs_create_snapshot - 기존 blob의 read-only 스냅샷을 생성 (공개 API)
+ *
+ * @bs:               blobstore
+ * @blobid:           스냅샷의 원본이 될 blob (data_ro/md_ro=false 여야 함)
+ * @snapshot_xattrs:  새 스냅샷에 부여할 사용자 xattr (옵션)
+ * @cb_fn:            완료 콜백 (cb_arg, new_snap_blobid, bserrno)
+ *
+ * 흐름 (단순화):
+ * 1) origblob open → bs_snapshot_origblob_open_cpl
+ * 2) 임시 SNAPSHOT_IN_PROGRESS xattr 부여 → 새 thin blob(snapshot) 생성
+ * 3) origblob의 IO를 freeze
+ * 4) cluster 매핑을 swap → origblob은 비어 있고 newblob이 데이터 보유
+ * 5) origblob의 부모를 newblob으로 변경, origblob에 BLOB_SNAPSHOT 내부 xattr 등록
+ * 6) 두 blob 모두 메타 sync 후 freeze 해제 → 사용자에게 new_snap_blobid 반환
+ *
+ * Snapshot의 핵심: 기존 blob의 데이터를 "이름만 바꿔" 새 blob에 옮기고, 원본은
+ * 새 blob을 부모로 가진 thin clone이 된다 (사용자에게는 데이터 그대로 보임).
+ */
+void
 spdk_bs_create_snapshot(struct spdk_blob_store *bs, spdk_blob_id blobid,
 			const struct spdk_blob_xattr_opts *snapshot_xattrs,
 			spdk_blob_op_with_id_complete cb_fn, void *cb_arg)
 {
-	struct spdk_clone_snapshot_ctx *ctx = calloc(1, sizeof(*ctx));
+	struct spdk_clone_snapshot_ctx *ctx = calloc(1, sizeof(*ctx)); /* [한국어] 콜백 체인 컨텍스트 */
 
 	if (!ctx) {
 		cb_fn(cb_arg, SPDK_BLOBID_INVALID, -ENOMEM);
@@ -6919,7 +7401,7 @@ spdk_bs_create_snapshot(struct spdk_blob_store *bs, spdk_blob_id blobid,
 	ctx->original.id = blobid;
 	ctx->xattrs = snapshot_xattrs;
 
-	spdk_bs_open_blob(bs, ctx->original.id, bs_snapshot_origblob_open_cpl, ctx);
+	spdk_bs_open_blob(bs, ctx->original.id, bs_snapshot_origblob_open_cpl, ctx); /* [한국어] origblob open으로 체인 시작 */
 }
 /* END spdk_bs_create_snapshot */
 
@@ -7009,6 +7491,22 @@ bs_clone_origblob_open_cpl(void *cb_arg, struct spdk_blob *_blob, int bserrno)
 		       bs_clone_newblob_create_cpl, ctx);
 }
 
+/*
+ * [한국어]
+ * spdk_bs_create_clone - read-only snapshot에서 새 thin clone 생성 (공개 API)
+ *
+ * @bs:           blobstore
+ * @blobid:       부모가 될 snapshot blob (data_ro && md_ro 여야 함)
+ * @clone_xattrs: 새 clone에 부여할 사용자 xattr (옵션)
+ * @cb_fn:        완료 콜백 (cb_arg, new_clone_blobid, bserrno)
+ *
+ * 흐름:
+ * 1) snapshot 부모 blob을 open → bs_clone_origblob_open_cpl
+ * 2) 부모와 같은 num_clusters / use_extent_table을 가진 thin blob 생성 (BLOB_SNAPSHOT 내부 xattr로 부모 id 기록)
+ * 3) clone 생성 후 부모 snapshot의 clone 리스트에 등록 → close
+ *
+ * Read 시 미할당 cluster는 부모 snapshot에서 가져온다 (back_bs_dev = blob_bs_dev(parent)).
+ */
 void
 spdk_bs_create_clone(struct spdk_blob_store *bs, spdk_blob_id blobid,
 		     const struct spdk_blob_xattr_opts *clone_xattrs,
@@ -7029,7 +7527,7 @@ spdk_bs_create_clone(struct spdk_blob_store *bs, spdk_blob_id blobid,
 	ctx->xattrs = clone_xattrs;
 	ctx->original.id = blobid;
 
-	spdk_bs_open_blob(bs, ctx->original.id, bs_clone_origblob_open_cpl, ctx);
+	spdk_bs_open_blob(bs, ctx->original.id, bs_clone_origblob_open_cpl, ctx); /* [한국어] 부모 open으로 체인 시작 */
 }
 
 /* END spdk_bs_create_clone */
@@ -7275,6 +7773,18 @@ bs_inflate_blob(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
 	spdk_bs_open_blob(bs, ctx->original.id, bs_inflate_blob_open_cpl, ctx);
 }
 
+/*
+ * [한국어]
+ * spdk_bs_inflate_blob - thin blob을 thick으로 변환 (모든 cluster 채움) (공개 API)
+ *
+ * @bs:      blobstore
+ * @channel: IO channel (할당된 cluster의 zero/copy IO 발사용)
+ * @blobid:  변환할 thin blob
+ * @cb_fn:   완료 콜백
+ *
+ * allocate_all=true: 미할당 cluster를 모두 새로 잡고, 부모에서 데이터를 복사 (또는 zero).
+ * 결과적으로 부모와의 의존이 사라져 BLOB_SNAPSHOT xattr이 제거되고 parent_id=INVALID로.
+ */
 void
 spdk_bs_inflate_blob(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
 		     spdk_blob_id blobid, spdk_blob_op_complete cb_fn, void *cb_arg)
@@ -7282,6 +7792,15 @@ spdk_bs_inflate_blob(struct spdk_blob_store *bs, struct spdk_io_channel *channel
 	bs_inflate_blob(bs, channel, blobid, true, cb_fn, cb_arg);
 }
 
+/*
+ * [한국어]
+ * spdk_bs_blob_decouple_parent - clone과 직속 부모 사이의 의존 끊기 (공개 API)
+ *
+ * @bs/channel/blobid/cb_fn/cb_arg: inflate와 동일
+ *
+ * allocate_all=false: 부모에 의존하던 cluster만 복사해 자기 cluster로 만들고, 부모를
+ * "할아버지"(grandparent)로 갱신한다 (부모는 더 이상 필요 없어 삭제 가능 상태가 됨).
+ */
 void
 spdk_bs_blob_decouple_parent(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
 			     spdk_blob_id blobid, spdk_blob_op_complete cb_fn, void *cb_arg)
@@ -7473,6 +7992,24 @@ blobstore block size\n", _blob->id);
 	bs_shallow_copy_cluster_find_next(ctx);
 }
 
+/*
+ * [한국어]
+ * spdk_bs_blob_shallow_copy - blob의 "할당된" cluster만 외부 bs_dev로 복사 (공개 API)
+ *
+ * @blob_id:        복사 원본 blob
+ * @ext_dev:        목적지 bs_dev (외부, blobstore 외부 매체일 수 있음)
+ * @status_cb_fn:   진행 상황 보고 콜백 (선택) — (ctx, copied_clusters, total_clusters)
+ * @cb_fn:          최종 완료 콜백
+ *
+ * 할당되지 않은 cluster는 건너뛰며, 할당된 cluster만 read 후 ext_dev에 write 한다.
+ * 이렇게 하면 thin blob의 실제 데이터만 효율적으로 외부로 export 가능 (예: 백업 시).
+ *
+ * 동작:
+ * 1) 컨텍스트와 cluster 크기의 read_buff 할당
+ * 2) ext_dev에 채널 생성
+ * 3) blob open → bs_shallow_copy_blob_open_cpl
+ * 4) bs_shallow_copy_cluster_find_next → 다음 할당 cluster를 찾아 read → write 반복
+ */
 int
 spdk_bs_blob_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
 			  spdk_blob_id blobid, struct spdk_bs_dev *ext_dev,
@@ -7707,6 +8244,16 @@ bs_set_parent_blob_open_cpl(void *cb_arg, struct spdk_blob *blob, int bserrno)
 	spdk_bs_open_blob(ctx->bs, ctx->parent.u.snapshot.id, bs_set_parent_snapshot_open_cpl, ctx);
 }
 
+/*
+ * [한국어]
+ * spdk_bs_blob_set_parent - 기존 blob의 부모를 다른 snapshot으로 재지정 (공개 API)
+ *
+ * @blob_id:     thin blob (대상)
+ * @snapshot_id: 새 부모 snapshot
+ *
+ * 사전 조건: blob은 thin이어야 하고, blob_id != snapshot_id, 이미 같은 부모면 -EEXIST.
+ * 흐름: blob open → snapshot open → 부모 list 갱신 + back_bs_dev 교체 → sync_md.
+ */
 void
 spdk_bs_blob_set_parent(struct spdk_blob_store *bs, spdk_blob_id blob_id,
 			spdk_blob_id snapshot_id, spdk_blob_op_complete cb_fn, void *cb_arg)
@@ -7880,6 +8427,21 @@ error:
 	spdk_blob_close(blob, bs_set_external_parent_cleanup_finish, ctx);
 }
 
+/*
+ * [한국어]
+ * spdk_bs_blob_set_external_parent - blob에 외부 snapshot(esnap)을 부모로 지정 (공개 API)
+ *
+ * @blob_id:       대상 blob (thin)
+ * @esnap_bs_dev:  새 부모가 될 외부 bs_dev (사이즈는 cluster_sz의 배수여야 함)
+ * @esnap_id:      외부 부모를 식별하는 사용자 정의 id (디스크 xattr로 영속화)
+ * @esnap_id_len:  esnap_id 길이
+ *
+ * blob의 invalid_flags에 EXTERNAL_SNAPSHOT 비트를 켜고, BLOB_EXTERNAL_SNAPSHOT_ID 내부
+ * xattr로 식별 정보를 저장. back_bs_dev는 esnap_bs_dev로 교체.
+ *
+ * 활용: 다른 blobstore의 snapshot 또는 readonly 외부 데이터를 이 blob의 부모로 만들어
+ * thin clone처럼 활용 (export/import 시나리오).
+ */
 void
 spdk_bs_blob_set_external_parent(struct spdk_blob_store *bs, spdk_blob_id blob_id,
 				 struct spdk_bs_dev *esnap_bs_dev, const void *esnap_id,
@@ -7974,26 +8536,42 @@ bs_resize_freeze_cpl(void *cb_arg, int rc)
 	blob_unfreeze_io(ctx->blob, bs_resize_unfreeze_cpl, ctx);
 }
 
+/*
+ * [한국어]
+ * spdk_blob_resize - blob의 cluster 수를 변경 (확장 또는 축소) (공개 API)
+ *
+ * @blob:  대상 blob
+ * @sz:    새 cluster 수 (0이면 빈 blob)
+ * @cb_fn: 완료 콜백
+ *
+ * 동작:
+ * 1) md_ro면 -EPERM, 변경 없으면 즉시 0 반환, 다른 작업 진행 중이면 -EBUSY
+ * 2) blob_freeze_io로 진행 중인 IO 모두 멈춤
+ * 3) blob_resize로 클러스터 배열 확장/축소 (thin: 매핑 슬롯만 늘림, thick: 즉시 cluster 할당)
+ * 4) 완료 후 blob_unfreeze_io → 사용자 콜백
+ *
+ * 주의: 새 크기는 메모리에만 반영 — 디스크 영속화는 spdk_blob_sync_md를 따로 호출해야 한다.
+ */
 void
 spdk_blob_resize(struct spdk_blob *blob, uint64_t sz, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
 	struct spdk_bs_resize_ctx *ctx;
 
-	blob_verify_md_op(blob);
+	blob_verify_md_op(blob);                           /* [한국어] md_thread 강제 */
 
 	SPDK_DEBUGLOG(blob, "Resizing blob 0x%" PRIx64 " to %" PRIu64 " clusters\n", blob->id, sz);
 
-	if (blob->md_ro) {
+	if (blob->md_ro) {                                 /* [한국어] read-only blob은 변경 거부 */
 		cb_fn(cb_arg, -EPERM);
 		return;
 	}
 
-	if (sz == blob->active.num_clusters) {
+	if (sz == blob->active.num_clusters) {             /* [한국어] 동일 크기면 no-op */
 		cb_fn(cb_arg, 0);
 		return;
 	}
 
-	if (blob->locked_operation_in_progress) {
+	if (blob->locked_operation_in_progress) {          /* [한국어] 동시 작업 충돌 회피 */
 		cb_fn(cb_arg, -EBUSY);
 		return;
 	}
@@ -8004,12 +8582,12 @@ spdk_blob_resize(struct spdk_blob *blob, uint64_t sz, spdk_blob_op_complete cb_f
 		return;
 	}
 
-	blob->locked_operation_in_progress = true;
+	blob->locked_operation_in_progress = true;         /* [한국어] resize 동안 다른 op 차단 */
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
 	ctx->blob = blob;
 	ctx->sz = sz;
-	blob_freeze_io(blob, bs_resize_freeze_cpl, ctx);
+	blob_freeze_io(blob, bs_resize_freeze_cpl, ctx);   /* [한국어] IO freeze → bs_resize_freeze_cpl에서 실제 resize */
 }
 
 /* END spdk_blob_resize */
@@ -8596,6 +9174,22 @@ bs_delete_open_cpl(void *cb_arg, struct spdk_blob *blob, int bserrno)
 	}
 }
 
+/*
+ * [한국어]
+ * spdk_bs_delete_blob - blob을 영구 삭제 (공개 API)
+ *
+ * @bs:     blobstore
+ * @blobid: 삭제할 blob (다른 곳에서 열려 있으면 -EBUSY)
+ * @cb_fn:  완료 콜백
+ *
+ * 삭제 흐름:
+ * 1) bs_open_blob → bs_delete_open_cpl
+ * 2) bs_is_blob_deletable: snapshot이고 clone이 있는지 → 있다면 clone들을 부모로 갱신
+ * 3) cluster/extent_page를 모두 free, used_blobids/md_pages 비트 OFF
+ * 4) blob_persist로 디스크 메타 정리 → 사용자 콜백
+ *
+ * 실행 컨텍스트: md_thread (assert로 강제).
+ */
 void
 spdk_bs_delete_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
 		    spdk_blob_op_complete cb_fn, void *cb_arg)
@@ -8605,7 +9199,7 @@ spdk_bs_delete_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
 
 	SPDK_DEBUGLOG(blob, "Deleting blob 0x%" PRIx64 "\n", blobid);
 
-	assert(spdk_get_thread() == bs->md_thread);
+	assert(spdk_get_thread() == bs->md_thread);        /* [한국어] md_thread 강제 */
 
 	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
 	cpl.u.blob_basic.cb_fn = cb_fn;
@@ -8617,7 +9211,7 @@ spdk_bs_delete_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
 		return;
 	}
 
-	spdk_bs_open_blob(bs, blobid, bs_delete_open_cpl, seq);
+	spdk_bs_open_blob(bs, blobid, bs_delete_open_cpl, seq); /* [한국어] open 후 bs_delete_open_cpl로 진행 */
 }
 
 /* END spdk_bs_delete_blob */
@@ -8737,13 +9331,33 @@ bs_open_blob(struct spdk_blob_store *bs,
 	blob_load(seq, blob, bs_open_blob_cpl, blob);
 }
 
+/*
+ * [한국어]
+ * spdk_bs_open_blob - blobid로 blob을 열어 핸들 획득 (공개 API)
+ *
+ * @bs:     blobstore
+ * @blobid: 열고자 하는 blob id (used_blobids에 등록되어 있어야 함)
+ * @cb_fn:  완료 콜백 (cb_arg, struct spdk_blob*, bserrno)
+ *
+ * 이미 열려 있는 blob이면 ref count만 증가시키고 즉시 콜백 (open이 idempotent).
+ * 처음 여는 경우엔 blob_alloc → blob_load(메타 read) → bs_open_blob_cpl 체인으로
+ * RB tree에 등록한다.
+ *
+ * 실행 컨텍스트: md_thread (assert로 강제).
+ */
 void
 spdk_bs_open_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
 		  spdk_blob_op_with_handle_complete cb_fn, void *cb_arg)
 {
-	bs_open_blob(bs, blobid, NULL, cb_fn, cb_arg);
+	bs_open_blob(bs, blobid, NULL, cb_fn, cb_arg);     /* [한국어] opts NULL = 디폴트 */
 }
 
+/*
+ * [한국어]
+ * spdk_bs_open_blob_ext - 옵션과 함께 blob 열기 (공개 API)
+ *
+ * @opts: clear_method, esnap_ctx 등. esnap clone을 열 때는 esnap_ctx로 부모 bs_dev 매핑.
+ */
 void
 spdk_bs_open_blob_ext(struct spdk_blob_store *bs, spdk_blob_id blobid,
 		      struct spdk_blob_open_opts *opts, spdk_blob_op_with_handle_complete cb_fn, void *cb_arg)
@@ -8754,14 +9368,21 @@ spdk_bs_open_blob_ext(struct spdk_blob_store *bs, spdk_blob_id blobid,
 /* END spdk_bs_open_blob */
 
 /* START spdk_blob_set_read_only */
+/*
+ * [한국어]
+ * spdk_blob_set_read_only - blob을 read-only 플래그로 표시 (공개 API)
+ *
+ * 이후 sync_md 호출에서 디스크에 영속화되며, sync 완료 콜백(blob_sync_md_cpl)에서
+ * data_ro=true 가 적용된다. set 후엔 write 시도가 실패한다.
+ */
 int
 spdk_blob_set_read_only(struct spdk_blob *blob)
 {
 	blob_verify_md_op(blob);
 
-	blob->data_ro_flags |= SPDK_BLOB_READ_ONLY;
+	blob->data_ro_flags |= SPDK_BLOB_READ_ONLY;       /* [한국어] 영속 플래그 비트 ON */
 
-	blob->state = SPDK_BLOB_STATE_DIRTY;
+	blob->state = SPDK_BLOB_STATE_DIRTY;               /* [한국어] sync 대상 */
 	return 0;
 }
 /* END spdk_blob_set_read_only */
@@ -8800,6 +9421,19 @@ blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
 	blob_persist(seq, blob, blob_sync_md_cpl, blob);
 }
 
+/*
+ * [한국어]
+ * spdk_blob_sync_md - blob의 in-memory 메타를 디스크에 영속화 (공개 API)
+ *
+ * @blob:  대상 blob
+ * @cb_fn: 완료 콜백
+ *
+ * resize/xattr 변경 등 메타 변경 후에 호출되어 변경 내용을 superblock의 md page에 기록한다.
+ * md_ro blob은 sync 자체가 의미 없음 — 즉시 0 반환.
+ *
+ * 내부적으로 blob_persist를 호출 — 이는 dirty/clean 상태 차이를 비교해 변경된 페이지만
+ * 디스크에 쓰는 핵심 영속화 함수.
+ */
 void
 spdk_blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
@@ -8813,7 +9447,7 @@ spdk_blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_
 		return;
 	}
 
-	blob_sync_md(blob, cb_fn, cb_arg);
+	blob_sync_md(blob, cb_fn, cb_arg);                 /* [한국어] 실제 비동기 sync 시작 */
 }
 
 /* END spdk_blob_sync_md */
@@ -9138,17 +9772,36 @@ blob_close_esnap_done(void *cb_arg, struct spdk_blob *blob, int bserrno)
 	blob_persist(seq, blob, blob_close_cpl, blob);
 }
 
+/*
+ * [한국어]
+ * spdk_blob_close - blob ref 감소 / 마지막 닫기 시 메타 sync 후 자원 해제 (공개 API)
+ *
+ * @blob:   닫을 blob 핸들 (open_ref > 0이어야 함)
+ * @cb_fn:  완료 콜백
+ *
+ * - open_ref == 0 → -EBADF (이미 닫힌 핸들).
+ * - 마지막 close (이후 ref 0) + esnap clone:
+ *     먼저 esnap 채널들을 모두 파괴한 뒤 (blob_esnap_destroy_bs_dev_channels) 메타 sync.
+ * - 그 외: 곧바로 blob_persist → blob_close_cpl → ref 감소·필요 시 RB tree에서 제거.
+ *
+ * 실행 컨텍스트: md_thread (blob_verify_md_op로 강제).
+ *
+ * 호출 체인:
+ *   spdk_blob_close → bs_sequence_start_bs
+ *     → (esnap?) blob_esnap_destroy_bs_dev_channels → blob_close_esnap_done → blob_persist
+ *     → blob_close_cpl (ref 감소, RB remove)
+ */
 void
 spdk_blob_close(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
 	struct spdk_bs_cpl	cpl;
 	spdk_bs_sequence_t	*seq;
 
-	blob_verify_md_op(blob);
+	blob_verify_md_op(blob);                           /* [한국어] md_thread 강제 */
 
 	SPDK_DEBUGLOG(blob, "Closing blob 0x%" PRIx64 "\n", blob->id);
 
-	if (blob->open_ref == 0) {
+	if (blob->open_ref == 0) {                         /* [한국어] 이미 닫힌 blob — bad fd */
 		cb_fn(cb_arg, -EBADF);
 		return;
 	}
@@ -9163,29 +9816,54 @@ spdk_blob_close(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_ar
 		return;
 	}
 
+	/* [한국어] 마지막 ref + esnap → 채널 파괴 후 sync. esnap 채널이 아직 살아 있으면
+	 * blob 메타가 disk에 가기 전에 backing dev IO가 진행 중일 수 있어 위험. */
 	if (blob->open_ref == 1 && blob_is_esnap_clone(blob)) {
 		blob_esnap_destroy_bs_dev_channels(blob, false, blob_close_esnap_done, seq);
 		return;
 	}
 
 	/* Sync metadata */
-	blob_persist(seq, blob, blob_close_cpl, blob);
+	blob_persist(seq, blob, blob_close_cpl, blob);     /* [한국어] 일반 close 경로 */
 }
 
 /* END spdk_blob_close */
 
+/*
+ * [한국어]
+ * spdk_bs_alloc_io_channel - blobstore에 대한 IO 채널 획득 (공개 API)
+ *
+ * 내부적으로 spdk_get_io_channel(bs) — SPDK io channel 인프라가 thread-local 캐시에서
+ * 채널을 만들어 준다. 채널은 thread 단위로 1개씩 caching된다.
+ */
 struct spdk_io_channel *spdk_bs_alloc_io_channel(struct spdk_blob_store *bs)
 {
 	return spdk_get_io_channel(bs);
 }
 
+/*
+ * [한국어]
+ * spdk_bs_free_io_channel - 위에서 잡은 IO 채널 해제 (공개 API)
+ *
+ * 채널이 esnap 채널 캐시(RB tree)를 가지고 있을 수 있으므로 먼저 그것들을 모두 파괴한 후
+ * spdk_put_io_channel로 ref 감소.
+ */
 void
 spdk_bs_free_io_channel(struct spdk_io_channel *channel)
 {
-	blob_esnap_destroy_bs_channel(spdk_io_channel_get_ctx(channel));
-	spdk_put_io_channel(channel);
+	blob_esnap_destroy_bs_channel(spdk_io_channel_get_ctx(channel)); /* [한국어] esnap 채널 정리 */
+	spdk_put_io_channel(channel);                      /* [한국어] ref 감소 (0이면 진짜 해제) */
 }
 
+/*
+ * [한국어]
+ * spdk_blob_io_unmap - blob 영역 [offset, offset+length) io_unit를 invalid화 (공개 API)
+ *
+ * @offset/length: io_unit 단위 (cluster 아님 — io_unit은 블록 단위 가장 작은 IO).
+ *
+ * 경계 cluster를 통째로 unmap할 수 있으면 cluster를 free 시키며 그 외 영역은 backing
+ * dev에 unmap (NVMe Deallocate / SCSI UNMAP)을 위임한다.
+ */
 void
 spdk_blob_io_unmap(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		   uint64_t offset, uint64_t length, spdk_blob_op_complete cb_fn, void *cb_arg)
@@ -9194,6 +9872,13 @@ spdk_blob_io_unmap(struct spdk_blob *blob, struct spdk_io_channel *channel,
 			       SPDK_BLOB_UNMAP);
 }
 
+/*
+ * [한국어]
+ * spdk_blob_io_write_zeroes - blob 영역 [offset, offset+length)을 0으로 채움 (공개 API)
+ *
+ * write_zeroes는 NVMe Write Zeroes 명령(payload를 보내지 않는 효율적 방법)으로 처리.
+ * thin blob의 경우 cluster가 아직 할당되지 않은 영역은 그대로 두고, 할당된 영역만 0 처리.
+ */
 void
 spdk_blob_io_write_zeroes(struct spdk_blob *blob, struct spdk_io_channel *channel,
 			  uint64_t offset, uint64_t length, spdk_blob_op_complete cb_fn, void *cb_arg)
@@ -9202,6 +9887,19 @@ spdk_blob_io_write_zeroes(struct spdk_blob *blob, struct spdk_io_channel *channe
 			       SPDK_BLOB_WRITE_ZEROES);
 }
 
+/*
+ * [한국어]
+ * spdk_blob_io_write - 단일 payload 버퍼 → blob의 [offset, length) 영역에 비동기 쓰기
+ *
+ * @payload: DMA-가능 버퍼 (io_unit 정렬). 사용자가 spdk_dma_zmalloc 등으로 미리 마련해야 함.
+ * @offset/length: io_unit 단위.
+ *
+ * 동작 단계 (blob_request_submit_op 내부):
+ * 1) IO를 cluster 경계로 split 가능하면 split.
+ * 2) cluster가 비어 있고 thin이면 새 cluster 할당 (md_thread로 우회).
+ * 3) snapshot/clone이라면 COW: 부모에서 cluster 전체를 read 후 새 cluster에 merge write.
+ * 4) backing bs_dev->writev 발사 → 완료 시 사용자 cb_fn.
+ */
 void
 spdk_blob_io_write(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		   void *payload, uint64_t offset, uint64_t length,
@@ -9211,6 +9909,14 @@ spdk_blob_io_write(struct spdk_blob *blob, struct spdk_io_channel *channel,
 			       SPDK_BLOB_WRITE);
 }
 
+/*
+ * [한국어]
+ * spdk_blob_io_read - blob의 [offset, length) 영역을 payload로 읽기 (공개 API)
+ *
+ * thin blob에서 매핑되지 않은 영역은:
+ *   - 부모 snapshot이 있으면 부모 bs_dev에서 read
+ *   - 부모도 없거나 esnap이고 부모 없음 → zero-fill (zeroes_bs_dev가 자동 처리)
+ */
 void
 spdk_blob_io_read(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		  void *payload, uint64_t offset, uint64_t length,
@@ -9220,6 +9926,12 @@ spdk_blob_io_read(struct spdk_blob *blob, struct spdk_io_channel *channel,
 			       SPDK_BLOB_READ);
 }
 
+/*
+ * [한국어]
+ * spdk_blob_io_writev - iovec(scatter) 입력으로 blob 쓰기 (공개 API)
+ *
+ * blob_request_submit_rw_iov 가 read=false 로 호출되어 split/COW/매핑 처리를 거친다.
+ */
 void
 spdk_blob_io_writev(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		    struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
@@ -9228,6 +9940,12 @@ spdk_blob_io_writev(struct spdk_blob *blob, struct spdk_io_channel *channel,
 	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, false, NULL);
 }
 
+/*
+ * [한국어]
+ * spdk_blob_io_readv - iovec(gather) 입력으로 blob 읽기 (공개 API)
+ *
+ * read=true 분기 — payload split 없는 직접 매핑이 가능하면 곧장 backing dev->readv.
+ */
 void
 spdk_blob_io_readv(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		   struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
@@ -9236,6 +9954,12 @@ spdk_blob_io_readv(struct spdk_blob *blob, struct spdk_io_channel *channel,
 	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, true, NULL);
 }
 
+/*
+ * [한국어]
+ * spdk_blob_io_writev_ext - 메타옵션 동반 writev (공개 API)
+ *
+ * @io_opts: ext_io_opts(메타데이터/encryption ctx 등). 일부 backing bs_dev이 사용한다.
+ */
 void
 spdk_blob_io_writev_ext(struct spdk_blob *blob, struct spdk_io_channel *channel,
 			struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
@@ -9245,6 +9969,10 @@ spdk_blob_io_writev_ext(struct spdk_blob *blob, struct spdk_io_channel *channel,
 				   io_opts);
 }
 
+/*
+ * [한국어]
+ * spdk_blob_io_readv_ext - 메타옵션 동반 readv (공개 API)
+ */
 void
 spdk_blob_io_readv_ext(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		       struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
@@ -9288,6 +10016,23 @@ bs_iter_cpl(void *cb_arg, struct spdk_blob *_blob, int bserrno)
 	spdk_bs_open_blob(bs, id, bs_iter_cpl, ctx);
 }
 
+/*
+ * [한국어]
+ * spdk_bs_iter_first - blobstore의 첫 번째 blob을 열어 콜백으로 반환 (공개 API)
+ *
+ * @bs:    blobstore
+ * @cb_fn: 각 blob에 대해 호출 — (cb_arg, blob, 0=정상). 더 없으면 (NULL, -ENOENT).
+ *
+ * 사용 패턴 (모든 blob 순회):
+ *   spdk_bs_iter_first(bs, my_cb, NULL);
+ *   void my_cb(void *_, struct spdk_blob *b, int err) {
+ *     if (err) return;
+ *     // b 사용 후
+ *     spdk_bs_iter_next(bs, b, my_cb, NULL);
+ *   }
+ *
+ * 동작: page_num=-1 부터 시작해 used_blobids 비트맵에서 다음 set bit를 찾아 그 blob을 open.
+ */
 void
 spdk_bs_iter_first(struct spdk_blob_store *bs,
 		   spdk_blob_op_with_handle_complete cb_fn, void *cb_arg)
@@ -9300,22 +10045,35 @@ spdk_bs_iter_first(struct spdk_blob_store *bs,
 		return;
 	}
 
-	ctx->page_num = -1;
+	ctx->page_num = -1;                                /* [한국어] iter_cpl이 +1 증가시켜 0부터 검색 */
 	ctx->bs = bs;
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
 
-	bs_iter_cpl(ctx, NULL, -1);
+	bs_iter_cpl(ctx, NULL, -1);                        /* [한국어] err=-1로 초기 진입 → 다음 검색 분기 */
 }
 
+/*
+ * [한국어]
+ * bs_iter_close_cpl - 이전 blob close 후 다음 검색 시작 (static helper)
+ */
 static void
 bs_iter_close_cpl(void *cb_arg, int bserrno)
 {
 	struct spdk_bs_iter_ctx *ctx = cb_arg;
 
-	bs_iter_cpl(ctx, NULL, -1);
+	bs_iter_cpl(ctx, NULL, -1);                        /* [한국어] err=-1 = "다음으로" 신호 */
 }
 
+/*
+ * [한국어]
+ * spdk_bs_iter_next - 현재 blob을 close하고 다음 blob을 열어 콜백 (공개 API)
+ *
+ * @blob:  현재 사용 중이던 blob (close됨)
+ *
+ * 호출 시 현재 blob의 페이지 번호를 기준으로 used_blobids에서 다음 set bit를 찾아
+ * 새 ctx로 콜백 체인을 이어간다. 핵심은 "iter는 동시에 한 blob만 잡는다"는 protocol.
+ */
 void
 spdk_bs_iter_next(struct spdk_blob_store *bs, struct spdk_blob *blob,
 		  spdk_blob_op_with_handle_complete cb_fn, void *cb_arg)
@@ -9336,7 +10094,7 @@ spdk_bs_iter_next(struct spdk_blob_store *bs, struct spdk_blob *blob,
 	ctx->cb_arg = cb_arg;
 
 	/* Close the existing blob */
-	spdk_blob_close(blob, bs_iter_close_cpl, ctx);
+	spdk_blob_close(blob, bs_iter_close_cpl, ctx);     /* [한국어] close 완료 후 다음 검색 */
 }
 
 static int
@@ -9412,6 +10170,16 @@ blob_set_xattr(struct spdk_blob *blob, const char *name, const void *value,
 	return 0;
 }
 
+/*
+ * [한국어]
+ * spdk_blob_set_xattr - 사용자 xattr 설정 (또는 갱신) (공개 API)
+ *
+ * @name:      xattr 이름 (NULL 종료 문자열, 디스크에 그대로 저장됨)
+ * @value:     값 버퍼 (내부에서 복사됨)
+ * @value_len: 값 길이 (uint16_t — 디스크 메타 포맷 한계)
+ *
+ * blob의 state를 DIRTY로 만들고 in-memory xattr 리스트에 삽입. 영속화는 따로 sync_md 필요.
+ */
 int
 spdk_blob_set_xattr(struct spdk_blob *blob, const char *name, const void *value,
 		    uint16_t value_len)
@@ -9451,6 +10219,12 @@ blob_remove_xattr(struct spdk_blob *blob, const char *name, bool internal)
 	return -ENOENT;
 }
 
+/*
+ * [한국어]
+ * spdk_blob_remove_xattr - 사용자 xattr 제거 (공개 API)
+ *
+ * 내부 xattr (SPDK 자체 메타)은 제거 불가 — internal=false 고정.
+ */
 int
 spdk_blob_remove_xattr(struct spdk_blob *blob, const char *name)
 {
@@ -9476,6 +10250,13 @@ blob_get_xattr_value(struct spdk_blob *blob, const char *name,
 	return -ENOENT;
 }
 
+/*
+ * [한국어]
+ * spdk_blob_get_xattr_value - 사용자 xattr 값 조회 (공개 API)
+ *
+ * @value:     (out) 내부 버퍼 포인터 (free 금지). blob 수명 동안 유효.
+ * @value_len: (out) 값 길이
+ */
 int
 spdk_blob_get_xattr_value(struct spdk_blob *blob, const char *name,
 			  const void **value, size_t *value_len)
@@ -9512,6 +10293,15 @@ blob_get_xattr_names(struct spdk_xattr_tailq *xattrs, struct spdk_xattr_names **
 	return 0;
 }
 
+/*
+ * [한국어]
+ * spdk_blob_get_xattr_names - blob의 사용자 xattr 이름 목록 획득 (공개 API)
+ *
+ * @names: (out) 새로 할당된 spdk_xattr_names — 사용 후 spdk_xattr_names_free로 해제 필수.
+ *
+ * 동적 할당된 names 배열은 blob의 xattr 포인터를 그대로 가리키므로 blob이 close되지
+ * 않은 동안에만 유효.
+ */
 int
 spdk_blob_get_xattr_names(struct spdk_blob *blob, struct spdk_xattr_names **names)
 {
@@ -9520,6 +10310,7 @@ spdk_blob_get_xattr_names(struct spdk_blob *blob, struct spdk_xattr_names **name
 	return blob_get_xattr_names(&blob->xattrs, names);
 }
 
+/* [한국어] xattr 이름 배열의 항목 수 반환 (공개 API). */
 uint32_t
 spdk_xattr_names_get_count(struct spdk_xattr_names *names)
 {
@@ -9528,6 +10319,7 @@ spdk_xattr_names_get_count(struct spdk_xattr_names *names)
 	return names->count;
 }
 
+/* [한국어] index번째 이름 반환 (범위 초과 시 NULL) (공개 API). */
 const char *
 spdk_xattr_names_get_name(struct spdk_xattr_names *names, uint32_t index)
 {
@@ -9538,24 +10330,33 @@ spdk_xattr_names_get_name(struct spdk_xattr_names *names, uint32_t index)
 	return names->names[index];
 }
 
+/* [한국어] spdk_blob_get_xattr_names 결과 해제 (공개 API). */
 void
 spdk_xattr_names_free(struct spdk_xattr_names *names)
 {
 	free(names);
 }
 
+/* [한국어] blobstore 식별 태그(bstype) 반환 — init 시 지정한 16바이트 사용자 식별자. */
 struct spdk_bs_type
 spdk_bs_get_bstype(struct spdk_blob_store *bs)
 {
 	return bs->bstype;
 }
 
+/* [한국어] bstype 변경 — 다음 unload 시 super에 영속화됨. */
 void
 spdk_bs_set_bstype(struct spdk_blob_store *bs, struct spdk_bs_type bstype)
 {
 	memcpy(&bs->bstype, &bstype, sizeof(bstype));
 }
 
+/*
+ * [한국어]
+ * spdk_blob_is_read_only - 데이터 또는 메타 RO 여부 (공개 API)
+ *
+ * snapshot blob은 둘 다 true. read-only로 set 된 blob도 true.
+ */
 bool
 spdk_blob_is_read_only(struct spdk_blob *blob)
 {
@@ -9563,6 +10364,12 @@ spdk_blob_is_read_only(struct spdk_blob *blob)
 	return (blob->data_ro || blob->md_ro);
 }
 
+/*
+ * [한국어]
+ * spdk_blob_is_snapshot - blob이 snapshot 인지 검사 (공개 API)
+ *
+ * snapshots 리스트에 등록되어 있으면 snapshot. 등록은 spdk_bs_create_snapshot 흐름에서.
+ */
 bool
 spdk_blob_is_snapshot(struct spdk_blob *blob)
 {
@@ -9578,6 +10385,12 @@ spdk_blob_is_snapshot(struct spdk_blob *blob)
 	return true;
 }
 
+/*
+ * [한국어]
+ * spdk_blob_is_clone - blob이 다른 blob의 clone (esnap 제외) 인지 (공개 API)
+ *
+ * parent_id가 유효하고 EXTERNAL_SNAPSHOT이 아니면 일반 clone. clone은 항상 thin이다.
+ */
 bool
 spdk_blob_is_clone(struct spdk_blob *blob)
 {
@@ -9592,6 +10405,7 @@ spdk_blob_is_clone(struct spdk_blob *blob)
 	return false;
 }
 
+/* [한국어] thin provision 플래그 검사 — 미할당 cluster가 zero/parent에서 채워짐. */
 bool
 spdk_blob_is_thin_provisioned(struct spdk_blob *blob)
 {
@@ -9599,6 +10413,7 @@ spdk_blob_is_thin_provisioned(struct spdk_blob *blob)
 	return !!(blob->invalid_flags & SPDK_BLOB_THIN_PROV);
 }
 
+/* [한국어] esnap clone(외부 snapshot이 부모) 여부 — invalid_flags의 EXTERNAL_SNAPSHOT 비트. */
 bool
 spdk_blob_is_esnap_clone(const struct spdk_blob *blob)
 {
@@ -9626,6 +10441,13 @@ blob_update_clear_method(struct spdk_blob *blob)
 	}
 }
 
+/*
+ * [한국어]
+ * spdk_blob_get_parent_snapshot - blob_id의 직속 snapshot 부모 id를 반환 (공개 API)
+ *
+ * snapshots 리스트 전체를 순회하며 각 snapshot의 clones 리스트에서 blob_id를 찾는다.
+ * 부모가 없거나 esnap clone이면 SPDK_BLOBID_INVALID 반환.
+ */
 spdk_blob_id
 spdk_blob_get_parent_snapshot(struct spdk_blob_store *bs, spdk_blob_id blob_id)
 {
@@ -9643,6 +10465,17 @@ spdk_blob_get_parent_snapshot(struct spdk_blob_store *bs, spdk_blob_id blob_id)
 	return SPDK_BLOBID_INVALID;
 }
 
+/*
+ * [한국어]
+ * spdk_blob_get_clones - 주어진 snapshot의 자식 clone id 목록 반환 (공개 API)
+ *
+ * @ids:   (in/out) 사용자 제공 버퍼
+ * @count: (in/out) in=버퍼 크기, out=실제 clone 수
+ * @return: 0 성공, -ENOMEM 버퍼 부족 (이때 *count에 필요한 크기 채움)
+ *
+ * 첫 호출에서 ids=NULL/count=0으로 호출해 필요한 크기를 받은 뒤 두 번째 호출로
+ * 채우는 패턴을 권장.
+ */
 int
 spdk_blob_get_clones(struct spdk_blob_store *bs, spdk_blob_id blobid, spdk_blob_id *ids,
 		     size_t *count)
@@ -9964,6 +10797,22 @@ bs_grow_live_load_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	bs_write_super(seq, ctx->bs, ctx->super, bs_grow_live_super_write_cpl, ctx);
 }
 
+/*
+ * [한국어]
+ * spdk_bs_grow_live - 마운트된 blobstore의 backing dev 확장을 즉시 반영 (공개 API)
+ *
+ * @bs:    이미 load된 blobstore (재시작 없이 그 자리에서 cluster 확장)
+ * @cb_fn: 완료 콜백
+ *
+ * 사용 사례: lvol/bdev 사이즈가 늘어났을 때 blobstore가 새 cluster를 인식하게 한다.
+ * 동작:
+ * 1) super를 다시 read
+ * 2) 새 dev_size 기반 used_cluster_mask 길이 재계산 (init 시 max 영역 안에 있어야 함)
+ * 3) super clean=0 표시 후 super write → spdk_bs_grow_live_super_write_cpl 체인
+ * 4) used_cluster bit_pool/bit_array를 확장 → 새 cluster들을 free로 마킹 → super write
+ *
+ * 실행 컨텍스트: md_thread (assert).
+ */
 void
 spdk_bs_grow_live(struct spdk_blob_store *bs,
 		  spdk_bs_op_complete cb_fn, void *cb_arg)
@@ -10008,6 +10857,16 @@ spdk_bs_grow_live(struct spdk_blob_store *bs,
 			     bs_grow_live_load_super_cpl, ctx);
 }
 
+/*
+ * [한국어]
+ * spdk_bs_grow - load + grow를 한 번에 (offline grow) (공개 API)
+ *
+ * @dev: 새 크기로 늘어난 backing bs_dev (이전엔 load된 적 없거나 unload된 상태여야 함)
+ *
+ * spdk_bs_load와 거의 같지만, super read 후 grow 처리(used_cluster mask 확장)를 거쳐
+ * 새 cluster들을 사용 가능하게 만든 뒤 사용자에게 핸들 반환. 재시작 직후의 grow
+ * 시나리오에 적합.
+ */
 void
 spdk_bs_grow(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	     spdk_bs_op_with_handle_complete cb_fn, void *cb_arg)
@@ -10069,6 +10928,16 @@ spdk_bs_grow(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 			     bs_grow_load_super_cpl, ctx);
 }
 
+/*
+ * [한국어]
+ * spdk_blob_get_esnap_id - esnap clone의 외부 snapshot id를 반환 (공개 API)
+ *
+ * @id:  (out) BLOB_EXTERNAL_SNAPSHOT_ID 내부 xattr 값 포인터 (free 금지)
+ * @len: (out) 값 길이
+ * @return: 0 성공, -EINVAL esnap clone이 아님
+ *
+ * id의 의미는 사용자(esnap_bs_dev_create 콜백)가 정의 — 보통 부모 lvol id 등.
+ */
 int
 spdk_blob_get_esnap_id(struct spdk_blob *blob, const void **id, size_t *len)
 {
@@ -10334,6 +11203,20 @@ blob_set_back_bs_dev_frozen(void *_ctx, int bserrno)
 	blob_esnap_destroy_bs_dev_channels(blob, true, blob_frozen_set_back_bs_dev, ctx);
 }
 
+/*
+ * [한국어]
+ * spdk_blob_set_esnap_bs_dev - esnap clone의 backing bs_dev를 hot-swap (공개 API)
+ *
+ * @back_bs_dev: 새 부모 bs_dev (소유권 인계)
+ *
+ * esnap clone이 아닌 blob에는 -EINVAL. 동작:
+ * 1) blob freeze (진행 중 IO 정지)
+ * 2) 기존 esnap 채널을 모두 파괴 (abort_io=true — 진행 중 read는 실패 처리)
+ * 3) 옛 back_bs_dev 해제 → 새 것으로 교체
+ * 4) blob unfreeze
+ *
+ * 사용 사례: 부모 lvol/vbdev이 다른 위치로 이동했을 때 인플레이트 없이 backing 교체.
+ */
 void
 spdk_blob_set_esnap_bs_dev(struct spdk_blob *blob, struct spdk_bs_dev *back_bs_dev,
 			   spdk_blob_op_complete cb_fn, void *cb_arg)
@@ -10347,6 +11230,12 @@ spdk_blob_set_esnap_bs_dev(struct spdk_blob *blob, struct spdk_bs_dev *back_bs_d
 	blob_set_back_bs_dev(blob, back_bs_dev, NULL, NULL, cb_fn, cb_arg);
 }
 
+/*
+ * [한국어]
+ * spdk_blob_get_esnap_bs_dev - 현재 esnap clone의 backing bs_dev 포인터 반환 (공개 API)
+ *
+ * 단순 getter — esnap clone이 아니면 NULL.
+ */
 struct spdk_bs_dev *
 spdk_blob_get_esnap_bs_dev(const struct spdk_blob *blob)
 {
@@ -10358,6 +11247,15 @@ spdk_blob_get_esnap_bs_dev(const struct spdk_blob *blob)
 	return blob->back_bs_dev;
 }
 
+/*
+ * [한국어]
+ * spdk_blob_is_degraded - blob 또는 그 backing dev가 degraded 상태인지 (공개 API)
+ *
+ * - 자체 bs_dev->is_degraded() == true 면 degraded
+ * - back_bs_dev가 있고 그쪽이 degraded면 degraded
+ *
+ * 사용 사례: 사용자 모니터링 / RPC 응답 — 운영 중인 blob 상태 진단.
+ */
 bool
 spdk_blob_is_degraded(const struct spdk_blob *blob)
 {

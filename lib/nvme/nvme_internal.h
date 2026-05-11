@@ -1669,7 +1669,7 @@ struct spdk_nvme_ctrlr {
 		uint32_t		id_valid : 1;
                                   /* [한국어] numa.id 필드가 유효하게 초기화됐는지 — 0이 유효 NUMA 노드일 수 있어 별도 비트로 표시 */
 		int32_t			id : 31;
-                                  /* [한국어] 이 컨트롤러가 속한 NUMA 노드 (리눅스 /sys/bus/pci/devices/*/numa_node 등으로 판정) */
+                                  /* [한국어] 이 컨트롤러가 속한 NUMA 노드 (리눅스 /sys/bus/pci/devices/<dev>/numa_node 등으로 판정) */
 	} numa;
 
 	union spdk_nvme_cap_register	cap;

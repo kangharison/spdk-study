@@ -60,7 +60,7 @@
  */
 
 #include "spdk/stdinc.h"
-/* [한국어] SPDK 표준 헤더 묶음 — size_t/uint*/bool/string.h 등 일괄 가시화. */
+/* [한국어] SPDK 표준 헤더 묶음 — size_t/uintXX/bool/string.h 등 일괄 가시화. */
 #include "spdk/fsdev.h"
 /* [한국어] fsdev 공개 API 시그니처와 spdk_fsdev_opts/desc/io 구조체. */
 #include "spdk/config.h"
@@ -70,7 +70,7 @@
 #include "spdk/likely.h"
 /* [한국어] spdk_likely/spdk_unlikely — 분기 예측 힌트 매크로. */
 #include "spdk/queue.h"
-/* [한국어] TAILQ_*/STAILQ_*/RB_* 매크로 (sys/queue.h 호환 + RB tree 확장). */
+/* [한국어] TAILQ_x/STAILQ_x/RB_x 매크로 (sys/queue.h 호환 + RB tree 확장). */
 #include "spdk/util.h"
 /* [한국어] SPDK_COUNTOF, offsetof 래퍼 등 유틸 매크로. */
 #include "spdk/notify.h"

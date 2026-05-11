@@ -289,7 +289,7 @@ iscsi_param_add(struct iscsi_param **params, const char *key,
 	param->list = xstrdup(list);
 	/* [한국어] 허용값 후보 list 복제. */
 	param->type = type;
-	/* [한국어] ISPT_LIST/NUMERICAL_*/BOOLEAN_*/DECLARATIVE/INVALID 등. */
+	/* [한국어] ISPT_LIST/NUMERICAL_xxx/BOOLEAN_xxx/DECLARATIVE/INVALID 등. */
 
 	last_param = *params;
 	/* [한국어] 헤드부터 시작. */
