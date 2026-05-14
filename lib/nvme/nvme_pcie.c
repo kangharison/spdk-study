@@ -111,11 +111,30 @@
  */
 struct nvme_pcie_enum_ctx {
 	struct spdk_nvme_probe_ctx *probe_ctx;
-                                  /* [한국어] 상위 probe 요청 컨텍스트 (콜백 + 필터) */
+	/* [한국어] 상위 probe 요청 컨텍스트 — 사용자가 spdk_nvme_probe/connect로 넘긴
+	 *   probe_cb/attach_cb/remove_cb 콜백과 trid 필터를 담고 있다.
+	 * 설정자: nvme_pcie_ctrlr_scan이 enum_ctx.probe_ctx = probe_ctx로 채운 뒤
+	 *   spdk_pci_enumerate/attach의 user ctx로 전달.
+	 * 읽는 자: pcie_nvme_enum_cb가 nvme_ctrlr_probe(&trid, enum_ctx->probe_ctx, ...)로
+	 *   probe 본체에 다시 넘김 — 즉 enumerate 콜백 → probe 콜백을 잇는 통로.
+	 * 값 범위: 유효한 probe_ctx 포인터 (NULL 불가). scan 호출 동안만 살아있는 스택 객체.
+	 * 동기화: g_spdk_nvme_driver->lock을 잡은 채 scan→enum_cb가 동기 호출되므로 별도 락 불필요. */
 	struct spdk_pci_addr pci_addr;
-                                  /* [한국어] 특정 traddr로 제한된 probe의 대상 주소 */
+	/* [한국어] 사용자가 특정 traddr 하나만 probe하려 할 때 그 대상 PCI 주소(BDF).
+	 * 설정자: nvme_pcie_ctrlr_scan이 probe_ctx->trid.traddr를 spdk_pci_addr_parse로
+	 *   파싱해 채움 (traddr 문자열이 비어있지 않을 때만).
+	 * 읽는 자: pcie_nvme_enum_cb가 spdk_pci_addr_compare로 현재 열거 중인 장치 주소와
+	 *   비교 — 불일치면 1(skip) 반환. 또한 spdk_pci_device_attach의 대상 주소로도 사용.
+	 * 값 범위: has_pci_addr가 true일 때만 유효. false면 미초기화 상태({}로 0).
+	 * 동기화: scan 호출 동안만 유효한 스택 값 — 락 불필요. */
 	bool has_pci_addr;
-                                  /* [한국어] true면 pci_addr만 대상, false면 모든 PCI NVMe 장치 */
+	/* [한국어] pci_addr 필드가 유효한지(= 특정 traddr probe인지) 나타내는 플래그.
+	 * 설정자: nvme_pcie_ctrlr_scan이 traddr 문자열 길이가 0이 아니고 파싱에 성공하면 true.
+	 * 읽는 자: pcie_nvme_enum_cb가 true면 pci_addr 일치 검사 수행,
+	 *   nvme_pcie_ctrlr_scan이 true면 spdk_pci_device_attach(단일 장치),
+	 *   false면 spdk_pci_enumerate(전체 NVMe 장치 순회)를 선택.
+	 * 값 범위: true = 단일 traddr probe / false = 전체 enumerate (기본, {} 초기화 시).
+	 * 동기화: 스택 값 — 락 불필요. */
 };
 
 static uint16_t g_signal_lock;

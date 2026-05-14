@@ -7,7 +7,7 @@
  */
 
 /*
- * [한국어 설명] NVMe Namespace I/O 커맨드 빌더 (nvme_ns_cmd.c) — 1516 라인
+ * [한국어 설명] NVMe Namespace I/O 커맨드 빌더 (nvme_ns_cmd.c)
  *
  * === 파일의 역할 ===
  * SPDK 공개 API `spdk_nvme_ns_cmd_read/write/...`의 **실제 구현**.
@@ -445,6 +445,48 @@ _nvme_ns_cmd_setup_request(struct spdk_nvme_ns *ns, struct nvme_request *req,
                                    *  - ELBAT는 PI AppTag 기대값, ELBATM은 비교 마스크 (bit=1인 비트만 비교) */
 }
 
+/*
+ * [한국어]
+ * _nvme_ns_cmd_split_request_prp - ★ PRP 페이지 경계 위반 시 SGL→child 분할 ★
+ *
+ * @ns:             대상 네임스페이스
+ * @qpair:          제출 큐 (page_size, ctrlr 정보 출처)
+ * @payload:        원본 SGL 페이로드 기술자
+ * @payload_offset: 원본 SGL 내 시작 바이트 오프셋
+ * @md_offset:      분리 메타 버퍼 내 시작 바이트 오프셋
+ * @lba:            요청 시작 LBA
+ * @lba_count:      요청 LBA 수
+ * @cb_fn / @cb_arg: 완료 콜백 + 컨텍스트 (child들이 공유)
+ * @opc:            NVMe opcode (READ/WRITE 등)
+ * @io_flags:       PRACT/FUA/PRCHK 등 제어 플래그
+ * @req:            parent nvme_request (이미 할당됨, SGL 콜백 보유)
+ * @apptag_mask / @apptag: PI AppTag 검사 파라미터
+ * @cdw13:          호출자 지정 CDW13
+ * @accel_sequence: accel 시퀀스 (split 경로에서는 반드시 NULL이어야 함)
+ * @rc:             OUT 에러 코드
+ * @return:         parent req 포인터 (성공) 또는 NULL (실패, *rc에 errno)
+ *
+ * 왜 필요한가:
+ *   장치가 SGL을 지원하지 않으면 NVMe 드라이버는 데이터 버퍼를 PRP(Physical
+ *   Region Page) 리스트로 변환해야 한다. PRP는 "각 엔트리가 페이지 경계에
+ *   정렬된 물리 주소"라는 강한 제약이 있다(NVMe 스펙 §4.3). 호스트가 넘긴
+ *   SGE(scatter-gather element)들의 시작/끝 주소가 페이지 정렬을 만족하지
+ *   못하면 단일 PRP 리스트로 표현할 수 없으므로, 정렬이 깨지는 지점마다
+ *   요청을 child로 쪼개 각 child가 자체적으로 유효한 PRP 리스트를 갖도록 한다.
+ *
+ * 동작 과정:
+ *   1) SGL 반복자를 payload_offset으로 리셋하고 첫 SGE를 읽는다.
+ *   2) SGE를 순회하며 "현재 child"에 누적할 수 있는지 판정:
+ *      - start_valid: SGE 시작 주소가 페이지 정렬 (child 첫 SGE면 예외 허용)
+ *      - end_valid:   SGE 끝 주소가 페이지 정렬 (parent 마지막 SGE면 예외 허용)
+ *   3) start/end가 모두 유효하면 계속 누적, 깨지면 그 지점에서 child를 끊는다.
+ *   4) child를 _nvme_add_child_request로 생성·parent에 연결하고 offset 전진.
+ *   5) split이 전혀 필요 없었으면(child_length == payload_size) parent 자체를
+ *      단일 요청으로 setup하여 반환.
+ *
+ * 실행 컨텍스트: qpair 소유 스레드. 락 없음(스레드 고정).
+ * 호출 체인: _nvme_ns_cmd_rw → [이 함수] → _nvme_add_child_request → _nvme_ns_cmd_rw(child)
+ */
 static struct nvme_request *
 _nvme_ns_cmd_split_request_prp(struct spdk_nvme_ns *ns,
 			       struct spdk_nvme_qpair *qpair,
@@ -457,23 +499,35 @@ _nvme_ns_cmd_split_request_prp(struct spdk_nvme_ns *ns,
 			       void *accel_sequence, int *rc)
 {
 	spdk_nvme_req_reset_sgl_cb reset_sgl_fn = req->payload.reset_sgl_fn;
+	                          /* [한국어] SGL 반복자를 특정 오프셋으로 되감는 호출자 콜백 */
 	spdk_nvme_req_next_sge_cb next_sge_fn = req->payload.next_sge_fn;
+	                          /* [한국어] 다음 SGE(주소,길이)를 반환하는 호출자 콜백 */
 	void *sgl_cb_arg = req->payload.contig_or_cb_arg;
+	                          /* [한국어] SGL 콜백에 전달할 호출자 iter 상태 */
 	bool start_valid, end_valid, last_sge, child_equals_parent;
-	uint64_t child_lba = lba;
+	                          /* [한국어] SGE 시작/끝 정렬 유효성, 마지막 SGE 여부, child가 parent 전체와 동일한지 */
+	uint64_t child_lba = lba; /* [한국어] 현재 만들고 있는 child의 시작 LBA (child 생성마다 전진) */
 	uint32_t req_current_length = 0;
-	uint32_t child_length = 0;
-	uint32_t sge_length;
+	                          /* [한국어] 지금까지 순회한 누적 바이트 (parent 전체 기준) */
+	uint32_t child_length = 0;/* [한국어] 현재 child에 누적된 바이트 (child 끊을 때 0으로 리셋) */
+	uint32_t sge_length;      /* [한국어] next_sge_fn이 돌려준 현재 SGE의 바이트 길이 */
 	uint32_t page_size = qpair->ctrlr->page_size;
-	uintptr_t address;
+	                          /* [한국어] 컨트롤러 PRP 페이지 크기(보통 4KB) — 정렬 판정 기준 */
+	uintptr_t address;        /* [한국어] next_sge_fn이 돌려준 현재 SGE의 시작 (가상) 주소 */
 
 	reset_sgl_fn(sgl_cb_arg, payload_offset);
+	                          /* [한국어] SGL 반복자를 split 시작 오프셋으로 되감음 */
 	next_sge_fn(sgl_cb_arg, (void **)&address, &sge_length);
+	                          /* [한국어] 첫 SGE 획득 — 루프 진입 전 선행 fetch */
 	while (req_current_length < req->payload_size) {
+	                          /* [한국어] parent 전체 payload를 다 소비할 때까지 SGE 순회 */
 
 		if (sge_length == 0) {
+		                  /* [한국어] 길이 0 SGE는 의미 없음 — 건너뜀 (다음 SGE는 if/else 분기상 아래에서 fetch 안 됨에 주의:
+		                   *          이 경로는 address/sge_length가 갱신되지 않은 채 루프 재진입) */
 			continue;
 		} else if (req_current_length + sge_length > req->payload_size) {
+		                  /* [한국어] 마지막 SGE가 payload 경계를 넘김 → payload 끝까지만 사용하도록 잘라냄 */
 			sge_length = req->payload_size - req_current_length;
 		}
 
@@ -482,15 +536,20 @@ _nvme_ns_cmd_split_request_prp(struct spdk_nvme_ns *ns,
 		 *  unless it is the first SGE in the child request.
 		 */
 		start_valid = child_length == 0 || _is_page_aligned(address, page_size);
+		                  /* [한국어] child 첫 SGE(child_length==0)는 시작이 페이지 정렬 안 돼도 허용 —
+		                   *          PRP1은 임의 오프셋 가능. 그 외 SGE는 페이지 정렬돼야 PRP 리스트로 이어붙일 수 있음 */
 
 		/* Boolean for whether this is the last SGE in the parent request. */
 		last_sge = (req_current_length + sge_length == req->payload_size);
+		                  /* [한국어] 이번 SGE로 parent 전체 payload가 끝나는가 */
 
 		/*
 		 * The end of the SGE is invalid if the end address is not page aligned,
 		 *  unless it is the last SGE in the parent request.
 		 */
 		end_valid = last_sge || _is_page_aligned(address + sge_length, page_size);
+		                  /* [한국어] parent 마지막 SGE는 끝이 페이지 정렬 안 돼도 허용 —
+		                   *          PRP 리스트의 마지막 엔트리는 페이지 중간에서 끝나도 됨. 중간 SGE는 정렬 필수 */
 
 		/*
 		 * This child request equals the parent request, meaning that no splitting
@@ -499,8 +558,10 @@ _nvme_ns_cmd_split_request_prp(struct spdk_nvme_ns *ns,
 		 *  the original request as a single request at the end of this function.
 		 */
 		child_equals_parent = (child_length + sge_length == req->payload_size);
+		                  /* [한국어] 이번 SGE를 합치면 child가 parent 전체와 같아짐 → split 불필요 신호 */
 
 		if (start_valid) {
+		                  /* [한국어] 시작이 유효하면 이 SGE를 현재 child에 누적 */
 			/*
 			 * The start of the SGE is valid, so advance the length parameters,
 			 *  to include this SGE with previous SGEs for this child request
@@ -509,8 +570,11 @@ _nvme_ns_cmd_split_request_prp(struct spdk_nvme_ns *ns,
 			 *  been collected before this SGE as a child request.
 			 */
 			child_length += sge_length;
+			                  /* [한국어] 현재 child 누적 바이트 증가 */
 			req_current_length += sge_length;
+			                  /* [한국어] parent 전체 진행 바이트 증가 */
 			if (req_current_length < req->payload_size) {
+			                  /* [한국어] 아직 parent payload가 남았으면 다음 SGE 미리 fetch */
 				next_sge_fn(sgl_cb_arg, (void **)&address, &sge_length);
 				/*
 				 * If the next SGE is not page aligned, we will need to create a
@@ -518,10 +582,12 @@ _nvme_ns_cmd_split_request_prp(struct spdk_nvme_ns *ns,
 				 *  child request for the next SGE.
 				 */
 				start_valid = _is_page_aligned(address, page_size);
+				                  /* [한국어] 다음 SGE 시작 정렬 재평가 — 깨졌으면 아래에서 child를 끊게 됨 */
 			}
 		}
 
 		if (start_valid && end_valid && !last_sge) {
+		                  /* [한국어] 시작·끝 모두 정렬되고 아직 parent 끝이 아니면 — child를 끊지 않고 계속 누적 */
 			continue;
 		}
 
@@ -532,22 +598,30 @@ _nvme_ns_cmd_split_request_prp(struct spdk_nvme_ns *ns,
 		 *  a single request with no children for the entire I/O.
 		 */
 		if (!child_equals_parent) {
+		                  /* [한국어] child가 parent 전체와 다를 때만 실제 child 생성 (같으면 split 불필요 → 아래 fall-through) */
 			struct nvme_request *child;
+			                  /* [한국어] 생성될 child request */
 			uint32_t child_lba_count;
+			                  /* [한국어] 이 child가 담당할 LBA 수 */
 
 			if ((child_length % ns->extended_lba_size) != 0) {
+			                  /* [한국어] child 바이트가 블록 크기(extended LBA = data+meta)의 배수가 아님 —
+			                   *          PRP 경계와 블록 경계가 어긋난 비정상 SGL → I/O 불가 */
 				NVME_QPAIR_ERRLOG(qpair, "child_length %u not even multiple of lba_size %u\n",
 						  child_length, ns->extended_lba_size);
 				*rc = -EINVAL;
+				                  /* [한국어] 영구 실패 — retry 무의미 */
 				return NULL;
 			}
 			if (spdk_unlikely(accel_sequence != NULL)) {
+			                  /* [한국어] accel 시퀀스는 원자 단위라 split 불가 — split 발생 시점에 거부 */
 				NVME_QPAIR_ERRLOG(qpair, "Splitting requests with accel sequence is unsupported\n");
 				*rc = -EINVAL;
 				return NULL;
 			}
 
 			child_lba_count = child_length / ns->extended_lba_size;
+			                  /* [한국어] child 바이트 → LBA 수 변환 (블록당 extended_lba_size 바이트) */
 			/*
 			 * Note the last parameter is set to "false" - this tells the recursive
 			 *  call to _nvme_ns_cmd_rw() to not bother with checking for SGL splitting
@@ -557,24 +631,70 @@ _nvme_ns_cmd_split_request_prp(struct spdk_nvme_ns *ns,
 							child_lba, child_lba_count,
 							cb_fn, cb_arg, opc, io_flags,
 							apptag_mask, apptag, cdw13, req, false, rc);
+			                  /* [한국어] child 생성 + parent에 연결. check_sgl=false —
+			                   *          이미 여기서 PRP 경계를 검증했으므로 child에서 재귀 split 검사 불필요 */
 			if (child == NULL) {
+			                  /* [한국어] 실패 시 _nvme_add_child_request가 parent+형제 이미 해제 — 그대로 전파 */
 				return NULL;
 			}
 			payload_offset += child_length;
+			                  /* [한국어] 다음 child를 위해 데이터 버퍼 오프셋 전진 */
 			md_offset += child_lba_count * ns->md_size;
+			                  /* [한국어] 분리 메타 버퍼 오프셋도 child가 담당한 블록 수만큼 전진 */
 			child_lba += child_lba_count;
-			child_length = 0;
+			                  /* [한국어] 다음 child의 시작 LBA 전진 */
+			child_length = 0; /* [한국어] 새 child 누적 시작 — child_length 리셋 */
 		}
 	}
 
 	if (child_length == req->payload_size) {
+	                          /* [한국어] 루프 동안 한 번도 split하지 않음 → parent 자체가 유효한 단일 PRP 요청 */
 		/* No splitting was required, so setup the whole payload as one request. */
 		_nvme_ns_cmd_setup_request(ns, req, opc, lba, lba_count, io_flags, apptag_mask, apptag, cdw13);
+		                  /* [한국어] parent의 SQE 필드(opc/SLBA/NLB/PI)를 직접 채움 */
 	}
 
-	return req;
+	return req;               /* [한국어] parent 반환 — child가 있으면 parent는 완료 집계만, 없으면 단일 제출 대상 */
 }
 
+/*
+ * [한국어]
+ * _nvme_ns_cmd_split_request_sgl - ★ SGE 개수가 장치 max_sges 초과 시 child 분할 ★
+ *
+ * @ns:             대상 네임스페이스
+ * @qpair:          제출 큐
+ * @payload:        원본 SGL 페이로드 기술자
+ * @payload_offset: 원본 SGL 내 시작 바이트 오프셋
+ * @md_offset:      분리 메타 버퍼 내 시작 바이트 오프셋
+ * @lba / @lba_count: 요청 시작 LBA와 LBA 수
+ * @cb_fn / @cb_arg:  완료 콜백 + 컨텍스트
+ * @opc:            NVMe opcode
+ * @io_flags:       제어 플래그
+ * @req:            parent nvme_request (SGL 콜백 보유)
+ * @apptag_mask / @apptag: PI AppTag 파라미터
+ * @cdw13:          호출자 지정 CDW13
+ * @accel_sequence: accel 시퀀스 (split 경로에서는 NULL이어야 함)
+ * @rc:             OUT 에러 코드
+ * @return:         parent req (성공) / NULL (실패, *rc에 errno)
+ *
+ * 왜 필요한가:
+ *   장치가 SGL을 지원하더라도, 한 NVMe 커맨드가 참조할 수 있는 SGL 디스크립터
+ *   개수에는 하드웨어 한계(ns->ctrlr->max_sges)가 있다. 호스트 버퍼가 너무
+ *   잘게 흩어져 SGE 수가 이 한계를 넘으면 단일 커맨드로 표현할 수 없으므로,
+ *   max_sges 단위로 요청을 child로 분할한다. PRP 분할과 달리 "주소 정렬"이
+ *   아니라 "SGE 개수"가 분할 기준이다.
+ *
+ * 동작 과정:
+ *   1) SGL 반복자를 payload_offset으로 리셋.
+ *   2) SGE를 순회하며 num_sges를 세고 accumulated_length에 바이트를 누적.
+ *   3) num_sges가 max_sges에 도달하거나 parent payload 끝에 닿으면 child를 끊는다.
+ *   4) child 경계가 블록(extended_lba_size) 경계에 맞지 않으면(extra_length)
+ *      마지막 SGE 일부를 잘라 블록 경계로 맞춘다. 다음 child가 잘린 나머지를 이어받음.
+ *   5) split이 전혀 필요 없으면 parent를 단일 요청으로 setup.
+ *
+ * 실행 컨텍스트: qpair 소유 스레드. 락 없음.
+ * 호출 체인: _nvme_ns_cmd_rw → [이 함수] → _nvme_add_child_request → _nvme_ns_cmd_rw(child)
+ */
 static struct nvme_request *
 _nvme_ns_cmd_split_request_sgl(struct spdk_nvme_ns *ns,
 			       struct spdk_nvme_qpair *qpair,
@@ -587,32 +707,46 @@ _nvme_ns_cmd_split_request_sgl(struct spdk_nvme_ns *ns,
 			       void *accel_sequence, int *rc)
 {
 	spdk_nvme_req_reset_sgl_cb reset_sgl_fn = req->payload.reset_sgl_fn;
+	                          /* [한국어] SGL 반복자 되감기 콜백 */
 	spdk_nvme_req_next_sge_cb next_sge_fn = req->payload.next_sge_fn;
+	                          /* [한국어] 다음 SGE(주소,길이) 반환 콜백 */
 	void *sgl_cb_arg = req->payload.contig_or_cb_arg;
-	uint64_t child_lba = lba;
+	                          /* [한국어] SGL 콜백에 전달할 호출자 iter 상태 */
+	uint64_t child_lba = lba; /* [한국어] 현재 만들고 있는 child의 시작 LBA */
 	uint32_t req_current_length = 0;
+	                          /* [한국어] parent 전체 기준 누적 바이트 */
 	uint32_t accumulated_length = 0;
-	uint32_t sge_length;
+	                          /* [한국어] 아직 child로 끊지 않고 모아둔 바이트 */
+	uint32_t sge_length;      /* [한국어] 현재 SGE 바이트 길이 */
 	uint16_t max_sges, num_sges;
-	uintptr_t address;
+	                          /* [한국어] 장치가 허용하는 SGE 최대 개수 / 현재 child에 모은 SGE 개수 */
+	uintptr_t address;        /* [한국어] 현재 SGE 시작 주소 (사용하지 않지만 next_sge_fn 시그니처상 필요) */
 
 	max_sges = ns->ctrlr->max_sges;
+	                          /* [한국어] 컨트롤러가 단일 커맨드에서 지원하는 SGE 최대 개수 */
 
 	reset_sgl_fn(sgl_cb_arg, payload_offset);
-	num_sges = 0;
+	                          /* [한국어] SGL 반복자를 split 시작 오프셋으로 되감음 */
+	num_sges = 0;             /* [한국어] 첫 child의 SGE 카운터 초기화 */
 
 	while (req_current_length < req->payload_size) {
+	                          /* [한국어] parent 전체 payload를 다 소비할 때까지 SGE 순회 */
 		next_sge_fn(sgl_cb_arg, (void **)&address, &sge_length);
+		                  /* [한국어] 다음 SGE 획득 */
 
 		if (req_current_length + sge_length > req->payload_size) {
+		                  /* [한국어] 마지막 SGE가 payload 경계 초과 → payload 끝까지만 사용 */
 			sge_length = req->payload_size - req_current_length;
 		}
 
 		accumulated_length += sge_length;
+		                  /* [한국어] 현재 child에 모은 바이트 증가 */
 		req_current_length += sge_length;
-		num_sges++;
+		                  /* [한국어] parent 전체 진행 바이트 증가 */
+		num_sges++;       /* [한국어] 현재 child의 SGE 개수 증가 */
 
 		if (num_sges < max_sges && req_current_length < req->payload_size) {
+		                  /* [한국어] 아직 SGE 한계에 안 닿았고 parent 끝도 아니면 — child를 끊지 않고 계속 누적 */
 			continue;
 		}
 
@@ -623,27 +757,40 @@ _nvme_ns_cmd_split_request_sgl(struct spdk_nvme_ns *ns,
 		 *  fall-through and just create a single request with no children for the entire I/O.
 		 */
 		if (accumulated_length != req->payload_size) {
+		                  /* [한국어] 모은 양이 parent 전체와 다를 때만 실제 child 생성 (같으면 split 불필요) */
 			struct nvme_request *child;
+			                  /* [한국어] 생성될 child request */
 			uint32_t child_lba_count;
+			                  /* [한국어] child가 담당할 LBA 수 */
 			uint32_t child_length;
+			                  /* [한국어] child가 실제로 담당할 바이트 (블록 경계로 잘린 후 값) */
 			uint32_t extra_length;
+			                  /* [한국어] 블록 경계를 넘어 삐져나온 바이트 (다음 child로 이월) */
 
 			child_length = accumulated_length;
+			                  /* [한국어] 일단 모은 전체를 child 후보 길이로 */
 			/* Child length may not be a multiple of the block size! */
 			child_lba_count = child_length / ns->extended_lba_size;
+			                  /* [한국어] child가 온전히 담을 수 있는 블록 수 (내림 나눗셈) */
 			extra_length = child_length - (child_lba_count * ns->extended_lba_size);
+			                  /* [한국어] 블록 경계를 넘어선 나머지 바이트 */
 			if (extra_length != 0) {
+			                  /* [한국어] 마지막 SGE가 블록 경계에서 끝나지 않음 → 경계까지만 child로 사용 */
 				/* The last SGE does not end on a block boundary. We need to cut it off. */
 				if (extra_length >= child_length) {
+				                  /* [한국어] 한 블록조차 못 채움 — SGE가 너무 잘게 쪼개져 max_sges로도 1블록 불가 */
 					NVME_QPAIR_ERRLOG(qpair, "Unable to send I/O. Would require more than the supported number of "
 							  "SGL Elements.");
 					*rc = -EINVAL;
+					                  /* [한국어] 영구 실패 — 표현 불가능한 요청 */
 					return NULL;
 				}
 				child_length -= extra_length;
+				                  /* [한국어] 블록 경계로 child 길이를 줄임 — 잘린 extra_length는 다음 child가 이어받음 */
 			}
 
 			if (spdk_unlikely(accel_sequence != NULL)) {
+			                  /* [한국어] accel 시퀀스는 원자 단위 — split 발생 시점에 거부 */
 				NVME_QPAIR_ERRLOG(qpair, "Splitting requests with accel sequence is unsupported\n");
 				*rc = -EINVAL;
 				return NULL;
@@ -658,23 +805,32 @@ _nvme_ns_cmd_split_request_sgl(struct spdk_nvme_ns *ns,
 							child_lba, child_lba_count,
 							cb_fn, cb_arg, opc, io_flags,
 							apptag_mask, apptag, cdw13, req, false, rc);
+			                  /* [한국어] child 생성 + parent에 연결. check_sgl=false — 여기서 이미 SGE 수 검증 완료 */
 			if (child == NULL) {
+			                  /* [한국어] 실패 시 _nvme_add_child_request가 parent+형제 해제 — 그대로 전파 */
 				return NULL;
 			}
 			payload_offset += child_length;
+			                  /* [한국어] 다음 child를 위해 데이터 버퍼 오프셋 전진 (잘린 child_length 기준) */
 			md_offset += child_lba_count * ns->md_size;
+			                  /* [한국어] 분리 메타 버퍼 오프셋도 child 블록 수만큼 전진 */
 			child_lba += child_lba_count;
+			                  /* [한국어] 다음 child 시작 LBA 전진 */
 			accumulated_length -= child_length;
+			                  /* [한국어] child로 보낸 만큼 차감 — 남은 값(extra_length)은 다음 child의 시작 누적분 */
 			num_sges = accumulated_length > 0;
+			                  /* [한국어] 잘린 SGE 나머지가 있으면 다음 child는 이미 SGE 1개를 가진 상태로 시작(=1), 없으면 0 */
 		}
 	}
 
 	if (accumulated_length == req->payload_size) {
+	                          /* [한국어] 루프 동안 한 번도 split 안 함 → parent 자체가 max_sges 이내 단일 요청 */
 		/* No splitting was required, so setup the whole payload as one request. */
 		_nvme_ns_cmd_setup_request(ns, req, opc, lba, lba_count, io_flags, apptag_mask, apptag, cdw13);
+		                  /* [한국어] parent SQE 필드 직접 채움 */
 	}
 
-	return req;
+	return req;               /* [한국어] parent 반환 — child가 있으면 완료 집계 전용, 없으면 단일 제출 대상 */
 }
 
 /*
