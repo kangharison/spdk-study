@@ -93,17 +93,39 @@ static AvahiClient *g_avahi_client = NULL;
  */
 struct mdns_discovery_entry_ctx {
 	char                                            name[256];
-	/* [한국어] 자동 생성된 엔트리 이름. 형식: "<base_name><seqno>_nvme".
-	 * bdev_nvme_start_discovery에 base_name 인자로 전달됨. */
+	/* [한국어] 발견된 디스커버리 컨트롤러에 자동 부여되는 bdev 이름. 형식: "<base_name><seqno>_nvme".
+	 * 설정자: create_mdns_discovery_entry_ctx()에서 snprintf로 생성.
+	 * 읽는 자: mdns_start_discovery_ctx_in_app_thread()에서 bdev_nvme_start_discovery() base_name 인자.
+	 * 값 범위: NULL-terminated, 최대 255자 (고정 배열). seqno 단조 증가로 중복 없음.
+	 * 동기화: 생성 후 변경 없음. 소속 ctx의 poller 스레드에서만 접근. */
+
 	struct spdk_nvme_transport_id                   trid;
-	/* [한국어] resolve된 트랜스포트 ID (TCP/IPv4 + traddr/trsvcid/subnqn).
-	 * 현재 코드는 TCP+IPv4만 처리. */
+	/* [한국어] resolve 단계에서 채워지는 NVMe-oF 트랜스포트 주소 (TCP/IPv4 + traddr/trsvcid/subnqn).
+	 * 설정자: create_mdns_discovery_entry_ctx()에서 memcpy로 복사.
+	 * 읽는 자: mdns_start_discovery_ctx_in_app_thread()에서 bdev_nvme_start_discovery() trid 인자.
+	 * 값 범위: 현재 코드는 TCP+IPv4만 처리; IPv6/RDMA는 함수 내 adrfam 체크에서 drop됨.
+	 * 동기화: 생성 후 변경 없음. 소속 ctx의 poller 스레드에서만 접근. */
+
 	struct spdk_nvme_ctrlr_opts                     drv_opts;
-	/* [한국어] lib/nvme 드라이버 옵션 사본 (hostnqn 등 포함). */
+	/* [한국어] NVMe 컨트롤러 연결 시 lib/nvme에 전달되는 드라이버 옵션 사본.
+	 * 설정자: create_mdns_discovery_entry_ctx()에서 부모 ctx->drv_opts memcpy + hostnqn 덮어쓰기.
+	 * 읽는 자: mdns_start_discovery_ctx_in_app_thread()에서 bdev_nvme_start_discovery() opts 인자.
+	 * 값 범위: spdk_nvme_ctrlr_opts 구조체. hostnqn은 부모 ctx의 hostnqn으로 강제 통일.
+	 * 동기화: 생성 후 변경 없음. 소속 ctx의 poller 스레드에서만 접근. */
+
 	TAILQ_ENTRY(mdns_discovery_entry_ctx)           tailq;
-	/* [한국어] 부모 ctx의 mdns_discovery_entry_ctxs 리스트 노드. */
+	/* [한국어] 부모 mdns_discovery_ctx의 mdns_discovery_entry_ctxs 리스트에 연결되는 링크드 리스트 노드.
+	 * 설정자: create_mdns_discovery_entry_ctx() 반환 직후 mdns_browse_handler()에서 TAILQ_INSERT_TAIL.
+	 * 읽는 자: mdns_browse_handler()의 중복 검사 TAILQ_FOREACH, bdev_nvme_stop_mdns_discovery()의 cleanup.
+	 * 값 범위: 부모 TAILQ에 연결된 동안 유효. 제거 후 dangling pointer가 되므로 즉시 free.
+	 * 동기화: 부모 ctx와 동일한 poller/app 스레드에서만 접근. */
+
 	struct mdns_discovery_ctx                       *ctx;
-	/* [한국어] 부모 mdns_discovery_ctx 역참조 (start_discovery에서 옵션 참조용). */
+	/* [한국어] 이 entry가 속한 부모 mDNS 세션(mdns_discovery_ctx)에 대한 역참조.
+	 * 설정자: create_mdns_discovery_entry_ctx()에서 new_ctx->ctx = ctx 대입.
+	 * 읽는 자: mdns_start_discovery_ctx_in_app_thread()에서 부모의 bdev_opts/drv_opts 참조.
+	 * 값 범위: 유효한 포인터 (NULL 불가). 부모가 해제되기 전에 entry도 먼저 해제됨.
+	 * 동기화: 생성 후 변경 없음. 단일 스레드(poller/app 스레드) 내에서만 접근. */
 };
 
 /*
@@ -115,27 +137,81 @@ struct mdns_discovery_entry_ctx {
  */
 struct mdns_discovery_ctx {
 	char                                    *name;
-	/* [한국어] 사용자가 지정한 base_name. 발견된 ctrlr 이름 prefix로 사용. */
+	/* [한국어] 사용자가 지정한 디스커버리 세션 이름 (발견되는 entry bdev 이름의 prefix).
+	 * 설정자: bdev_nvme_start_mdns_discovery()에서 strdup.
+	 * 읽는 자: create_mdns_discovery_entry_ctx()에서 entry 이름 snprintf, 중복 세션 검사.
+	 * 값 범위: NULL 불가. 동일 이름의 세션이 이미 있으면 start 함수가 -EEXIST 반환.
+	 * 동기화: 생성 후 변경 없음. bdev_nvme_stop_mdns_discovery()에서 free. */
+
 	char                                    *svcname;
-	/* [한국어] mDNS 서비스 타입 문자열 (예: "_nvme-disc._tcp"). */
+	/* [한국어] Avahi 서비스 브라우저가 watch할 mDNS 서비스 타입 문자열 (예: "_nvme-disc._tcp").
+	 * 설정자: bdev_nvme_start_mdns_discovery()에서 strdup.
+	 * 읽는 자: avahi_service_browser_new() 인자로 전달, svcname 중복 세션 검사.
+	 * 값 범위: NULL 불가. NVMe-oF 표준 mDNS 서비스 타입은 "_nvme-disc._tcp".
+	 * 동기화: 생성 후 변경 없음. stop/cleanup 단계에서 free. */
+
 	char                                    *hostnqn;
-	/* [한국어] 호스트 NQN 사본 (drv_opts에서 복제). entry별로 strncpy. */
+	/* [한국어] 이 세션에서 발견되는 모든 entry에 공통으로 적용할 호스트 NQN 문자열.
+	 * 설정자: bdev_nvme_start_mdns_discovery()에서 drv_opts.hostnqn을 strdup.
+	 * 읽는 자: create_mdns_discovery_entry_ctx()에서 entry의 drv_opts.hostnqn에 snprintf로 복사.
+	 * 값 범위: NULL 불가. NQN 형식은 "nqn.YYYY-MM.com.example:xxx".
+	 * 동기화: 생성 후 변경 없음. stop/cleanup 단계에서 free. */
+
 	AvahiServiceBrowser                     *sb;
-	/* [한국어] Avahi 서비스 브라우저 핸들. svcname을 watch. */
+	/* [한국어] Avahi 서비스 브라우저 핸들 (svcname에 매칭되는 mDNS 서비스를 지속 감시).
+	 * 설정자: bdev_nvme_start_mdns_discovery()에서 avahi_service_browser_new()로 생성.
+	 * 읽는 자: bdev_nvme_stop_mdns_discovery()에서 avahi_service_browser_free()로 제거.
+	 * 값 범위: 유효한 Avahi 핸들. 실패 시 NULL (이 경우 세션 생성 자체를 abort).
+	 * 동기화: Avahi poll 스레드(SPDK poller)에서만 접근. 다른 스레드에서 건드리면 안 됨. */
+
 	struct spdk_poller                      *poller;
-	/* [한국어] bdev_nvme_avahi_iterate를 100ms마다 호출하는 poller. */
+	/* [한국어] bdev_nvme_avahi_iterate()를 100ms마다 깨우는 SPDK 타이머 poller.
+	 * 설정자: bdev_nvme_start_mdns_discovery()에서 SPDK_POLLER_REGISTER.
+	 * 읽는 자: bdev_nvme_avahi_iterate()에서 stop 플래그 확인 후 spdk_poller_unregister.
+	 * 값 범위: 유효한 spdk_poller 핸들. 세션이 활성 상태인 동안만 non-NULL.
+	 * 동기화: SPDK app 스레드에서만 등록/해제. */
+
 	struct spdk_nvme_ctrlr_opts             drv_opts;
-	/* [한국어] 디스커버리/attach에 사용할 lib/nvme 옵션 사본. */
+	/* [한국어] 발견된 NVMe-oF 디스커버리 컨트롤러 연결에 사용할 lib/nvme 드라이버 옵션.
+	 * 설정자: bdev_nvme_start_mdns_discovery() 인자로 받은 opts를 memcpy.
+	 * 읽는 자: create_mdns_discovery_entry_ctx()에서 각 entry의 drv_opts에 memcpy.
+	 * 값 범위: spdk_nvme_ctrlr_opts 전체. hostnqn은 start 단계에서 이미 설정됨.
+	 * 동기화: 생성 후 변경 없음. 읽기 전용. */
+
 	struct spdk_bdev_nvme_ctrlr_opts        bdev_opts;
-	/* [한국어] bdev_nvme 옵션 사본. */
+	/* [한국어] NVMe bdev 레이어 옵션 (큐 깊이, ctrlr loss timeout 등).
+	 * 설정자: bdev_nvme_start_mdns_discovery() 인자로 받은 bdev_opts를 memcpy.
+	 * 읽는 자: mdns_start_discovery_ctx_in_app_thread()에서 bdev_nvme_start_discovery() 인자로 전달.
+	 * 값 범위: spdk_bdev_nvme_ctrlr_opts 전체.
+	 * 동기화: 생성 후 변경 없음. 읽기 전용. */
+
 	uint32_t                                seqno;
-	/* [한국어] entry 이름 부여용 시퀀스. resolve할 때마다 ++. */
+	/* [한국어] entry 이름 중복 방지를 위한 단조 증가 시퀀스 번호.
+	 * 설정자: create_mdns_discovery_entry_ctx()에서 entry 이름 생성 후 ctx->seqno++.
+	 * 읽는 자: create_mdns_discovery_entry_ctx()에서 snprintf("%s%u_nvme") 시 사용.
+	 * 값 범위: 0 이상. 오버플로우 시 래핑될 수 있지만 실제 환경에서는 발생 가능성 없음.
+	 * 동기화: Avahi 콜백(poller 스레드)에서만 증가. 단일 스레드 접근. */
+
 	bool                                    stop;
-	/* [한국어] true면 다음 poller 실행 시 자기 자신을 unregister하고 ctx 해제. */
+	/* [한국어] true로 설정되면 다음 poller 실행 시 세션을 자동 cleanup하는 플래그.
+	 * 설정자: bdev_nvme_stop_mdns_discovery()에서 ctx->stop = true.
+	 * 읽는 자: bdev_nvme_avahi_iterate() 진입 시 확인. true면 poller unregister + ctx free.
+	 * 값 범위: false(활성) / true(종료 요청).
+	 * 동기화: stop은 app 스레드에서만 설정, iterate는 poller 스레드(app 스레드와 같음). */
+
 	TAILQ_ENTRY(mdns_discovery_ctx)         tailq;
-	/* [한국어] g_mdns_discovery_ctxs 리스트 노드. */
+	/* [한국어] 전역 g_mdns_discovery_ctxs 리스트에 연결되는 링크드 리스트 노드.
+	 * 설정자: bdev_nvme_start_mdns_discovery()에서 TAILQ_INSERT_TAIL.
+	 * 읽는 자: bdev_nvme_stop_mdns_discovery()의 TAILQ_FOREACH lookup, cleanup시 TAILQ_REMOVE.
+	 * 값 범위: g_mdns_discovery_ctxs에 있는 동안 유효.
+	 * 동기화: app 스레드에서만 추가/제거. */
+
 	TAILQ_HEAD(, mdns_discovery_entry_ctx)  mdns_discovery_entry_ctxs;
-	/* [한국어] 이 세션이 발견한 모든 entry 리스트. */
+	/* [한국어] 이 세션이 발견한 모든 mdns_discovery_entry_ctx의 헤드.
+	 * 설정자: bdev_nvme_start_mdns_discovery()에서 TAILQ_INIT, mdns_browse_handler()에서 entry TAILQ_INSERT_TAIL.
+	 * 읽는 자: bdev_nvme_stop_mdns_discovery()의 cleanup TAILQ_FOREACH, 중복 체크 루프.
+	 * 값 범위: 0개 이상의 entry. 발견된 mDNS 서비스 수에 비례.
+	 * 동기화: Avahi 콜백(poller/app 스레드)에서만 변경. */
 };
 
 /* [한국어] 모든 mDNS 디스커버리 세션의 전역 헤드. */

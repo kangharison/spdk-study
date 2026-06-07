@@ -59,12 +59,19 @@
  */
 struct rpc_bdev_nvme_opal_init {
 	char *nvme_ctrlr_name;
-	/* [한국어] Opal SED를 초기화할 NVMe 컨트롤러 이름.
-	 * 설정자: spdk_json_decode_string. 읽는 자: nvme_ctrlr_get_by_name. */
+	/* [한국어] Opal SED를 초기화할 NVMe 컨트롤러 이름 (예: "Nvme0").
+	 * 설정자: spdk_json_decode_object()가 spdk_json_decode_string()으로 strdup.
+	 * 읽는 자: rpc_bdev_nvme_opal_init()에서 nvme_ctrlr_get_by_name() 인자로 사용.
+	 * 값 범위: null-terminated C 문자열, NULL이면 디코딩 실패 (필수 필드).
+	 * 동기화: 단일 RPC 콜백 내에서만 사용. free_rpc_*()가 해제. */
+
 	char *password;
-	/* [한국어] 새 SID(Security ID, 즉 Owner) 패스워드.
-	 * Take Ownership 시 디바이스의 MSID(공장 기본 SID)를 이 값으로 변경한다.
-	 * 동기화: 단일 RPC 콜백 내. */
+	/* [한국어] 새 SID(Security ID, Owner)로 설정할 패스워드 문자열.
+	 * Take Ownership 절차에서 디바이스의 MSID(공장 기본 SID)를 이 값으로 교체한다.
+	 * 설정자: spdk_json_decode_string()으로 strdup.
+	 * 읽는 자: spdk_opal_cmd_take_ownership() 및 spdk_opal_cmd_activate_locking_sp() 인자.
+	 * 값 범위: 임의 길이의 null-terminated 문자열 (SED 펌웨어가 최대 길이 검증).
+	 * 동기화: 단일 RPC 콜백 내. 보안 상 RPC 전송 후 메모리에 잔류하지 않도록 free 필수. */
 };
 
 /* [한국어] free 헬퍼: strdup된 두 문자열 모두 해제. */
@@ -175,8 +182,20 @@ SPDK_RPC_REGISTER("bdev_nvme_opal_init", rpc_bdev_nvme_opal_init, SPDK_RPC_RUNTI
  * 주의: revert TPer는 SED를 공장 초기화하며, 디스크의 모든 데이터가 사용 불가능해진다 (DEK 재생성).
  */
 struct rpc_bdev_nvme_opal_revert {
-	char *nvme_ctrlr_name;   /* [한국어] 대상 NVMe 컨트롤러 이름. */
-	char *password;          /* [한국어] PSID 또는 SID 패스워드 (revert 권한 인증). */
+	char *nvme_ctrlr_name;
+	/* [한국어] 공장 초기화를 수행할 대상 NVMe 컨트롤러 이름.
+	 * 설정자: spdk_json_decode_string()으로 strdup.
+	 * 읽는 자: rpc_bdev_nvme_opal_revert()의 nvme_ctrlr_get_by_name() 인자.
+	 * 값 범위: null-terminated 문자열. 필수.
+	 * 동기화: 단일 RPC 콜백 내. */
+
+	char *password;
+	/* [한국어] Revert TPer 권한 인증용 패스워드.
+	 * SED Revert는 PSID(Physical Secure ID, 보통 디바이스 라벨에 표기) 또는 SID로 인증.
+	 * 설정자: spdk_json_decode_string()으로 strdup.
+	 * 읽는 자: spdk_opal_cmd_revert_tper() 인자.
+	 * 값 범위: null-terminated 문자열. 필수. 잘못된 값이면 SED가 -EACCES 반환.
+	 * 동기화: 단일 RPC 콜백 내. */
 };
 
 /* [한국어] free 헬퍼: revert 요청 임시 문자열 해제. */
@@ -261,17 +280,40 @@ SPDK_RPC_REGISTER("bdev_nvme_opal_revert", rpc_bdev_nvme_opal_revert, SPDK_RPC_R
  */
 struct rpc_bdev_opal_create {
 	char *nvme_ctrlr_name;
-	/* [한국어] 대상 NVMe 컨트롤러 이름 (Opal 지원 필수). */
+	/* [한국어] Locking Range를 만들 NVMe 컨트롤러 이름 (Opal SED 지원 필수).
+	 * 설정자: spdk_json_decode_string()으로 strdup. 읽는 자: vbdev_opal_create() 첫 인자.
+	 * 값 범위: null-terminated 문자열. 필수.
+	 * 동기화: 단일 RPC 콜백 내. */
+
 	uint32_t nsid;
-	/* [한국어] LBA 범위가 속한 namespace ID. */
+	/* [한국어] Locking Range의 LBA 범위가 속한 NVMe namespace ID.
+	 * 설정자: spdk_json_decode_uint32(). 읽는 자: vbdev_opal_create() 두 번째 인자.
+	 * 값 범위: 현재 NSID_SUPPORTED(=1)만 허용 (vbdev_opal.c 제한).
+	 * 동기화: 단일 RPC 콜백 내. */
+
 	uint16_t locking_range_id;
-	/* [한국어] SED 내 Locking Range 인덱스 (보통 0~7). */
+	/* [한국어] 설정할 Locking Range 인덱스 (SED 내부 인덱스, 보통 0~7).
+	 * 설정자: spdk_json_decode_uint16(). 읽는 자: vbdev_opal_create().
+	 * 값 범위: 0 이상. 최대값은 디바이스에 따라 다름.
+	 * 동기화: 단일 RPC 콜백 내. */
+
 	uint64_t range_start;
-	/* [한국어] 시작 LBA (이 LBA부터 length개의 블록이 보호 범위). */
+	/* [한국어] Locking Range가 보호할 시작 LBA 번호 (베이스 namespace 기준 절대 LBA).
+	 * 설정자: spdk_json_decode_uint64(). 읽는 자: vbdev_opal_create() 네 번째 인자.
+	 * 값 범위: 0 이상, range_start + range_length <= NS 총 블록 수.
+	 * 동기화: 단일 RPC 콜백 내. */
+
 	uint64_t range_length;
-	/* [한국어] 보호할 LBA 개수. */
+	/* [한국어] Locking Range가 보호할 LBA 개수.
+	 * 설정자: spdk_json_decode_uint64(). 읽는 자: vbdev_opal_create() 다섯 번째 인자.
+	 * 값 범위: 1 이상. 0이면 SED가 전체 NS를 뜻하는 경우도 있으나 현재 SPDK는 미처리.
+	 * 동기화: 단일 RPC 콜백 내. */
+
 	char *password;
-	/* [한국어] Admin SP 인증 패스워드. */
+	/* [한국어] Locking Range 설정에 필요한 Admin SP 인증 패스워드.
+	 * 설정자: spdk_json_decode_string()으로 strdup. 읽는 자: vbdev_opal_create() 여섯 번째 인자.
+	 * 값 범위: null-terminated 문자열. 필수.
+	 * 동기화: 단일 RPC 콜백 내. free_rpc_bdev_opal_create()에서 해제. */
 };
 
 /* [한국어] free 헬퍼: strdup된 문자열 두 개 해제 (uint 필드는 free 불필요). */
@@ -354,8 +396,19 @@ SPDK_RPC_REGISTER("bdev_opal_create", rpc_bdev_opal_create, SPDK_RPC_RUNTIME)
  * JSON: {"bdev_name": "...", "password": "..."}.
  */
 struct rpc_bdev_opal_get_info {
-	char *bdev_name;   /* [한국어] 조회 대상 vbdev_opal bdev 이름. */
-	char *password;    /* [한국어] 인증 패스워드 (Locking Range Get은 인증 필요). */
+	char *bdev_name;
+	/* [한국어] 메타데이터를 조회할 vbdev_opal bdev 이름 (예: "Nvme0n1r1").
+	 * 설정자: spdk_json_decode_string()으로 strdup.
+	 * 읽는 자: rpc_bdev_opal_get_info()에서 vbdev_opal_get_info_from_bdev()의 첫 인자.
+	 * 값 범위: null-terminated 문자열. 필수.
+	 * 동기화: 단일 RPC 콜백 내. free_rpc_bdev_opal_get_info()에서 해제. */
+
+	char *password;
+	/* [한국어] Locking Range Get-Range 인증에 사용할 Admin 패스워드.
+	 * 설정자: spdk_json_decode_string()으로 strdup.
+	 * 읽는 자: vbdev_opal_get_info_from_bdev() 내부에서 SED 인증 세션 열 때 사용.
+	 * 값 범위: null-terminated 문자열. 필수.
+	 * 동기화: 단일 RPC 콜백 내. free_rpc_bdev_opal_get_info()에서 해제. */
 };
 
 /* [한국어] free 헬퍼. */
@@ -436,8 +489,19 @@ SPDK_RPC_REGISTER("bdev_opal_get_info", rpc_bdev_opal_get_info, SPDK_RPC_RUNTIME
  * JSON: {"bdev_name": "...", "password": "..."}.
  */
 struct rpc_bdev_opal_delete {
-	char *bdev_name;   /* [한국어] 제거할 vbdev_opal 이름. */
-	char *password;    /* [한국어] Admin 인증 패스워드. */
+	char *bdev_name;
+	/* [한국어] 제거할 vbdev_opal bdev의 이름 (예: "Nvme0n1r1").
+	 * 설정자: spdk_json_decode_string()으로 strdup.
+	 * 읽는 자: rpc_bdev_opal_delete()에서 vbdev_opal_destruct() 첫 인자.
+	 * 값 범위: null-terminated 문자열. 필수.
+	 * 동기화: 단일 RPC 콜백 내. free_rpc_bdev_opal_delete()에서 해제. */
+
+	char *password;
+	/* [한국어] vbdev_opal 삭제 시 Admin SP 인증에 사용할 패스워드.
+	 * 설정자: spdk_json_decode_string()으로 strdup.
+	 * 읽는 자: vbdev_opal_destruct() 내부에서 SED 세션 열 때 사용.
+	 * 값 범위: null-terminated 문자열. 필수.
+	 * 동기화: 단일 RPC 콜백 내. free_rpc_bdev_opal_delete()에서 해제. */
 };
 
 /* [한국어] free 헬퍼. */
@@ -499,10 +563,33 @@ SPDK_RPC_REGISTER("bdev_opal_delete", rpc_bdev_opal_delete, SPDK_RPC_RUNTIME)
  * lock_state: "RWLOCK"|"READONLY"|"RWUNLOCK" (vbdev_opal.c가 파싱).
  */
 struct rpc_bdev_opal_set_lock_state {
-	char *bdev_name;     /* [한국어] 대상 vbdev 이름. */
-	uint16_t user_id;    /* [한국어] 인증 주체 User ID. */
-	char *password;      /* [한국어] 해당 user의 패스워드. */
-	char *lock_state;    /* [한국어] 변경할 잠금 상태 문자열. */
+	char *bdev_name;
+	/* [한국어] 잠금 상태를 변경할 vbdev_opal bdev 이름 (예: "Nvme0n1r1").
+	 * 설정자: spdk_json_decode_string()으로 strdup.
+	 * 읽는 자: rpc_bdev_opal_set_lock_state()에서 vbdev_opal_set_lock_state() 첫 인자.
+	 * 값 범위: null-terminated 문자열. 필수.
+	 * 동기화: 단일 RPC 콜백 내. free_rpc_bdev_opal_set_lock_state()에서 해제. */
+
+	uint16_t user_id;
+	/* [한국어] 인증에 사용할 User 슬롯 ID (0 = Admin, 1~N = User1~UserN).
+	 * 설정자: spdk_json_decode_uint16().
+	 * 읽는 자: vbdev_opal_set_lock_state() 내부에서 인증 Authority 선택에 사용.
+	 * 값 범위: 0 이상. SED 사양에 따라 지원 최대값이 다름.
+	 * 동기화: 정수값, 단일 RPC 콜백 내. */
+
+	char *password;
+	/* [한국어] user_id에 대응하는 패스워드 (잠금 변경 인증용).
+	 * 설정자: spdk_json_decode_string()으로 strdup.
+	 * 읽는 자: vbdev_opal_set_lock_state() 내부에서 SED 세션 인증 시 사용.
+	 * 값 범위: null-terminated 문자열. 필수.
+	 * 동기화: 단일 RPC 콜백 내. free_rpc_bdev_opal_set_lock_state()에서 해제. */
+
+	char *lock_state;
+	/* [한국어] 변경할 잠금 상태 문자열: "RWLOCK"(읽기+쓰기 잠금), "READONLY"(쓰기 잠금), "RWUNLOCK"(잠금 해제).
+	 * 설정자: spdk_json_decode_string()으로 strdup.
+	 * 읽는 자: vbdev_opal_set_lock_state()에서 문자열 비교로 enum 변환 후 SED Set-Range 발급.
+	 * 값 범위: 위 3가지 문자열 중 하나. 다른 값이면 vbdev_opal_set_lock_state()가 오류 반환.
+	 * 동기화: 단일 RPC 콜백 내. free_rpc_bdev_opal_set_lock_state()에서 해제. */
 };
 
 /* [한국어] free 헬퍼: 3개 strdup 문자열 해제. */
@@ -568,10 +655,33 @@ SPDK_RPC_REGISTER("bdev_opal_set_lock_state", rpc_bdev_opal_set_lock_state, SPDK
  * Admin이 새 User 슬롯에 권한과 패스워드를 동시에 부여.
  */
 struct rpc_bdev_opal_new_user {
-	char *bdev_name;       /* [한국어] 대상 vbdev. */
-	char *admin_password;  /* [한국어] Admin SP 인증 패스워드 (권한 부여 자격). */
-	uint16_t user_id;      /* [한국어] 활성화할 User 슬롯 (1~N, SED 의존). */
-	char *user_password;   /* [한국어] 해당 User에 부여할 패스워드. */
+	char *bdev_name;
+	/* [한국어] 새 User를 활성화할 대상 vbdev_opal bdev 이름 (예: "Nvme0n1r1").
+	 * 설정자: spdk_json_decode_string()으로 strdup.
+	 * 읽는 자: rpc_bdev_opal_new_user()에서 vbdev_opal_enable_new_user() 첫 인자.
+	 * 값 범위: null-terminated 문자열. 필수.
+	 * 동기화: 단일 RPC 콜백 내. free_rpc_bdev_opal_new_user()에서 해제. */
+
+	char *admin_password;
+	/* [한국어] User 슬롯 활성화 권한을 갖는 Admin SP 인증 패스워드.
+	 * 설정자: spdk_json_decode_string()으로 strdup.
+	 * 읽는 자: vbdev_opal_enable_new_user() 내부에서 Admin Authority로 SED 세션 열 때 사용.
+	 * 값 범위: null-terminated 문자열. 필수.
+	 * 동기화: 단일 RPC 콜백 내. free_rpc_bdev_opal_new_user()에서 해제. */
+
+	uint16_t user_id;
+	/* [한국어] 활성화할 User 슬롯 ID (1~N; 0은 Admin이므로 이 RPC에서는 1 이상 사용).
+	 * 설정자: spdk_json_decode_uint16().
+	 * 읽는 자: vbdev_opal_enable_new_user() 내부에서 해당 User 슬롯 enable + ACL 부여 시 사용.
+	 * 값 범위: 1 이상. SED 사양에 따라 최대 슬롯 수가 다름.
+	 * 동기화: 정수값, 단일 RPC 콜백 내. */
+
+	char *user_password;
+	/* [한국어] 새로 활성화되는 User 슬롯에 설정할 패스워드.
+	 * 설정자: spdk_json_decode_string()으로 strdup.
+	 * 읽는 자: vbdev_opal_enable_new_user() 내부에서 SED Set-Credentials 명령 발급 시 사용.
+	 * 값 범위: null-terminated 문자열. 필수.
+	 * 동기화: 단일 RPC 콜백 내. free_rpc_bdev_opal_new_user()에서 해제. */
 };
 
 /* [한국어] free 헬퍼: strdup된 3개 문자열 해제 (user_id는 정수). */

@@ -80,34 +80,69 @@ enum spdk_nvme_rpc_type {
  */
 struct rpc_bdev_nvme_send_cmd_req {
 	char			*name;
-	/* [한국어] 대상 NVMe 컨트롤러 이름.
-	 * 설정자: spdk_json_decode_string. 읽는 자: nvme_ctrlr_get_by_name. */
+	/* [한국어] 명령을 발행할 대상 NVMe 컨트롤러 이름 (예: "Nvme0").
+	 * 설정자: spdk_json_decode_object()가 spdk_json_decode_string()으로 strdup.
+	 * 읽는 자: rpc_bdev_nvme_send_cmd()에서 nvme_ctrlr_get_by_name() 인자.
+	 * 값 범위: null-terminated 문자열. 필수. 없으면 디코딩 실패.
+	 * 동기화: 단일 RPC 컨텍스트(ctx->req.name). free_rpc_bdev_nvme_send_cmd_ctx()에서 free. */
+
 	int			cmd_type;
-	/* [한국어] enum spdk_nvme_rpc_type 값 (NVME_ADMIN_CMD/NVME_IO_CMD).
-	 * 디코더: rpc_decode_cmd_type ("admin"|"io" 문자열을 enum으로 매핑). */
+	/* [한국어] 발행할 NVMe 명령의 종류: NVME_ADMIN_CMD(1) 또는 NVME_IO_CMD(2).
+	 * 설정자: rpc_decode_cmd_type()에서 "admin"→NVME_ADMIN_CMD, "io"→NVME_IO_CMD.
+	 * 읽는 자: rpc_bdev_nvme_send_cmd_cb() 내 nvme_rpc_send_cmd()에서 switch로 분기.
+	 * 값 범위: NVME_ADMIN_CMD(1) 또는 NVME_IO_CMD(2). 다른 값이면 -EINVAL.
+	 * 동기화: 단일 RPC 컨텍스트 내. 변경 없음. */
+
 	int			data_direction;
-	/* [한국어] SPDK_NVME_DATA_HOST_TO_CONTROLLER 또는 _CONTROLLER_TO_HOST.
-	 * 디코더: rpc_decode_data_direction ("h2c"|"c2h"). */
+	/* [한국어] DMA 전송 방향: host→device (h2c) 또는 device→host (c2h).
+	 * 설정자: rpc_decode_data_direction()에서 "h2c"→SPDK_NVME_DATA_HOST_TO_CONTROLLER, "c2h"→역방향.
+	 * 읽는 자: rpc_bdev_nvme_send_cmd_resp_construct()에서 c2h일 때 data_text를 응답에 포함.
+	 * 값 범위: SPDK_NVME_DATA_HOST_TO_CONTROLLER 또는 SPDK_NVME_DATA_CONTROLLER_TO_HOST.
+	 * 동기화: 단일 RPC 컨텍스트 내. 변경 없음. */
+
 	uint32_t		timeout_ms;
-	/* [한국어] 명령 타임아웃 (현재 코드에서는 lib/nvme로 전달되지는 않는 듯; 향후 사용 예약). */
+	/* [한국어] NVMe 명령 타임아웃 (밀리초). 현재 lib/nvme raw cmd API에는 전달되지 않고 예약됨.
+	 * 설정자: spdk_json_decode_uint32(). 디코더 테이블에 optional=true로 등록됨.
+	 * 읽는 자: 현재 코드에서는 미사용. 향후 spdk_nvme_ctrlr_cmd_admin_raw timeout 확장 시 사용 예정.
+	 * 값 범위: 0 이상. 0이면 기본 타임아웃 적용.
+	 * 동기화: 단일 RPC 컨텍스트 내. 변경 없음. */
+
 	uint32_t		data_len;
-	/* [한국어] data 버퍼 길이 (바이트).
-	 * 디코더 분기: data 또는 data_len 중 먼저 디코딩되는 쪽이 길이를 결정.
-	 * 두 값이 모두 오면 일관성 검증 (불일치 시 -EINVAL). */
+	/* [한국어] DMA 데이터 버퍼 크기 (바이트). data 필드와 연동됨.
+	 * 설정자: rpc_decode_data_len() 또는 rpc_decode_data() 내 일관성 체크로 결정.
+	 *   - data_len이 먼저 디코딩되면 길이를 기록, data 디코딩 시 일관성 검증.
+	 *   - data가 먼저 디코딩되면 base64 길이로 역산하여 채움.
+	 * 읽는 자: nvme_send_cmd_io()/admin()에서 데이터 버퍼 크기 인자로 전달.
+	 * 값 범위: 0 이상. 0이면 DMA 없이 non-data 명령.
+	 * 동기화: 단일 RPC 컨텍스트. completion까지 불변. */
+
 	uint32_t		md_len;
-	/* [한국어] metadata 버퍼 길이 (DIF/DIX 같은 PI 정보용). */
+	/* [한국어] DMA metadata 버퍼 크기 (바이트). DIF/DIX(PI, Protection Information) 용도.
+	 * 설정자: rpc_decode_metadata_len() 또는 rpc_decode_metadata()에서 결정.
+	 * 읽는 자: nvme_send_cmd_io()에서 spdk_nvme_ns_cmd_read_with_md() md 크기 인자.
+	 * 값 범위: 0 이상. 0이면 metadata 없음. PI 사용 namespace에서만 의미 있음.
+	 * 동기화: 단일 RPC 컨텍스트. completion까지 불변. */
 
 	struct spdk_nvme_cmd	*cmdbuf;
-	/* [한국어] 64바이트 NVMe SQE 사본 (base64 디코딩 결과).
-	 * lib/nvme의 raw cmd API에 그대로 전달됨.
-	 * 동기화: 한 RPC 호출 컨텍스트에 한정. */
+	/* [한국어] 64바이트 NVMe SQE (Submission Queue Entry) 사본 (JSON base64 디코딩 결과).
+	 * 설정자: rpc_decode_cmdbuf()에서 base64 디코딩 후 malloc된 버퍼 포인터 저장.
+	 * 읽는 자: nvme_send_cmd_admin()/io()에서 lib/nvme raw cmd API의 cmd 인자로 직접 전달.
+	 * 값 범위: 정확히 sizeof(struct spdk_nvme_cmd)==64바이트. 다르면 -EINVAL.
+	 * 동기화: 한 RPC 컨텍스트에서만 사용. free_rpc_bdev_nvme_send_cmd_ctx()에서 free. */
 
 	char			*data;
-	/* [한국어] DMA 가능한 데이터 버퍼 (spdk_malloc(SPDK_MALLOC_DMA)로 할당).
-	 * hugepage 정렬 4KB 보장. NVMe PRP/SGL의 대상.
-	 * 동기화: completion까지 살아있어야 함. */
+	/* [한국어] DMA 가능한 데이터 버퍼 (spdk_malloc(SPDK_MALLOC_DMA|SPDK_MALLOC_SHARE)로 할당).
+	 * 설정자: rpc_decode_data()에서 hugepage 버퍼 할당 후 base64 디코딩 결과를 담음.
+	 * 읽는 자: nvme_send_cmd_admin()/io()에서 payload 인자로 전달. c2h면 응답에 base64 포함.
+	 * 값 범위: data_len 바이트의 hugepage 버퍼. 4KB 정렬 보장. NULL이면 non-data 명령.
+	 * 동기화: completion 콜백까지 살아있어야 함. spdk_free()로만 해제. */
+
 	char			*md;
-	/* [한국어] DMA 가능한 metadata 버퍼 (PI 등). */
+	/* [한국어] DMA 가능한 metadata 버퍼 (PI/DIF용; spdk_malloc(SPDK_MALLOC_DMA)로 할당).
+	 * 설정자: rpc_decode_metadata()에서 hugepage 버퍼 할당 후 base64 디코딩.
+	 * 읽는 자: nvme_send_cmd_io()에서 spdk_nvme_ns_cmd_*_with_md의 md 인자로 전달.
+	 * 값 범위: md_len 바이트의 hugepage 버퍼. NULL이면 metadata 없음.
+	 * 동기화: completion까지 살아있어야 함. spdk_free()로만 해제. */
 };
 
 /*
@@ -116,11 +151,25 @@ struct rpc_bdev_nvme_send_cmd_req {
  */
 struct rpc_bdev_nvme_send_cmd_resp {
 	char	*cpl_text;
-	/* [한국어] base64 인코딩된 16바이트 NVMe CPL (Completion Queue Entry). 항상 채워짐. */
+	/* [한국어] NVMe CPL(Completion Queue Entry) 16바이트를 base64 url-safe 인코딩한 문자열.
+	 * 설정자: rpc_bdev_nvme_send_cmd_resp_construct()에서 spdk_base64_urlsafe_encode()로 생성.
+	 * 읽는 자: rpc_bdev_nvme_send_cmd_cb()에서 JSON 응답 객체의 "cpl" 필드로 write.
+	 * 값 범위: 항상 non-NULL (성공 경로). CPL에는 SC(Status Code)/SCT 등 완료 정보 포함.
+	 * 동기화: completion 콜백 내에서만 생성/참조. free_rpc_bdev_nvme_send_cmd_ctx()에서 free. */
+
 	char	*data_text;
-	/* [한국어] data direction이 c2h일 때만 채워지는 read 데이터 base64. */
+	/* [한국어] c2h(device→host) 명령에서 디바이스가 DMA 쓴 데이터를 base64 인코딩한 문자열.
+	 * 설정자: rpc_bdev_nvme_send_cmd_resp_construct()에서 data_direction==c2h일 때만 생성.
+	 * 읽는 자: rpc_bdev_nvme_send_cmd_cb()에서 data_text가 non-NULL이면 "data" 필드로 write.
+	 * 값 범위: c2h 명령에서만 non-NULL. h2c나 non-data 명령에서는 NULL.
+	 * 동기화: completion 콜백 내에서만 생성/참조. free_rpc_bdev_nvme_send_cmd_ctx()에서 free. */
+
 	char	*md_text;
-	/* [한국어] c2h이면서 metadata가 있을 때 채워지는 base64. */
+	/* [한국어] c2h 명령에서 metadata도 있을 때(PI 포함) DMA 결과를 base64 인코딩한 문자열.
+	 * 설정자: rpc_bdev_nvme_send_cmd_resp_construct()에서 c2h이고 md != NULL일 때 생성.
+	 * 읽는 자: rpc_bdev_nvme_send_cmd_cb()에서 md_text가 non-NULL이면 "metadata" 필드로 write.
+	 * 값 범위: c2h이고 metadata 있는 경우에만 non-NULL. 나머지는 NULL.
+	 * 동기화: completion 콜백 내에서만 생성/참조. free_rpc_bdev_nvme_send_cmd_ctx()에서 free. */
 };
 
 /*
@@ -132,16 +181,39 @@ struct rpc_bdev_nvme_send_cmd_resp {
  */
 struct rpc_bdev_nvme_send_cmd_ctx {
 	struct spdk_jsonrpc_request	*jsonrpc_request;
-	/* [한국어] 응답을 보낼 RPC 요청 핸들. completion에서 사용. */
+	/* [한국어] 응답을 전송할 SPDK JSON-RPC 서버 요청 핸들.
+	 * 설정자: rpc_bdev_nvme_send_cmd()에서 request 파라미터를 저장.
+	 * 읽는 자: rpc_bdev_nvme_send_cmd_cb()에서 spdk_jsonrpc_begin_result() 인자로 사용.
+	 * 값 범위: 유효한 포인터 (NULL 불가). 응답 전송 후 서버 측에서 무효화됨.
+	 * 동기화: 비동기 완료까지 단일 RPC 컨텍스트. 응답 후에는 접근 금지. */
+
 	struct rpc_bdev_nvme_send_cmd_req	req;
-	/* [한국어] 디코딩된 입력. */
+	/* [한국어] JSON 파라미터 디코딩 결과를 담는 요청 구조체 (name, cmdbuf, data 등 포함).
+	 * 설정자: rpc_bdev_nvme_send_cmd()에서 디코더로 채움.
+	 * 읽는 자: nvme_rpc_send_cmd()에서 cmd_type 스위치, nvme_send_cmd_*()에서 각 필드 사용.
+	 * 값 범위: 디코딩 성공 후 유효. 실패 시 ctx 자체를 free.
+	 * 동기화: 비동기 완료까지 ctx와 동일 수명. free_rpc_bdev_nvme_send_cmd_ctx()에서 해제. */
+
 	struct rpc_bdev_nvme_send_cmd_resp	resp;
-	/* [한국어] 출력 base64 버퍼 보관. */
+	/* [한국어] completion 시 JSON 응답에 포함될 base64 인코딩 문자열들을 보관하는 구조체.
+	 * 설정자: rpc_bdev_nvme_send_cmd_resp_construct()에서 base64 인코딩 후 포인터 저장.
+	 * 읽는 자: rpc_bdev_nvme_send_cmd_cb()에서 JSON 응답 빌드 시 각 필드 write.
+	 * 값 범위: cpl_text는 항상 non-NULL(성공), data_text/md_text는 c2h+존재 시만 non-NULL.
+	 * 동기화: completion 콜백 내 단일 스레드. free_rpc_bdev_nvme_send_cmd_ctx()에서 각 필드 free. */
+
 	struct nvme_ctrlr		*nvme_ctrlr;
-	/* [한국어] lookup된 대상 컨트롤러. */
+	/* [한국어] 명령을 발행할 대상 NVMe 컨트롤러 객체 포인터.
+	 * 설정자: rpc_bdev_nvme_send_cmd()에서 nvme_ctrlr_get_by_name()으로 lookup 후 저장.
+	 * 읽는 자: nvme_send_cmd_admin()에서 spdk_nvme_ctrlr_cmd_admin_raw()의 첫 인자.
+	 * 값 범위: 유효한 포인터 (lookup 실패 시 NULL, 이 경우 에러 응답 후 ctx free).
+	 * 동기화: RPC 컨텍스트 내. 컨트롤러는 completion 이전에 제거되면 안 됨. */
+
 	struct spdk_io_channel		*ctrlr_io_ch;
-	/* [한국어] IO 명령 발행 시 spdk_get_io_channel로 잡은 채널 (qpair 사용 후 spdk_put_io_channel).
-	 * Admin 명령에서는 NULL (admin queue는 별도). */
+	/* [한국어] IO 명령 발행 시 획득하는 nvme_ctrlr IO 채널 (NVMe qpair를 포함).
+	 * 설정자: nvme_send_cmd_io()에서 spdk_get_io_channel(nvme_ctrlr)로 획득.
+	 * 읽는 자: nvme_send_cmd_io()에서 bdev_nvme_get_io_qpair()로 qpair 추출; completion 후 put.
+	 * 값 범위: IO 명령에서만 non-NULL. Admin 명령에서는 NULL (admin queue 사용).
+	 * 동기화: completion 콜백에서 spdk_put_io_channel()로 반드시 해제해야 qpair 점유가 풀림. */
 };
 
 /*

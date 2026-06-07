@@ -74,27 +74,64 @@ struct opal_vbdev {
 	 * 동기화: 변경은 app 스레드에서만. */
 
 	struct nvme_ctrlr *nvme_ctrlr;
-	/* [한국어] 이 Locking Range가 속한 NVMe 컨트롤러. opal_dev는 ctrlr 내부 필드. */
+	/* [한국어] 이 Locking Range가 속한 NVMe 컨트롤러 객체 포인터.
+	 * 설정자: vbdev_opal_create()에서 nvme_ctrlr_get_by_name()으로 lookup 후 저장.
+	 * 읽는 자: vbdev_opal_get_info_from_bdev, vbdev_opal_set_lock_state, vbdev_opal_destruct 등
+	 *          nvme_ctrlr를 통해 opal_dev에 접근하는 모든 경로.
+	 * 값 범위: 유효한 nvme_ctrlr 포인터. 핫리무브 후에는 NULL로 세팅(현재 구현은 직접 NULL 세팅 없음).
+	 * 동기화: 변경은 app 스레드에서만. 핫리무브 경로에서는 오직 TAILQ_REMOVE 후 접근 않음. */
 
 	struct spdk_opal_dev *opal_dev;
-	/* [한국어] lib/nvme/opal이 만든 Opal 드라이버 핸들 (nvme_ctrlr->opal_dev 사본).
-	 * 자주 사용해서 캐싱. */
+	/* [한국어] lib/nvme/opal이 만든 Opal 드라이버 핸들 (nvme_ctrlr->opal_dev의 캐싱 사본).
+	 * 설정자: vbdev_opal_create()에서 nvme_ctrlr->opal_dev를 직접 복사.
+	 * 읽는 자: vbdev_opal_destruct, get_info_from_bdev, set_lock_state, enable_new_user 등
+	 *          spdk_opal_cmd_*() 호출 시 첫 번째 인자.
+	 * 값 범위: spdk_opal_init 시 감지된 SED 핸들 (NULL이면 Opal 미지원 디바이스).
+	 * 동기화: nvme_ctrlr->opal_dev와 동일 생명주기. app 스레드에서만 접근. */
 
 	struct spdk_bdev_part *bdev_part;
-	/* [한국어] 베이스 bdev 위에 만들어진 partition bdev (실제 SPDK bdev로 등록됨).
-	 * spdk_bdev_part는 첫 필드가 spdk_bdev이므로 이 포인터를 spdk_bdev *로 캐스팅 가능. */
+	/* [한국어] 베이스 nvme bdev 위에 만들어진 partition bdev (실제 SPDK bdev 레이어에 등록됨).
+	 * 설정자: vbdev_opal_create()에서 calloc 후 spdk_bdev_part_construct()로 등록 완료 후 저장.
+	 * 읽는 자: vbdev_opal_destruct_bdev()가 spdk_bdev_part_get_offset_blocks/get_bdev로 접근.
+	 *          dump_info_json()이 part 컨텍스트로 사용.
+	 * 값 범위: 정상 create 후 유효한 포인터. destruct 후 free됨.
+	 * 동기화: app 스레드 전용. IO 발행은 채널을 통해 간접 접근. */
 
 	uint8_t locking_range_id;
-	/* [한국어] SED 내 Locking Range 인덱스 (0~7 등). */
+	/* [한국어] SED(Self-Encrypting Drive) 내 Locking Range 인덱스 (보통 0~7, 디바이스 의존).
+	 * 설정자: vbdev_opal_create() 인자로 전달된 값.
+	 * 읽는 자: 모든 spdk_opal_cmd_*()가 Locking Range 선택자로 사용.
+	 * 값 범위: 0 이상의 uint8_t. 디바이스별 최대값은 spdk_opal_cmd_get_max_ranges() 참조.
+	 * 동기화: 생성 이후 불변. 동기화 불필요. */
+
 	uint64_t range_start;
-	/* [한국어] 보호 시작 LBA (베이스 bdev 기준 절대 LBA). */
+	/* [한국어] 보호 시작 LBA (베이스 nvme bdev 기준 절대 LBA 번호).
+	 * 설정자: vbdev_opal_create() 인자. SED에 Setup-Locking-Range로 등록됨.
+	 * 읽는 자: vbdev_opal_destruct_bdev()의 sanity check, spdk_bdev_part_construct() 인자.
+	 * 값 범위: 0 이상 uint64_t. namespace 크기보다 작아야 함.
+	 * 동기화: 생성 이후 불변. */
+
 	uint64_t range_length;
-	/* [한국어] 보호 LBA 개수. */
+	/* [한국어] 보호 LBA 개수 (range_start부터 이 개수만큼의 LBA가 SED 보호 범위).
+	 * 설정자: vbdev_opal_create() 인자. Setup-Locking-Range 및 spdk_bdev_part_construct() 인자.
+	 * 읽는 자: part_construct, info_from_bdev가 spdk_opal_get_locking_range_info로 캐시 갱신 후 사용.
+	 * 값 범위: 1 이상 uint64_t. range_start + range_length <= NS 블록 수.
+	 * 동기화: 생성 이후 불변. */
+
 	struct vbdev_opal_part_base *opal_base;
-	/* [한국어] 베이스 nvme bdev에 대한 part_base 래퍼 (같은 베이스를 쓰는 여러 vbdev가 공유). */
+	/* [한국어] 이 vbdev가 속한 베이스 nvme bdev의 part_base 래퍼.
+	 * 같은 베이스 bdev를 공유하는 여러 opal_vbdev가 동일한 opal_base를 가리킴.
+	 * 설정자: vbdev_opal_create()에서 g_opal_base 검색 또는 신규 생성 후 저장.
+	 * 읽는 자: vbdev_opal_create()의 part_base lookup, vbdev_opal_destruct_bdev()에서 assert.
+	 * 값 범위: 항상 유효한 vbdev_opal_part_base * (create 성공 시).
+	 * 동기화: app 스레드에서만 변경. */
 
 	TAILQ_ENTRY(opal_vbdev) tailq;
-	/* [한국어] g_opal_vbdev 리스트 노드. */
+	/* [한국어] g_opal_vbdev 전역 리스트의 연결 노드.
+	 * 설정자: vbdev_opal_create()의 TAILQ_INSERT_TAIL.
+	 * 읽는 자: TAILQ_FOREACH가 g_opal_vbdev를 순회할 때.
+	 * 값 범위: 불투명 TAILQ 링크 구조 (직접 접근 금지).
+	 * 동기화: app 스레드에서만 삽입/제거. */
 };
 
 /* [한국어] 모든 vbdev_opal 인스턴스를 추적하는 전역 리스트.
@@ -112,11 +149,25 @@ static TAILQ_HEAD(, opal_vbdev) g_opal_vbdev =
  */
 struct vbdev_opal_bdev_io {
 	struct spdk_io_channel *ch;
-	/* [한국어] 원래 IO를 받은 채널. resubmit 시 같은 채널로 재발행. */
+	/* [한국어] 원래 IO 요청이 들어온 vbdev_opal 채널 포인터.
+	 * 설정자: _vbdev_opal_submit_request()에서 -ENOMEM 발생 시 io_ctx->ch = _ch로 저장.
+	 * 읽는 자: vbdev_opal_resubmit_io()가 _vbdev_opal_submit_request()의 첫 인자로 재사용.
+	 * 값 범위: 유효한 spdk_io_channel * (SPDK 스레드와 vbdev 한 쌍에 1개).
+	 * 동기화: 동일 SPDK 스레드 내에서만 사용. 스레드 이동 없음. */
+
 	struct spdk_bdev_io *bdev_io;
-	/* [한국어] 원래의 bdev_io 포인터 (resubmit 시 재사용). */
+	/* [한국어] 재시도 대상이 되는 원본 bdev_io 포인터.
+	 * 설정자: _vbdev_opal_submit_request()에서 -ENOMEM 발생 시 io_ctx->bdev_io = bdev_io로 저장.
+	 * 읽는 자: vbdev_opal_resubmit_io()가 _vbdev_opal_submit_request()의 두 번째 인자로 재사용.
+	 * 값 범위: SPDK bdev 코어가 관리하는 유효한 bdev_io *.
+	 * 동기화: 동일 SPDK 스레드 내에서만 접근. put_io_u 전까지 유효. */
+
 	struct spdk_bdev_io_wait_entry bdev_io_wait;
-	/* [한국어] queue_io_wait에 등록되는 노드. cb_fn=vbdev_opal_resubmit_io. */
+	/* [한국어] spdk_bdev_queue_io_wait()에 등록되는 대기 항목.
+	 * 설정자: vbdev_opal_queue_io()에서 bdev, cb_fn, cb_arg를 채운 뒤 queue_io_wait() 호출.
+	 * 읽는 자: bdev 코어가 IO 슬롯이 생기면 cb_fn(=vbdev_opal_resubmit_io)을 호출.
+	 * 값 범위: TAILQ 링크 + bdev* + cb_fn* + cb_arg* 로 구성된 불투명 구조.
+	 * 동기화: 큐 등록 후 cb_fn 호출까지 bdev 코어가 내부 lock으로 보호. */
 };
 
 /*
@@ -128,7 +179,13 @@ struct vbdev_opal_bdev_io {
  */
 struct vbdev_opal_channel {
 	struct spdk_bdev_part_channel part_ch;
-	/* [한국어] 베이스 bdev에 대한 채널을 포함. 베이스 bdev의 io_channel을 자동 관리. */
+	/* [한국어] 베이스 bdev에 대한 채널을 내부에 포함하는 part 채널 구조체.
+	 * 설정자: spdk_bdev_part_base_construct_ext() 등록 후 채널 생성 시 SPDK part 프레임워크가
+	 *          part_ch.base_ch를 자동으로 베이스 bdev 채널로 초기화.
+	 * 읽는 자: vbdev_opal_queue_io()에서 ch->part_ch.base_ch를 통해 베이스 채널 접근.
+	 *          spdk_bdev_part_submit_request()도 part_ch를 통해 베이스 채널 사용.
+	 * 값 범위: spdk_bdev_part_channel의 첫 필드가 base_ch인 구조체. 직접 접근 시 part API 사용 권장.
+	 * 동기화: 채널은 SPDK 스레드에 고정 (thread-local). 다른 스레드에서 접근 금지. */
 };
 
 /*
@@ -140,16 +197,42 @@ struct vbdev_opal_channel {
  */
 struct vbdev_opal_part_base {
 	char *nvme_ctrlr_name;
-	/* [한국어] 베이스 NVMe 컨트롤러 이름 (lookup용). */
+	/* [한국어] 이 part_base가 감싸고 있는 베이스 NVMe 컨트롤러 이름 문자열.
+	 * 설정자: vbdev_opal_create()에서 strdup(nvme_ctrlr_name)으로 할당.
+	 * 읽는 자: vbdev_opal_delete_all_base_config()에서 동일 컨트롤러에 매달린
+	 *          opal_vbdev들을 식별하는 키로 strcmp 비교.
+	 * 값 범위: null-terminated C 문자열 (예: "Nvme0"). NULL이면 초기화 실패.
+	 * 동기화: 생성 이후 불변. vbdev_opal_base_free()에서 free(). */
+
 	struct spdk_bdev_part_base *part_base;
-	/* [한국어] SPDK가 관리하는 part_base 핸들. */
+	/* [한국어] SPDK bdev part 프레임워크가 관리하는 part_base 핸들.
+	 * 설정자: vbdev_opal_create()에서 spdk_bdev_part_base_construct_ext() 성공 후 저장.
+	 * 읽는 자: spdk_bdev_part_base_get_bdev_name()으로 베이스 이름 비교,
+	 *          spdk_bdev_part_base_get_ctx()로 우리 측 opal_part_base 역참조,
+	 *          spdk_bdev_part_base_hotremove()에 전달.
+	 * 값 범위: spdk_bdev_part_base_construct_ext()가 반환하는 불투명 핸들.
+	 * 동기화: app 스레드에서만 접근. 마지막 part 제거 시 SPDK가 내부 락으로 보호 후 free. */
+
 	SPDK_BDEV_PART_TAILQ part_tailq;
-	/* [한국어] 이 베이스에 속한 모든 spdk_bdev_part 리스트. */
+	/* [한국어] 이 베이스 bdev에서 파생된 모든 spdk_bdev_part 인스턴스를 추적하는 리스트.
+	 * 설정자: vbdev_opal_create()에서 TAILQ_INIT() 후 spdk_bdev_part_construct()가 삽입.
+	 * 읽는 자: spdk_bdev_part_base_hotremove()가 이 리스트를 순회해 모든 part를 unregister.
+	 * 값 범위: TAILQ 헤드 (불투명). SPDK_BDEV_PART_TAILQ가 확장하는 BSD TAILQ.
+	 * 동기화: part 삽입/제거는 app 스레드에서만. */
+
 	TAILQ_ENTRY(vbdev_opal_part_base) tailq;
-	/* [한국어] g_opal_base 리스트 노드. */
+	/* [한국어] g_opal_base 전역 리스트의 연결 노드.
+	 * 설정자: vbdev_opal_create()의 TAILQ_INSERT_TAIL(&g_opal_base, opal_part_base, tailq).
+	 * 읽는 자: TAILQ_FOREACH(&g_opal_base, ...) 순회로 이미 존재하는 part_base lookup.
+	 * 값 범위: TAILQ 링크 포인터 (직접 접근 금지).
+	 * 동기화: app 스레드 전용. */
 };
 
-/* [한국어] 모든 part_base를 추적하는 전역 리스트. */
+/* [한국어] 모든 part_base를 추적하는 전역 리스트.
+ * 설정자: vbdev_opal_create()에서 TAILQ_INSERT_TAIL로 신규 part_base 등록.
+ * 읽는 자: vbdev_opal_create()가 기존 part_base를 찾기 위해 순회.
+ *          vbdev_opal_base_free()가 TAILQ_REMOVE로 제거.
+ * 동기화: app 스레드에서만 수정. */
 static TAILQ_HEAD(, vbdev_opal_part_base) g_opal_base = TAILQ_HEAD_INITIALIZER(g_opal_base);
 
 /* [한국어] 내부 IO submit 헬퍼의 forward 선언 (queue_io에서 호출, submit_request에서도 호출). */
@@ -187,10 +270,11 @@ vbdev_opal_delete(struct opal_vbdev *opal_bdev)
 static void
 vbdev_opal_clear(void)
 {
-	struct opal_vbdev *opal_bdev, *tmp;
+	struct opal_vbdev *opal_bdev, *tmp;   /* [한국어] 순회 커서와 임시 보관 (SAFE 패턴). */
 
 	TAILQ_FOREACH_SAFE(opal_bdev, &g_opal_vbdev, tailq, tmp) {
-		vbdev_opal_delete(opal_bdev);
+		/* [한국어] 삭제 중에 리스트 노드가 변경되므로 SAFE 매크로 사용 필수. */
+		vbdev_opal_delete(opal_bdev);   /* [한국어] 각 메타 객체 해제. */
 	}
 }
 
@@ -242,8 +326,8 @@ vbdev_opal_get_ctx_size(void)
 static void
 vbdev_opal_delete_all_base_config(struct vbdev_opal_part_base *base)
 {
-	char *nvme_ctrlr_name = base->nvme_ctrlr_name;
-	struct opal_vbdev *bdev, *tmp_bdev;
+	char *nvme_ctrlr_name = base->nvme_ctrlr_name;   /* [한국어] 비교 키로 자주 사용하므로 로컬 캐싱. */
+	struct opal_vbdev *bdev, *tmp_bdev;               /* [한국어] TAILQ_FOREACH_SAFE 순회 커서. */
 
 	TAILQ_FOREACH_SAFE(bdev, &g_opal_vbdev, tailq, tmp_bdev) {
 		/* [한국어] 컨트롤러 이름이 일치하면 메타 객체 정리. */
@@ -266,8 +350,9 @@ vbdev_opal_delete_all_base_config(struct vbdev_opal_part_base *base)
 static int
 _vbdev_opal_destruct(void *ctx)
 {
-	struct spdk_bdev_part *part = ctx;
+	struct spdk_bdev_part *part = ctx;   /* [한국어] fn_table ctx는 spdk_bdev_part * (vbdev_opal_create에서 전달). */
 
+	/* [한국어] spdk_bdev_part_free: part 객체와 그 안의 spdk_bdev를 해제. destruct 완료 신호 포함. */
 	return spdk_bdev_part_free(part);
 }
 
@@ -281,12 +366,12 @@ _vbdev_opal_destruct(void *ctx)
 static void
 vbdev_opal_base_free(void *ctx)
 {
-	struct vbdev_opal_part_base *base = ctx;
+	struct vbdev_opal_part_base *base = ctx;   /* [한국어] base_bdev_free_fn의 불투명 ctx를 구체 타입으로 캐스팅. */
 
-	TAILQ_REMOVE(&g_opal_base, base, tailq);   /* [한국어] 전역 리스트에서 제거. */
+	TAILQ_REMOVE(&g_opal_base, base, tailq);   /* [한국어] 전역 part_base 리스트에서 제거. */
 
-	free(base->nvme_ctrlr_name);                 /* [한국어] strdup된 이름 해제. */
-	free(base);
+	free(base->nvme_ctrlr_name);                 /* [한국어] strdup된 컨트롤러 이름 문자열 해제. */
+	free(base);                                   /* [한국어] part_base 구조체 자체 해제. */
 }
 
 /*
@@ -299,8 +384,9 @@ vbdev_opal_base_free(void *ctx)
 static void
 vbdev_opal_resubmit_io(void *arg)
 {
-	struct vbdev_opal_bdev_io *io_ctx = (struct vbdev_opal_bdev_io *)arg;
+	struct vbdev_opal_bdev_io *io_ctx = (struct vbdev_opal_bdev_io *)arg;   /* [한국어] queue_io_wait cb_arg를 구체 타입으로 복원. */
 
+	/* [한국어] 보관해두었던 채널/bdev_io로 다시 submit 시도. 이번엔 슬롯이 있으므로 성공 기대. */
 	_vbdev_opal_submit_request(io_ctx->ch, io_ctx->bdev_io);
 }
 
@@ -314,8 +400,8 @@ vbdev_opal_resubmit_io(void *arg)
 static void
 vbdev_opal_queue_io(struct vbdev_opal_bdev_io *io_ctx)
 {
-	struct vbdev_opal_channel *ch = spdk_io_channel_get_ctx(io_ctx->ch);   /* [한국어] 채널 컨텍스트 얻기. */
-	int rc;
+	struct vbdev_opal_channel *ch = spdk_io_channel_get_ctx(io_ctx->ch);   /* [한국어] 채널 컨텍스트 얻기 (part_ch.base_ch 접근용). */
+	int rc;   /* [한국어] queue_io_wait 등록 결과. 0이면 성공, 비0이면 등록 불가 → 즉시 실패. */
 
 	/* [한국어] wait 엔트리 초기화: 어느 bdev에 대한 대기인지, 깨울 때 호출할 cb_fn. */
 	io_ctx->bdev_io_wait.bdev = io_ctx->bdev_io->bdev;
@@ -348,9 +434,9 @@ vbdev_opal_queue_io(struct vbdev_opal_bdev_io *io_ctx)
 static void
 _vbdev_opal_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io)
 {
-	struct vbdev_opal_channel *ch = spdk_io_channel_get_ctx(_ch);   /* [한국어] 채널 ctx. */
-	struct vbdev_opal_bdev_io *io_ctx = (struct vbdev_opal_bdev_io *)bdev_io->driver_ctx;   /* [한국어] driver_ctx 임베드. */
-	int rc;
+	struct vbdev_opal_channel *ch = spdk_io_channel_get_ctx(_ch);   /* [한국어] 채널 ctx (part_ch 접근용). */
+	struct vbdev_opal_bdev_io *io_ctx = (struct vbdev_opal_bdev_io *)bdev_io->driver_ctx;   /* [한국어] driver_ctx 끝에 임베드된 opal 전용 컨텍스트. */
+	int rc;   /* [한국어] part_submit_request 반환값 (0=성공, -ENOMEM=큐 만석, 기타=에러). */
 
 	/* [한국어] 베이스 bdev로 IO 발행 위임 (오프셋/길이는 part 프레임워크가 보정). */
 	rc = spdk_bdev_part_submit_request(&ch->part_ch, bdev_io);
@@ -380,10 +466,12 @@ static void
 vbdev_opal_io_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bool success)
 {
 	if (!success) {
+		/* [한국어] bdev 코어가 버퍼를 준비하지 못했다 (ENOMEM 등) → IO 실패로 즉시 완료. */
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		return;
 	}
 
+	/* [한국어] 버퍼 준비 성공 → 베이스 bdev로 Read 위임. */
 	_vbdev_opal_submit_request(ch, bdev_io);
 }
 
@@ -423,10 +511,10 @@ vbdev_opal_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 struct spdk_opal_locking_range_info *
 vbdev_opal_get_info_from_bdev(const char *opal_bdev_name, const char *password)
 {
-	struct opal_vbdev *vbdev;
-	struct nvme_ctrlr *nvme_ctrlr;
-	int locking_range_id;
-	int rc;
+	struct opal_vbdev *vbdev;         /* [한국어] g_opal_vbdev 순회 결과. */
+	struct nvme_ctrlr *nvme_ctrlr;   /* [한국어] vbdev에서 얻은 컨트롤러. */
+	int locking_range_id;             /* [한국어] 조회 대상 Locking Range 인덱스. */
+	int rc;                            /* [한국어] SED 명령 결과. */
 
 	/* [한국어] 1단계: 이름으로 vbdev lookup. */
 	TAILQ_FOREACH(vbdev, &g_opal_vbdev, tailq) {
@@ -469,9 +557,9 @@ vbdev_opal_get_info_from_bdev(const char *opal_bdev_name, const char *password)
 static int
 vbdev_opal_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 {
-	struct spdk_bdev_part *part = ctx;
-	struct spdk_bdev *base_bdev = spdk_bdev_part_get_base_bdev(part);   /* [한국어] 베이스 bdev 참조. */
-	uint64_t offset = spdk_bdev_part_get_offset_blocks(part);            /* [한국어] LBA 시작 오프셋. */
+	struct spdk_bdev_part *part = ctx;                                    /* [한국어] fn_table ctx는 spdk_bdev_part *. */
+	struct spdk_bdev *base_bdev = spdk_bdev_part_get_base_bdev(part);   /* [한국어] 베이스 bdev 참조 (이름 출력용). */
+	uint64_t offset = spdk_bdev_part_get_offset_blocks(part);            /* [한국어] vbdev의 LBA 시작 오프셋 (=range_start). */
 
 	spdk_json_write_named_object_begin(w, "opal");
 
@@ -493,8 +581,8 @@ vbdev_opal_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 static void
 vbdev_opal_base_bdev_hotremove_cb(void *_part_base)
 {
-	struct spdk_bdev_part_base *part_base = _part_base;
-	struct vbdev_opal_part_base *base = spdk_bdev_part_base_get_ctx(part_base);
+	struct spdk_bdev_part_base *part_base = _part_base;                            /* [한국어] 불투명 핸들을 구체 타입으로 복원. */
+	struct vbdev_opal_part_base *base = spdk_bdev_part_base_get_ctx(part_base);   /* [한국어] part_base ctx에 저장해둔 우리 측 오브젝트. */
 
 	/* [한국어] 1단계: SPDK part 프레임워크에 hotremove 위임 (각 part_bdev unregister 트리거). */
 	spdk_bdev_part_base_hotremove(part_base, spdk_bdev_part_base_get_tailq(part_base));
@@ -511,9 +599,11 @@ vbdev_opal_base_bdev_hotremove_cb(void *_part_base)
 static bool
 vbdev_opal_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 {
-	struct spdk_bdev_part *part = ctx;
-	struct spdk_bdev *base_bdev = spdk_bdev_part_get_base_bdev(part);
+	struct spdk_bdev_part *part = ctx;                                     /* [한국어] fn_table ctx = spdk_bdev_part *. */
+	struct spdk_bdev *base_bdev = spdk_bdev_part_get_base_bdev(part);   /* [한국어] part 아래 실제 nvme bdev. */
 
+	/* [한국어] 베이스 bdev에 동일 io_type 지원 여부 위임.
+	 * vbdev_opal은 IO 타입 제한을 두지 않고 베이스 기능을 그대로 노출. */
 	return spdk_bdev_io_type_supported(base_bdev, io_type);
 }
 
@@ -747,18 +837,18 @@ err:
 static void
 vbdev_opal_destruct_bdev(struct opal_vbdev *opal_bdev)
 {
-	struct spdk_bdev_part *part = opal_bdev->bdev_part;
+	struct spdk_bdev_part *part = opal_bdev->bdev_part;   /* [한국어] 해제 대상 part 포인터. */
 
-	assert(opal_bdev->opal_base != NULL);
-	assert(part != NULL);
+	assert(opal_bdev->opal_base != NULL);   /* [한국어] opal_base 없는 opal_bdev는 버그. */
+	assert(part != NULL);                    /* [한국어] create 성공 후이므로 part는 항상 유효. */
 
-	/* [한국어] 일치 검증: 메타 range_start == part 실제 오프셋. */
+	/* [한국어] 일치 검증: 메타 range_start == part 실제 오프셋 (같은 Range를 가리키는지 확인). */
 	if (opal_bdev->range_start == spdk_bdev_part_get_offset_blocks(part)) {
 		/* [한국어] spdk_bdev_unregister: 모든 채널/descriptor를 정리하고 fn_table::destruct 호출.
-		 * cb=NULL이므로 비동기 완료를 기다리지 않음. */
+		 * cb=NULL이므로 비동기 완료를 기다리지 않음 (unregister는 사실상 동기적으로 완료). */
 		spdk_bdev_unregister(spdk_bdev_part_get_bdev(part), NULL, NULL);
 	}
-	vbdev_opal_delete(opal_bdev);
+	vbdev_opal_delete(opal_bdev);   /* [한국어] 메타 객체 정리 (g_opal_vbdev에서 제거 + free). */
 }
 
 /*
@@ -775,10 +865,10 @@ vbdev_opal_destruct_bdev(struct opal_vbdev *opal_bdev)
 int
 vbdev_opal_destruct(const char *bdev_name, const char *password)
 {
-	struct nvme_ctrlr *nvme_ctrlr;
-	int locking_range_id;
-	int rc;
-	struct opal_vbdev *opal_bdev;
+	struct nvme_ctrlr *nvme_ctrlr;      /* [한국어] 대상 컨트롤러. */
+	int locking_range_id;                /* [한국어] Secure Erase + Reset 대상 Range 인덱스. */
+	int rc;                              /* [한국어] SED 명령 결과. err: 라벨로 전파. */
+	struct opal_vbdev *opal_bdev;       /* [한국어] lookup 결과. */
 
 	/* [한국어] 1단계: 이름으로 lookup. */
 	TAILQ_FOREACH(opal_bdev, &g_opal_vbdev, tailq) {
@@ -789,11 +879,11 @@ vbdev_opal_destruct(const char *bdev_name, const char *password)
 
 	if (opal_bdev == NULL) {
 		SPDK_ERRLOG("%s not found\n", bdev_name);
-		rc = -ENODEV;
+		rc = -ENODEV;   /* [한국어] 이름 찾기 실패 → ENODEV. err: 라벨에서 rc 반환. */
 		goto err;
 	}
 
-	locking_range_id = opal_bdev->locking_range_id;
+	locking_range_id = opal_bdev->locking_range_id;   /* [한국어] 이 opal_bdev의 Locking Range 인덱스를 캐싱. */
 
 	/* [한국어] 2단계: 컨트롤러 유효성. */
 	nvme_ctrlr = opal_bdev->nvme_ctrlr;
@@ -859,11 +949,11 @@ int
 vbdev_opal_set_lock_state(const char *bdev_name, uint16_t user_id, const char *password,
 			  const char *lock_state)
 {
-	struct nvme_ctrlr *nvme_ctrlr;
-	int locking_range_id;
-	int rc;
-	enum spdk_opal_lock_state state_flag;
-	struct opal_vbdev *opal_bdev;
+	struct nvme_ctrlr *nvme_ctrlr;           /* [한국어] 대상 컨트롤러. */
+	int locking_range_id;                     /* [한국어] SED에 전달할 Range 인덱스. */
+	int rc;                                   /* [한국어] SED 명령 결과. */
+	enum spdk_opal_lock_state state_flag;    /* [한국어] 문자열 → enum 변환 결과. */
+	struct opal_vbdev *opal_bdev;            /* [한국어] lookup 결과. */
 
 	/* [한국어] 1단계: 이름으로 vbdev lookup. */
 	TAILQ_FOREACH(opal_bdev, &g_opal_vbdev, tailq) {
@@ -922,10 +1012,10 @@ int
 vbdev_opal_enable_new_user(const char *bdev_name, const char *admin_password, uint16_t user_id,
 			   const char *user_password)
 {
-	struct nvme_ctrlr *nvme_ctrlr;
-	int locking_range_id;
-	int rc;
-	struct opal_vbdev *opal_bdev;
+	struct nvme_ctrlr *nvme_ctrlr;   /* [한국어] 대상 컨트롤러. */
+	int locking_range_id;             /* [한국어] ACL 등록 대상 Range 인덱스. */
+	int rc;                           /* [한국어] 각 SED 명령 결과. */
+	struct opal_vbdev *opal_bdev;   /* [한국어] lookup 결과. */
 
 	/* [한국어] 1단계: vbdev lookup. */
 	TAILQ_FOREACH(opal_bdev, &g_opal_vbdev, tailq) {
