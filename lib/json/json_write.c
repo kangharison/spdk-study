@@ -1108,6 +1108,7 @@ spdk_json_write_named_uint32(struct spdk_json_write_ctx *w, const char *name, ui
 	return rc ? rc : spdk_json_write_uint32(w, val);
 }
 
+/* [한국어] named_int64 — "name": <부호 있는 64bit 정수>. NVMe 통계/타임스탬프(ns 단위) 등에 사용. */
 int
 spdk_json_write_named_int64(struct spdk_json_write_ctx *w, const char *name, int64_t val)
 {
@@ -1116,6 +1117,7 @@ spdk_json_write_named_int64(struct spdk_json_write_ctx *w, const char *name, int
 	return rc ? rc : spdk_json_write_int64(w, val);
 }
 
+/* [한국어] named_uint64 — "name": <부호 없는 64bit 정수>. tsc, byte count, LBA 등 모든 큰 양수 카운터의 표준. */
 int
 spdk_json_write_named_uint64(struct spdk_json_write_ctx *w, const char *name, uint64_t val)
 {
@@ -1124,6 +1126,7 @@ spdk_json_write_named_uint64(struct spdk_json_write_ctx *w, const char *name, ui
 	return rc ? rc : spdk_json_write_uint64(w, val);
 }
 
+/* [한국어] named_double — "name": <부동소수>. 비율/시간(초)/평균 latency 등에 사용. %.20e 포맷으로 정밀도 유지. */
 int
 spdk_json_write_named_double(struct spdk_json_write_ctx *w, const char *name, double val)
 {

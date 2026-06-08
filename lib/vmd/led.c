@@ -67,7 +67,11 @@ struct vmd_led_indicator_config {
 	 * 값 의미: IDENTIFY에서는 01(Blink 4Hz와 조합), OFF/FAULT에서는 11(Off). */
 
 	uint8_t reserved		: 4;
-	/* [한국어] 비트필드 패딩 - 8-bit alignment용 reserved 비트. */
+	/* [한국어] 비트필드 패딩 - attention(2)+power(2)=4비트를 8비트(uint8_t) 경계로 채우는 reserved 4비트.
+	 * 설정자: designated initializer가 명시하지 않으므로 항상 0으로 초기화됨.
+	 * 읽는 자: 누구도 읽지 않음 - 구조체 크기를 1바이트로 고정하기 위한 패딩 전용.
+	 * 값 범위: 항상 0 (의미 없음).
+	 * 동기화: 컴파일 타임 상수 테이블의 일부이므로 런타임 변경 없음 - 동기화 불필요. */
 };
 
 /*
@@ -89,9 +93,13 @@ struct vmd_led_indicator_config {
  * 설정자: 컴파일 타임 상수 - 변경 불가.
  * 읽는 자: vmd_led_set_indicator_control이 state로 인덱싱, vmd_led_get_state가 역검색. */
 static const struct vmd_led_indicator_config g_led_config[] = {
+	/* [한국어] OFF: attention=3(11b=Off), power=3(11b=Off) → 두 indicator 모두 꺼짐 → amber LED 소등. */
 	[SPDK_VMD_LED_STATE_OFF]	= { .attention_indicator = 3, .power_indicator = 3 },
+	/* [한국어] IDENTIFY: attention=3(11b=Off), power=1(01b=On) → 펌웨어가 power On을 보고 4Hz blink 출력. */
 	[SPDK_VMD_LED_STATE_IDENTIFY]	= { .attention_indicator = 3, .power_indicator = 1 },
+	/* [한국어] FAULT: attention=1(01b=On), power=3(11b=Off) → attention On → solid(continuous) On. */
 	[SPDK_VMD_LED_STATE_FAULT]	= { .attention_indicator = 1, .power_indicator = 3 },
+	/* [한국어] REBUILD: attention=1(01b=On), power=1(01b=On) → 둘 다 On → 펌웨어가 1Hz blink 출력. */
 	[SPDK_VMD_LED_STATE_REBUILD]	= { .attention_indicator = 1, .power_indicator = 1 },
 };
 

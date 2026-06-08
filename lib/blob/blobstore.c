@@ -537,39 +537,230 @@ spdk_blob_open_opts_init(struct spdk_blob_open_opts *opts, size_t opts_size)
 #undef SET_FILED
 }
 
+/*
+ * [한국어]
+ * blob_alloc - 새 in-memory blob 객체를 할당하고 기본 상태로 초기화
+ *
+ * @bs: 이 blob이 속할 blobstore (소유자) — blob->bs로 역참조 저장
+ * @id: 이 blob에 부여할 blob ID (보통 metadata page 인덱스에서 유래)
+ * @return: 초기화된 spdk_blob* (성공), NULL (메모리 부족)
+ *
+ * blob 생성(spdk_bs_create_blob)이나 로드(blob load) 경로의 첫 단계에서 호출되어
+ * 디스크 메타데이터를 담을 빈 in-memory 컨테이너를 만든다. 새로 만든 blob은 아직
+ * 디스크에 기록되지 않았으므로 state=DIRTY로 시작한다 (persist가 필요함을 의미).
+ *
+ * 실행 컨텍스트: md_thread (메타데이터 스레드)에서만 호출된다. blob 객체는 lockless
+ * 설계상 단일 md_thread가 소유하므로 별도 락 없이 안전하다.
+ *
+ * 호출 체인:
+ *   bs_create_blob / blob 로드 경로 → [blob_alloc] → calloc
+ */
 static struct spdk_blob *
 blob_alloc(struct spdk_blob_store *bs, spdk_blob_id id)
 {
-	struct spdk_blob *blob;
+	struct spdk_blob *blob;                            /* [한국어] 새로 할당할 blob 포인터 */
 
-	blob = calloc(1, sizeof(*blob));
-	if (!blob) {
+	blob = calloc(1, sizeof(*blob));                   /* [한국어] 0으로 초기화된 blob 본체 할당 */
+	if (!blob) {                                       /* [한국어] 메모리 부족 시 NULL 반환 */
 		return NULL;
 	}
 
-	blob->id = id;
-	blob->bs = bs;
+	blob->id = id;                                     /* [한국어] blob 식별자 저장 */
+	blob->bs = bs;                                     /* [한국어] 소속 blobstore 역참조 저장 */
 
-	blob->parent_id = SPDK_BLOBID_INVALID;
+	blob->parent_id = SPDK_BLOBID_INVALID;             /* [한국어] 부모 없음 — snapshot/clone 시 설정됨 */
 
-	blob->state = SPDK_BLOB_STATE_DIRTY;
-	blob->extent_rle_found = false;
-	blob->extent_table_found = false;
-	blob->active.num_pages = 1;
-	blob->active.pages = calloc(1, sizeof(*blob->active.pages));
-	if (!blob->active.pages) {
+	blob->state = SPDK_BLOB_STATE_DIRTY;               /* [한국어] 아직 디스크 미반영 → persist 필요 */
+	blob->extent_rle_found = false;                    /* [한국어] 레거시 RLE extent 미발견 (로드 시 갱신) */
+	blob->extent_table_found = false;                  /* [한국어] EXTENT_TABLE 미발견 (로드 시 갱신) */
+	blob->active.num_pages = 1;                        /* [한국어] 최소 1개 md page(blob 자체) 점유 */
+	blob->active.pages = calloc(1, sizeof(*blob->active.pages)); /* [한국어] md page 인덱스 배열 1개 */
+	if (!blob->active.pages) {                         /* [한국어] 배열 할당 실패 시 본체 정리 후 NULL */
 		free(blob);
 		return NULL;
 	}
 
-	blob->active.pages[0] = bs_blobid_to_page(id);
+	blob->active.pages[0] = bs_blobid_to_page(id);     /* [한국어] blob ID → 첫 md page 번호 매핑 */
 
-	TAILQ_INIT(&blob->xattrs);
-	TAILQ_INIT(&blob->xattrs_internal);
-	TAILQ_INIT(&blob->pending_persists);
-	TAILQ_INIT(&blob->persists_to_complete);
+	TAILQ_INIT(&blob->xattrs);                         /* [한국어] 외부 xattr 리스트 초기화 */
+	TAILQ_INIT(&blob->xattrs_internal);                /* [한국어] 내부(SPDK 전용) xattr 리스트 초기화 */
+	TAILQ_INIT(&blob->pending_persists);               /* [한국어] 대기 중 persist 요청 큐 초기화 */
+	TAILQ_INIT(&blob->persists_to_complete);           /* [한국어] 완료 처리 대기 persist 큐 초기화 */
 
-	return blob;
+	return blob;                                       /* [한국어] 초기화 완료된 blob 반환 */
+}
+
+/*
+ * [한국어]
+ * xattrs_free - xattr TAILQ에 매달린 모든 xattr 항목과 그 이름/값 메모리를 해제
+ *
+ * @xattrs: 해제할 xattr 리스트 (외부 xattrs 또는 internal xattrs)
+ *
+ * blob_free에서 호출되어 blob이 소유한 확장 속성(key-value)을 모두 정리한다.
+ * 각 xattr은 name/value 버퍼를 별도로 calloc/strdup 했으므로 개별 free가 필요하다.
+ *
+ * 실행 컨텍스트: md_thread. blob 소멸 경로의 일부이므로 다른 스레드 접근 없음.
+ *
+ * 호출 체인:
+ *   blob_free → [xattrs_free] → free
+ */
+static void
+xattrs_free(struct spdk_xattr_tailq *xattrs)
+{
+	struct spdk_xattr	*xattr, *xattr_tmp;        /* [한국어] 순회 커서 + 안전 삭제용 임시 */
+
+	/* [한국어] _SAFE 변형: 삭제하면서 순회할 수 있도록 다음 노드를 미리 보관 */
+	TAILQ_FOREACH_SAFE(xattr, xattrs, link, xattr_tmp) {
+		TAILQ_REMOVE(xattrs, xattr, link);         /* [한국어] 리스트에서 분리 */
+		free(xattr->name);                         /* [한국어] 속성 이름 버퍼 해제 */
+		free(xattr->value);                        /* [한국어] 속성 값 버퍼 해제 */
+		free(xattr);                               /* [한국어] xattr 노드 자체 해제 */
+	}
+}
+
+/*
+ * [한국어]
+ * blob_unref_back_bs_dev - blob의 부모 back_bs_dev 참조를 끊고 정리
+ *
+ * @blob: 부모(back) 디바이스를 가진 blob (clone/esnap clone)
+ *
+ * clone blob은 미할당 cluster를 읽을 때 부모 스냅샷의 데이터를 back_bs_dev를 통해
+ * 읽는다. blob 소멸 시 이 back 디바이스의 destroy vtable을 호출해 리소스를 반환한다.
+ *
+ * 실행 컨텍스트: md_thread (blob_free 경로).
+ *
+ * 호출 체인:
+ *   blob_free → [blob_unref_back_bs_dev] → back_bs_dev->destroy
+ */
+static void
+blob_unref_back_bs_dev(struct spdk_blob *blob)
+{
+	blob->back_bs_dev->destroy(blob->back_bs_dev);     /* [한국어] back 디바이스 vtable destroy 호출 */
+	blob->back_bs_dev = NULL;                          /* [한국어] dangling 방지로 포인터 무효화 */
+}
+
+/*
+ * [한국어]
+ * blob_free - in-memory blob 객체와 그 하위 할당을 모두 해제
+ *
+ * @blob: 해제할 blob (디스크 미반영 상태가 모두 정리되어 있어야 함)
+ *
+ * blob close/delete 경로의 마지막에서 호출된다. active/clean 두 세트의 매핑 배열
+ * (extent_pages/clusters/pages), xattr 리스트, back_bs_dev를 차례로 해제한다.
+ * pending/persists_to_complete 큐가 비어 있다고 가정(assert)한다 — 진행 중 I/O가
+ * 남아 있으면 use-after-free가 되므로 호출자가 보장해야 한다.
+ *
+ * 실행 컨텍스트: md_thread. blob은 단일 스레드 소유이므로 락 불필요.
+ *
+ * 호출 체인:
+ *   blob close/delete cpl → [blob_free] → xattrs_free / blob_unref_back_bs_dev / free
+ */
+static void
+blob_free(struct spdk_blob *blob)
+{
+	assert(blob != NULL);                              /* [한국어] NULL 방어 */
+	assert(TAILQ_EMPTY(&blob->pending_persists));      /* [한국어] 진행 중 persist 없어야 안전 */
+	assert(TAILQ_EMPTY(&blob->persists_to_complete));  /* [한국어] 완료 대기 persist도 비어야 함 */
+
+	free(blob->active.extent_pages);                   /* [한국어] active EXTENT_PAGE 인덱스 배열 */
+	free(blob->clean.extent_pages);                    /* [한국어] clean(디스크 반영본) EXTENT_PAGE 배열 */
+	free(blob->active.clusters);                       /* [한국어] active cluster LBA 매핑 배열 */
+	free(blob->clean.clusters);                        /* [한국어] clean cluster LBA 매핑 배열 */
+	free(blob->active.pages);                          /* [한국어] active md page 인덱스 배열 */
+	free(blob->clean.pages);                           /* [한국어] clean md page 인덱스 배열 */
+
+	xattrs_free(&blob->xattrs);                        /* [한국어] 외부 xattr 전체 해제 */
+	xattrs_free(&blob->xattrs_internal);               /* [한국어] 내부 xattr 전체 해제 */
+
+	if (blob->back_bs_dev) {                            /* [한국어] clone/esnap이면 부모 디바이스 정리 */
+		blob_unref_back_bs_dev(blob);
+	}
+
+	free(blob);                                        /* [한국어] blob 본체 해제 */
+}
+
+/*
+ * [한국어]
+ * blob_back_bs_destroy_esnap_done - esnap back_bs_dev 채널 파괴 완료 콜백
+ *
+ * @ctx:     blob_back_bs_destroy가 넘긴 cb_arg — 파괴할 bs_dev 포인터
+ * @blob:    대상 blob (로그/식별용)
+ * @bserrno: 채널 파괴 결과 (0=성공)
+ *
+ * external snapshot(esnap) clone의 back_bs_dev는 각 io_channel마다 부모 디바이스
+ * 채널을 만들어 두므로, back_bs_dev를 destroy하기 전에 모든 스레드의 채널을 먼저
+ * 파괴해야 한다. 그 비동기 순회가 끝나면 이 콜백에서 실제 destroy를 호출한다.
+ *
+ * 실행 컨텍스트: 채널 순회를 시작한 스레드(md_thread)에서 완료 콜백으로 실행.
+ *
+ * 호출 체인:
+ *   blob_back_bs_destroy → blob_esnap_destroy_bs_dev_channels(순회)
+ *     → [blob_back_bs_destroy_esnap_done] → bs_dev->destroy
+ */
+static void
+blob_back_bs_destroy_esnap_done(void *ctx, struct spdk_blob *blob, int bserrno)
+{
+	struct spdk_bs_dev	*bs_dev = ctx;            /* [한국어] 파괴 대상 부모 디바이스 */
+
+	if (bserrno != 0) {                                /* [한국어] 채널 파괴 실패 — 보통 ctx 할당 실패 */
+		/*
+		 * This is probably due to a memory allocation failure when creating the
+		 * blob_esnap_destroy_ctx before iterating threads.
+		 */
+		/* [한국어] 채널 컨텍스트 할당 실패 등으로 순회 자체가 불가했던 경우 */
+		SPDK_ERRLOG("blob 0x%" PRIx64 ": Unable to destroy bs dev channels: error %d\n",
+			    blob->id, bserrno);
+		assert(false);                             /* [한국어] 디버그 빌드에서 즉시 중단 */
+	}
+
+	if (bs_dev == NULL) {                              /* [한국어] 파괴할 디바이스가 없는 방어 분기 */
+		/*
+		 * This check exists to make scanbuild happy.
+		 *
+		 * blob->back_bs_dev for an esnap is NULL during the first iteration of blobs while
+		 * the blobstore is being loaded. It could also be NULL if there was an error
+		 * opening the esnap device. In each of these cases, no channels could have been
+		 * created because back_bs_dev->create_channel() would have led to a NULL pointer
+		 * deref.
+		 */
+		/* [한국어] 로드 초기 또는 esnap open 실패 시 back_bs_dev가 NULL일 수 있음.
+		 * 이 경우 채널이 생성된 적 없으므로 파괴할 것도 없다 (scanbuild 만족용 가드). */
+		assert(false);
+		return;
+	}
+
+	SPDK_DEBUGLOG(blob_esnap, "blob 0x%" PRIx64 ": calling destroy on back_bs_dev\n", blob->id);
+	bs_dev->destroy(bs_dev);                           /* [한국어] 모든 채널 정리 후 디바이스 destroy */
+}
+
+/*
+ * [한국어]
+ * blob_back_bs_destroy - blob의 back_bs_dev를 안전하게 파괴 (채널 먼저 정리)
+ *
+ * @blob: back_bs_dev를 가진 blob (esnap clone)
+ *
+ * back_bs_dev에는 스레드별 io_channel이 매달려 있을 수 있으므로, 먼저 모든 스레드의
+ * 채널을 비동기로 파괴하고(blob_esnap_destroy_bs_dev_channels) 그 완료 콜백에서 실제
+ * destroy를 수행한다. blob->back_bs_dev 포인터는 즉시 NULL로 만들지만, 실제 디바이스
+ * 객체 수명은 콜백까지 ctx로 전달해 유지한다.
+ *
+ * 실행 컨텍스트: md_thread.
+ *
+ * 호출 체인:
+ *   blob teardown → [blob_back_bs_destroy] → blob_esnap_destroy_bs_dev_channels
+ *     → blob_back_bs_destroy_esnap_done
+ */
+static void
+blob_back_bs_destroy(struct spdk_blob *blob)
+{
+	SPDK_DEBUGLOG(blob_esnap, "blob 0x%" PRIx64 ": preparing to destroy back_bs_dev\n",
+		      blob->id);
+
+	/* [한국어] 모든 스레드의 esnap 채널을 먼저 비동기 파괴 후, 완료 콜백에서 destroy.
+	 * 마지막 인자 blob->back_bs_dev가 완료 콜백의 ctx(파괴 대상)로 전달된다. */
+	blob_esnap_destroy_bs_dev_channels(blob, false, blob_back_bs_destroy_esnap_done,
+					   blob->back_bs_dev);
+	blob->back_bs_dev = NULL;                          /* [한국어] blob에서 즉시 참조 끊음(실수명은 ctx가 보유) */
 }
 
 static void
@@ -660,201 +851,391 @@ blob_back_bs_destroy(struct spdk_blob *blob)
 	blob->back_bs_dev = NULL;
 }
 
+/*
+ * [한국어]
+ * struct blob_parent - "부모 설정(set parent)" 연산에서 새 부모 정보를 담는 union
+ *
+ * blob의 부모는 두 종류일 수 있다: (1) 같은 blobstore 안의 다른 blob(snapshot), 또는
+ * (2) 외부 디바이스(external snapshot, esnap). set_parent_refs_cb 콜백이 이 구조체를
+ * 받아 blob의 부모 참조(parent_id 또는 esnap xattr)를 갱신한다.
+ */
 struct blob_parent {
 	union {
 		struct {
 			spdk_blob_id id;
+			/* [한국어] 새 부모 snapshot blob의 ID.
+			 * 설정자: snapshot/clone 연산 준비 코드.
+			 * 읽는 자: set_parent_refs_cb 구현(blob->parent_id 갱신).
+			 * 값 범위: 유효한 blob ID 또는 SPDK_BLOBID_INVALID. */
 			struct spdk_blob *blob;
+			/* [한국어] 위 ID에 해당하는 부모 blob의 in-memory 객체.
+			 * 설정자: 부모 blob을 open한 후 저장.
+			 * 읽는 자: ref count 증가/snapshot 리스트 갱신 시 사용.
+			 * 동기화: md_thread 단일 소유. */
 		} snapshot;
 
 		struct {
 			void *id;
+			/* [한국어] external snapshot 식별자 바이트열(불투명).
+			 * 설정자: esnap clone 생성 시 사용자 제공 id 복사 위치.
+			 * 읽는 자: esnap xattr(SPDK_BLOB_EXTERNAL_SNAPSHOT) 기록 코드.
+			 * 값 범위: id_len 바이트만큼 유효. */
 			uint32_t id_len;
+			/* [한국어] 위 id 바이트열의 길이.
+			 * 설정자/읽는 자: esnap id와 짝으로 사용. */
 			struct spdk_bs_dev *back_bs_dev;
+			/* [한국어] esnap 부모를 표현하는 back 디바이스 vtable.
+			 * 설정자: esnap open 콜백이 만든 bs_dev.
+			 * 읽는 자: blob->back_bs_dev로 설치되어 미할당 cluster 읽기에 사용. */
 		} esnap;
 	} u;
 };
 
+/* [한국어] 부모 참조 갱신 콜백 타입 — blob과 새 부모 정보를 받아 0(성공)/음수 errno 반환.
+ * snapshot용과 esnap용 두 구현이 존재하며 blob_set_back_bs_dev 경로에서 선택 호출됨. */
 typedef int (*set_parent_refs_cb)(struct spdk_blob *blob, struct blob_parent *parent);
 
+/*
+ * [한국어]
+ * struct set_bs_dev_ctx - back_bs_dev 교체(set parent) 비동기 연산의 컨텍스트
+ *
+ * back_bs_dev 교체는 진행 중인 I/O를 freeze → 교체 → unfreeze 하는 다단계 비동기
+ * 과정이므로, 각 단계 콜백 사이에서 필요한 상태를 이 구조체에 보관한다.
+ */
 struct set_bs_dev_ctx {
 	struct spdk_blob	*blob;
+	/* [한국어] 부모를 교체할 대상 blob.
+	 * 설정자: blob_set_back_bs_dev.
+	 * 읽는 자: freeze/교체/unfreeze 각 콜백.
+	 * 동기화: md_thread 단일 소유. */
 	struct spdk_bs_dev	*back_bs_dev;
+	/* [한국어] 설치할 새 back 디바이스(NULL이면 부모 제거).
+	 * 설정자: blob_set_back_bs_dev 진입 시.
+	 * 읽는 자: freeze 완료 후 blob->back_bs_dev에 설치. */
 
 	/*
 	 * This callback is used during a set parent operation to change the references
 	 * to the parent of the blob.
 	 */
 	set_parent_refs_cb	parent_refs_cb_fn;
+	/* [한국어] 부모 참조(메타데이터) 갱신 콜백.
+	 * 설정자: blob_set_back_bs_dev 인자.
+	 * 읽는 자: 교체 단계에서 호출되어 parent_id/xattr 갱신.
+	 * 값 범위: NULL일 수 있음(참조 갱신 불필요 시). */
 	struct blob_parent	*parent_refs_cb_arg;
+	/* [한국어] 위 콜백에 전달할 새 부모 정보(blob_parent).
+	 * 설정자/읽는 자: parent_refs_cb_fn과 짝. */
 
 	spdk_blob_op_complete	cb_fn;
+	/* [한국어] 전체 set parent 연산 완료를 사용자에게 알리는 콜백.
+	 * 설정자: blob_set_back_bs_dev 인자.
+	 * 읽는 자: 최종 완료 콜백에서 호출. */
 	void			*cb_arg;
+	/* [한국어] cb_fn에 전달할 사용자 컨텍스트. */
 	int			bserrno;
+	/* [한국어] 중간 단계에서 발생한 에러를 최종 완료까지 전달하는 누적 코드.
+	 * 설정자: 각 단계 콜백. 읽는 자: 최종 cb_fn 호출 시. */
 };
 
+/*
+ * [한국어]
+ * blob_set_back_bs_dev - blob의 back_bs_dev(부모 디바이스)를 비동기 교체 시작
+ *
+ * @blob:               대상 blob
+ * @back_bs_dev:        설치할 새 back 디바이스
+ * @parent_refs_cb_fn:  부모 참조 메타데이터 갱신 콜백(snapshot/esnap별)
+ * @parent_refs_cb_arg: 위 콜백에 줄 새 부모 정보
+ * @cb_fn:              전체 완료 콜백
+ * @cb_arg:             완료 콜백 컨텍스트
+ *
+ * 부모 교체는 진행 중인 I/O와 경쟁하면 안 되므로 먼저 blob_freeze_io로 I/O를 멈춘 뒤
+ * frozen 콜백(blob_set_back_bs_dev_frozen)에서 실제 교체를 수행한다. 여기서는 ctx를
+ * 할당해 이후 단계로 상태를 전달하는 준비만 한다.
+ *
+ * 실행 컨텍스트: md_thread.
+ *
+ * 호출 체인:
+ *   set parent/snapshot/esnap API → [blob_set_back_bs_dev]
+ *     → blob_freeze_io → blob_set_back_bs_dev_frozen
+ */
 static void
 blob_set_back_bs_dev(struct spdk_blob *blob, struct spdk_bs_dev *back_bs_dev,
 		     set_parent_refs_cb parent_refs_cb_fn, struct blob_parent *parent_refs_cb_arg,
 		     spdk_blob_op_complete cb_fn, void *cb_arg)
 {
-	struct set_bs_dev_ctx	*ctx;
+	struct set_bs_dev_ctx	*ctx;                     /* [한국어] 다단계 비동기 상태 컨텍스트 */
 
-	ctx = calloc(1, sizeof(*ctx));
-	if (ctx == NULL) {
+	ctx = calloc(1, sizeof(*ctx));                     /* [한국어] 단계 간 상태 보관용 ctx 할당 */
+	if (ctx == NULL) {                                 /* [한국어] 메모리 부족 시 즉시 에러 콜백 */
 		SPDK_ERRLOG("blob 0x%" PRIx64 ": out of memory while setting back_bs_dev\n",
 			    blob->id);
 		cb_fn(cb_arg, -ENOMEM);
 		return;
 	}
 
-	ctx->parent_refs_cb_fn = parent_refs_cb_fn;
-	ctx->parent_refs_cb_arg = parent_refs_cb_arg;
-	ctx->cb_fn = cb_fn;
-	ctx->cb_arg = cb_arg;
-	ctx->back_bs_dev = back_bs_dev;
-	ctx->blob = blob;
+	ctx->parent_refs_cb_fn = parent_refs_cb_fn;        /* [한국어] 부모 참조 갱신 콜백 저장 */
+	ctx->parent_refs_cb_arg = parent_refs_cb_arg;      /* [한국어] 새 부모 정보 저장 */
+	ctx->cb_fn = cb_fn;                                /* [한국어] 최종 완료 콜백 저장 */
+	ctx->cb_arg = cb_arg;                              /* [한국어] 완료 콜백 컨텍스트 저장 */
+	ctx->back_bs_dev = back_bs_dev;                    /* [한국어] 설치할 새 back 디바이스 저장 */
+	ctx->blob = blob;                                  /* [한국어] 대상 blob 저장 */
 
+	/* [한국어] 먼저 I/O를 freeze하고, 멈춘 뒤 frozen 콜백에서 실제 교체 수행 */
 	blob_freeze_io(blob, blob_set_back_bs_dev_frozen, ctx);
 }
 
+/*
+ * [한국어]
+ * struct freeze_io_ctx - blob I/O freeze/unfreeze 채널 순회의 완료 컨텍스트
+ *
+ * freeze/unfreeze는 모든 io_channel을 순회(spdk_for_each_channel)하며 처리하므로,
+ * 순회 완료 시 사용자 콜백을 호출하기 위한 정보를 담는다.
+ */
 struct freeze_io_ctx {
 	struct spdk_bs_cpl cpl;
+	/* [한국어] 순회 완료 시 호출할 완료 콜백 디스크립터(cb_fn/cb_arg 포함).
+	 * 설정자: blob_freeze_io/blob_unfreeze_io.
+	 * 읽는 자: blob_io_cpl(순회 종료 콜백). */
 	struct spdk_blob *blob;
+	/* [한국어] freeze/unfreeze 대상 blob.
+	 * 읽는 자: blob_execute_queued_io가 이 blob에 매인 큐 I/O를 식별할 때 사용. */
 };
 
+/*
+ * [한국어]
+ * blob_io_sync - freeze 순회에서 각 채널이 할 일이 없을 때의 per-channel 콜백
+ *
+ * @i: 채널 순회 반복자
+ *
+ * freeze는 "현재 진행 중인 채널 작업이 모두 한 바퀴 돌아 동기화될 때까지" 기다리는
+ * 의미만 있으므로 채널별로 추가 작업 없이 즉시 다음 채널로 진행한다. 순회 자체가
+ * 모든 reactor 스레드를 한 번씩 거치는 배리어 역할을 한다.
+ *
+ * 실행 컨텍스트: 각 io_channel을 소유한 스레드에서 순차 실행.
+ *
+ * 호출 체인:
+ *   blob_freeze_io → spdk_for_each_channel → [blob_io_sync] → spdk_for_each_channel_continue
+ */
 static void
 blob_io_sync(struct spdk_io_channel_iter *i)
 {
-	spdk_for_each_channel_continue(i, 0);
+	spdk_for_each_channel_continue(i, 0);              /* [한국어] 작업 없이 다음 채널로 진행 */
 }
 
+/*
+ * [한국어]
+ * blob_execute_queued_io - unfreeze 시 각 채널의 대기 I/O 중 해당 blob 것을 재실행
+ *
+ * @i: 채널 순회 반복자
+ *
+ * freeze 동안 이 blob에 도착한 사용자 I/O는 각 채널의 queued_io 큐에 쌓여 있다.
+ * unfreeze 시 모든 채널을 순회하며 이 blob에 매인 대기 op를 큐에서 빼서 실제 실행
+ * (bs_user_op_execute)한다. 다른 blob의 대기 I/O는 건드리지 않는다.
+ *
+ * 실행 컨텍스트: 각 채널 소유 스레드. 해당 채널의 queued_io는 그 스레드만 만지므로
+ * lockless 안전.
+ *
+ * 호출 체인:
+ *   blob_unfreeze_io → spdk_for_each_channel → [blob_execute_queued_io] → bs_user_op_execute
+ */
 static void
 blob_execute_queued_io(struct spdk_io_channel_iter *i)
 {
-	struct spdk_io_channel *_ch = spdk_io_channel_iter_get_channel(i);
-	struct spdk_bs_channel *ch = spdk_io_channel_get_ctx(_ch);
-	struct freeze_io_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
-	struct spdk_bs_request_set	*set;
-	struct spdk_bs_user_op_args	*args;
-	spdk_bs_user_op_t *op, *tmp;
+	struct spdk_io_channel *_ch = spdk_io_channel_iter_get_channel(i); /* [한국어] 현재 순회 채널 핸들 */
+	struct spdk_bs_channel *ch = spdk_io_channel_get_ctx(_ch);         /* [한국어] blobstore 전용 채널 컨텍스트 */
+	struct freeze_io_ctx *ctx = spdk_io_channel_iter_get_ctx(i);       /* [한국어] 어느 blob을 깨울지 정보 */
+	struct spdk_bs_request_set	*set;             /* [한국어] op를 request_set으로 캐스팅하기 위한 변수 */
+	struct spdk_bs_user_op_args	*args;            /* [한국어] user op 인자(대상 blob 포함) */
+	spdk_bs_user_op_t *op, *tmp;                       /* [한국어] 순회 커서 + 안전 삭제 임시 */
 
+	/* [한국어] 채널의 대기 I/O 큐를 안전 순회(처리 중 삭제 가능) */
 	TAILQ_FOREACH_SAFE(op, &ch->queued_io, link, tmp) {
-		set = (struct spdk_bs_request_set *)op;
-		args = &set->u.user_op;
+		set = (struct spdk_bs_request_set *)op;    /* [한국어] op는 request_set의 첫 멤버라 캐스팅 가능 */
+		args = &set->u.user_op;                    /* [한국어] user op 인자 추출 */
 
-		if (args->blob == ctx->blob) {
-			TAILQ_REMOVE(&ch->queued_io, op, link);
-			bs_user_op_execute(op);
+		if (args->blob == ctx->blob) {             /* [한국어] freeze 풀린 blob의 대기 I/O만 선택 */
+			TAILQ_REMOVE(&ch->queued_io, op, link); /* [한국어] 대기 큐에서 분리 */
+			bs_user_op_execute(op);            /* [한국어] 실제 I/O 실행(이제 freeze 해제됨) */
 		}
 	}
 
-	spdk_for_each_channel_continue(i, 0);
+	spdk_for_each_channel_continue(i, 0);              /* [한국어] 다음 채널로 진행 */
 }
 
+/*
+ * [한국어]
+ * blob_io_cpl - freeze/unfreeze 채널 순회가 모든 스레드에서 끝났을 때의 종료 콜백
+ *
+ * @i:      채널 순회 반복자
+ * @status: 순회 결과(여기선 사용 안 함, 항상 0 전달)
+ *
+ * spdk_for_each_channel의 마지막 단계(순회 시작 스레드로 복귀)에서 호출되어 사용자
+ * 완료 콜백(blob_freeze_io/unfreeze_io에 전달된 cb_fn)을 실행하고 ctx를 해제한다.
+ *
+ * 실행 컨텍스트: 순회를 시작한 스레드(md_thread).
+ *
+ * 호출 체인:
+ *   spdk_for_each_channel 종료 → [blob_io_cpl] → cpl.u.blob_basic.cb_fn
+ */
 static void
 blob_io_cpl(struct spdk_io_channel_iter *i, int status)
 {
-	struct freeze_io_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+	struct freeze_io_ctx *ctx = spdk_io_channel_iter_get_ctx(i); /* [한국어] 완료 콜백 정보 추출 */
 
-	ctx->cpl.u.blob_basic.cb_fn(ctx->cpl.u.blob_basic.cb_arg, 0);
+	ctx->cpl.u.blob_basic.cb_fn(ctx->cpl.u.blob_basic.cb_arg, 0); /* [한국어] 사용자 완료 콜백 호출 */
 
-	free(ctx);
+	free(ctx);                                         /* [한국어] 순회 컨텍스트 해제 */
 }
 
+/*
+ * [한국어]
+ * blob_freeze_io - blob에 대한 모든 진행/신규 I/O를 일시 정지(freeze)
+ *
+ * @blob:   freeze할 blob
+ * @cb_fn:  freeze 완료 시 호출할 콜백
+ * @cb_arg: 콜백 컨텍스트
+ *
+ * snapshot 분기, back_bs_dev 교체 등 메타데이터를 바꾸는 동안 사용자 I/O와 경쟁하면
+ * 안 되므로 사용한다. frozen_refcnt를 증가시키면 이후 도착하는 I/O는 즉시 실행되지
+ * 않고 각 채널의 queued_io에 적재된다(중첩 freeze를 위해 refcount 사용). 그 후 모든
+ * 채널을 순회(blob_io_sync)해 "현재 in-flight 작업이 모두 한 바퀴 돈" 시점을 보장하고
+ * 완료 콜백을 호출한다.
+ *
+ * 실행 컨텍스트: md_thread. frozen_refcnt 변경은 md_thread 단일 소유라 락 불필요.
+ *
+ * 호출 체인:
+ *   blob_set_back_bs_dev 등 → [blob_freeze_io] → spdk_for_each_channel(blob_io_sync)
+ */
 static void
 blob_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
-	struct freeze_io_ctx *ctx;
+	struct freeze_io_ctx *ctx;                         /* [한국어] 순회 완료 컨텍스트 */
 
-	blob_verify_md_op(blob);
+	blob_verify_md_op(blob);                           /* [한국어] md_thread에서 호출되었는지 검증 */
 
-	ctx = calloc(1, sizeof(*ctx));
-	if (!ctx) {
+	ctx = calloc(1, sizeof(*ctx));                     /* [한국어] 완료 콜백 정보 담을 ctx 할당 */
+	if (!ctx) {                                        /* [한국어] 메모리 부족 시 에러 콜백 */
 		cb_fn(cb_arg, -ENOMEM);
 		return;
 	}
 
-	ctx->cpl.type = SPDK_BS_CPL_TYPE_BS_BASIC;
-	ctx->cpl.u.blob_basic.cb_fn = cb_fn;
-	ctx->cpl.u.blob_basic.cb_arg = cb_arg;
-	ctx->blob = blob;
+	ctx->cpl.type = SPDK_BS_CPL_TYPE_BS_BASIC;         /* [한국어] 기본 완료 타입 지정 */
+	ctx->cpl.u.blob_basic.cb_fn = cb_fn;               /* [한국어] 사용자 완료 콜백 저장 */
+	ctx->cpl.u.blob_basic.cb_arg = cb_arg;             /* [한국어] 완료 콜백 컨텍스트 저장 */
+	ctx->blob = blob;                                  /* [한국어] 대상 blob 저장 */
 
 	/* Freeze I/O on blob */
-	blob->frozen_refcnt++;
+	blob->frozen_refcnt++;                             /* [한국어] freeze 카운터 증가 → 이후 I/O는 큐잉됨 */
 
+	/* [한국어] 모든 채널을 배리어처럼 한 바퀴 돌아 in-flight 동기화 후 완료 통지 */
 	spdk_for_each_channel(blob->bs, blob_io_sync, ctx, blob_io_cpl);
 }
 
+/*
+ * [한국어]
+ * blob_unfreeze_io - blob의 I/O 정지를 해제하고 큐잉된 대기 I/O를 재개
+ *
+ * @blob:   unfreeze할 blob
+ * @cb_fn:  완료 콜백
+ * @cb_arg: 콜백 컨텍스트
+ *
+ * blob_freeze_io의 짝. frozen_refcnt를 감소시키고(0이 되어야 실제 해제), 모든 채널을
+ * 순회하며 freeze 동안 쌓인 이 blob의 대기 I/O를 재실행(blob_execute_queued_io)한다.
+ *
+ * 실행 컨텍스트: md_thread. assert로 frozen_refcnt>0(짝이 맞는 freeze 존재)을 검증.
+ *
+ * 호출 체인:
+ *   메타 변경 완료 후 → [blob_unfreeze_io] → spdk_for_each_channel(blob_execute_queued_io)
+ */
 static void
 blob_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
-	struct freeze_io_ctx *ctx;
+	struct freeze_io_ctx *ctx;                         /* [한국어] 순회 완료 컨텍스트 */
 
-	blob_verify_md_op(blob);
+	blob_verify_md_op(blob);                           /* [한국어] md_thread 검증 */
 
-	ctx = calloc(1, sizeof(*ctx));
-	if (!ctx) {
+	ctx = calloc(1, sizeof(*ctx));                     /* [한국어] 완료 콜백 정보 ctx 할당 */
+	if (!ctx) {                                        /* [한국어] 메모리 부족 시 에러 콜백 */
 		cb_fn(cb_arg, -ENOMEM);
 		return;
 	}
 
-	ctx->cpl.type = SPDK_BS_CPL_TYPE_BS_BASIC;
-	ctx->cpl.u.blob_basic.cb_fn = cb_fn;
-	ctx->cpl.u.blob_basic.cb_arg = cb_arg;
-	ctx->blob = blob;
+	ctx->cpl.type = SPDK_BS_CPL_TYPE_BS_BASIC;         /* [한국어] 기본 완료 타입 */
+	ctx->cpl.u.blob_basic.cb_fn = cb_fn;               /* [한국어] 사용자 완료 콜백 저장 */
+	ctx->cpl.u.blob_basic.cb_arg = cb_arg;             /* [한국어] 완료 콜백 컨텍스트 저장 */
+	ctx->blob = blob;                                  /* [한국어] 대상 blob 저장 */
 
-	assert(blob->frozen_refcnt > 0);
+	assert(blob->frozen_refcnt > 0);                   /* [한국어] freeze 없이 unfreeze하면 버그 */
 
-	blob->frozen_refcnt--;
+	blob->frozen_refcnt--;                             /* [한국어] freeze 카운터 감소 */
 
+	/* [한국어] 채널 순회하며 큐잉된 대기 I/O 재실행 후 완료 통지 */
 	spdk_for_each_channel(blob->bs, blob_execute_queued_io, ctx, blob_io_cpl);
 }
 
+/*
+ * [한국어]
+ * blob_mark_clean - active 메타데이터 스냅샷을 clean 세트로 승격(persist 성공 후 호출)
+ *
+ * @blob: 메타데이터가 디스크에 막 기록 완료된 blob
+ * @return: 0 성공, -ENOMEM 메모리 부족(스냅샷 복제 실패)
+ *
+ * blob은 두 벌의 매핑 세트를 갖는다: active(현재 in-memory 최신본)와 clean(마지막으로
+ * 디스크에 영속화된 본). persist가 끝나면 지금의 active를 clean으로 옮겨 "디스크와 일치"
+ * 상태를 표시한다. 이때 active용으로는 새 복사본을 만들어 둬서, 이후 변경이 clean을
+ * 오염시키지 않도록 한다(copy-on-write 유사). 복사본 할당이 모두 성공해야 교체를
+ * 진행하므로, 실패 시 이미 잡은 임시 버퍼를 풀고 -ENOMEM을 반환해 atomicity를 지킨다.
+ *
+ * 실행 컨텍스트: md_thread (persist 완료 콜백 경로). blob 단일 소유라 락 불필요.
+ *
+ * 호출 체인:
+ *   blob persist 완료 → [blob_mark_clean]
+ */
 static int
 blob_mark_clean(struct spdk_blob *blob)
 {
-	uint32_t *extent_pages = NULL;
-	uint64_t *clusters = NULL;
-	uint32_t *pages = NULL;
+	uint32_t *extent_pages = NULL;                     /* [한국어] 새 active extent_pages 복사본 */
+	uint64_t *clusters = NULL;                         /* [한국어] 새 active clusters 복사본 */
+	uint32_t *pages = NULL;                            /* [한국어] 새 active pages 복사본 */
 
-	assert(blob != NULL);
+	assert(blob != NULL);                              /* [한국어] NULL 방어 */
 
-	if (blob->active.num_extent_pages) {
-		assert(blob->active.extent_pages);
-		extent_pages = calloc(blob->active.num_extent_pages, sizeof(*blob->active.extent_pages));
-		if (!extent_pages) {
+	if (blob->active.num_extent_pages) {               /* [한국어] extent_pages가 있을 때만 복제 */
+		assert(blob->active.extent_pages);         /* [한국어] count>0이면 배열도 있어야 함 */
+		extent_pages = calloc(blob->active.num_extent_pages, sizeof(*blob->active.extent_pages)); /* [한국어] 새 active용 버퍼 */
+		if (!extent_pages) {                       /* [한국어] 실패 시 아직 교체 전이라 그냥 반환 */
 			return -ENOMEM;
 		}
 		memcpy(extent_pages, blob->active.extent_pages,
-		       blob->active.num_extent_pages * sizeof(*extent_pages));
+		       blob->active.num_extent_pages * sizeof(*extent_pages)); /* [한국어] 현재 매핑 복사 */
 	}
 
-	if (blob->active.num_clusters) {
+	if (blob->active.num_clusters) {                   /* [한국어] cluster 매핑 복제 */
 		assert(blob->active.clusters);
-		clusters = calloc(blob->active.num_clusters, sizeof(*blob->active.clusters));
-		if (!clusters) {
+		clusters = calloc(blob->active.num_clusters, sizeof(*blob->active.clusters)); /* [한국어] 새 active용 cluster 배열 */
+		if (!clusters) {                           /* [한국어] 실패 시 앞서 잡은 extent_pages 롤백 */
 			free(extent_pages);
 			return -ENOMEM;
 		}
-		memcpy(clusters, blob->active.clusters, blob->active.num_clusters * sizeof(*blob->active.clusters));
+		memcpy(clusters, blob->active.clusters, blob->active.num_clusters * sizeof(*blob->active.clusters)); /* [한국어] 매핑 복사 */
 	}
 
-	if (blob->active.num_pages) {
+	if (blob->active.num_pages) {                      /* [한국어] md page 인덱스 배열 복제 */
 		assert(blob->active.pages);
-		pages = calloc(blob->active.num_pages, sizeof(*blob->active.pages));
-		if (!pages) {
+		pages = calloc(blob->active.num_pages, sizeof(*blob->active.pages)); /* [한국어] 새 active용 pages 배열 */
+		if (!pages) {                              /* [한국어] 실패 시 앞 두 버퍼 모두 롤백 */
 			free(extent_pages);
 			free(clusters);
 			return -ENOMEM;
 		}
-		memcpy(pages, blob->active.pages, blob->active.num_pages * sizeof(*blob->active.pages));
+		memcpy(pages, blob->active.pages, blob->active.num_pages * sizeof(*blob->active.pages)); /* [한국어] 매핑 복사 */
 	}
 
-	free(blob->clean.extent_pages);
+	free(blob->clean.extent_pages);                    /* [한국어] 이전 clean 세트(구버전) 해제 */
 	free(blob->clean.clusters);
 	free(blob->clean.pages);
 
+	/* [한국어] 여기서부터 active → clean 승격: 현재 active 배열들을 clean으로 이동 */
 	blob->clean.num_extent_pages = blob->active.num_extent_pages;
 	blob->clean.extent_pages = blob->active.extent_pages;
 	blob->clean.num_clusters = blob->active.num_clusters;
@@ -863,6 +1244,7 @@ blob_mark_clean(struct spdk_blob *blob)
 	blob->clean.num_pages = blob->active.num_pages;
 	blob->clean.pages = blob->active.pages;
 
+	/* [한국어] active 포인터는 위에서 만든 복사본으로 교체(이후 변경이 clean 오염 안 함) */
 	blob->active.extent_pages = extent_pages;
 	blob->active.clusters = clusters;
 	blob->active.pages = pages;
@@ -870,168 +1252,226 @@ blob_mark_clean(struct spdk_blob *blob)
 	/* If the metadata was dirtied again while the metadata was being written to disk,
 	 *  we do not want to revert the DIRTY state back to CLEAN here.
 	 */
+	/* [한국어] persist 진행 중 메타가 또 더럽혀졌으면(state가 LOADING이 아닌 DIRTY) CLEAN으로
+	 * 되돌리지 않는다 — LOADING(=막 기록 완료) 상태에서만 CLEAN으로 전이. */
 	if (blob->state == SPDK_BLOB_STATE_LOADING) {
-		blob->state = SPDK_BLOB_STATE_CLEAN;
+		blob->state = SPDK_BLOB_STATE_CLEAN;       /* [한국어] 디스크와 일치 상태로 표시 */
 	}
 
-	return 0;
+	return 0;                                          /* [한국어] 승격 성공 */
 }
 
+/*
+ * [한국어]
+ * blob_deserialize_xattr - 디스크 md 디스크립터의 xattr 하나를 in-memory xattr로 복원
+ *
+ * @blob:      복원된 xattr을 매달 blob
+ * @desc_xattr: 디스크 metadata page에서 읽은 xattr 디스크립터(와이어 포맷)
+ * @internal:  true면 내부(SPDK 전용) xattr 리스트로, false면 외부 xattr 리스트로
+ * @return: 0 성공, -EINVAL 길이 불일치(손상된 메타), -ENOMEM 메모리 부족
+ *
+ * blob 로드 시 metadata page를 파싱하는 blob_parse_page에서 호출된다. 디스크의 xattr
+ * 디스크립터는 [name_length][value_length][name bytes][value bytes]가 연속 패킹된
+ * 포맷이므로, 이를 분해해 name/value 버퍼를 따로 할당하고 spdk_xattr 노드를 만들어
+ * 적절한 리스트에 매단다. 먼저 length 필드가 실제 name/value 길이 합과 맞는지 검증해
+ * 손상된 메타데이터를 거른다.
+ *
+ * 실행 컨텍스트: md_thread (blob 로드 파싱 경로).
+ *
+ * 호출 체인:
+ *   blob_parse_page → [blob_deserialize_xattr] → calloc/malloc/memcpy
+ */
 static int
 blob_deserialize_xattr(struct spdk_blob *blob,
 		       struct spdk_blob_md_descriptor_xattr *desc_xattr, bool internal)
 {
-	struct spdk_xattr                       *xattr;
+	struct spdk_xattr                       *xattr;   /* [한국어] 복원할 in-memory xattr 노드 */
 
+	/* [한국어] 디스크 length가 헤더(name_len+value_len) + name + value 합과 일치하는지 검증.
+	 * 불일치면 손상된 metadata page이므로 거부한다. */
 	if (desc_xattr->length != sizeof(desc_xattr->name_length) +
 	    sizeof(desc_xattr->value_length) +
 	    desc_xattr->name_length + desc_xattr->value_length) {
 		return -EINVAL;
 	}
 
-	xattr = calloc(1, sizeof(*xattr));
+	xattr = calloc(1, sizeof(*xattr));                 /* [한국어] xattr 노드 본체 할당 */
 	if (xattr == NULL) {
 		return -ENOMEM;
 	}
 
-	xattr->name = malloc(desc_xattr->name_length + 1);
-	if (xattr->name == NULL) {
+	xattr->name = malloc(desc_xattr->name_length + 1); /* [한국어] 이름 버퍼(+1은 NUL 종결자) */
+	if (xattr->name == NULL) {                         /* [한국어] 실패 시 노드 정리 후 반환 */
 		free(xattr);
 		return -ENOMEM;
 	}
 
-	xattr->value = malloc(desc_xattr->value_length);
-	if (xattr->value == NULL) {
+	xattr->value = malloc(desc_xattr->value_length);   /* [한국어] 값 버퍼(바이너리, NUL 없음) */
+	if (xattr->value == NULL) {                        /* [한국어] 실패 시 이름/노드 정리 후 반환 */
 		free(xattr->name);
 		free(xattr);
 		return -ENOMEM;
 	}
 
-	memcpy(xattr->name, desc_xattr->name, desc_xattr->name_length);
-	xattr->name[desc_xattr->name_length] = '\0';
-	xattr->value_len = desc_xattr->value_length;
+	memcpy(xattr->name, desc_xattr->name, desc_xattr->name_length); /* [한국어] 이름 바이트 복사 */
+	xattr->name[desc_xattr->name_length] = '\0';       /* [한국어] C 문자열로 쓰도록 NUL 종결 */
+	xattr->value_len = desc_xattr->value_length;       /* [한국어] 값 길이 저장(바이너리) */
+	/* [한국어] 값은 디스크립터 내 name 바이트 바로 뒤에 위치 → 오프셋 산술로 시작 주소 계산 */
 	memcpy(xattr->value,
 	       (void *)((uintptr_t)desc_xattr->name + desc_xattr->name_length),
 	       desc_xattr->value_length);
 
+	/* [한국어] internal 여부에 따라 두 xattr 리스트 중 하나에 매단다 */
 	TAILQ_INSERT_TAIL(internal ? &blob->xattrs_internal : &blob->xattrs, xattr, link);
 
-	return 0;
+	return 0;                                          /* [한국어] 복원 성공 */
 }
 
 
+/*
+ * [한국어]
+ * blob_parse_page - 디스크 metadata page 한 장의 디스크립터 스트림을 파싱해 blob 복원
+ *
+ * @page: 디스크에서 읽은 metadata page(고정 크기, descriptors[] 영역에 가변 디스크립터 연속)
+ * @blob: 파싱 결과를 채울 in-memory blob (LOADING 상태)
+ * @return: 0 성공, -EINVAL 손상/모순된 메타, -ENOMEM 배열 확장 실패
+ *
+ * metadata page는 [type][length][payload]로 패킹된 디스크립터들이 연속된 TLV 스트림이다.
+ * 이 함수는 cur_desc 오프셋을 desc->length만큼 전진시키며 각 디스크립터 타입을 해석한다:
+ *   - PADDING(length 0): 페이지 종료 표식
+ *   - FLAGS: invalid/data_ro/md_ro 플래그 → blob의 읽기전용/유효성 속성 복원
+ *   - EXTENT_RLE: 레거시 run-length 인코딩 cluster 매핑 (구포맷)
+ *   - EXTENT_TABLE: 새 포맷 — extent page들의 목록(외부화된 cluster 매핑)
+ *   - EXTENT_PAGE: EXTENT_TABLE이 가리키는 실제 cluster 인덱스 배열
+ *   - XATTR / XATTR_INTERNAL: 확장 속성(외부/내부)
+ * RLE와 TABLE은 상호 배타적이며(둘 다 있으면 손상), 미인식 타입은 forward-compat을 위해
+ * 무시한다. cluster 인덱스가 used_clusters 풀에 실제 할당돼 있는지도 교차 검증한다.
+ *
+ * 실행 컨텍스트: md_thread (blob 로드 경로). blob은 LOADING 상태 단일 소유.
+ *
+ * 호출 체인:
+ *   blob_parse / blob_parse_extent_page → [blob_parse_page] → blob_deserialize_xattr 등
+ */
 static int
 blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 {
-	struct spdk_blob_md_descriptor *desc;
-	size_t	cur_desc = 0;
-	void *tmp;
+	struct spdk_blob_md_descriptor *desc;              /* [한국어] 현재 파싱 중인 디스크립터 포인터 */
+	size_t	cur_desc = 0;                              /* [한국어] descriptors[] 내 현재 오프셋(바이트) */
+	void *tmp;                                         /* [한국어] realloc 결과 임시 보관(롤백 안전) */
 
-	desc = (struct spdk_blob_md_descriptor *)page->descriptors;
-	while (cur_desc < sizeof(page->descriptors)) {
-		if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_PADDING) {
+	desc = (struct spdk_blob_md_descriptor *)page->descriptors; /* [한국어] 첫 디스크립터부터 시작 */
+	while (cur_desc < sizeof(page->descriptors)) {     /* [한국어] descriptors 영역 끝까지 TLV 순회 */
+		if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_PADDING) { /* [한국어] 패딩 디스크립터 */
 			if (desc->length == 0) {
 				/* If padding and length are 0, this terminates the page */
-				break;
+				break;                     /* [한국어] length 0 패딩 = 페이지 종료 마커 */
 			}
-		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_FLAGS) {
-			struct spdk_blob_md_descriptor_flags	*desc_flags;
+		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_FLAGS) { /* [한국어] 플래그 디스크립터 */
+			struct spdk_blob_md_descriptor_flags	*desc_flags; /* [한국어] FLAGS 디스크립터 캐스팅용 */
 
-			desc_flags = (struct spdk_blob_md_descriptor_flags *)desc;
+			desc_flags = (struct spdk_blob_md_descriptor_flags *)desc; /* [한국어] desc를 flags 타입으로 해석 */
 
-			if (desc_flags->length != sizeof(*desc_flags) - sizeof(*desc)) {
+			if (desc_flags->length != sizeof(*desc_flags) - sizeof(*desc)) { /* [한국어] payload 길이 검증 */
 				return -EINVAL;
 			}
 
+			/* [한국어] invalid_flags에 우리가 모르는 비트가 켜져 있으면(마스크 밖) 이 blob을
+			 * 로드할 수 없는 신규 기능이 필요한 것 → 거부 */
 			if ((desc_flags->invalid_flags | SPDK_BLOB_INVALID_FLAGS_MASK) !=
 			    SPDK_BLOB_INVALID_FLAGS_MASK) {
 				return -EINVAL;
 			}
 
+			/* [한국어] 모르는 data_ro 플래그가 있으면 안전하게 data/md 모두 읽기전용 처리 */
 			if ((desc_flags->data_ro_flags | SPDK_BLOB_DATA_RO_FLAGS_MASK) !=
 			    SPDK_BLOB_DATA_RO_FLAGS_MASK) {
 				blob->data_ro = true;
 				blob->md_ro = true;
 			}
 
+			/* [한국어] 모르는 md_ro 플래그가 있으면 메타데이터를 읽기전용 처리 */
 			if ((desc_flags->md_ro_flags | SPDK_BLOB_MD_RO_FLAGS_MASK) !=
 			    SPDK_BLOB_MD_RO_FLAGS_MASK) {
 				blob->md_ro = true;
 			}
 
+			/* [한국어] 명시적 READ_ONLY 비트가 켜졌으면 data/md 모두 읽기전용 */
 			if ((desc_flags->data_ro_flags & SPDK_BLOB_READ_ONLY)) {
 				blob->data_ro = true;
 				blob->md_ro = true;
 			}
 
-			blob->invalid_flags = desc_flags->invalid_flags;
+			blob->invalid_flags = desc_flags->invalid_flags;  /* [한국어] 원본 플래그 보존(재직렬화용) */
 			blob->data_ro_flags = desc_flags->data_ro_flags;
 			blob->md_ro_flags = desc_flags->md_ro_flags;
 
-		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_EXTENT_RLE) {
-			struct spdk_blob_md_descriptor_extent_rle	*desc_extent_rle;
-			unsigned int				i, j;
-			unsigned int				cluster_count = blob->active.num_clusters;
+		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_EXTENT_RLE) { /* [한국어] 레거시 RLE cluster 매핑 */
+			struct spdk_blob_md_descriptor_extent_rle	*desc_extent_rle; /* [한국어] RLE 캐스팅용 */
+			unsigned int				i, j;     /* [한국어] extent/런 인덱스 */
+			unsigned int				cluster_count = blob->active.num_clusters; /* [한국어] 누적 cluster 수 */
 
-			if (blob->extent_table_found) {
+			if (blob->extent_table_found) {            /* [한국어] TABLE과 RLE 공존 = 손상 */
 				/* Extent Table already present in the md,
 				 * both descriptors should never be at the same time. */
 				return -EINVAL;
 			}
-			blob->extent_rle_found = true;
+			blob->extent_rle_found = true;             /* [한국어] 이 blob은 구포맷(RLE) 사용 표시 */
 
-			desc_extent_rle = (struct spdk_blob_md_descriptor_extent_rle *)desc;
+			desc_extent_rle = (struct spdk_blob_md_descriptor_extent_rle *)desc; /* [한국어] RLE로 해석 */
 
+			/* [한국어] length가 0이거나 extent 단위로 정렬되지 않으면 손상 */
 			if (desc_extent_rle->length == 0 ||
 			    (desc_extent_rle->length % sizeof(desc_extent_rle->extents[0]) != 0)) {
 				return -EINVAL;
 			}
 
+			/* [한국어] 1차 패스: 총 cluster 수를 세고, 할당 cluster가 실제 used 풀에 있는지 검증 */
 			for (i = 0; i < desc_extent_rle->length / sizeof(desc_extent_rle->extents[0]); i++) {
-				for (j = 0; j < desc_extent_rle->extents[i].length; j++) {
-					if (desc_extent_rle->extents[i].cluster_idx != 0) {
+				for (j = 0; j < desc_extent_rle->extents[i].length; j++) { /* [한국어] 런 길이만큼 확장 */
+					if (desc_extent_rle->extents[i].cluster_idx != 0) { /* [한국어] 0은 미할당(thin) */
 						if (!spdk_bit_pool_is_allocated(blob->bs->used_clusters,
 										desc_extent_rle->extents[i].cluster_idx + j)) {
-							return -EINVAL;
+							return -EINVAL; /* [한국어] used 풀에 없는 cluster 참조 = 손상 */
 						}
 					}
-					cluster_count++;
+					cluster_count++;           /* [한국어] cluster 슬롯 1개 증가 */
 				}
 			}
 
-			if (cluster_count == 0) {
+			if (cluster_count == 0) {                  /* [한국어] 빈 매핑은 손상 */
 				return -EINVAL;
 			}
-			tmp = realloc(blob->active.clusters, cluster_count * sizeof(*blob->active.clusters));
+			tmp = realloc(blob->active.clusters, cluster_count * sizeof(*blob->active.clusters)); /* [한국어] cluster 배열 확장 */
 			if (tmp == NULL) {
 				return -ENOMEM;
 			}
-			blob->active.clusters = tmp;
-			blob->active.cluster_array_size = cluster_count;
+			blob->active.clusters = tmp;               /* [한국어] 확장된 배열 적용 */
+			blob->active.cluster_array_size = cluster_count; /* [한국어] 배열 용량 기록 */
 
+			/* [한국어] 2차 패스: 실제 LBA 매핑 채우기 */
 			for (i = 0; i < desc_extent_rle->length / sizeof(desc_extent_rle->extents[0]); i++) {
 				for (j = 0; j < desc_extent_rle->extents[i].length; j++) {
-					if (desc_extent_rle->extents[i].cluster_idx != 0) {
+					if (desc_extent_rle->extents[i].cluster_idx != 0) { /* [한국어] 할당된 cluster */
 						blob->active.clusters[blob->active.num_clusters++] = bs_cluster_to_lba(blob->bs,
-								desc_extent_rle->extents[i].cluster_idx + j);
-						blob->active.num_allocated_clusters++;
-					} else if (spdk_blob_is_thin_provisioned(blob)) {
+								desc_extent_rle->extents[i].cluster_idx + j); /* [한국어] cluster idx → LBA */
+						blob->active.num_allocated_clusters++; /* [한국어] 할당 cluster 카운트 */
+					} else if (spdk_blob_is_thin_provisioned(blob)) { /* [한국어] thin이면 0(미할당) 허용 */
 						blob->active.clusters[blob->active.num_clusters++] = 0;
-					} else {
+					} else {                   /* [한국어] thin 아닌데 0 = 손상 */
 						return -EINVAL;
 					}
 				}
 			}
-		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_EXTENT_TABLE) {
-			struct spdk_blob_md_descriptor_extent_table *desc_extent_table;
-			uint32_t num_extent_pages = blob->active.num_extent_pages;
-			uint32_t i, j;
-			size_t extent_pages_length;
+		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_EXTENT_TABLE) { /* [한국어] 새 포맷 extent 테이블 */
+			struct spdk_blob_md_descriptor_extent_table *desc_extent_table; /* [한국어] TABLE 캐스팅용 */
+			uint32_t num_extent_pages = blob->active.num_extent_pages; /* [한국어] 누적 extent page 수 */
+			uint32_t i, j;                             /* [한국어] 순회 인덱스 */
+			size_t extent_pages_length;                /* [한국어] extent_page 항목들의 총 바이트 길이 */
 
-			desc_extent_table = (struct spdk_blob_md_descriptor_extent_table *)desc;
-			extent_pages_length = desc_extent_table->length - sizeof(desc_extent_table->num_clusters);
+			desc_extent_table = (struct spdk_blob_md_descriptor_extent_table *)desc; /* [한국어] TABLE로 해석 */
+			extent_pages_length = desc_extent_table->length - sizeof(desc_extent_table->num_clusters); /* [한국어] num_clusters 필드 제외한 payload */
 
-			if (blob->extent_rle_found) {
+			if (blob->extent_rle_found) {              /* [한국어] RLE와 공존 금지 */
 				/* This means that Extent RLE is present in MD,
 				 * both should never be at the same time. */
 				return -EINVAL;
@@ -1039,122 +1479,131 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 				   desc_extent_table->num_clusters != blob->remaining_clusters_in_et) {
 				/* Number of clusters in this ET does not match number
 				 * from previously read EXTENT_TABLE. */
+				/* [한국어] 여러 페이지에 걸친 TABLE이라면 cluster 총수가 일관돼야 함 */
 				return -EINVAL;
 			}
 
+			/* [한국어] length 0 또는 extent_page 단위 미정렬 = 손상 */
 			if (desc_extent_table->length == 0 ||
 			    (extent_pages_length % sizeof(desc_extent_table->extent_page[0]) != 0)) {
 				return -EINVAL;
 			}
 
-			blob->extent_table_found = true;
+			blob->extent_table_found = true;           /* [한국어] 이 blob은 신포맷(TABLE) 사용 표시 */
 
+			/* [한국어] 1차 패스: 모든 entry의 num_pages 합산 → 필요한 extent_pages 배열 크기 */
 			for (i = 0; i < extent_pages_length / sizeof(desc_extent_table->extent_page[0]); i++) {
 				num_extent_pages += desc_extent_table->extent_page[i].num_pages;
 			}
 
-			if (num_extent_pages > 0) {
+			if (num_extent_pages > 0) {                /* [한국어] extent page 배열 확장 */
 				tmp = realloc(blob->active.extent_pages, num_extent_pages * sizeof(uint32_t));
 				if (tmp == NULL) {
 					return -ENOMEM;
 				}
 				blob->active.extent_pages = tmp;
 			}
-			blob->active.extent_pages_array_size = num_extent_pages;
+			blob->active.extent_pages_array_size = num_extent_pages; /* [한국어] 배열 용량 기록 */
 
-			blob->remaining_clusters_in_et = desc_extent_table->num_clusters;
+			blob->remaining_clusters_in_et = desc_extent_table->num_clusters; /* [한국어] ET가 약속한 총 cluster 수 */
 
 			/* Extent table entries contain md page numbers for extent pages.
 			 * Zeroes represent unallocated extent pages, those are run-length-encoded.
 			 */
+			/* [한국어] 2차 패스: 각 entry는 extent page의 md page 번호. 0은 미할당(thin)이며 RLE로 압축됨 */
 			for (i = 0; i < extent_pages_length / sizeof(desc_extent_table->extent_page[0]); i++) {
-				if (desc_extent_table->extent_page[i].page_idx != 0) {
-					assert(desc_extent_table->extent_page[i].num_pages == 1);
+				if (desc_extent_table->extent_page[i].page_idx != 0) { /* [한국어] 할당된 extent page */
+					assert(desc_extent_table->extent_page[i].num_pages == 1); /* [한국어] 할당 entry는 단일 페이지 */
 					blob->active.extent_pages[blob->active.num_extent_pages++] =
-						desc_extent_table->extent_page[i].page_idx;
-				} else if (spdk_blob_is_thin_provisioned(blob)) {
+						desc_extent_table->extent_page[i].page_idx; /* [한국어] page 번호 저장 */
+				} else if (spdk_blob_is_thin_provisioned(blob)) { /* [한국어] thin이면 미할당 run 허용 */
 					for (j = 0; j < desc_extent_table->extent_page[i].num_pages; j++) {
-						blob->active.extent_pages[blob->active.num_extent_pages++] = 0;
+						blob->active.extent_pages[blob->active.num_extent_pages++] = 0; /* [한국어] 미할당 슬롯 */
 					}
-				} else {
+				} else {                           /* [한국어] thin 아닌데 미할당 = 손상 */
 					return -EINVAL;
 				}
 			}
-		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_EXTENT_PAGE) {
-			struct spdk_blob_md_descriptor_extent_page	*desc_extent;
-			unsigned int					i;
-			unsigned int					cluster_count = 0;
-			size_t						cluster_idx_length;
+		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_EXTENT_PAGE) { /* [한국어] TABLE이 가리키는 실제 cluster 배열 */
+			struct spdk_blob_md_descriptor_extent_page	*desc_extent; /* [한국어] EXTENT_PAGE 캐스팅용 */
+			unsigned int					i;        /* [한국어] cluster 인덱스 */
+			unsigned int					cluster_count = 0; /* [한국어] 이 페이지가 담은 cluster 수 */
+			size_t						cluster_idx_length; /* [한국어] cluster_idx[] 총 바이트 */
 
-			if (blob->extent_rle_found) {
+			if (blob->extent_rle_found) {              /* [한국어] RLE와 공존 금지 */
 				/* This means that Extent RLE is present in MD,
 				 * both should never be at the same time. */
 				return -EINVAL;
 			}
 
-			desc_extent = (struct spdk_blob_md_descriptor_extent_page *)desc;
-			cluster_idx_length = desc_extent->length - sizeof(desc_extent->start_cluster_idx);
+			desc_extent = (struct spdk_blob_md_descriptor_extent_page *)desc; /* [한국어] EXTENT_PAGE로 해석 */
+			cluster_idx_length = desc_extent->length - sizeof(desc_extent->start_cluster_idx); /* [한국어] start 필드 제외 */
 
+			/* [한국어] payload가 start 필드보다 작거나 cluster 단위 미정렬 = 손상 */
 			if (desc_extent->length <= sizeof(desc_extent->start_cluster_idx) ||
 			    (cluster_idx_length % sizeof(desc_extent->cluster_idx[0]) != 0)) {
 				return -EINVAL;
 			}
 
+			/* [한국어] 1차 패스: cluster 수 세고 used 풀 존재 검증 */
 			for (i = 0; i < cluster_idx_length / sizeof(desc_extent->cluster_idx[0]); i++) {
-				if (desc_extent->cluster_idx[i] != 0) {
+				if (desc_extent->cluster_idx[i] != 0) { /* [한국어] 0은 미할당 */
 					if (!spdk_bit_pool_is_allocated(blob->bs->used_clusters, desc_extent->cluster_idx[i])) {
-						return -EINVAL;
+						return -EINVAL; /* [한국어] used 풀에 없는 cluster = 손상 */
 					}
 				}
-				cluster_count++;
+				cluster_count++;                   /* [한국어] cluster 슬롯 1개 */
 			}
 
-			if (cluster_count == 0) {
+			if (cluster_count == 0) {                  /* [한국어] 빈 페이지 = 손상 */
 				return -EINVAL;
 			}
 
 			/* When reading extent pages sequentially starting cluster idx should match
 			 * current size of a blob.
 			 * If changed to batch reading, this check shall be removed. */
+			/* [한국어] extent page는 순차 읽기 가정 → start_cluster_idx가 현재 blob 크기와 일치해야 함 */
 			if (desc_extent->start_cluster_idx != blob->active.num_clusters) {
 				return -EINVAL;
 			}
 
+			/* [한국어] cluster 배열을 (기존 + 이번 페이지)만큼 확장 */
 			tmp = realloc(blob->active.clusters,
 				      (cluster_count + blob->active.num_clusters) * sizeof(*blob->active.clusters));
 			if (tmp == NULL) {
 				return -ENOMEM;
 			}
-			blob->active.clusters = tmp;
-			blob->active.cluster_array_size = (cluster_count + blob->active.num_clusters);
+			blob->active.clusters = tmp;               /* [한국어] 확장 배열 적용 */
+			blob->active.cluster_array_size = (cluster_count + blob->active.num_clusters); /* [한국어] 용량 기록 */
 
+			/* [한국어] 2차 패스: 실제 LBA 매핑 채우기 */
 			for (i = 0; i < cluster_idx_length / sizeof(desc_extent->cluster_idx[0]); i++) {
-				if (desc_extent->cluster_idx[i] != 0) {
+				if (desc_extent->cluster_idx[i] != 0) { /* [한국어] 할당된 cluster */
 					blob->active.clusters[blob->active.num_clusters++] = bs_cluster_to_lba(blob->bs,
-							desc_extent->cluster_idx[i]);
-					blob->active.num_allocated_clusters++;
-				} else if (spdk_blob_is_thin_provisioned(blob)) {
+							desc_extent->cluster_idx[i]); /* [한국어] idx → LBA */
+					blob->active.num_allocated_clusters++; /* [한국어] 할당 카운트 */
+				} else if (spdk_blob_is_thin_provisioned(blob)) { /* [한국어] thin 미할당 */
 					blob->active.clusters[blob->active.num_clusters++] = 0;
-				} else {
+				} else {                           /* [한국어] thin 아닌데 0 = 손상 */
 					return -EINVAL;
 				}
 			}
-			assert(desc_extent->start_cluster_idx + cluster_count == blob->active.num_clusters);
-			assert(blob->remaining_clusters_in_et >= cluster_count);
-			blob->remaining_clusters_in_et -= cluster_count;
-		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_XATTR) {
-			int rc;
+			assert(desc_extent->start_cluster_idx + cluster_count == blob->active.num_clusters); /* [한국어] 순차 누적 일관성 */
+			assert(blob->remaining_clusters_in_et >= cluster_count); /* [한국어] ET 약속치 초과 금지 */
+			blob->remaining_clusters_in_et -= cluster_count; /* [한국어] 남은 cluster 수 차감 */
+		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_XATTR) { /* [한국어] 외부 xattr */
+			int rc;                                    /* [한국어] 디시리얼라이즈 결과 */
 
 			rc = blob_deserialize_xattr(blob,
-						    (struct spdk_blob_md_descriptor_xattr *) desc, false);
+						    (struct spdk_blob_md_descriptor_xattr *) desc, false); /* [한국어] internal=false */
 			if (rc != 0) {
 				return rc;
 			}
-		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_XATTR_INTERNAL) {
-			int rc;
+		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_XATTR_INTERNAL) { /* [한국어] 내부(SPDK 전용) xattr */
+			int rc;                                    /* [한국어] 디시리얼라이즈 결과 */
 
 			rc = blob_deserialize_xattr(blob,
-						    (struct spdk_blob_md_descriptor_xattr *) desc, true);
+						    (struct spdk_blob_md_descriptor_xattr *) desc, true); /* [한국어] internal=true */
 			if (rc != 0) {
 				return rc;
 			}
@@ -1165,123 +1614,185 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 			 *  should create and set an associated feature flag to specify if this
 			 *  blob can be loaded or not.
 			 */
+			/* [한국어] 모르는 디스크립터 타입은 실패시키지 않고 건너뜀(forward-compat).
+			 * 로드 불가한 신규 기능이면 위 FLAGS 검사가 invalid_flags로 걸러냄. */
 		}
 
 		/* Advance to the next descriptor */
-		cur_desc += sizeof(*desc) + desc->length;
-		if (cur_desc + sizeof(*desc) > sizeof(page->descriptors)) {
+		cur_desc += sizeof(*desc) + desc->length;          /* [한국어] TLV: 헤더 + payload 만큼 오프셋 전진 */
+		if (cur_desc + sizeof(*desc) > sizeof(page->descriptors)) { /* [한국어] 다음 헤더가 영역 밖이면 종료 */
 			break;
 		}
-		desc = (struct spdk_blob_md_descriptor *)((uintptr_t)page->descriptors + cur_desc);
+		desc = (struct spdk_blob_md_descriptor *)((uintptr_t)page->descriptors + cur_desc); /* [한국어] 다음 디스크립터 위치 */
 	}
 
-	return 0;
+	return 0;                                          /* [한국어] 페이지 전체 파싱 성공 */
 }
 
+/* [한국어] extent page의 CRC/유효성 검사 헬퍼 — 아래쪽에 정의됨(forward decl). */
 static bool bs_load_cur_extent_page_valid(struct spdk_blob_md_page *page);
 
+/*
+ * [한국어]
+ * blob_parse_extent_page - 별도 읽은 extent page 한 장을 검증 후 파싱
+ *
+ * @extent_page: 디스크에서 읽은 extent page(EXTENT_TABLE이 가리키던 페이지)
+ * @blob:        매핑을 채울 blob (LOADING)
+ * @return: 0 성공, -ENOENT 유효하지 않은 페이지(CRC/마커 불일치), 그 외 파싱 에러
+ *
+ * EXTENT_TABLE 포맷에서는 cluster 매핑이 별도 extent page들에 외부화되어 있어, blob을
+ * 로드할 때 메인 metadata page를 먼저 읽고 그 다음 각 extent page를 따로 읽는다. 이
+ * 함수는 그렇게 읽은 extent page 한 장을 유효성 검사 후 공통 파서(blob_parse_page)로 넘긴다.
+ *
+ * 실행 컨텍스트: md_thread (blob 로드 경로).
+ *
+ * 호출 체인:
+ *   blob 로드(extent page 읽기 완료) → [blob_parse_extent_page] → blob_parse_page
+ */
 static int
 blob_parse_extent_page(struct spdk_blob_md_page *extent_page, struct spdk_blob *blob)
 {
-	assert(blob != NULL);
-	assert(blob->state == SPDK_BLOB_STATE_LOADING);
+	assert(blob != NULL);                              /* [한국어] NULL 방어 */
+	assert(blob->state == SPDK_BLOB_STATE_LOADING);    /* [한국어] 로드 중에만 호출 */
 
-	if (bs_load_cur_extent_page_valid(extent_page) == false) {
-		return -ENOENT;
+	if (bs_load_cur_extent_page_valid(extent_page) == false) { /* [한국어] CRC/마커 검사 */
+		return -ENOENT;                            /* [한국어] 미할당/손상 extent page */
 	}
 
-	return blob_parse_page(extent_page, blob);
+	return blob_parse_page(extent_page, blob);         /* [한국어] 공통 파서로 디스크립터 해석 */
 }
 
+/*
+ * [한국어]
+ * blob_parse - blob의 메인 metadata page 체인 전체를 파싱해 in-memory blob 구성
+ *
+ * @pages:      연속으로 읽은 metadata page 배열(page[0]은 blob의 첫 페이지)
+ * @page_count: 페이지 수
+ * @blob:       채울 blob (LOADING, active.clusters 비어 있어야 함)
+ * @return: 0 성공, -ENOENT blob ID 불일치, -ENOMEM, 그 외 파싱 에러
+ *
+ * blob 메타데이터는 여러 metadata page에 걸쳐 단방향 링크(page->next)로 연결된다.
+ * 이 함수는 (1) blob ID 일치 검증, (2) 각 페이지의 md page 번호를 active.pages에 복원
+ * (next 링크 따라가기), (3) 각 페이지를 blob_parse_page로 파싱하는 3단계를 수행한다.
+ *
+ * 실행 컨텍스트: md_thread (blob 로드 경로).
+ *
+ * 호출 체인:
+ *   blob 로드(metadata page 읽기 완료) → [blob_parse] → blob_parse_page
+ */
 static int
 blob_parse(const struct spdk_blob_md_page *pages, uint32_t page_count,
 	   struct spdk_blob *blob)
 {
-	const struct spdk_blob_md_page *page;
-	uint32_t i;
-	int rc;
-	void *tmp;
+	const struct spdk_blob_md_page *page;              /* [한국어] 현재 파싱 중인 페이지 */
+	uint32_t i;                                        /* [한국어] 페이지 인덱스 */
+	int rc;                                            /* [한국어] 파싱 결과 */
+	void *tmp;                                         /* [한국어] realloc 임시 보관 */
 
-	assert(page_count > 0);
-	assert(pages[0].sequence_num == 0);
+	assert(page_count > 0);                            /* [한국어] 최소 1페이지 */
+	assert(pages[0].sequence_num == 0);                /* [한국어] 첫 페이지의 시퀀스는 0 */
 	assert(blob != NULL);
-	assert(blob->state == SPDK_BLOB_STATE_LOADING);
-	assert(blob->active.clusters == NULL);
+	assert(blob->state == SPDK_BLOB_STATE_LOADING);    /* [한국어] 로드 중에만 */
+	assert(blob->active.clusters == NULL);             /* [한국어] 아직 매핑이 비어 있어야 함 */
 
 	/* The blobid provided doesn't match what's in the MD, this can
 	 * happen for example if a bogus blobid is passed in through open.
 	 */
+	/* [한국어] open에 잘못된 blobid가 들어와 실제 metadata의 id와 다르면 거부 */
 	if (blob->id != pages[0].id) {
 		SPDK_ERRLOG("Blobid (0x%" PRIx64 ") doesn't match what's in metadata "
 			    "(0x%" PRIx64 ")\n", blob->id, pages[0].id);
 		return -ENOENT;
 	}
 
-	tmp = realloc(blob->active.pages, page_count * sizeof(*blob->active.pages));
+	tmp = realloc(blob->active.pages, page_count * sizeof(*blob->active.pages)); /* [한국어] page 번호 배열 확장 */
 	if (!tmp) {
 		return -ENOMEM;
 	}
-	blob->active.pages = tmp;
+	blob->active.pages = tmp;                          /* [한국어] 확장 배열 적용 */
 
-	blob->active.pages[0] = pages[0].id;
+	blob->active.pages[0] = pages[0].id;               /* [한국어] 첫 페이지 번호는 blob id에서 유래 */
 
+	/* [한국어] page[i].next 링크를 따라 후속 페이지 번호들을 복원 */
 	for (i = 1; i < page_count; i++) {
-		assert(spdk_bit_array_get(blob->bs->used_md_pages, pages[i - 1].next));
-		blob->active.pages[i] = pages[i - 1].next;
+		assert(spdk_bit_array_get(blob->bs->used_md_pages, pages[i - 1].next)); /* [한국어] next가 used 표시돼야 함 */
+		blob->active.pages[i] = pages[i - 1].next; /* [한국어] 이전 페이지의 next = 현재 페이지 번호 */
 	}
-	blob->active.num_pages = page_count;
+	blob->active.num_pages = page_count;               /* [한국어] 총 페이지 수 기록 */
 
+	/* [한국어] 각 페이지를 순서대로 파싱(시퀀스/ID 일관성 검증 포함) */
 	for (i = 0; i < page_count; i++) {
 		page = &pages[i];
 
-		assert(page->id == blob->id);
-		assert(page->sequence_num == i);
+		assert(page->id == blob->id);              /* [한국어] 모든 페이지가 같은 blob 소속 */
+		assert(page->sequence_num == i);           /* [한국어] 시퀀스가 인덱스와 일치 */
 
-		rc = blob_parse_page(page, blob);
+		rc = blob_parse_page(page, blob);          /* [한국어] 디스크립터 파싱 */
 		if (rc != 0) {
-			return rc;
+			return rc;                         /* [한국어] 한 페이지라도 실패하면 전체 실패 */
 		}
 	}
 
-	return 0;
+	return 0;                                          /* [한국어] 전체 메타데이터 파싱 성공 */
 }
 
+/*
+ * [한국어]
+ * blob_serialize_add_page - 직렬화 중 metadata page 한 장을 새로 할당/확장하고 헤더 초기화
+ *
+ * @blob:       직렬화 대상 blob (md_page_size, id 참조)
+ * @pages:      (in/out) DMA-가능 페이지 배열 포인터 — 첫 호출 시 NULL
+ * @page_count: (in/out) 현재 페이지 수 — 함수가 1 증가
+ * @last_page:  (out) 새로 추가된 페이지를 가리키는 포인터
+ * @return: 0 성공, -ENOMEM 할당 실패
+ *
+ * blob 메타데이터를 디스크 포맷으로 직렬화할 때, 디스크립터가 한 페이지를 넘으면 페이지를
+ * 추가한다. 페이지 버퍼는 bs_dev로 DMA 전송되므로 spdk_malloc(SPDK_MALLOC_DMA)로 hugepage
+ * 기반 DMA-가능 메모리에 잡는다. 새 페이지 헤더(id/sequence_num/next)를 초기화하며,
+ * next는 일단 INVALID로 두고 다음 페이지가 추가될 때 이전 페이지가 갱신한다.
+ *
+ * 실행 컨텍스트: md_thread (blob_serialize 경로).
+ *
+ * 호출 체인:
+ *   blob_serialize / blob_serialize_extent_table → [blob_serialize_add_page] → spdk_malloc/realloc
+ */
 static int
 blob_serialize_add_page(const struct spdk_blob *blob,
 			struct spdk_blob_md_page **pages,
 			uint32_t *page_count,
 			struct spdk_blob_md_page **last_page)
 {
-	struct spdk_blob_md_page *page, *tmp_pages;
+	struct spdk_blob_md_page *page, *tmp_pages;        /* [한국어] 새 페이지 + realloc 임시 */
 
 	assert(pages != NULL);
 	assert(page_count != NULL);
 
-	*last_page = NULL;
-	if (*page_count == 0) {
+	*last_page = NULL;                                 /* [한국어] 실패 대비 초기화 */
+	if (*page_count == 0) {                            /* [한국어] 첫 페이지: 새로 할당 */
 		assert(*pages == NULL);
+		/* [한국어] DMA-가능 메모리로 1페이지 할당(NUMA 무관, bs_dev 전송용) */
 		*pages = spdk_malloc(blob->bs->md_page_size, 0,
 				     NULL, SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
 		if (*pages == NULL) {
 			return -ENOMEM;
 		}
-		*page_count = 1;
-	} else {
+		*page_count = 1;                           /* [한국어] 페이지 수 1로 설정 */
+	} else {                                           /* [한국어] 추가 페이지: 기존 배열 확장 */
 		assert(*pages != NULL);
-		tmp_pages = spdk_realloc(*pages, blob->bs->md_page_size * (*page_count + 1), 0);
+		tmp_pages = spdk_realloc(*pages, blob->bs->md_page_size * (*page_count + 1), 0); /* [한국어] 1페이지 늘림 */
 		if (tmp_pages == NULL) {
 			return -ENOMEM;
 		}
-		(*page_count)++;
-		*pages = tmp_pages;
+		(*page_count)++;                           /* [한국어] 페이지 수 증가 */
+		*pages = tmp_pages;                        /* [한국어] 확장 배열 적용 */
 	}
 
-	page = &(*pages)[*page_count - 1];
-	memset(page, 0, sizeof(*page));
-	page->id = blob->id;
-	page->sequence_num = *page_count - 1;
-	page->next = SPDK_INVALID_MD_PAGE;
-	*last_page = page;
+	page = &(*pages)[*page_count - 1];                 /* [한국어] 마지막(새) 페이지 위치 */
+	memset(page, 0, sizeof(*page));                    /* [한국어] 페이지 전체 0 초기화 */
+	page->id = blob->id;                               /* [한국어] 소속 blob id 기록 */
+	page->sequence_num = *page_count - 1;              /* [한국어] 페이지 순번(0-based) */
+	page->next = SPDK_INVALID_MD_PAGE;                 /* [한국어] 다음 페이지 미정(추후 갱신) */
+	*last_page = page;                                 /* [한국어] 호출자에게 새 페이지 반환 */
 
 	return 0;
 }
@@ -1290,32 +1801,55 @@ blob_serialize_add_page(const struct spdk_blob *blob,
  * Update required_sz on both success and failure.
  *
  */
+/*
+ * [한국어]
+ * blob_serialize_xattr - in-memory xattr 하나를 디스크 xattr 디스크립터로 직렬화
+ *
+ * @xattr:       직렬화할 in-memory 확장 속성
+ * @buf:         디스크립터를 쓸 대상 버퍼(metadata page 내부)
+ * @buf_sz:      buf의 남은 용량
+ * @required_sz: (out) 이 xattr이 필요로 하는 바이트 수(성공/실패 모두 채움)
+ * @internal:    true면 XATTR_INTERNAL 타입, false면 XATTR
+ * @return: 0 성공, -1 버퍼 부족(required_sz로 호출자가 페이지 추가 판단)
+ *
+ * blob_deserialize_xattr의 역연산. [type][length][name_len][value_len][name][value]
+ * 패킹 포맷으로 buf에 기록한다. 버퍼가 부족하면 required_sz만 채우고 -1을 반환해,
+ * 호출자가 새 페이지를 추가한 뒤 재시도하게 한다.
+ *
+ * 실행 컨텍스트: md_thread (blob_serialize 경로).
+ *
+ * 호출 체인:
+ *   blob_serialize → [blob_serialize_xattr] → memcpy
+ */
 static int
 blob_serialize_xattr(const struct spdk_xattr *xattr,
 		     uint8_t *buf, size_t buf_sz,
 		     size_t *required_sz, bool internal)
 {
-	struct spdk_blob_md_descriptor_xattr	*desc;
+	struct spdk_blob_md_descriptor_xattr	*desc;    /* [한국어] 디스크 xattr 디스크립터 뷰 */
 
+	/* [한국어] 헤더 + 이름 + 값 길이의 합 = 필요한 총 바이트 */
 	*required_sz = sizeof(struct spdk_blob_md_descriptor_xattr) +
 		       strlen(xattr->name) +
 		       xattr->value_len;
 
-	if (buf_sz < *required_sz) {
+	if (buf_sz < *required_sz) {                       /* [한국어] 공간 부족 → 호출자가 페이지 추가하도록 */
 		return -1;
 	}
 
-	desc = (struct spdk_blob_md_descriptor_xattr *)buf;
+	desc = (struct spdk_blob_md_descriptor_xattr *)buf; /* [한국어] buf를 디스크립터로 해석 */
 
-	desc->type = internal ? SPDK_MD_DESCRIPTOR_TYPE_XATTR_INTERNAL : SPDK_MD_DESCRIPTOR_TYPE_XATTR;
+	desc->type = internal ? SPDK_MD_DESCRIPTOR_TYPE_XATTR_INTERNAL : SPDK_MD_DESCRIPTOR_TYPE_XATTR; /* [한국어] 타입 결정 */
+	/* [한국어] length = 헤더의 두 길이 필드 + name + value (type/length 자체 제외) */
 	desc->length = sizeof(desc->name_length) +
 		       sizeof(desc->value_length) +
 		       strlen(xattr->name) +
 		       xattr->value_len;
-	desc->name_length = strlen(xattr->name);
-	desc->value_length = xattr->value_len;
+	desc->name_length = strlen(xattr->name);           /* [한국어] 이름 길이 기록 */
+	desc->value_length = xattr->value_len;             /* [한국어] 값 길이 기록 */
 
-	memcpy(desc->name, xattr->name, desc->name_length);
+	memcpy(desc->name, xattr->name, desc->name_length); /* [한국어] 이름 바이트 복사 */
+	/* [한국어] 값은 name 바로 뒤에 연속 배치 → 오프셋 산술로 위치 계산 후 복사 */
 	memcpy((void *)((uintptr_t)desc->name + desc->name_length),
 	       xattr->value,
 	       desc->value_length);
@@ -1323,57 +1857,100 @@ blob_serialize_xattr(const struct spdk_xattr *xattr,
 	return 0;
 }
 
+/*
+ * [한국어]
+ * blob_serialize_extent_table_entry - EXTENT_TABLE 디스크립터 하나를 버퍼에 직렬화
+ *
+ * @blob:        직렬화 대상 blob
+ * @start_ep:    이번 디스크립터가 다룰 시작 extent page 인덱스
+ * @next_ep:     (out) 다음에 이어서 직렬화할 extent page 인덱스(버퍼가 차면 멈춘 지점)
+ * @buf:         (in/out) 쓰기 커서 — 직렬화한 만큼 전진
+ * @remaining_sz:(in/out) 남은 버퍼 — 직렬화한 만큼 감소
+ *
+ * EXTENT_TABLE은 extent page들의 md page 번호 목록이며, 미할당(0) extent page 구간은
+ * run-length 인코딩(num_pages)으로 압축한다. 버퍼 공간이 부족하면 거기까지만 직렬화하고
+ * next_ep로 멈춘 위치를 알려, 상위(blob_serialize_extent_table)가 새 페이지를 추가해
+ * 이어가게 한다.
+ *
+ * 실행 컨텍스트: md_thread.
+ *
+ * 호출 체인:
+ *   blob_serialize_extent_table → [blob_serialize_extent_table_entry]
+ */
 static void
 blob_serialize_extent_table_entry(const struct spdk_blob *blob,
 				  uint64_t start_ep, uint64_t *next_ep,
 				  uint8_t **buf, size_t *remaining_sz)
 {
-	struct spdk_blob_md_descriptor_extent_table *desc;
-	size_t cur_sz;
-	uint64_t i, et_idx;
-	uint32_t extent_page, ep_len;
+	struct spdk_blob_md_descriptor_extent_table *desc; /* [한국어] EXTENT_TABLE 디스크립터 뷰 */
+	size_t cur_sz;                                     /* [한국어] 현재까지 디스크립터 크기 */
+	uint64_t i, et_idx;                                /* [한국어] extent page 인덱스 / entry 인덱스 */
+	uint32_t extent_page, ep_len;                      /* [한국어] page 번호 / RLE 런 길이 */
 
 	/* The buffer must have room for at least num_clusters entry */
-	cur_sz = sizeof(struct spdk_blob_md_descriptor) + sizeof(desc->num_clusters);
-	if (*remaining_sz < cur_sz) {
+	cur_sz = sizeof(struct spdk_blob_md_descriptor) + sizeof(desc->num_clusters); /* [한국어] 최소 헤더+num_clusters */
+	if (*remaining_sz < cur_sz) {                      /* [한국어] 최소 크기도 안 들어가면 멈춤 */
 		*next_ep = start_ep;
 		return;
 	}
 
-	desc = (struct spdk_blob_md_descriptor_extent_table *)*buf;
-	desc->type = SPDK_MD_DESCRIPTOR_TYPE_EXTENT_TABLE;
+	desc = (struct spdk_blob_md_descriptor_extent_table *)*buf; /* [한국어] 버퍼를 디스크립터로 해석 */
+	desc->type = SPDK_MD_DESCRIPTOR_TYPE_EXTENT_TABLE; /* [한국어] 타입 설정 */
 
-	desc->num_clusters = blob->active.num_clusters;
+	desc->num_clusters = blob->active.num_clusters;    /* [한국어] 검증용 총 cluster 수 기록 */
 
-	ep_len = 1;
-	et_idx = 0;
-	for (i = start_ep; i < blob->active.num_extent_pages; i++) {
-		if (*remaining_sz < cur_sz  + sizeof(desc->extent_page[0])) {
+	ep_len = 1;                                        /* [한국어] 현재 런 길이(최소 1) */
+	et_idx = 0;                                        /* [한국어] 기록한 entry 수 */
+	for (i = start_ep; i < blob->active.num_extent_pages; i++) { /* [한국어] extent page 순회 */
+		if (*remaining_sz < cur_sz  + sizeof(desc->extent_page[0])) { /* [한국어] entry 추가 공간 부족 */
 			/* If we ran out of buffer space, return */
 			break;
 		}
 
-		extent_page = blob->active.extent_pages[i];
+		extent_page = blob->active.extent_pages[i];/* [한국어] 현재 extent page 번호 */
 		/* Verify that next extent_page is unallocated */
+		/* [한국어] 미할당(0)이 연속되면 한 entry로 RLE 압축(런 길이만 증가) */
 		if (extent_page == 0 &&
 		    (i + 1 < blob->active.num_extent_pages && blob->active.extent_pages[i + 1] == 0)) {
 			ep_len++;
 			continue;
 		}
-		desc->extent_page[et_idx].page_idx = extent_page;
-		desc->extent_page[et_idx].num_pages = ep_len;
-		et_idx++;
+		desc->extent_page[et_idx].page_idx = extent_page; /* [한국어] page 번호 기록 */
+		desc->extent_page[et_idx].num_pages = ep_len;     /* [한국어] 런 길이 기록 */
+		et_idx++;                                  /* [한국어] entry 1개 완성 */
 
-		ep_len = 1;
-		cur_sz += sizeof(desc->extent_page[et_idx]);
+		ep_len = 1;                                /* [한국어] 다음 런 초기화 */
+		cur_sz += sizeof(desc->extent_page[et_idx]); /* [한국어] 누적 크기 갱신 */
 	}
-	*next_ep = i;
+	*next_ep = i;                                      /* [한국어] 멈춘 위치(다음 시작점) 반환 */
 
-	desc->length = sizeof(desc->num_clusters) + sizeof(desc->extent_page[0]) * et_idx;
-	*remaining_sz -= sizeof(struct spdk_blob_md_descriptor) + desc->length;
-	*buf += sizeof(struct spdk_blob_md_descriptor) + desc->length;
+	desc->length = sizeof(desc->num_clusters) + sizeof(desc->extent_page[0]) * et_idx; /* [한국어] payload 길이 */
+	*remaining_sz -= sizeof(struct spdk_blob_md_descriptor) + desc->length; /* [한국어] 버퍼 소비 */
+	*buf += sizeof(struct spdk_blob_md_descriptor) + desc->length; /* [한국어] 쓰기 커서 전진 */
 }
 
+/*
+ * [한국어]
+ * blob_serialize_extent_table - blob의 extent table을 (필요 시 여러 페이지에 걸쳐) 직렬화
+ *
+ * @blob:        직렬화 대상 blob
+ * @pages:       (in/out) 페이지 배열(페이지 추가 시 확장됨)
+ * @cur_page:    현재 쓰고 있는 페이지
+ * @page_count:  (in/out) 페이지 수
+ * @buf:         (in/out) 쓰기 커서
+ * @remaining_sz:(in/out) 현재 페이지의 남은 공간
+ * @return: 0 성공, 음수 errno(페이지 추가 실패)
+ *
+ * extent table이 한 페이지에 안 들어가면 blob_serialize_add_page로 페이지를 추가하며
+ * 반복 직렬화한다. num_extent_pages==0(아무 extent page 없음)이어도 최소 1개 entry는
+ * 항상 기록해야 하므로 루프 조건이 <=로 되어 있다.
+ *
+ * 실행 컨텍스트: md_thread.
+ *
+ * 호출 체인:
+ *   blob_serialize → [blob_serialize_extent_table]
+ *     → blob_serialize_extent_table_entry / blob_serialize_add_page
+ */
 static int
 blob_serialize_extent_table(const struct spdk_blob *blob,
 			    struct spdk_blob_md_page **pages,
@@ -1381,98 +1958,141 @@ blob_serialize_extent_table(const struct spdk_blob *blob,
 			    uint32_t *page_count, uint8_t **buf,
 			    size_t *remaining_sz)
 {
-	uint64_t				last_extent_page;
-	int					rc;
+	uint64_t				last_extent_page; /* [한국어] 직렬화 진행 위치 */
+	int					rc;       /* [한국어] 페이지 추가 결과 */
 
-	last_extent_page = 0;
+	last_extent_page = 0;                              /* [한국어] 처음부터 시작 */
 	/* At least single extent table entry has to be always persisted.
 	 * Such case occurs with num_extent_pages == 0. */
+	/* [한국어] extent page가 0개여도 빈 table entry 1개는 반드시 기록(<= 조건) */
 	while (last_extent_page <= blob->active.num_extent_pages) {
 		blob_serialize_extent_table_entry(blob, last_extent_page, &last_extent_page, buf,
-						  remaining_sz);
+						  remaining_sz); /* [한국어] 한 디스크립터 직렬화(멈춘 위치 갱신) */
 
-		if (last_extent_page == blob->active.num_extent_pages) {
+		if (last_extent_page == blob->active.num_extent_pages) { /* [한국어] 모두 직렬화 완료 */
 			break;
 		}
 
+		/* [한국어] 버퍼가 차서 멈춤 → 새 페이지 추가 후 이어서 */
 		rc = blob_serialize_add_page(blob, pages, page_count, &cur_page);
 		if (rc < 0) {
 			return rc;
 		}
 
-		*buf = (uint8_t *)cur_page->descriptors;
-		*remaining_sz = sizeof(cur_page->descriptors);
+		*buf = (uint8_t *)cur_page->descriptors;   /* [한국어] 새 페이지의 디스크립터 영역으로 커서 이동 */
+		*remaining_sz = sizeof(cur_page->descriptors); /* [한국어] 새 페이지의 전체 공간 */
 	}
 
 	return 0;
 }
 
+/*
+ * [한국어]
+ * blob_serialize_extent_rle - 레거시 RLE extent 디스크립터 하나를 버퍼에 직렬화
+ *
+ * @blob:         직렬화 대상 blob
+ * @start_cluster: 직렬화 시작 cluster 인덱스
+ * @next_cluster: (out) 다음 시작 위치(버퍼가 차면 멈춘 지점, 끝까지면 num_clusters)
+ * @buf:          (in/out) 쓰기 커서
+ * @buf_sz:       (in/out) 남은 버퍼
+ *
+ * blob_parse_page의 EXTENT_RLE 파싱과 짝. 연속된 LBA(시퀀셜 할당)나 연속 미할당(0) 구간을
+ * (cluster_idx, length) run-length로 압축한다. 버퍼가 부족하면 거기까지만 직렬화하고
+ * next_cluster로 멈춘 위치를 알린다.
+ *
+ * 실행 컨텍스트: md_thread.
+ *
+ * 호출 체인:
+ *   blob_serialize_extents_rle → [blob_serialize_extent_rle]
+ */
 static void
 blob_serialize_extent_rle(const struct spdk_blob *blob,
 			  uint64_t start_cluster, uint64_t *next_cluster,
 			  uint8_t **buf, size_t *buf_sz)
 {
-	struct spdk_blob_md_descriptor_extent_rle *desc_extent_rle;
-	size_t cur_sz;
-	uint64_t i, extent_idx;
-	uint64_t lba, lba_per_cluster, lba_count;
+	struct spdk_blob_md_descriptor_extent_rle *desc_extent_rle; /* [한국어] RLE 디스크립터 뷰 */
+	size_t cur_sz;                                     /* [한국어] 현재 디스크립터 크기 */
+	uint64_t i, extent_idx;                            /* [한국어] cluster 인덱스 / extent entry 인덱스 */
+	uint64_t lba, lba_per_cluster, lba_count;          /* [한국어] 현재 런 시작 LBA / cluster당 LBA / 런 LBA 수 */
 
 	/* The buffer must have room for at least one extent */
-	cur_sz = sizeof(struct spdk_blob_md_descriptor) + sizeof(desc_extent_rle->extents[0]);
-	if (*buf_sz < cur_sz) {
+	cur_sz = sizeof(struct spdk_blob_md_descriptor) + sizeof(desc_extent_rle->extents[0]); /* [한국어] 최소 1 extent */
+	if (*buf_sz < cur_sz) {                            /* [한국어] 공간 부족 → 멈춤 */
 		*next_cluster = start_cluster;
 		return;
 	}
 
-	desc_extent_rle = (struct spdk_blob_md_descriptor_extent_rle *)*buf;
-	desc_extent_rle->type = SPDK_MD_DESCRIPTOR_TYPE_EXTENT_RLE;
+	desc_extent_rle = (struct spdk_blob_md_descriptor_extent_rle *)*buf; /* [한국어] 버퍼를 RLE 디스크립터로 해석 */
+	desc_extent_rle->type = SPDK_MD_DESCRIPTOR_TYPE_EXTENT_RLE; /* [한국어] 타입 설정 */
 
-	lba_per_cluster = bs_cluster_to_lba(blob->bs, 1);
+	lba_per_cluster = bs_cluster_to_lba(blob->bs, 1);  /* [한국어] cluster 1개 = 몇 LBA인지 */
 	/* Assert for scan-build false positive */
-	assert(lba_per_cluster > 0);
+	assert(lba_per_cluster > 0);                       /* [한국어] 0 나눗셈 방지(정적분석 만족) */
 
-	lba = blob->active.clusters[start_cluster];
-	lba_count = lba_per_cluster;
-	extent_idx = 0;
-	for (i = start_cluster + 1; i < blob->active.num_clusters; i++) {
-		if ((lba + lba_count) == blob->active.clusters[i] && lba != 0) {
+	lba = blob->active.clusters[start_cluster];        /* [한국어] 첫 cluster의 LBA */
+	lba_count = lba_per_cluster;                       /* [한국어] 현재 런 길이(1 cluster) */
+	extent_idx = 0;                                    /* [한국어] 기록한 extent 수 */
+	for (i = start_cluster + 1; i < blob->active.num_clusters; i++) { /* [한국어] 다음 cluster들 순회 */
+		if ((lba + lba_count) == blob->active.clusters[i] && lba != 0) { /* [한국어] 시퀀셜 할당 cluster */
 			/* Run-length encode sequential non-zero LBA */
-			lba_count += lba_per_cluster;
+			lba_count += lba_per_cluster;      /* [한국어] 런 연장 */
 			continue;
-		} else if (lba == 0 && blob->active.clusters[i] == 0) {
+		} else if (lba == 0 && blob->active.clusters[i] == 0) { /* [한국어] 연속 미할당(thin) */
 			/* Run-length encode unallocated clusters */
-			lba_count += lba_per_cluster;
+			lba_count += lba_per_cluster;      /* [한국어] 미할당 런 연장 */
 			continue;
 		}
-		desc_extent_rle->extents[extent_idx].cluster_idx = lba / lba_per_cluster;
-		desc_extent_rle->extents[extent_idx].length = lba_count / lba_per_cluster;
+		/* [한국어] 런이 끊김 → 현재 런을 extent로 확정 기록 */
+		desc_extent_rle->extents[extent_idx].cluster_idx = lba / lba_per_cluster; /* [한국어] LBA → cluster idx */
+		desc_extent_rle->extents[extent_idx].length = lba_count / lba_per_cluster; /* [한국어] 런 cluster 수 */
 		extent_idx++;
 
-		cur_sz += sizeof(desc_extent_rle->extents[extent_idx]);
+		cur_sz += sizeof(desc_extent_rle->extents[extent_idx]); /* [한국어] 다음 extent 분 크기 누적 */
 
-		if (*buf_sz < cur_sz) {
+		if (*buf_sz < cur_sz) {                    /* [한국어] 더 못 담음 → 멈춤 */
 			/* If we ran out of buffer space, return */
 			*next_cluster = i;
 			break;
 		}
 
-		lba = blob->active.clusters[i];
-		lba_count = lba_per_cluster;
+		lba = blob->active.clusters[i];            /* [한국어] 새 런 시작 LBA */
+		lba_count = lba_per_cluster;               /* [한국어] 새 런 길이 초기화 */
 	}
 
-	if (*buf_sz >= cur_sz) {
+	if (*buf_sz >= cur_sz) {                           /* [한국어] 끝까지 다 담았으면 마지막 런 기록 */
 		desc_extent_rle->extents[extent_idx].cluster_idx = lba / lba_per_cluster;
 		desc_extent_rle->extents[extent_idx].length = lba_count / lba_per_cluster;
 		extent_idx++;
 
-		*next_cluster = blob->active.num_clusters;
+		*next_cluster = blob->active.num_clusters; /* [한국어] 전체 완료 표시 */
 	}
 
-	desc_extent_rle->length = sizeof(desc_extent_rle->extents[0]) * extent_idx;
-	*buf_sz -= sizeof(struct spdk_blob_md_descriptor) + desc_extent_rle->length;
-	*buf += sizeof(struct spdk_blob_md_descriptor) + desc_extent_rle->length;
+	desc_extent_rle->length = sizeof(desc_extent_rle->extents[0]) * extent_idx; /* [한국어] payload 길이 */
+	*buf_sz -= sizeof(struct spdk_blob_md_descriptor) + desc_extent_rle->length; /* [한국어] 버퍼 소비 */
+	*buf += sizeof(struct spdk_blob_md_descriptor) + desc_extent_rle->length; /* [한국어] 커서 전진 */
 }
 
+/*
+ * [한국어]
+ * blob_serialize_extents_rle - blob 전체 cluster 매핑을 RLE로 (여러 페이지에 걸쳐) 직렬화
+ *
+ * @blob:        직렬화 대상
+ * @pages:       (in/out) 페이지 배열
+ * @cur_page:    현재 페이지
+ * @page_count:  (in/out) 페이지 수
+ * @buf:         (in/out) 쓰기 커서
+ * @remaining_sz:(in/out) 현재 페이지 남은 공간
+ * @return: 0 성공, 음수 errno
+ *
+ * extent table을 쓰지 않는(구포맷) blob의 cluster 매핑 직렬화 경로. 한 페이지에 다 안
+ * 들어가면 페이지를 추가하며 반복한다.
+ *
+ * 실행 컨텍스트: md_thread.
+ *
+ * 호출 체인:
+ *   blob_serialize → [blob_serialize_extents_rle]
+ *     → blob_serialize_extent_rle / blob_serialize_add_page
+ */
 static int
 blob_serialize_extents_rle(const struct spdk_blob *blob,
 			   struct spdk_blob_md_page **pages,
@@ -1480,78 +2100,135 @@ blob_serialize_extents_rle(const struct spdk_blob *blob,
 			   uint32_t *page_count, uint8_t **buf,
 			   size_t *remaining_sz)
 {
-	uint64_t				last_cluster;
-	int					rc;
+	uint64_t				last_cluster; /* [한국어] 직렬화 진행 위치 */
+	int					rc;       /* [한국어] 페이지 추가 결과 */
 
-	last_cluster = 0;
-	while (last_cluster < blob->active.num_clusters) {
-		blob_serialize_extent_rle(blob, last_cluster, &last_cluster, buf, remaining_sz);
+	last_cluster = 0;                                  /* [한국어] 처음부터 */
+	while (last_cluster < blob->active.num_clusters) { /* [한국어] 모든 cluster 직렬화까지 */
+		blob_serialize_extent_rle(blob, last_cluster, &last_cluster, buf, remaining_sz); /* [한국어] 한 디스크립터 */
 
-		if (last_cluster == blob->active.num_clusters) {
+		if (last_cluster == blob->active.num_clusters) { /* [한국어] 완료 */
 			break;
 		}
 
-		rc = blob_serialize_add_page(blob, pages, page_count, &cur_page);
+		rc = blob_serialize_add_page(blob, pages, page_count, &cur_page); /* [한국어] 새 페이지 추가 */
 		if (rc < 0) {
 			return rc;
 		}
 
-		*buf = (uint8_t *)cur_page->descriptors;
-		*remaining_sz = sizeof(cur_page->descriptors);
+		*buf = (uint8_t *)cur_page->descriptors;   /* [한국어] 새 페이지로 커서 이동 */
+		*remaining_sz = sizeof(cur_page->descriptors); /* [한국어] 새 페이지 공간 */
 	}
 
 	return 0;
 }
 
+/*
+ * [한국어]
+ * blob_serialize_extent_page - EXTENT_PAGE 한 장(최대 SPDK_EXTENTS_PER_EP cluster) 직렬화
+ *
+ * @blob:    직렬화 대상
+ * @cluster: 이 extent page가 담당하는 cluster 영역 내 임의 cluster 인덱스
+ * @page:    채울 extent page(헤더는 호출자가 준비)
+ *
+ * EXTENT_TABLE 포맷에서 cluster 매핑은 별도 extent page들에 저장된다. 각 extent page는
+ * SPDK_EXTENTS_PER_EP 개 cluster를 담으므로, cluster 인덱스를 그 경계로 내림 정렬해
+ * start_cluster_idx를 정하고 해당 구간의 cluster_idx 배열을 채운다.
+ *
+ * 실행 컨텍스트: md_thread.
+ *
+ * 호출 체인:
+ *   extent page persist 경로 → [blob_serialize_extent_page]
+ */
 static void
 blob_serialize_extent_page(const struct spdk_blob *blob,
 			   uint64_t cluster, struct spdk_blob_md_page *page)
 {
-	struct spdk_blob_md_descriptor_extent_page *desc_extent;
-	uint64_t i, extent_idx;
-	uint64_t lba, lba_per_cluster;
+	struct spdk_blob_md_descriptor_extent_page *desc_extent; /* [한국어] EXTENT_PAGE 디스크립터 뷰 */
+	uint64_t i, extent_idx;                            /* [한국어] cluster 인덱스 / 기록 위치 */
+	uint64_t lba, lba_per_cluster;                     /* [한국어] cluster LBA / cluster당 LBA */
+	/* [한국어] cluster를 EXTENTS_PER_EP 경계로 내림 정렬 → 이 페이지의 시작 cluster idx */
 	uint64_t start_cluster_idx = (cluster / SPDK_EXTENTS_PER_EP) * SPDK_EXTENTS_PER_EP;
 
-	desc_extent = (struct spdk_blob_md_descriptor_extent_page *) page->descriptors;
-	desc_extent->type = SPDK_MD_DESCRIPTOR_TYPE_EXTENT_PAGE;
+	desc_extent = (struct spdk_blob_md_descriptor_extent_page *) page->descriptors; /* [한국어] 페이지 디스크립터 영역 */
+	desc_extent->type = SPDK_MD_DESCRIPTOR_TYPE_EXTENT_PAGE; /* [한국어] 타입 설정 */
 
-	lba_per_cluster = bs_cluster_to_lba(blob->bs, 1);
+	lba_per_cluster = bs_cluster_to_lba(blob->bs, 1);  /* [한국어] cluster당 LBA 수 */
 
-	desc_extent->start_cluster_idx = start_cluster_idx;
-	extent_idx = 0;
-	for (i = start_cluster_idx; i < blob->active.num_clusters; i++) {
-		lba = blob->active.clusters[i];
-		desc_extent->cluster_idx[extent_idx++] = lba / lba_per_cluster;
-		if (extent_idx >= SPDK_EXTENTS_PER_EP) {
+	desc_extent->start_cluster_idx = start_cluster_idx; /* [한국어] 시작 cluster 기록(파싱 시 검증) */
+	extent_idx = 0;                                    /* [한국어] 채운 cluster 수 */
+	for (i = start_cluster_idx; i < blob->active.num_clusters; i++) { /* [한국어] 이 페이지 담당 구간 */
+		lba = blob->active.clusters[i];            /* [한국어] cluster의 현재 LBA(0이면 미할당) */
+		desc_extent->cluster_idx[extent_idx++] = lba / lba_per_cluster; /* [한국어] LBA → cluster idx 저장 */
+		if (extent_idx >= SPDK_EXTENTS_PER_EP) {   /* [한국어] 페이지 한 장 분량 채우면 종료 */
 			break;
 		}
 	}
 	desc_extent->length = sizeof(desc_extent->start_cluster_idx) +
-			      sizeof(desc_extent->cluster_idx[0]) * extent_idx;
+			      sizeof(desc_extent->cluster_idx[0]) * extent_idx; /* [한국어] payload 길이 */
 }
 
+/*
+ * [한국어]
+ * blob_serialize_flags - blob의 FLAGS 디스크립터를 직렬화(항상 가장 먼저)
+ *
+ * @blob:   직렬화 대상
+ * @buf:    쓰기 위치(페이지 디스크립터 영역 시작)
+ * @buf_sz: (in/out) 남은 버퍼 — flags 크기만큼 감소
+ *
+ * invalid/data_ro/md_ro 플래그를 디스크 포맷으로 기록한다. flags는 항상 첫 디스크립터로
+ * 직렬화되므로 공간이 부족할 수 없다(assert로 보장).
+ *
+ * 실행 컨텍스트: md_thread.
+ *
+ * 호출 체인:
+ *   blob_serialize → [blob_serialize_flags]
+ */
 static void
 blob_serialize_flags(const struct spdk_blob *blob,
 		     uint8_t *buf, size_t *buf_sz)
 {
-	struct spdk_blob_md_descriptor_flags *desc;
+	struct spdk_blob_md_descriptor_flags *desc;        /* [한국어] FLAGS 디스크립터 뷰 */
 
 	/*
 	 * Flags get serialized first, so we should always have room for the flags
 	 *  descriptor.
 	 */
-	assert(*buf_sz >= sizeof(*desc));
+	assert(*buf_sz >= sizeof(*desc));                  /* [한국어] 첫 직렬화라 공간 보장 */
 
-	desc = (struct spdk_blob_md_descriptor_flags *)buf;
-	desc->type = SPDK_MD_DESCRIPTOR_TYPE_FLAGS;
-	desc->length = sizeof(*desc) - sizeof(struct spdk_blob_md_descriptor);
-	desc->invalid_flags = blob->invalid_flags;
-	desc->data_ro_flags = blob->data_ro_flags;
-	desc->md_ro_flags = blob->md_ro_flags;
+	desc = (struct spdk_blob_md_descriptor_flags *)buf; /* [한국어] buf를 flags 디스크립터로 해석 */
+	desc->type = SPDK_MD_DESCRIPTOR_TYPE_FLAGS;        /* [한국어] 타입 설정 */
+	desc->length = sizeof(*desc) - sizeof(struct spdk_blob_md_descriptor); /* [한국어] payload 길이(헤더 제외) */
+	desc->invalid_flags = blob->invalid_flags;         /* [한국어] 로드 가능 여부 플래그 */
+	desc->data_ro_flags = blob->data_ro_flags;         /* [한국어] 데이터 읽기전용 플래그 */
+	desc->md_ro_flags = blob->md_ro_flags;             /* [한국어] 메타 읽기전용 플래그 */
 
-	*buf_sz -= sizeof(*desc);
+	*buf_sz -= sizeof(*desc);                          /* [한국어] 버퍼 소비 */
 }
 
+/*
+ * [한국어]
+ * blob_serialize_xattrs - xattr 리스트 전체를 (필요 시 페이지 추가하며) 직렬화
+ *
+ * @blob:        직렬화 대상
+ * @xattrs:      직렬화할 xattr 리스트(외부 또는 내부)
+ * @internal:    internal xattr 여부
+ * @pages:       (in/out) 페이지 배열
+ * @cur_page:    현재 페이지
+ * @page_count:  (in/out) 페이지 수
+ * @buf:         (in/out) 쓰기 커서
+ * @remaining_sz:(in/out) 남은 공간
+ * @return: 0 성공, 음수 errno(에러 시 pages 전체 해제 후 NULL 리셋)
+ *
+ * 각 xattr을 blob_serialize_xattr로 기록하다 공간이 부족하면(-1) 새 페이지를 추가하고
+ * 재시도한다. 재시도도 실패하면(단일 xattr이 한 페이지를 초과 등) 지금까지 만든 페이지를
+ * 모두 해제하고 에러를 반환한다.
+ *
+ * 실행 컨텍스트: md_thread.
+ *
+ * 호출 체인:
+ *   blob_serialize → [blob_serialize_xattrs] → blob_serialize_xattr / blob_serialize_add_page
+ */
 static int
 blob_serialize_xattrs(const struct spdk_blob *blob,
 		      const struct spdk_xattr_tailq *xattrs, bool internal,
@@ -1560,36 +2237,36 @@ blob_serialize_xattrs(const struct spdk_blob *blob,
 		      uint32_t *page_count, uint8_t **buf,
 		      size_t *remaining_sz)
 {
-	const struct spdk_xattr	*xattr;
-	int	rc;
+	const struct spdk_xattr	*xattr;                   /* [한국어] 순회 커서 */
+	int	rc;                                        /* [한국어] 직렬화/페이지 추가 결과 */
 
-	TAILQ_FOREACH(xattr, xattrs, link) {
-		size_t required_sz = 0;
+	TAILQ_FOREACH(xattr, xattrs, link) {               /* [한국어] 모든 xattr 직렬화 */
+		size_t required_sz = 0;                    /* [한국어] 이 xattr이 필요로 한 바이트 */
 
 		rc = blob_serialize_xattr(xattr,
 					  *buf, *remaining_sz,
-					  &required_sz, internal);
-		if (rc < 0) {
+					  &required_sz, internal); /* [한국어] 현재 페이지에 시도 */
+		if (rc < 0) {                              /* [한국어] 공간 부족 → 새 페이지 필요 */
 			/* Need to add a new page to the chain */
 			rc = blob_serialize_add_page(blob, pages, page_count,
 						     &cur_page);
-			if (rc < 0) {
+			if (rc < 0) {                      /* [한국어] 페이지 추가 실패 → 전체 롤백 */
 				spdk_free(*pages);
 				*pages = NULL;
 				*page_count = 0;
 				return rc;
 			}
 
-			*buf = (uint8_t *)cur_page->descriptors;
-			*remaining_sz = sizeof(cur_page->descriptors);
+			*buf = (uint8_t *)cur_page->descriptors; /* [한국어] 새 페이지로 커서 이동 */
+			*remaining_sz = sizeof(cur_page->descriptors); /* [한국어] 새 페이지 공간 */
 
 			/* Try again */
 			required_sz = 0;
 			rc = blob_serialize_xattr(xattr,
 						  *buf, *remaining_sz,
-						  &required_sz, internal);
+						  &required_sz, internal); /* [한국어] 새 페이지에 재시도 */
 
-			if (rc < 0) {
+			if (rc < 0) {                      /* [한국어] 단일 xattr이 페이지 초과 등 → 롤백 */
 				spdk_free(*pages);
 				*pages = NULL;
 				*page_count = 0;
@@ -1597,158 +2274,278 @@ blob_serialize_xattrs(const struct spdk_blob *blob,
 			}
 		}
 
-		*remaining_sz -= required_sz;
-		*buf += required_sz;
+		*remaining_sz -= required_sz;              /* [한국어] 버퍼 소비 */
+		*buf += required_sz;                       /* [한국어] 커서 전진 */
 	}
 
 	return 0;
 }
 
+/*
+ * [한국어]
+ * blob_serialize - blob의 in-memory 상태를 디스크 metadata page들로 직렬화 (persist 준비)
+ *
+ * @blob:       직렬화 대상 blob (DIRTY 상태)
+ * @pages:      (out) 새로 할당된 DMA-가능 페이지 배열 — 호출자가 spdk_free 책임
+ * @page_count: (out) 페이지 수
+ * @return: 0 성공, 음수 errno
+ *
+ * blob persist의 핵심: flags → 외부 xattrs → 내부 xattrs → extent(table 또는 RLE) 순으로
+ * 디스크립터를 직렬화한다. 결과 페이지들은 이후 bs_dev로 DMA 기록된다. blob은 디스크립터가
+ * 없어도 최소 1페이지를 갖는다.
+ *
+ * 실행 컨텍스트: md_thread.
+ *
+ * 호출 체인:
+ *   blob persist → [blob_serialize] → blob_serialize_flags/xattrs/extent_table/extents_rle
+ */
 static int
 blob_serialize(const struct spdk_blob *blob, struct spdk_blob_md_page **pages,
 	       uint32_t *page_count)
 {
-	struct spdk_blob_md_page		*cur_page;
-	int					rc;
-	uint8_t					*buf;
-	size_t					remaining_sz;
+	struct spdk_blob_md_page		*cur_page; /* [한국어] 현재 직렬화 중 페이지 */
+	int					rc;       /* [한국어] 단계별 결과 */
+	uint8_t					*buf;     /* [한국어] 쓰기 커서 */
+	size_t					remaining_sz; /* [한국어] 현재 페이지 남은 공간 */
 
 	assert(pages != NULL);
 	assert(page_count != NULL);
 	assert(blob != NULL);
-	assert(blob->state == SPDK_BLOB_STATE_DIRTY);
+	assert(blob->state == SPDK_BLOB_STATE_DIRTY);      /* [한국어] DIRTY(persist 필요) 상태에서만 */
 
-	*pages = NULL;
+	*pages = NULL;                                     /* [한국어] 출력 초기화 */
 	*page_count = 0;
 
 	/* A blob always has at least 1 page, even if it has no descriptors */
-	rc = blob_serialize_add_page(blob, pages, page_count, &cur_page);
+	rc = blob_serialize_add_page(blob, pages, page_count, &cur_page); /* [한국어] 최소 1페이지 확보 */
 	if (rc < 0) {
 		return rc;
 	}
 
-	buf = (uint8_t *)cur_page->descriptors;
-	remaining_sz = sizeof(cur_page->descriptors);
+	buf = (uint8_t *)cur_page->descriptors;            /* [한국어] 첫 페이지 디스크립터 영역 */
+	remaining_sz = sizeof(cur_page->descriptors);      /* [한국어] 가용 공간 */
 
 	/* Serialize flags */
-	blob_serialize_flags(blob, buf, &remaining_sz);
-	buf += sizeof(struct spdk_blob_md_descriptor_flags);
+	blob_serialize_flags(blob, buf, &remaining_sz);    /* [한국어] (1) FLAGS 먼저 */
+	buf += sizeof(struct spdk_blob_md_descriptor_flags); /* [한국어] flags 만큼 커서 전진 */
 
 	/* Serialize xattrs */
 	rc = blob_serialize_xattrs(blob, &blob->xattrs, false,
-				   pages, cur_page, page_count, &buf, &remaining_sz);
+				   pages, cur_page, page_count, &buf, &remaining_sz); /* [한국어] (2) 외부 xattr */
 	if (rc < 0) {
 		return rc;
 	}
 
 	/* Serialize internal xattrs */
 	rc = blob_serialize_xattrs(blob, &blob->xattrs_internal, true,
-				   pages, cur_page, page_count, &buf, &remaining_sz);
+				   pages, cur_page, page_count, &buf, &remaining_sz); /* [한국어] (3) 내부 xattr */
 	if (rc < 0) {
 		return rc;
 	}
 
-	if (blob->use_extent_table) {
+	if (blob->use_extent_table) {                      /* [한국어] (4) 포맷에 따라 extent 직렬화 분기 */
 		/* Serialize extent table */
-		rc = blob_serialize_extent_table(blob, pages, cur_page, page_count, &buf, &remaining_sz);
+		rc = blob_serialize_extent_table(blob, pages, cur_page, page_count, &buf, &remaining_sz); /* [한국어] 신포맷 */
 	} else {
 		/* Serialize extents */
-		rc = blob_serialize_extents_rle(blob, pages, cur_page, page_count, &buf, &remaining_sz);
+		rc = blob_serialize_extents_rle(blob, pages, cur_page, page_count, &buf, &remaining_sz); /* [한국어] 구포맷 RLE */
 	}
 
-	return rc;
+	return rc;                                          /* [한국어] 마지막 단계 결과 반환 */
 }
 
+/*
+ * [한국어]
+ * struct spdk_blob_load_ctx - blob을 디스크에서 읽어오는 다단계 비동기 로드의 컨텍스트
+ *
+ * blob 로드는 (1) 메인 metadata page 체인 읽기 → (2) extent page들 읽기 → (3) backing
+ * device(부모 snapshot/esnap/zeroes) 설치까지 여러 비동기 bs_dev 읽기를 거친다. 각 단계
+ * 완료 콜백 사이에서 진행 상태를 이 구조체에 보관한다.
+ */
 struct spdk_blob_load_ctx {
 	struct spdk_blob		*blob;
+	/* [한국어] 로드 대상 blob(LOADING 상태).
+	 * 설정자: blob_load. 읽는 자: 모든 로드 단계 콜백.
+	 * 동기화: md_thread 단일 소유. */
 
 	struct spdk_blob_md_page	*pages;
+	/* [한국어] 읽어들인 metadata/extent page 버퍼(DMA-가능 메모리).
+	 * 설정자: blob_load/blob_load_cpl가 페이지 추가 시 realloc.
+	 * 읽는 자: blob_parse 등. 수명: blob_load_final/parse 완료 후 spdk_free. */
 	uint32_t			num_pages;
+	/* [한국어] 현재까지 읽은 페이지 수.
+	 * 설정자: 페이지 추가 시 증가. 읽는 자: blob_parse, CRC 검사. */
 	uint32_t			next_extent_page;
+	/* [한국어] 다음에 읽을 extent page의 인덱스(extent page 순차 읽기 커서).
+	 * 설정자/읽는 자: blob_load_cpl_extents_cpl. */
 	spdk_bs_sequence_t	        *seq;
+	/* [한국어] 이 로드에 사용하는 bs_dev I/O 시퀀스 핸들.
+	 * 설정자: blob_load. 읽는 자: 모든 bs_sequence_read_dev 호출. */
 
 	spdk_bs_sequence_cpl		cb_fn;
+	/* [한국어] 로드 전체 완료를 호출자에게 알리는 콜백.
+	 * 설정자: blob_load. 읽는 자: blob_load_final. */
 	void				*cb_arg;
+	/* [한국어] cb_fn에 전달할 컨텍스트. */
 };
 
+/*
+ * [한국어]
+ * blob_md_page_calc_crc - metadata/super 페이지의 CRC32C 계산(끝 4바이트 crc 필드 제외)
+ *
+ * @page: CRC를 계산할 페이지 버퍼(SPDK_BS_PAGE_SIZE 크기)
+ * @return: 계산된 CRC32C 값
+ *
+ * metadata page는 마지막 4바이트에 자신의 CRC를 담는다. 손상 검출을 위해 그 4바이트를
+ * 뺀 나머지에 대해 CRC32C(Castagnoli)를 계산한다. 초기값 0xffffffff로 시작하고 끝에서
+ * 다시 XOR하는 것은 RFC 3720(iSCSI) 호환 CRC 관례다.
+ *
+ * 실행 컨텍스트: md_thread (로드/검증 경로). 순수 계산이라 부작용 없음.
+ *
+ * 호출 체인:
+ *   blob_load_cpl / bs_super_validate / persist 등 → [blob_md_page_calc_crc] → spdk_crc32c_update
+ */
 static uint32_t
 blob_md_page_calc_crc(void *page)
 {
-	uint32_t		crc;
+	uint32_t		crc;                       /* [한국어] 누적 CRC 값 */
 
-	crc = BLOB_CRC32C_INITIAL;
-	crc = spdk_crc32c_update(page, SPDK_BS_PAGE_SIZE - 4, crc);
-	crc ^= BLOB_CRC32C_INITIAL;
+	crc = BLOB_CRC32C_INITIAL;                         /* [한국어] 초기값 0xffffffff (RFC 3720) */
+	crc = spdk_crc32c_update(page, SPDK_BS_PAGE_SIZE - 4, crc); /* [한국어] crc 필드(끝 4B) 제외하고 계산 */
+	crc ^= BLOB_CRC32C_INITIAL;                        /* [한국어] 최종 XOR 마무리 */
 
 	return crc;
 
 }
 
+/*
+ * [한국어]
+ * blob_load_final - blob 로드의 마지막 정리: 성공 시 clean 표시 후 사용자 콜백 호출
+ *
+ * @ctx:     로드 컨텍스트
+ * @bserrno: 로드 결과(0=성공)
+ *
+ * 모든 로드 단계가 끝났거나 중간에 실패했을 때 호출되는 단일 종료 지점. 성공이면
+ * blob_mark_clean으로 디스크와 일치 상태를 표시하고, 사용자 cb_fn을 호출한 뒤 페이지
+ * 버퍼와 ctx를 해제한다.
+ *
+ * 실행 컨텍스트: md_thread (마지막 bs_dev 완료 콜백 또는 에러 경로).
+ *
+ * 호출 체인:
+ *   각 로드 단계 콜백 → [blob_load_final] → ctx->cb_fn
+ */
 static void
 blob_load_final(struct spdk_blob_load_ctx *ctx, int bserrno)
 {
-	struct spdk_blob		*blob = ctx->blob;
+	struct spdk_blob		*blob = ctx->blob; /* [한국어] 로드 대상 blob */
 
-	if (bserrno == 0) {
+	if (bserrno == 0) {                                /* [한국어] 성공 시에만 clean 승격 */
 		blob_mark_clean(blob);
 	}
 
-	ctx->cb_fn(ctx->seq, ctx->cb_arg, bserrno);
+	ctx->cb_fn(ctx->seq, ctx->cb_arg, bserrno);        /* [한국어] 사용자 완료 콜백 호출(결과 전달) */
 
 	/* Free the memory */
-	spdk_free(ctx->pages);
-	free(ctx);
+	spdk_free(ctx->pages);                             /* [한국어] DMA 페이지 버퍼 해제 */
+	free(ctx);                                         /* [한국어] 로드 컨텍스트 해제 */
 }
 
+/*
+ * [한국어]
+ * blob_load_snapshot_cpl - 부모 snapshot blob open 완료 콜백(thin clone backing 설치)
+ *
+ * @cb_arg:   로드 컨텍스트
+ * @snapshot: open된 부모 snapshot blob
+ * @bserrno:  open 결과(0=성공)
+ *
+ * thin-provisioned clone은 미할당 cluster를 부모 snapshot에서 읽으므로, 부모 blob을
+ * open한 뒤 그 blob을 감싸는 backing bs_dev(bs_create_blob_bs_dev)를 만들어 설치한다.
+ * 그 후 로드를 마무리한다.
+ *
+ * 실행 컨텍스트: md_thread (spdk_bs_open_blob 완료 콜백).
+ *
+ * 호출 체인:
+ *   blob_load_backing_dev → spdk_bs_open_blob → [blob_load_snapshot_cpl] → blob_load_final
+ */
 static void
 blob_load_snapshot_cpl(void *cb_arg, struct spdk_blob *snapshot, int bserrno)
 {
-	struct spdk_blob_load_ctx	*ctx = cb_arg;
-	struct spdk_blob		*blob = ctx->blob;
+	struct spdk_blob_load_ctx	*ctx = cb_arg;    /* [한국어] 로드 컨텍스트 */
+	struct spdk_blob		*blob = ctx->blob; /* [한국어] 로드 중인 clone blob */
 
-	if (bserrno == 0) {
-		blob->back_bs_dev = bs_create_blob_bs_dev(snapshot);
-		if (blob->back_bs_dev == NULL) {
+	if (bserrno == 0) {                                /* [한국어] 부모 open 성공 */
+		blob->back_bs_dev = bs_create_blob_bs_dev(snapshot); /* [한국어] snapshot을 backing 디바이스로 래핑 */
+		if (blob->back_bs_dev == NULL) {           /* [한국어] 래퍼 할당 실패 */
 			bserrno = -ENOMEM;
 		}
 	}
-	if (bserrno != 0) {
+	if (bserrno != 0) {                                /* [한국어] open 또는 래핑 실패 로그 */
 		SPDK_ERRLOG("Snapshot fail\n");
 	}
 
-	blob_load_final(ctx, bserrno);
+	blob_load_final(ctx, bserrno);                     /* [한국어] 로드 마무리(에러 전파 포함) */
 }
 
+/* [한국어] clear_method 갱신 헬퍼 forward decl — 아래쪽에 정의됨. */
 static void blob_update_clear_method(struct spdk_blob *blob);
 
+/*
+ * [한국어]
+ * blob_load_esnap - esnap(external snapshot) 클론 blob의 백킹 디바이스(back_bs_dev)를 생성/연결
+ *
+ * @blob: 로드 중인 blob. 메타데이터 파싱 결과 esnap 클론으로 판명된 상태.
+ * @blob_ctx: 상위 콜 체인(spdk_bs_open_blob → blob_handle.esnap_ctx)에서 전달된 소비자 컨텍스트.
+ *            esnap_bs_dev_create 콜백이 외부 스냅샷을 어떤 디바이스로 매핑할지 결정하는 데 쓰임.
+ * @return: 0 = 성공(back_bs_dev 연결 또는 소비자가 의도적으로 미오픈), 음수 errno = 실패.
+ *          -ENOTSUP = blobstore가 esnap 미지원으로 열림, -EINVAL = esnap ID 없음/블록크기 불일치.
+ *
+ * esnap 클론은 blobstore 외부(다른 bdev 등)의 스냅샷을 부모로 갖는 thin-provisioned blob이다.
+ * 일반 스냅샷(같은 blobstore 내 blob)과 달리 부모가 blobstore 밖에 있으므로, 소비자가 등록한
+ * esnap_bs_dev_create 콜백을 통해 외부 디바이스를 bs_dev vtable로 래핑해 back_bs_dev에 연결한다.
+ * 읽기 시 미할당 클러스터는 이 back_bs_dev로 폴백되어 외부 스냅샷의 원본 데이터를 가져온다.
+ *
+ * 실행 컨텍스트: blob을 소유한 metadata thread(spdk_thread). blob_load 비동기 체인의 일부로
+ * blob_load_backing_dev에서 동기 호출된다(자체 I/O 없이 콜백만 호출).
+ *
+ * 호출 체인:
+ *   blob_load_backing_dev → [blob_load_esnap] → bs->esnap_bs_dev_create(소비자 콜백)
+ */
 static int
 blob_load_esnap(struct spdk_blob *blob, void *blob_ctx)
 {
-	struct spdk_blob_store *bs = blob->bs;
-	struct spdk_bs_dev *bs_dev = NULL;
-	const void *esnap_id = NULL;
-	size_t id_len = 0;
-	int rc;
+	struct spdk_blob_store *bs = blob->bs;		/* [한국어] blob이 속한 blobstore — esnap 콜백/블록크기 검증에 사용. */
+	struct spdk_bs_dev *bs_dev = NULL;		/* [한국어] 생성될 외부 스냅샷 백킹 디바이스. NULL이면 소비자가 미오픈 선택. */
+	const void *esnap_id = NULL;			/* [한국어] xattr에 저장된 외부 스냅샷 식별자(불투명 바이트열). 소비자가 해석. */
+	size_t id_len = 0;				/* [한국어] esnap_id의 바이트 길이. esnap_bs_dev_create에 uint32로 전달. */
+	int rc;						/* [한국어] 각 단계의 반환 코드 임시 저장. */
 
+	/* [한국어] blobstore를 열 때 esnap 지원 콜백을 등록하지 않았으면 이 클론을 로드할 수 없음 → -ENOTSUP. */
 	if (bs->esnap_bs_dev_create == NULL) {
 		SPDK_NOTICELOG("blob 0x%" PRIx64 " is an esnap clone but the blobstore was opened "
 			       "without support for esnap clones\n", blob->id);
 		return -ENOTSUP;
 	}
+	/* [한국어] 아직 백킹 디바이스가 붙지 않은 상태여야 함(중복 로드 방지 불변식). */
 	assert(blob->back_bs_dev == NULL);
 
+	/* [한국어] BLOB_EXTERNAL_SNAPSHOT_ID 내부 xattr에서 외부 스냅샷 ID 추출(internal=true: 내부 전용 xattr). */
 	rc = blob_get_xattr_value(blob, BLOB_EXTERNAL_SNAPSHOT_ID, &esnap_id, &id_len, true);
 	if (rc != 0) {
+		/* [한국어] esnap 클론이라고 표시됐는데 ID xattr이 없으면 메타데이터 모순 → -EINVAL. */
 		SPDK_ERRLOG("blob 0x%" PRIx64 " is an esnap clone but has no esnap ID\n", blob->id);
 		return -EINVAL;
 	}
+	/* [한국어] ID는 비어있지 않고 uint32로 표현 가능해야 함(콜백 인자 타입 제약). */
 	assert(id_len > 0 && id_len < UINT32_MAX);
 
 	SPDK_INFOLOG(blob, "Creating external snapshot device\n");
 
+	/* [한국어] 소비자 콜백 호출: esnap_ctx(blobstore 등록 시 컨텍스트)+blob_ctx(open 시 컨텍스트)+ID로
+	 * 외부 스냅샷을 bs_dev로 래핑. 소비자는 의도적으로 bs_dev=NULL을 반환해 미오픈을 선택할 수 있음. */
 	rc = bs->esnap_bs_dev_create(bs->esnap_ctx, blob_ctx, blob, esnap_id, (uint32_t)id_len,
 				     &bs_dev);
 	if (rc != 0) {
+		/* [한국어] 콜백 자체가 실패하면 그 errno를 그대로 전파(상위에서 blob_load_final로 처리). */
 		SPDK_DEBUGLOG(blob_esnap, "blob 0x%" PRIx64 ": failed to load back_bs_dev "
 			      "with error %d\n", blob->id, rc);
 		return rc;
@@ -1758,73 +2555,125 @@ blob_load_esnap(struct spdk_blob *blob, void *blob_ctx)
 	 * Note: bs_dev might be NULL if the consumer chose to not open the external snapshot.
 	 * This especially might happen during spdk_bs_load() iteration.
 	 */
+	/* [한국어] bs_dev가 NULL이 아니면 실제로 디바이스가 열린 것 → 블록 크기 호환성 검증 필요. */
 	if (bs_dev != NULL) {
 		SPDK_DEBUGLOG(blob_esnap, "blob 0x%" PRIx64 ": loaded back_bs_dev\n", blob->id);
+		/* [한국어] blobstore의 io_unit_size가 외부 디바이스 블록 크기의 정수배여야 폴백 읽기가 정렬됨.
+		 * 나누어떨어지지 않으면 I/O 정렬이 깨지므로 디바이스를 파괴하고 -EINVAL 반환. */
 		if ((bs->io_unit_size % bs_dev->blocklen) != 0) {
 			SPDK_NOTICELOG("blob 0x%" PRIx64 " external snapshot device block size %u "
 				       "is not compatible with blobstore block size %u\n",
 				       blob->id, bs_dev->blocklen, bs->io_unit_size);
-			bs_dev->destroy(bs_dev);
+			bs_dev->destroy(bs_dev);	/* [한국어] vtable destroy로 방금 만든 디바이스 리소스 해제. */
 			return -EINVAL;
 		}
 	}
 
+	/* [한국어] 검증 통과한 백킹 디바이스를 blob에 연결(NULL일 수도 있음 — 미오픈 케이스). */
 	blob->back_bs_dev = bs_dev;
+	/* [한국어] parent_id를 특수 센티넬로 설정 — 이 blob의 부모가 blobstore 외부임을 표시. */
 	blob->parent_id = SPDK_BLOBID_EXTERNAL_SNAPSHOT;
 
 	return 0;
 }
 
+/*
+ * [한국어]
+ * blob_load_backing_dev - blob 종류에 따라 백킹 디바이스(back_bs_dev)를 결정/연결하고 로드를 마무리
+ *
+ * @seq: 진행 중인 blobstore 시퀀스. cpl.u.blob_handle.esnap_ctx에 소비자 컨텍스트가 실려 있음.
+ * @cb_arg: spdk_blob_load_ctx* — 로드 중 누적 상태(blob, 페이지 버퍼, 콜백 등).
+ *
+ * blob 메타데이터 파싱이 끝난 뒤, 미할당 영역 읽기를 어디로 폴백할지(back_bs_dev)를 정하는 단계다.
+ * 세 갈래로 분기한다: (1) esnap 클론 → 외부 디바이스, (2) 부모 스냅샷 있는 thin blob → 부모 blob을
+ * 비동기로 열어 백킹으로 연결, (3) 부모 없는 thin blob → zeroes 디바이스(읽으면 0), (4) 일반 blob →
+ * 백킹 없음(NULL, 항상 자기 클러스터에서 읽음).
+ *
+ * 실행 컨텍스트: blob 소유 metadata thread. blob_load_cpl/blob_load_cpl_extents_cpl 완료 후 호출되며,
+ * 스냅샷 케이스만 추가 비동기 I/O(부모 blob open)를 유발하고 나머지는 동기적으로 종료한다.
+ *
+ * 호출 체인:
+ *   blob_load_cpl / blob_load_cpl_extents_cpl → [blob_load_backing_dev]
+ *     → blob_load_esnap / spdk_bs_open_blob(→blob_load_snapshot_cpl) / blob_load_final
+ */
 static void
 blob_load_backing_dev(spdk_bs_sequence_t *seq, void *cb_arg)
 {
-	struct spdk_blob_load_ctx	*ctx = cb_arg;
-	struct spdk_blob		*blob = ctx->blob;
-	const void			*value;
-	size_t				len;
-	int				rc;
+	struct spdk_blob_load_ctx	*ctx = cb_arg;		/* [한국어] 로드 진행 컨텍스트 복원. */
+	struct spdk_blob		*blob = ctx->blob;	/* [한국어] 로드 대상 blob. */
+	const void			*value;			/* [한국어] BLOB_SNAPSHOT xattr 값 포인터(부모 blob ID). */
+	size_t				len;			/* [한국어] xattr 값 길이 — spdk_blob_id 크기 검증용. */
+	int				rc;			/* [한국어] 단계별 반환 코드. */
 
+	/* [한국어] esnap 클론이면 외부 스냅샷 디바이스를 만들고 즉시 로드 마무리(blob_load_final). */
 	if (blob_is_esnap_clone(blob)) {
 		rc = blob_load_esnap(blob, seq->cpl.u.blob_handle.esnap_ctx);
 		blob_load_final(ctx, rc);
 		return;
 	}
 
+	/* [한국어] thin-provisioned blob은 미할당 클러스터를 부모/0으로 폴백해야 하므로 백킹 디바이스 필요. */
 	if (spdk_blob_is_thin_provisioned(blob)) {
+		/* [한국어] 내부 xattr BLOB_SNAPSHOT에서 부모 스냅샷 blob ID 조회. */
 		rc = blob_get_xattr_value(blob, BLOB_SNAPSHOT, &value, &len, true);
 		if (rc == 0) {
+			/* [한국어] 값 길이가 blob ID 크기와 다르면 메타데이터 손상 → -EINVAL. */
 			if (len != sizeof(spdk_blob_id)) {
 				blob_load_final(ctx, -EINVAL);
 				return;
 			}
 			/* open snapshot blob and continue in the callback function */
+			/* [한국어] 부모 ID 기록 후 부모 blob을 비동기로 open — 완료 시 blob_load_snapshot_cpl이
+			 * back_bs_dev에 부모를 연결하고 로드를 이어감. 여기서 함수는 반환(비동기 진행). */
 			blob->parent_id = *(spdk_blob_id *)value;
 			spdk_bs_open_blob(blob->bs, blob->parent_id,
 					  blob_load_snapshot_cpl, ctx);
 			return;
 		} else {
 			/* add zeroes_dev for thin provisioned blob */
+			/* [한국어] 부모 스냅샷이 없는 thin blob → 미할당 영역은 0으로 읽혀야 하므로 zeroes 디바이스 연결. */
 			blob->back_bs_dev = bs_create_zeroes_dev();
 		}
 	} else {
 		/* standard blob */
+		/* [한국어] thick-provisioned 일반 blob은 모든 클러스터가 할당돼 폴백이 불필요 → 백킹 없음. */
 		blob->back_bs_dev = NULL;
 	}
+	/* [한국어] esnap/스냅샷 케이스를 제외한 모든 경로의 공통 종료점 — 성공으로 로드 마무리. */
 	blob_load_final(ctx, 0);
 }
 
+/*
+ * [한국어]
+ * blob_load_cpl_extents_cpl - extent page들을 한 장씩 디스크에서 읽어 파싱하는 비동기 반복 콜백
+ *
+ * @seq: 진행 중인 blobstore 시퀀스(다음 extent page를 읽는 read I/O 발행에 사용).
+ * @cb_arg: spdk_blob_load_ctx* — next_extent_page 인덱스로 어디까지 읽었는지 추적.
+ * @bserrno: 직전 extent page read I/O의 결과(0=성공). 실패 시 즉시 로드 중단.
+ *
+ * EXTENT_TABLE 방식 blob은 클러스터 매핑을 여러 EXTENT_PAGE에 분산 저장한다. 이 함수는 자기 자신을
+ * 콜백으로 재등록하며 extent page를 1장씩 순차적으로 읽고 파싱하는 비동기 루프를 형성한다. 첫 진입엔
+ * 페이지 버퍼만 할당하고, 이후 진입마다 직전에 읽은 페이지를 CRC 검증→파싱하고 다음 할당 page를 읽는다.
+ * thin blob에서 미할당(0) extent page를 만나면 I/O 없이 클러스터 배열만 0으로 확장한다.
+ *
+ * 실행 컨텍스트: blob 소유 metadata thread. 각 read I/O 완료마다 같은 thread에서 재진입.
+ *
+ * 호출 체인:
+ *   blob_load_cpl → [blob_load_cpl_extents_cpl](자기 재귀, read I/O마다) → blob_load_backing_dev
+ */
 static void
 blob_load_cpl_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
-	struct spdk_blob_load_ctx	*ctx = cb_arg;
-	struct spdk_blob		*blob = ctx->blob;
-	struct spdk_blob_md_page	*page;
-	uint64_t			i;
-	uint32_t			crc;
-	uint64_t			lba;
-	void				*tmp;
-	uint64_t			sz;
+	struct spdk_blob_load_ctx	*ctx = cb_arg;		/* [한국어] 로드 진행 컨텍스트. */
+	struct spdk_blob		*blob = ctx->blob;	/* [한국어] 로드 대상 blob. */
+	struct spdk_blob_md_page	*page;			/* [한국어] 현재 처리 중인 extent page 포인터. */
+	uint64_t			i;			/* [한국어] extent page 순회 인덱스. */
+	uint32_t			crc;			/* [한국어] 페이지 무결성 검증용 계산 CRC. */
+	uint64_t			lba;			/* [한국어] 다음 extent page의 디바이스 LBA. */
+	void				*tmp;			/* [한국어] 클러스터 배열 realloc 임시 포인터. */
+	uint64_t			sz;			/* [한국어] 미할당 extent page가 표현하는 클러스터 수. */
 
+	/* [한국어] 직전 extent page read가 실패했으면 더 진행하지 않고 로드 종료. */
 	if (bserrno) {
 		SPDK_ERRLOG("Extent page read failed: %d\n", bserrno);
 		blob_load_final(ctx, bserrno);
@@ -1833,27 +2682,32 @@ blob_load_cpl_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 	if (ctx->pages == NULL) {
 		/* First iteration of this function, allocate buffer for single EXTENT_PAGE */
+		/* [한국어] 최초 진입: extent page 1장용 DMA 버퍼 할당(DMA 가능 메모리여야 디바이스 read 가능). */
 		ctx->pages = spdk_zmalloc(blob->bs->md_page_size, 0,
 					  NULL, SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
 		if (!ctx->pages) {
 			blob_load_final(ctx, -ENOMEM);
 			return;
 		}
-		ctx->num_pages = 1;
-		ctx->next_extent_page = 0;
+		ctx->num_pages = 1;		/* [한국어] 버퍼는 항상 1장만 재사용(extent page는 in-place로 한 장씩 처리). */
+		ctx->next_extent_page = 0;	/* [한국어] 0번 extent page부터 스캔 시작. */
 	} else {
+		/* [한국어] 재진입: 직전 read로 채워진 버퍼(pages[0])를 검증/파싱. */
 		page = &ctx->pages[0];
 		crc = blob_md_page_calc_crc(page);
+		/* [한국어] 저장된 CRC와 계산 CRC 불일치 = 페이지 손상 → -EINVAL. */
 		if (crc != page->crc) {
 			blob_load_final(ctx, -EINVAL);
 			return;
 		}
 
+		/* [한국어] extent page는 체인되지 않으므로 next는 INVALID여야 함. 아니면 메타데이터 모순. */
 		if (page->next != SPDK_INVALID_MD_PAGE) {
 			blob_load_final(ctx, -EINVAL);
 			return;
 		}
 
+		/* [한국어] extent page를 파싱해 클러스터 매핑을 blob->active.clusters에 반영. */
 		bserrno = blob_parse_extent_page(page, blob);
 		if (bserrno) {
 			blob_load_final(ctx, bserrno);
@@ -1861,11 +2715,13 @@ blob_load_cpl_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		}
 	}
 
+	/* [한국어] next_extent_page부터 남은 extent page를 순회 — 할당된 것은 read, 미할당은 즉시 확장. */
 	for (i = ctx->next_extent_page; i < blob->active.num_extent_pages; i++) {
 		if (blob->active.extent_pages[i] != 0) {
 			/* Extent page was allocated, read and parse it. */
+			/* [한국어] 할당된 extent page: 디바이스 LBA 계산 후 비동기 read 발행하고 반환(다음 진입에서 파싱). */
 			lba = bs_md_page_to_lba(blob->bs, blob->active.extent_pages[i]);
-			ctx->next_extent_page = i + 1;
+			ctx->next_extent_page = i + 1;	/* [한국어] 다음 진입은 i+1부터 스캔하도록 진행 위치 저장. */
 
 			bs_sequence_read_dev(seq, &ctx->pages[0], lba,
 					     bs_byte_to_lba(blob->bs, blob->bs->md_page_size),
@@ -1874,47 +2730,75 @@ blob_load_cpl_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		} else {
 			/* Thin provisioned blobs can point to unallocated extent pages.
 			 * In this case blob size should be increased by up to the amount left in remaining_clusters_in_et. */
+			/* [한국어] 미할당(0) extent page: 디스크에 페이지가 없으므로 read 없이 클러스터 수만 증가.
+			 * 이 extent page가 표현하는 클러스터 수만큼(최대 SPDK_EXTENTS_PER_EP) 0(미할당)으로 채움. */
 
 			sz = spdk_min(blob->remaining_clusters_in_et, SPDK_EXTENTS_PER_EP);
-			blob->active.num_clusters += sz;
-			blob->remaining_clusters_in_et -= sz;
+			blob->active.num_clusters += sz;		/* [한국어] 논리 클러스터 수 증가. */
+			blob->remaining_clusters_in_et -= sz;		/* [한국어] extent table 잔여 클러스터 차감. */
 
+			/* [한국어] 미할당 extent page는 thin blob에서만 정상(thick는 모두 할당돼 있어야 함). */
 			assert(spdk_blob_is_thin_provisioned(blob));
+			/* [한국어] 마지막 extent page이거나 잔여 클러스터가 0이어야 함(부분 채움은 마지막에만 허용). */
 			assert(i + 1 < blob->active.num_extent_pages || blob->remaining_clusters_in_et == 0);
 
+			/* [한국어] 클러스터 배열을 새 크기로 확장. */
 			tmp = realloc(blob->active.clusters, blob->active.num_clusters * sizeof(*blob->active.clusters));
 			if (tmp == NULL) {
 				blob_load_final(ctx, -ENOMEM);
 				return;
 			}
+			/* [한국어] 새로 늘어난 영역을 0(미할당 LBA)으로 초기화. */
 			memset(tmp + sizeof(*blob->active.clusters) * blob->active.cluster_array_size, 0,
 			       sizeof(*blob->active.clusters) * (blob->active.num_clusters - blob->active.cluster_array_size));
 			blob->active.clusters = tmp;
-			blob->active.cluster_array_size = blob->active.num_clusters;
+			blob->active.cluster_array_size = blob->active.num_clusters;	/* [한국어] 배열 용량 갱신. */
 		}
 	}
 
+	/* [한국어] 모든 extent page 처리 완료 → 백킹 디바이스 결정 단계로 진행. */
 	blob_load_backing_dev(seq, ctx);
 }
 
+/*
+ * [한국어]
+ * blob_load_cpl - blob 메타데이터 페이지 체인을 한 장씩 읽어들이는 비동기 반복 콜백
+ *
+ * @seq: 진행 중인 blobstore 시퀀스(다음 md page read 발행에 사용).
+ * @cb_arg: spdk_blob_load_ctx* — 지금까지 읽은 페이지 수(num_pages)와 버퍼를 추적.
+ * @bserrno: 직전 md page read I/O 결과(0=성공).
+ *
+ * blob의 메타데이터는 root 페이지(blobid가 가리키는 위치)에서 시작해 page->next 링크로 이어진
+ * 페이지 체인이다. 이 함수는 자기 자신을 콜백으로 재등록하며 체인 끝(next==INVALID)까지 한 장씩
+ * 읽어 버퍼에 누적한다. 모든 페이지가 모이면 blob_parse로 디스크리프터를 파싱하고, EXTENT_TABLE
+ * 사용 여부를 확정한 뒤 extent page 로딩 또는 백킹 디바이스 단계로 분기한다.
+ *
+ * 실행 컨텍스트: blob 소유 metadata thread. 각 페이지 read 완료마다 재진입.
+ *
+ * 호출 체인:
+ *   blob_load → bs_sequence_read_dev → [blob_load_cpl](자기 재귀)
+ *     → blob_parse → blob_load_cpl_extents_cpl / blob_load_backing_dev
+ */
 static void
 blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
-	struct spdk_blob_load_ctx	*ctx = cb_arg;
-	struct spdk_blob		*blob = ctx->blob;
-	struct spdk_blob_md_page	*page;
-	int				rc;
-	uint32_t			crc;
-	uint32_t			current_page;
+	struct spdk_blob_load_ctx	*ctx = cb_arg;		/* [한국어] 로드 진행 컨텍스트. */
+	struct spdk_blob		*blob = ctx->blob;	/* [한국어] 로드 대상 blob. */
+	struct spdk_blob_md_page	*page;			/* [한국어] 방금 읽은(또는 직전) 메타데이터 페이지. */
+	int				rc;			/* [한국어] blob_parse 등 반환 코드. */
+	uint32_t			crc;			/* [한국어] 페이지 무결성 검증용 계산 CRC. */
+	uint32_t			current_page;		/* [한국어] 현재 페이지의 md page 번호(에러 로그용). */
 
+	/* [한국어] 현재 페이지 번호 산출: 첫 페이지면 blobid에서, 아니면 직전 페이지의 next 링크에서. */
 	if (ctx->num_pages == 1) {
 		current_page = bs_blobid_to_page(blob->id);
 	} else {
 		assert(ctx->num_pages != 0);
-		page = &ctx->pages[ctx->num_pages - 2];
+		page = &ctx->pages[ctx->num_pages - 2];	/* [한국어] 직전 페이지(num_pages-2)가 이번 페이지를 가리킴. */
 		current_page = page->next;
 	}
 
+	/* [한국어] 페이지 read 실패 시 로드 중단. */
 	if (bserrno) {
 		SPDK_ERRLOG("Metadata page %d read failed for blobid 0x%" PRIx64 ": %d\n",
 			    current_page, blob->id, bserrno);
@@ -1922,6 +2806,7 @@ blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		return;
 	}
 
+	/* [한국어] 방금 읽은 마지막 페이지(num_pages-1)의 CRC 검증. */
 	page = &ctx->pages[ctx->num_pages - 1];
 	crc = blob_md_page_calc_crc(page);
 	if (crc != page->crc) {
@@ -1931,12 +2816,14 @@ blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		return;
 	}
 
+	/* [한국어] next 링크가 유효하면 체인이 더 남음 → 버퍼 확장 후 다음 페이지 read. */
 	if (page->next != SPDK_INVALID_MD_PAGE) {
 		struct spdk_blob_md_page *tmp_pages;
-		uint32_t next_page = page->next;
-		uint64_t next_lba = bs_md_page_to_lba(blob->bs, next_page);
+		uint32_t next_page = page->next;				/* [한국어] 다음 페이지 md page 번호. */
+		uint64_t next_lba = bs_md_page_to_lba(blob->bs, next_page);	/* [한국어] 다음 페이지 디바이스 LBA. */
 
 		/* Read the next page */
+		/* [한국어] 페이지 배열을 한 장 더 담도록 realloc(누적 누락 없이 전체 체인 보존). */
 		tmp_pages = spdk_realloc(ctx->pages, (sizeof(*page) * (ctx->num_pages + 1)), 0);
 		if (tmp_pages == NULL) {
 			blob_load_final(ctx, -ENOMEM);
@@ -1945,6 +2832,7 @@ blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		ctx->num_pages++;
 		ctx->pages = tmp_pages;
 
+		/* [한국어] 새 슬롯으로 다음 페이지 비동기 read 발행하고 반환(완료 시 재진입). */
 		bs_sequence_read_dev(seq, &ctx->pages[ctx->num_pages - 1],
 				     next_lba,
 				     bs_byte_to_lba(blob->bs, sizeof(*page)),
@@ -1953,14 +2841,17 @@ blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	}
 
 	/* Parse the pages */
+	/* [한국어] 체인 끝까지 다 읽음 → 모인 페이지들을 파싱해 blob의 메타데이터(xattr/extent/flags) 복원. */
 	rc = blob_parse(ctx->pages, ctx->num_pages, blob);
 	if (rc) {
 		blob_load_final(ctx, rc);
 		return;
 	}
 
+	/* [한국어] 파싱 중 EXTENT_TABLE 디스크립터가 발견됐다면 extent table 방식을 사용함을 확정. */
 	if (blob->extent_table_found == true) {
 		/* If EXTENT_TABLE was found, that means support for it should be enabled. */
+		/* [한국어] EXTENT_TABLE과 EXTENT_RLE은 상호배타 — 둘 다 있으면 안 됨. */
 		assert(blob->extent_rle_found == false);
 		blob->use_extent_table = true;
 	} else {
@@ -1968,17 +2859,22 @@ blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		 * for extent table. No extent_* descriptors means that blob has length of 0
 		 * and no extent_rle descriptors were persisted for it.
 		 * EXTENT_TABLE if used, is always present in metadata regardless of length. */
+		/* [한국어] EXTENT_RLE 또는 extent 디스크립터 부재(길이 0 blob) → extent table 미사용. */
 		blob->use_extent_table = false;
 	}
 
 	/* Check the clear_method stored in metadata vs what may have been passed
 	 * via spdk_bs_open_blob_ext() and update accordingly.
 	 */
+	/* [한국어] 메타데이터에 저장된 clear_method와 open 시 전달된 값을 비교해 최종 clear_method 확정. */
 	blob_update_clear_method(blob);
 
+	/* [한국어] 메타데이터 페이지 버퍼는 더 이상 불필요 → 해제(extent page는 별도 버퍼 사용). */
 	spdk_free(ctx->pages);
 	ctx->pages = NULL;
 
+	/* [한국어] extent table 방식이면 extent page들을 추가로 읽어야 함 → 0번부터 시작.
+	 * 아니면 클러스터 매핑이 이미 다 채워졌으므로 백킹 디바이스 단계로. */
 	if (blob->extent_table_found) {
 		blob_load_cpl_extents_cpl(seq, ctx, 0);
 	} else {
@@ -1987,19 +2883,39 @@ blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 }
 
 /* Load a blob from disk given a blobid */
+/*
+ * [한국어]
+ * blob_load - blobid로 디스크에서 blob 메타데이터를 읽어 메모리 객체를 채우는 로드 체인의 진입점
+ *
+ * @seq: 이 로드를 수행할 blobstore 시퀀스(상위에서 할당, I/O 발행 채널 역할).
+ * @blob: 이미 alloc된 빈 blob 골격. 이 함수가 디스크 내용으로 채움.
+ * @cb_fn: 로드 완료 시 호출될 시퀀스 콜백. blob_load_final이 ctx 정리 후 호출.
+ * @cb_arg: cb_fn에 전달될 사용자 컨텍스트.
+ *
+ * blob open 경로의 핵심으로, root 메타데이터 페이지부터 비동기 read를 시작해 페이지 체인 →
+ * extent page → 백킹 디바이스 순으로 진행하는 긴 비동기 체인의 머리다. 로드 진행 상태를 담는
+ * spdk_blob_load_ctx를 할당하고 첫 페이지 read를 발행한 뒤 즉시 반환하며, 이후 단계는 콜백으로 이어진다.
+ *
+ * 실행 컨텍스트: blob 소유 metadata thread(blob_verify_md_op이 thread affinity를 assert).
+ *
+ * 호출 체인:
+ *   bs_open_blob 등 → [blob_load] → bs_sequence_read_dev → blob_load_cpl → … → blob_load_final → cb_fn
+ */
 static void
 blob_load(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
 	  spdk_bs_sequence_cpl cb_fn, void *cb_arg)
 {
-	struct spdk_blob_load_ctx *ctx;
-	struct spdk_blob_store *bs;
-	uint32_t page_num;
-	uint64_t lba;
+	struct spdk_blob_load_ctx *ctx;		/* [한국어] 로드 진행 상태 컨텍스트(이 함수에서 할당). */
+	struct spdk_blob_store *bs;		/* [한국어] blob이 속한 blobstore. */
+	uint32_t page_num;			/* [한국어] root 메타데이터 페이지 번호(blobid에서 유도). */
+	uint64_t lba;				/* [한국어] root 페이지의 디바이스 LBA. */
 
+	/* [한국어] 이 호출이 blob 소유 thread에서 일어났는지 검증(메타데이터는 단일 thread 직렬 처리). */
 	blob_verify_md_op(blob);
 
 	bs = blob->bs;
 
+	/* [한국어] 로드 컨텍스트 할당 — 실패 시 즉시 사용자 콜백에 -ENOMEM 보고. */
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
 		cb_fn(seq, cb_arg, -ENOMEM);
@@ -2007,90 +2923,180 @@ blob_load(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
 	}
 
 	ctx->blob = blob;
+	/* [한국어] root 페이지를 담을 DMA 가능 버퍼 1장 확보(디바이스 read 대상이므로 DMA 메모리). */
 	ctx->pages = spdk_realloc(ctx->pages, bs->md_page_size, 0);
 	if (!ctx->pages) {
 		free(ctx);
 		cb_fn(seq, cb_arg, -ENOMEM);
 		return;
 	}
-	ctx->num_pages = 1;
-	ctx->cb_fn = cb_fn;
+	ctx->num_pages = 1;		/* [한국어] 시작은 1장(체인 추가분은 blob_load_cpl에서 realloc). */
+	ctx->cb_fn = cb_fn;		/* [한국어] 최종 완료 콜백 보관(blob_load_final이 호출). */
 	ctx->cb_arg = cb_arg;
 	ctx->seq = seq;
 
+	/* [한국어] blobid → root md page 번호 → 디바이스 LBA 변환. */
 	page_num = bs_blobid_to_page(blob->id);
 	lba = bs_md_page_to_lba(blob->bs, page_num);
 
+	/* [한국어] blob 상태를 LOADING으로 표시 — 로드 중 다른 메타데이터 연산을 막는 상태 가드. */
 	blob->state = SPDK_BLOB_STATE_LOADING;
 
+	/* [한국어] root 메타데이터 페이지 비동기 read 발행 → 완료 시 blob_load_cpl이 체인을 이어감. */
 	bs_sequence_read_dev(seq, &ctx->pages[0], lba,
 			     bs_byte_to_lba(bs, bs->md_page_size),
 			     blob_load_cpl, ctx);
 }
 
+/*
+ * [한국어]
+ * struct spdk_blob_persist_ctx - blob 메타데이터를 디스크에 영속화(persist)하는 비동기 체인의 상태 컨텍스트
+ *
+ * blob 메타데이터를 변경(resize/xattr/sync 등)한 뒤 디스크에 반영하는 다단계 비동기 작업 동안
+ * 진행 상태를 운반한다. persist는 여러 콜백 단계(새 md 생성 → extent page 쓰기 → page chain 쓰기 →
+ * root 쓰기 → 이전 페이지 zero → 클러스터/extent 해제)를 거치며, 이 ctx가 그 사이를 관통한다.
+ * 동시성: 한 blob에 대해 persist는 직렬화되며(persists_to_complete/pending_persists 큐), 이 ctx는
+ * blob 소유 metadata thread에서만 다뤄지므로 별도 락 불필요.
+ */
 struct spdk_blob_persist_ctx {
 	struct spdk_blob		*blob;
+	/* [한국어] 영속화 대상 blob.
+	 * 설정자: blob_persist() 진입 시 설정.
+	 * 읽는 자: 모든 persist 단계 콜백이 blob->active/clean 메타데이터에 접근할 때.
+	 * 값 범위: 유효한 blob 포인터(NULL 불가). 동기화: blob 소유 thread 전용. */
 
 	struct spdk_blob_md_page	*pages;
+	/* [한국어] 디스크에 쓸 직렬화된 메타데이터 페이지 배열(DMA 버퍼).
+	 * 설정자: blob_persist_generate_new_md()가 blob_serialize로 채움.
+	 * 읽는 자: blob_persist_write_page_chain/_root가 디바이스에 write.
+	 * 값 범위: spdk_zmalloc DMA 메모리. 완료 콜백에서 spdk_free로 해제. */
+
 	uint32_t			next_extent_page;
+	/* [한국어] extent page를 한 장씩 쓰는 비동기 루프의 진행 인덱스.
+	 * 설정자/읽는 자: blob_persist_write_extent_pages 계열 콜백.
+	 * 값 범위: 0..active.num_extent_pages. 다음에 쓸 extent page 위치. */
+
 	struct spdk_blob_md_page	*extent_page;
+	/* [한국어] 현재 쓰기 중인 단일 extent page용 임시 DMA 버퍼.
+	 * 설정자: extent page 쓰기 단계에서 할당/재사용.
+	 * 읽는 자: 같은 단계의 write 완료 콜백. 값 범위: DMA 메모리 또는 NULL. */
 
 	spdk_bs_sequence_t		*seq;
+	/* [한국어] 이 persist의 모든 I/O를 발행하는 blobstore 시퀀스 채널.
+	 * 설정자: blob_persist() 진입 시. 읽는 자: 각 단계가 read/write/batch 발행 시.
+	 * 값 범위: 유효한 시퀀스. 완료 시 사용자 cb_fn으로 전달. */
+
 	spdk_bs_sequence_cpl		cb_fn;
+	/* [한국어] persist 전체 완료 시 호출할 사용자 콜백.
+	 * 설정자: blob_persist() 진입 시. 읽는 자: blob_persist_complete_cb.
+	 * 값 범위: 유효한 함수 포인터. cb_fn(seq, cb_arg, bserrno) 형태로 호출. */
+
 	void				*cb_arg;
+	/* [한국어] cb_fn에 전달할 사용자 컨텍스트.
+	 * 설정자: blob_persist() 진입 시. 읽는 자: cb_fn 호출 시. 값 범위: 임의(불투명). */
+
 	TAILQ_ENTRY(spdk_blob_persist_ctx) link;
+	/* [한국어] blob의 persists_to_complete / pending_persists TAILQ 연결 노드.
+	 * 설정자/읽는 자: blob_persist_complete가 큐 이동(SWAP/REMOVE) 시 사용.
+	 * 동기화: blob 소유 thread 전용이므로 락 없이 큐 조작 안전. */
 };
 
+/*
+ * [한국어]
+ * bs_batch_clear_dev - blob의 clear_method 정책에 따라 디바이스 영역을 비우는 배치 명령 추가
+ *
+ * @blob: clear_method 정책을 제공하는 blob(클러스터 해제 시 데이터를 어떻게 지울지 결정).
+ * @batch: 명령을 누적할 blobstore 배치(여러 영역을 모아 한 번에 발행).
+ * @lba: 비울 영역의 시작 LBA.
+ * @lba_count: 비울 LBA 개수.
+ *
+ * 클러스터가 truncate/해제될 때 이전 데이터를 어떻게 처리할지는 blob의 clear_method 설정에 따른다:
+ * UNMAP(TRIM으로 SSD에 해제 통지) / WRITE_ZEROES(0으로 덮어씀) / NONE(아무것도 안 함, 잔존 데이터 무시).
+ * 정책에 맞는 배치 연산을 batch에 추가하기만 하고 실제 발행은 batch close 시 이뤄진다.
+ *
+ * 실행 컨텍스트: blob 소유 metadata thread, persist 클러스터/extent 정리 단계.
+ *
+ * 호출 체인:
+ *   blob_persist_clear_clusters → [bs_batch_clear_dev] → bs_batch_unmap_dev / bs_batch_write_zeroes_dev
+ */
 static void
 bs_batch_clear_dev(struct spdk_blob *blob, spdk_bs_batch_t *batch, uint64_t lba,
 		   uint64_t lba_count)
 {
+	/* [한국어] blob별 clear_method 정책 분기. */
 	switch (blob->clear_method) {
-	case BLOB_CLEAR_WITH_DEFAULT:
+	case BLOB_CLEAR_WITH_DEFAULT:	/* [한국어] 기본값은 UNMAP과 동일하게 처리(fallthrough). */
 	case BLOB_CLEAR_WITH_UNMAP:
+		/* [한국어] UNMAP/TRIM: SSD에 해당 LBA가 더 이상 쓰이지 않음을 통지(공간 회수·WAF 개선). */
 		bs_batch_unmap_dev(batch, lba, lba_count);
 		break;
 	case BLOB_CLEAR_WITH_WRITE_ZEROES:
+		/* [한국어] WRITE_ZEROES: 0으로 명시적으로 덮어써 이전 데이터 노출 방지(보안/정합성). */
 		bs_batch_write_zeroes_dev(batch, lba, lba_count);
 		break;
-	case BLOB_CLEAR_WITH_NONE:
+	case BLOB_CLEAR_WITH_NONE:	/* [한국어] NONE: 아무 동작 안 함 — 잔존 데이터는 신경 쓰지 않음(최고 성능). */
 	default:
 		break;
 	}
 }
 
+/*
+ * [한국어]
+ * bs_super_validate - 디스크에서 읽은 super block의 무결성/호환성을 검증
+ *
+ * @super: 디바이스 0번 영역에서 읽어들인 super block(blobstore 메타데이터 루트).
+ * @bs: 메모리상의 blobstore 객체(기대하는 bstype/디바이스 크기 제공).
+ * @return: 0 = 검증 통과, 음수 errno = 거부. -EILSEQ(버전/시그니처/CRC/크기 이상),
+ *          -ENXIO(bstype 불일치 — 다른 용도 blobstore).
+ *
+ * blobstore load의 첫 관문이다. super block은 시그니처·버전·CRC로 자기 무결성을 보증하고,
+ * bstype(소비자가 정한 blobstore 종류 태그)으로 의도한 blobstore인지 식별한다. bstype이 0(와일드카드)
+ * 이면 종류 무관 로드를 허용한다. 마지막으로 super에 기록된 크기가 실제 디바이스 용량을 넘지 않는지 본다.
+ *
+ * 실행 컨텍스트: blobstore load thread. 순수 검증 함수(I/O 없음, 부수효과 없음).
+ *
+ * 호출 체인:
+ *   bs_load_super_cpl 등 → [bs_super_validate]
+ */
 static int
 bs_super_validate(struct spdk_bs_super_block *super, struct spdk_blob_store *bs)
 {
-	uint32_t	crc;
-	static const char zeros[SPDK_BLOBSTORE_TYPE_LENGTH];
+	uint32_t	crc;					/* [한국어] super block에 대해 계산한 CRC. */
+	static const char zeros[SPDK_BLOBSTORE_TYPE_LENGTH];	/* [한국어] 와일드카드 bstype 비교용 0 채움 상수(정적 = 0 초기화). */
 
+	/* [한국어] 지원 버전 범위 밖이면 거부 — 너무 새롭거나(미래) 너무 오래된(초기 이전) 포맷. */
 	if (super->version > SPDK_BS_VERSION ||
 	    super->version < SPDK_BS_INITIAL_VERSION) {
 		return -EILSEQ;
 	}
 
+	/* [한국어] 시그니처("SPDKBLOB" 등 매직)가 다르면 blobstore가 아님 → 거부. */
 	if (memcmp(super->signature, SPDK_BS_SUPER_BLOCK_SIG,
 		   sizeof(super->signature)) != 0) {
 		return -EILSEQ;
 	}
 
+	/* [한국어] super block CRC 재계산 후 저장값과 비교 — 손상/부분 기록 감지. */
 	crc = blob_md_page_calc_crc(super);
 	if (crc != super->crc) {
 		return -EILSEQ;
 	}
 
+	/* [한국어] bstype 매칭: 정확 일치면 그대로 로드. */
 	if (memcmp(&bs->bstype, &super->bstype, SPDK_BLOBSTORE_TYPE_LENGTH) == 0) {
 		SPDK_DEBUGLOG(blob, "Bstype matched - loading blobstore\n");
 	} else if (memcmp(&bs->bstype, zeros, SPDK_BLOBSTORE_TYPE_LENGTH) == 0) {
+		/* [한국어] 기대 bstype이 0(와일드카드)이면 디스크의 bstype과 무관하게 로드 허용. */
 		SPDK_DEBUGLOG(blob, "Bstype wildcard used - loading blobstore regardless bstype\n");
 	} else {
+		/* [한국어] bstype 불일치 — 다른 종류의 blobstore일 수 있어 실수 로드 방지 위해 -ENXIO. */
 		SPDK_DEBUGLOG(blob, "Unexpected bstype\n");
 		SPDK_LOGDUMP(blob, "Expected:", bs->bstype.bstype, SPDK_BLOBSTORE_TYPE_LENGTH);
 		SPDK_LOGDUMP(blob, "Found:", super->bstype.bstype, SPDK_BLOBSTORE_TYPE_LENGTH);
 		return -ENXIO;
 	}
 
+	/* [한국어] super에 기록된 blobstore 크기가 실제 디바이스 바이트 용량을 초과하면 모순 → 거부. */
 	if (super->size > bs->dev->blockcnt * bs->dev->blocklen) {
 		SPDK_NOTICELOG("Size mismatch, dev size: %" PRIu64 ", blobstore size: %" PRIu64 "\n",
 			       bs->dev->blockcnt * bs->dev->blocklen, super->size);
@@ -2103,69 +3109,131 @@ bs_super_validate(struct spdk_bs_super_block *super, struct spdk_blob_store *bs)
 static void bs_mark_dirty(spdk_bs_sequence_t *seq, struct spdk_blob_store *bs,
 			  spdk_bs_sequence_cpl cb_fn, void *cb_arg);
 
+/*
+ * [한국어]
+ * blob_persist_complete_cb - 영속화 완료된 persist ctx의 사용자 콜백 호출 + 메모리 정리 (메시지 핸들러)
+ *
+ * @arg: spdk_blob_persist_ctx* — 완료 처리할 persist 컨텍스트.
+ *
+ * blob_persist_complete가 spdk_thread_send_msg로 이 함수를 큐에 넣는다. send_msg로 한 단계
+ * 미루는 이유는, 완료 콜백이 같은 스택에서 재진입(예: 콜백 안에서 또 persist 발행)해 무한 재귀나
+ * 큐 조작 중 리스트 변형이 일어나는 것을 막기 위함이다. 즉 모든 pending persist 완료를 평탄화한다.
+ *
+ * 실행 컨텍스트: blob 소유 metadata thread의 메시지 처리 시점(send_msg 디스패치 후).
+ *
+ * 호출 체인:
+ *   blob_persist_complete → spdk_thread_send_msg → [blob_persist_complete_cb] → ctx->cb_fn
+ */
 static void
 blob_persist_complete_cb(void *arg)
 {
-	struct spdk_blob_persist_ctx *ctx = arg;
+	struct spdk_blob_persist_ctx *ctx = arg;	/* [한국어] 완료 처리 대상 persist 컨텍스트. */
 
 	/* Call user callback */
+	/* [한국어] 사용자에게 persist 성공(0) 통지 — 이 시점에 메타데이터는 디스크에 영속화 완료. */
 	ctx->cb_fn(ctx->seq, ctx->cb_arg, 0);
 
 	/* Free the memory */
+	/* [한국어] 직렬화 페이지 DMA 버퍼와 ctx 자체 해제(이후 ctx 접근 금지). */
 	spdk_free(ctx->pages);
 	free(ctx);
 }
 
 static void blob_persist_start(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno);
 
+/*
+ * [한국어]
+ * blob_persist_complete - 현재 persist 체인을 마무리하고 대기 중이던 persist들을 처리/재시작
+ *
+ * @seq: 완료된 persist의 시퀀스 채널(다음 persist 재시작 시 재사용).
+ * @ctx: 방금 완료된 persist 컨텍스트(persists_to_complete의 선두여야 함).
+ * @bserrno: persist 결과(0=성공). 성공 시에만 blob을 clean으로 표시.
+ *
+ * 한 blob에 대한 persist는 직렬화된다: 진행 중 들어온 새 persist 요청은 pending_persists에 쌓이고,
+ * 현재 persist가 끝나면 그동안의 요청들을 한꺼번에 완료 통지한 뒤, pending이 있으면 다음 persist를
+ * 재시작한다. 이 함수가 그 상태 전이의 중심이다. 완료 통지는 send_msg로 평탄화해 재진입 안전성을 확보한다.
+ *
+ * 실행 컨텍스트: blob 소유 metadata thread(락 없이 큐 조작 — single-thread 직렬성 근거).
+ *
+ * 호출 체인:
+ *   각 persist 단계 콜백 → [blob_persist_complete]
+ *     → blob_mark_clean / spdk_thread_send_msg(blob_persist_complete_cb) / bs_mark_dirty(blob_persist_start)
+ */
 static void
 blob_persist_complete(spdk_bs_sequence_t *seq, struct spdk_blob_persist_ctx *ctx, int bserrno)
 {
-	struct spdk_blob_persist_ctx	*next_persist, *tmp;
-	struct spdk_blob		*blob = ctx->blob;
+	struct spdk_blob_persist_ctx	*next_persist, *tmp;	/* [한국어] 큐 순회/스왑용 포인터. */
+	struct spdk_blob		*blob = ctx->blob;	/* [한국어] persist 대상 blob. */
 
+	/* [한국어] 성공한 경우에만 blob을 clean 상태로 — 디스크와 메모리 메타데이터가 일치함을 표시. */
 	if (bserrno == 0) {
 		blob_mark_clean(blob);
 	}
 
+	/* [한국어] 완료 처리 대상은 항상 persists_to_complete 큐의 선두여야 한다는 불변식. */
 	assert(ctx == TAILQ_FIRST(&blob->persists_to_complete));
 
 	/* Complete all persists that were pending when the current persist started */
+	/* [한국어] 현재 persist 시작 시점에 묶여 있던 모든 요청을 완료 통지(send_msg로 평탄화 — 재진입 방지). */
 	TAILQ_FOREACH_SAFE(next_persist, &blob->persists_to_complete, link, tmp) {
 		TAILQ_REMOVE(&blob->persists_to_complete, next_persist, link);
 		spdk_thread_send_msg(spdk_get_thread(), blob_persist_complete_cb, next_persist);
 	}
 
+	/* [한국어] 그 사이 새로 들어온 대기 persist가 없으면 여기서 종료. */
 	if (TAILQ_EMPTY(&blob->pending_persists)) {
 		return;
 	}
 
 	/* Queue up all pending persists for completion and start blob persist with first one */
+	/* [한국어] 대기 큐를 완료-처리 큐로 스왑(이번 라운드에서 함께 묶어 처리)하고 그 선두로 재시작. */
 	TAILQ_SWAP(&blob->persists_to_complete, &blob->pending_persists, spdk_blob_persist_ctx, link);
 	next_persist = TAILQ_FIRST(&blob->persists_to_complete);
 
+	/* [한국어] 새 persist를 시작하므로 blob을 DIRTY로 표시하고, super dirty 마킹 후 persist_start 진입. */
 	blob->state = SPDK_BLOB_STATE_DIRTY;
 	bs_mark_dirty(seq, blob->bs, blob_persist_start, next_persist);
 }
 
+/*
+ * [한국어]
+ * blob_persist_clear_extents_cpl - truncate된 extent page들의 디스크 클리어 완료 후 메타 슬롯 해제
+ *
+ * @seq: persist 시퀀스. @cb_arg: spdk_blob_persist_ctx*. @bserrno: extent 클리어 I/O 결과.
+ *
+ * blob 축소(resize down) 시, 더 이상 쓰이지 않는 extent page들을 디스크에서 0으로 지운 뒤(직전 단계),
+ * 이 콜백에서 그 extent page들이 차지하던 used_md_pages 비트맵 슬롯을 반환하고 메모리 배열을 줄인다.
+ * 이로써 해당 md page들이 다른 blob에 재할당될 수 있게 된다. persist 체인의 마지막 단계로,
+ * 끝나면 blob_persist_complete로 전체 persist를 마무리한다.
+ *
+ * 실행 컨텍스트: blob 소유 metadata thread. used 비트맵 갱신 구간만 bs->used_lock으로 보호
+ * (used 비트맵은 여러 blob/채널이 공유하므로 lock 필요 — blob-local 상태와 달리 락리스 불가).
+ *
+ * 호출 체인:
+ *   blob_persist_clear_extents(batch) → [blob_persist_clear_extents_cpl] → blob_persist_complete
+ */
 static void
 blob_persist_clear_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
-	struct spdk_blob_persist_ctx	*ctx = cb_arg;
-	struct spdk_blob		*blob = ctx->blob;
-	struct spdk_blob_store		*bs = blob->bs;
-	size_t				i;
+	struct spdk_blob_persist_ctx	*ctx = cb_arg;		/* [한국어] persist 컨텍스트. */
+	struct spdk_blob		*blob = ctx->blob;	/* [한국어] persist 대상 blob. */
+	struct spdk_blob_store		*bs = blob->bs;		/* [한국어] used_md_pages 비트맵을 가진 blobstore. */
+	size_t				i;			/* [한국어] truncate된 extent page 순회 인덱스. */
 
+	/* [한국어] 디스크 클리어 I/O가 실패했으면 슬롯 해제 없이 persist를 에러로 마무리. */
 	if (bserrno != 0) {
 		blob_persist_complete(seq, ctx, bserrno);
 		return;
 	}
 
+	/* [한국어] used_md_pages는 모든 blob이 공유하는 전역 비트맵 → 갱신 동안 spinlock 보호. */
 	spdk_spin_lock(&bs->used_lock);
 
 	/* Release all extent_pages that were truncated */
+	/* [한국어] 새 num_extent_pages 이후(축소로 버려진) extent page들을 비트맵에서 해제. */
 	for (i = blob->active.num_extent_pages; i < blob->active.extent_pages_array_size; i++) {
 		/* Nothing to release if it was not allocated */
+		/* [한국어] 0이면 애초에 할당되지 않은 extent page라 해제할 것 없음(thin 미할당). */
 		if (blob->active.extent_pages[i] != 0) {
 			bs_release_md_page(bs, blob->active.extent_pages[i]);
 		}
@@ -2173,102 +3241,166 @@ blob_persist_clear_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrn
 
 	spdk_spin_unlock(&bs->used_lock);
 
+	/* [한국어] extent page가 0개가 되면 배열 자체를 해제(메모리 회수). */
 	if (blob->active.num_extent_pages == 0) {
 		free(blob->active.extent_pages);
 		blob->active.extent_pages = NULL;
 		blob->active.extent_pages_array_size = 0;
 	} else if (blob->active.num_extent_pages != blob->active.extent_pages_array_size) {
+		/* [한국어] 일부만 남았으면 배열을 새 크기로 축소 realloc(메모리 절약). */
 #ifndef __clang_analyzer__
 		void *tmp;
 
 		/* scan-build really can't figure reallocs, workaround it */
+		/* [한국어] 정적 분석기(scan-build)가 축소 realloc을 오판하므로 분석 빌드에서만 우회. */
 		tmp = realloc(blob->active.extent_pages, sizeof(uint32_t) * blob->active.num_extent_pages);
-		assert(tmp != NULL);
+		assert(tmp != NULL);	/* [한국어] 축소 realloc은 실패하지 않는다고 가정(크기 감소). */
 		blob->active.extent_pages = tmp;
 #endif
-		blob->active.extent_pages_array_size = blob->active.num_extent_pages;
+		blob->active.extent_pages_array_size = blob->active.num_extent_pages;	/* [한국어] 배열 용량 갱신. */
 	}
 
+	/* [한국어] extent page 정리 완료 → persist 전체 마무리. */
 	blob_persist_complete(seq, ctx, bserrno);
 }
 
+/*
+ * [한국어]
+ * blob_persist_clear_extents - truncate된 extent page들을 디스크에서 0으로 지우는 배치 발행
+ *
+ * @seq: persist 시퀀스(배치 채널로 변환해 사용).
+ * @ctx: persist 컨텍스트.
+ *
+ * blob 축소로 버려질 extent page들이 디스크에 남아 있으면, 나중에 그 md page가 재할당될 때 옛 내용이
+ * 오인될 수 있다. 이를 막기 위해 해당 페이지들을 write_zeroes 배치로 디스크에서 지운다. 배치를 닫으면
+ * 모든 write가 발행되고 완료 시 blob_persist_clear_extents_cpl이 비트맵 슬롯을 해제한다.
+ *
+ * 실행 컨텍스트: blob 소유 metadata thread. I/O는 비동기(배치 close가 발행 트리거).
+ *
+ * 호출 체인:
+ *   blob_persist_clear_clusters_cpl → [blob_persist_clear_extents] → bs_batch_close → blob_persist_clear_extents_cpl
+ */
 static void
 blob_persist_clear_extents(spdk_bs_sequence_t *seq, struct spdk_blob_persist_ctx *ctx)
 {
-	struct spdk_blob		*blob = ctx->blob;
-	struct spdk_blob_store		*bs = blob->bs;
-	size_t				i;
-	uint64_t                        lba;
-	uint64_t                        lba_count;
-	spdk_bs_batch_t                 *batch;
+	struct spdk_blob		*blob = ctx->blob;	/* [한국어] persist 대상 blob. */
+	struct spdk_blob_store		*bs = blob->bs;		/* [한국어] LBA 변환 파라미터 소유 blobstore. */
+	size_t				i;			/* [한국어] truncate된 extent page 순회 인덱스. */
+	uint64_t                        lba;			/* [한국어] 지울 extent page의 디바이스 LBA. */
+	uint64_t                        lba_count;		/* [한국어] md page 1장당 LBA 개수. */
+	spdk_bs_batch_t                 *batch;			/* [한국어] write_zeroes를 모을 배치. */
 
+	/* [한국어] 시퀀스를 배치로 전환 — 완료 콜백은 clear_extents_cpl. */
 	batch = bs_sequence_to_batch(seq, blob_persist_clear_extents_cpl, ctx);
-	lba_count = bs_byte_to_lba(bs, bs->md_page_size);
+	lba_count = bs_byte_to_lba(bs, bs->md_page_size);	/* [한국어] md page 크기를 LBA 단위로 환산. */
 
 	/* Clear all extent_pages that were truncated */
+	/* [한국어] 새 크기 이후로 버려진 extent page를 순회하며 디스크 클리어 추가. */
 	for (i = blob->active.num_extent_pages; i < blob->active.extent_pages_array_size; i++) {
 		/* Nothing to clear if it was not allocated */
+		/* [한국어] 미할당(0) extent page는 디스크에 실체가 없어 지울 필요 없음. */
 		if (blob->active.extent_pages[i] != 0) {
 			lba = bs_md_page_to_lba(bs, blob->active.extent_pages[i]);
 			bs_batch_write_zeroes_dev(batch, lba, lba_count);
 		}
 	}
 
+	/* [한국어] 배치 닫기 → 누적된 write_zeroes 일괄 발행, 완료 시 cpl 콜백. */
 	bs_batch_close(batch);
 }
 
+/*
+ * [한국어]
+ * blob_persist_clear_clusters_cpl - truncate된 클러스터들의 디스크 클리어 완료 후 클러스터 슬롯 해제
+ *
+ * @seq: persist 시퀀스. @cb_arg: spdk_blob_persist_ctx*. @bserrno: 클러스터 클리어 I/O 결과.
+ *
+ * blob 축소 시, 디스크에서 데이터를 지운 클러스터들의 used_clusters 비트맵 슬롯을 반환하고 메모리
+ * 클러스터 배열을 축소한다. 이로써 해당 클러스터가 다른 blob에 재할당 가능해진다. 이후 extent page
+ * 정리(clear_extents) 단계로 진행한다.
+ *
+ * 실행 컨텍스트: blob 소유 metadata thread. used 클러스터 비트맵 갱신만 bs->used_lock으로 보호.
+ *
+ * 호출 체인:
+ *   blob_persist_clear_clusters(batch) → [blob_persist_clear_clusters_cpl] → blob_persist_clear_extents
+ */
 static void
 blob_persist_clear_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
-	struct spdk_blob_persist_ctx	*ctx = cb_arg;
-	struct spdk_blob		*blob = ctx->blob;
-	struct spdk_blob_store		*bs = blob->bs;
-	size_t				i;
+	struct spdk_blob_persist_ctx	*ctx = cb_arg;		/* [한국어] persist 컨텍스트. */
+	struct spdk_blob		*blob = ctx->blob;	/* [한국어] persist 대상 blob. */
+	struct spdk_blob_store		*bs = blob->bs;		/* [한국어] used_clusters 비트맵 소유 blobstore. */
+	size_t				i;			/* [한국어] truncate된 클러스터 순회 인덱스. */
 
+	/* [한국어] 클러스터 디스크 클리어 실패 시 슬롯 해제 없이 에러로 마무리. */
 	if (bserrno != 0) {
 		blob_persist_complete(seq, ctx, bserrno);
 		return;
 	}
 
+	/* [한국어] used_clusters 비트맵은 전역 공유 자원 → 갱신 구간 spinlock 보호. */
 	spdk_spin_lock(&bs->used_lock);
 	/* Release all clusters that were truncated */
+	/* [한국어] 새 num_clusters 이후로 버려진 클러스터들을 비트맵에서 해제. */
 	for (i = blob->active.num_clusters; i < blob->active.cluster_array_size; i++) {
-		uint32_t cluster_num = bs_lba_to_cluster(bs, blob->active.clusters[i]);
+		uint32_t cluster_num = bs_lba_to_cluster(bs, blob->active.clusters[i]);	/* [한국어] LBA → 클러스터 번호 환산. */
 
 		/* Nothing to release if it was not allocated */
+		/* [한국어] 0이면 미할당(thin) 클러스터라 해제 불필요. */
 		if (blob->active.clusters[i] != 0) {
 			bs_release_cluster(bs, cluster_num);
 		}
 	}
 	spdk_spin_unlock(&bs->used_lock);
 
+	/* [한국어] 클러스터가 0개가 되면 배열 자체 해제. */
 	if (blob->active.num_clusters == 0) {
 		free(blob->active.clusters);
 		blob->active.clusters = NULL;
 		blob->active.cluster_array_size = 0;
 	} else if (blob->active.num_clusters != blob->active.cluster_array_size) {
+		/* [한국어] 일부만 남았으면 새 크기로 축소 realloc. */
 #ifndef __clang_analyzer__
 		void *tmp;
 
 		/* scan-build really can't figure reallocs, workaround it */
+		/* [한국어] scan-build의 축소 realloc 오판 회피(분석 빌드 전용 우회). */
 		tmp = realloc(blob->active.clusters, sizeof(*blob->active.clusters) * blob->active.num_clusters);
-		assert(tmp != NULL);
+		assert(tmp != NULL);	/* [한국어] 축소이므로 실패하지 않는다고 가정. */
 		blob->active.clusters = tmp;
 
 #endif
-		blob->active.cluster_array_size = blob->active.num_clusters;
+		blob->active.cluster_array_size = blob->active.num_clusters;	/* [한국어] 배열 용량 갱신. */
 	}
 
 	/* Move on to clearing extent pages */
+	/* [한국어] 클러스터 정리 완료 → 다음으로 extent page 정리 단계 진행. */
 	blob_persist_clear_extents(seq, ctx);
 }
 
+/*
+ * [한국어]
+ * lba_cmp - qsort용 uint64 LBA 오름차순 비교 함수
+ *
+ * @a, @b: 비교할 두 LBA 값의 주소(qsort가 전달하는 void* 원소 포인터).
+ * @return: a<b면 -1, a>b면 1, 같으면 0.
+ *
+ * blob_persist_clear_clusters에서 truncate된 클러스터 LBA들을 정렬해, 인접 LBA를 묶어
+ * 한 번의 unmap/write_zeroes 배치로 발행(연속 영역 병합)하기 위해 사용한다. 단순 부호 없는 비교라
+ * (a-b) 캐스팅 대신 명시적 분기를 써서 64비트 오버플로/wrap을 피한다.
+ *
+ * 실행 컨텍스트: blob 소유 metadata thread(qsort 내부에서 동기 호출). 부수효과 없음.
+ *
+ * 호출 체인:
+ *   blob_persist_clear_clusters → qsort → [lba_cmp]
+ */
 static int
 lba_cmp(const void *a, const void *b)
 {
-	uint64_t ua = *(const uint64_t *)a;
-	uint64_t ub = *(const uint64_t *)b;
+	uint64_t ua = *(const uint64_t *)a;	/* [한국어] 첫 번째 LBA 역참조. */
+	uint64_t ub = *(const uint64_t *)b;	/* [한국어] 두 번째 LBA 역참조. */
 
+	/* [한국어] (ua-ub) 캐스팅을 피하고 명시 분기 — 부호 없는 64비트 wrap 방지. */
 	if (ua < ub) {
 		return -1;
 	}
@@ -2278,50 +3410,76 @@ lba_cmp(const void *a, const void *b)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * blob_persist_clear_clusters - truncate된 클러스터들을 LBA 정렬·병합해 디스크에서 비우는 배치 발행
+ *
+ * @seq: persist 시퀀스(배치로 전환).
+ * @ctx: persist 컨텍스트.
+ *
+ * blob 축소로 버려지는 클러스터들의 데이터를 clear_method에 따라(unmap/write_zeroes/none) 디스크에서
+ * 지운다. 효율을 위해 LBA를 먼저 정렬한 뒤 인접한(연속) 클러스터들을 하나의 큰 clear 명령으로 병합한다.
+ * 0(미할당) LBA는 건너뛴다. 배치를 닫으면 발행되고 완료 시 clear_clusters_cpl이 슬롯을 해제한다.
+ *
+ * 실행 컨텍스트: blob 소유 metadata thread. 비동기 I/O(배치 close가 트리거).
+ *
+ * 호출 체인:
+ *   blob_persist_zero_pages_cpl → [blob_persist_clear_clusters]
+ *     → qsort(lba_cmp) → bs_batch_clear_dev → bs_batch_close → blob_persist_clear_clusters_cpl
+ */
 static void
 blob_persist_clear_clusters(spdk_bs_sequence_t *seq, struct spdk_blob_persist_ctx *ctx)
 {
-	struct spdk_blob		*blob = ctx->blob;
-	struct spdk_blob_store		*bs = blob->bs;
-	spdk_bs_batch_t			*batch;
-	size_t				i;
-	uint64_t			lba;
-	uint64_t			lba_count;
+	struct spdk_blob		*blob = ctx->blob;	/* [한국어] persist 대상 blob. */
+	struct spdk_blob_store		*bs = blob->bs;		/* [한국어] 클러스터↔LBA 변환 파라미터 소유. */
+	spdk_bs_batch_t			*batch;			/* [한국어] clear 명령을 모을 배치. */
+	size_t				i;			/* [한국어] truncate된 클러스터 순회 인덱스. */
+	uint64_t			lba;			/* [한국어] 현재 병합 중인 연속 영역 시작 LBA. */
+	uint64_t			lba_count;		/* [한국어] 현재 병합 중인 연속 영역 길이(LBA 수). */
 
 	/* Clusters don't move around in blobs. The list shrinks or grows
 	 * at the end, but no changes ever occur in the middle of the list.
 	 */
+	/* [한국어] 클러스터 리스트는 끝에서만 늘거나 줄고 중간 변경이 없다는 불변식(병합 로직의 전제). */
 
+	/* [한국어] 시퀀스를 배치로 전환 — 완료 콜백은 clear_clusters_cpl. */
 	batch = bs_sequence_to_batch(seq, blob_persist_clear_clusters_cpl, ctx);
 
 	/* Clear all clusters that were truncated */
-	lba = 0;
-	lba_count = 0;
+	lba = 0;		/* [한국어] 아직 병합 시작 전 — 0으로 초기화. */
+	lba_count = 0;		/* [한국어] 병합된 길이 0에서 시작. */
 
+	/* [한국어] truncate 구간이 존재하면 그 부분만 LBA 오름차순 정렬(연속 병합 가능하게). */
 	if (blob->active.cluster_array_size > blob->active.num_clusters) {
 		qsort(&blob->active.clusters[blob->active.num_clusters],
 		      blob->active.cluster_array_size - blob->active.num_clusters, sizeof(uint64_t), lba_cmp);
 	}
+	/* [한국어] 정렬된 truncate 클러스터를 순회하며 연속 영역을 병합해 clear 발행. */
 	for (i = blob->active.num_clusters; i < blob->active.cluster_array_size; i++) {
-		uint64_t next_lba = blob->active.clusters[i];
-		uint64_t next_lba_count = bs_cluster_to_lba(bs, 1);
+		uint64_t next_lba = blob->active.clusters[i];		/* [한국어] 이번 클러스터의 시작 LBA. */
+		uint64_t next_lba_count = bs_cluster_to_lba(bs, 1);	/* [한국어] 클러스터 1개의 LBA 길이. */
 
 		if (next_lba > 0 && (lba + lba_count) == next_lba) {
 			/* This cluster is contiguous with the previous one. */
+			/* [한국어] 직전 영역 끝과 맞붙으면 길이만 늘려 병합(별도 명령 안 냄). */
 			lba_count += next_lba_count;
 			continue;
 		} else if (next_lba == 0) {
+			/* [한국어] 미할당(0) 클러스터는 지울 대상 없음 → 건너뜀. */
 			continue;
 		}
 
 		/* This cluster is not contiguous with the previous one. */
+		/* [한국어] 비연속이면 지금까지 모은 영역을 먼저 발행해야 함. */
 
 		/* If a run of LBAs previously existing, clear them now */
+		/* [한국어] 누적된 연속 영역이 있으면 clear_method에 맞춰 발행. */
 		if (lba_count > 0) {
 			bs_batch_clear_dev(ctx->blob, batch, lba, lba_count);
 		}
 
 		/* Start building the next batch */
+		/* [한국어] 이번 클러스터를 새 병합 영역의 시작으로 설정. */
 		lba = next_lba;
 		if (next_lba > 0) {
 			lba_count = next_lba_count;
@@ -2331,73 +3489,114 @@ blob_persist_clear_clusters(spdk_bs_sequence_t *seq, struct spdk_blob_persist_ct
 	}
 
 	/* If we ended with a contiguous set of LBAs, clear them now */
+	/* [한국어] 루프 종료 시 마지막으로 모인 연속 영역이 남아 있으면 발행. */
 	if (lba_count > 0) {
 		bs_batch_clear_dev(ctx->blob, batch, lba, lba_count);
 	}
 
+	/* [한국어] 배치 닫기 → 누적 clear 일괄 발행, 완료 시 cpl 콜백. */
 	bs_batch_close(batch);
 }
 
+/*
+ * [한국어]
+ * blob_persist_zero_pages_cpl - 옛 메타데이터 페이지 zero 완료 후 그 md page 슬롯들을 해제
+ *
+ * @seq: persist 시퀀스. @cb_arg: spdk_blob_persist_ctx*. @bserrno: zero I/O 결과.
+ *
+ * 메타데이터는 첫 페이지(root)를 제외하면 in-place로 덮어쓰지 않고 항상 새 페이지에 쓴 뒤 옛 페이지를
+ * 지운다(원자적 교체로 crash-consistency 확보). 직전 단계에서 옛 clean 페이지들을 디스크에서 0으로
+ * 지웠고, 이 콜백은 그 페이지들의 used_md_pages 비트맵 슬롯을 반환한다. blob 삭제(active 페이지 0개)
+ * 시엔 root 페이지까지 해제한다. 이후 클러스터 정리 단계로 진행한다.
+ *
+ * 실행 컨텍스트: blob 소유 metadata thread. 비트맵 갱신만 bs->used_lock 보호.
+ *
+ * 호출 체인:
+ *   blob_persist_zero_pages(batch) → [blob_persist_zero_pages_cpl] → blob_persist_clear_clusters
+ */
 static void
 blob_persist_zero_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
-	struct spdk_blob_persist_ctx	*ctx = cb_arg;
-	struct spdk_blob		*blob = ctx->blob;
-	struct spdk_blob_store		*bs = blob->bs;
-	size_t				i;
+	struct spdk_blob_persist_ctx	*ctx = cb_arg;		/* [한국어] persist 컨텍스트. */
+	struct spdk_blob		*blob = ctx->blob;	/* [한국어] persist 대상 blob. */
+	struct spdk_blob_store		*bs = blob->bs;		/* [한국어] used_md_pages 비트맵 소유. */
+	size_t				i;			/* [한국어] 옛 clean 페이지 순회 인덱스. */
 
+	/* [한국어] zero I/O 실패 시 슬롯 해제 없이 에러로 마무리. */
 	if (bserrno != 0) {
 		blob_persist_complete(seq, ctx, bserrno);
 		return;
 	}
 
+	/* [한국어] md page 비트맵 갱신 구간 spinlock 보호. */
 	spdk_spin_lock(&bs->used_lock);
 
 	/* This loop starts at 1 because the first page is special and handled
 	 * below. The pages (except the first) are never written in place,
 	 * so any pages in the clean list must be zeroed.
 	 */
+	/* [한국어] i=1부터: 0번(root)은 특별 처리. 1번 이후 옛 clean 페이지 슬롯을 모두 해제(재사용 가능화). */
 	for (i = 1; i < blob->clean.num_pages; i++) {
 		bs_release_md_page(bs, blob->clean.pages[i]);
 	}
 
+	/* [한국어] active 페이지가 0개 = blob 삭제 케이스 → root 페이지 슬롯도 해제. */
 	if (blob->active.num_pages == 0) {
 		uint32_t page_num;
 
-		page_num = bs_blobid_to_page(blob->id);
+		page_num = bs_blobid_to_page(blob->id);	/* [한국어] blobid가 가리키는 root md page 번호. */
 		bs_release_md_page(bs, page_num);
 	}
 
 	spdk_spin_unlock(&bs->used_lock);
 
 	/* Move on to clearing clusters */
+	/* [한국어] 메타 페이지 정리 완료 → 데이터 클러스터 정리 단계로. */
 	blob_persist_clear_clusters(seq, ctx);
 }
 
+/*
+ * [한국어]
+ * blob_persist_zero_pages - 옛 메타데이터 페이지들을 디스크에서 0으로 지우는 배치 발행
+ *
+ * @seq: persist 시퀀스(배치로 전환). @cb_arg: spdk_blob_persist_ctx*. @bserrno: 직전 단계 결과.
+ *
+ * 새 메타데이터 페이지 체인을 모두 쓴 뒤(root 포함), 이제 더 이상 유효하지 않은 옛 clean 페이지들을
+ * 디스크에서 0으로 지운다. root를 제외한 페이지는 항상 새 위치에 쓰이므로 옛 위치는 반드시 비워야
+ * stale 메타데이터가 재할당 후 오인되지 않는다. blob 삭제 시엔 root 페이지도 0으로 지운다.
+ *
+ * 실행 컨텍스트: blob 소유 metadata thread. 비동기 I/O(배치 close가 트리거).
+ *
+ * 호출 체인:
+ *   blob_persist_write_page_root → [blob_persist_zero_pages] → bs_batch_close → blob_persist_zero_pages_cpl
+ */
 static void
 blob_persist_zero_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
-	struct spdk_blob_persist_ctx	*ctx = cb_arg;
-	struct spdk_blob		*blob = ctx->blob;
-	struct spdk_blob_store		*bs = blob->bs;
-	uint64_t			lba;
-	uint64_t			lba_count;
-	spdk_bs_batch_t			*batch;
-	size_t				i;
+	struct spdk_blob_persist_ctx	*ctx = cb_arg;		/* [한국어] persist 컨텍스트. */
+	struct spdk_blob		*blob = ctx->blob;	/* [한국어] persist 대상 blob. */
+	struct spdk_blob_store		*bs = blob->bs;		/* [한국어] LBA 변환 파라미터 소유. */
+	uint64_t			lba;			/* [한국어] 지울 페이지의 디바이스 LBA. */
+	uint64_t			lba_count;		/* [한국어] md page 1장당 LBA 수. */
+	spdk_bs_batch_t			*batch;			/* [한국어] write_zeroes를 모을 배치. */
+	size_t				i;			/* [한국어] 옛 clean 페이지 순회 인덱스. */
 
+	/* [한국어] 직전 단계 실패 시 zero 작업 없이 에러 마무리. */
 	if (bserrno != 0) {
 		blob_persist_complete(seq, ctx, bserrno);
 		return;
 	}
 
+	/* [한국어] 시퀀스를 배치로 전환 — 완료 콜백은 zero_pages_cpl. */
 	batch = bs_sequence_to_batch(seq, blob_persist_zero_pages_cpl, ctx);
 
-	lba_count = bs_byte_to_lba(bs, bs->md_page_size);
+	lba_count = bs_byte_to_lba(bs, bs->md_page_size);	/* [한국어] md page 크기를 LBA 단위로. */
 
 	/* This loop starts at 1 because the first page is special and handled
 	 * below. The pages (except the first) are never written in place,
 	 * so any pages in the clean list must be zeroed.
 	 */
+	/* [한국어] i=1부터: root(0번) 제외. 옛 clean 페이지들을 디스크에서 0으로 클리어. */
 	for (i = 1; i < blob->clean.num_pages; i++) {
 		lba = bs_md_page_to_lba(bs, blob->clean.pages[i]);
 
@@ -2405,101 +3604,165 @@ blob_persist_zero_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	}
 
 	/* The first page will only be zeroed if this is a delete. */
+	/* [한국어] root 페이지는 blob 삭제(active 0개)일 때만 지움 — 일반 업데이트 시 root는 새 내용으로 덮여 있음. */
 	if (blob->active.num_pages == 0) {
 		uint32_t page_num;
 
 		/* The first page in the metadata goes where the blobid indicates */
+		/* [한국어] root는 blobid가 지정한 고정 위치 → 그 LBA를 0으로. */
 		page_num = bs_blobid_to_page(blob->id);
 		lba = bs_md_page_to_lba(bs, page_num);
 
 		bs_batch_write_zeroes_dev(batch, lba, lba_count);
 	}
 
+	/* [한국어] 배치 닫기 → zero 일괄 발행, 완료 시 cpl 콜백. */
 	bs_batch_close(batch);
 }
 
+/*
+ * [한국어]
+ * blob_persist_write_page_root - 모든 비-root 페이지 기록 후 root 메타데이터 페이지를 디스크에 커밋
+ *
+ * @seq: persist 시퀀스. @cb_arg: spdk_blob_persist_ctx*. @bserrno: 비-root 페이지 쓰기 결과.
+ *
+ * root(0번) 페이지는 메타데이터 체인의 진입점이라 마지막에 써야 한다: 나머지 페이지들이 모두 디스크에
+ * 안착한 뒤 root를 갱신해야, root가 가리키는 체인이 항상 완전한 상태로 보여 crash-consistency가
+ * 보장된다(원자적 교체). blob 삭제(active 0개)면 root를 쓸 필요 없이 바로 옛 페이지 zero 단계로 간다.
+ *
+ * 실행 컨텍스트: blob 소유 metadata thread. 비동기 write 발행.
+ *
+ * 호출 체인:
+ *   blob_persist_write_page_chain(batch) → [blob_persist_write_page_root]
+ *     → bs_sequence_write_dev → blob_persist_zero_pages
+ */
 static void
 blob_persist_write_page_root(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
-	struct spdk_blob_persist_ctx	*ctx = cb_arg;
-	struct spdk_blob		*blob = ctx->blob;
-	struct spdk_blob_store		*bs = blob->bs;
-	uint64_t			lba;
-	uint32_t			lba_count;
-	struct spdk_blob_md_page	*page;
+	struct spdk_blob_persist_ctx	*ctx = cb_arg;		/* [한국어] persist 컨텍스트. */
+	struct spdk_blob		*blob = ctx->blob;	/* [한국어] persist 대상 blob. */
+	struct spdk_blob_store		*bs = blob->bs;		/* [한국어] LBA 변환 파라미터 소유. */
+	uint64_t			lba;			/* [한국어] root 페이지 디바이스 LBA. */
+	uint32_t			lba_count;		/* [한국어] root 페이지 LBA 길이. */
+	struct spdk_blob_md_page	*page;			/* [한국어] 쓸 root 페이지(pages[0]). */
 
+	/* [한국어] 비-root 페이지 쓰기 실패 시 root를 쓰지 않고 에러 마무리(불완전 체인 커밋 방지). */
 	if (bserrno != 0) {
 		blob_persist_complete(seq, ctx, bserrno);
 		return;
 	}
 
+	/* [한국어] active 페이지 0개 = 삭제 → root 쓰기 생략하고 옛 페이지 zero 단계로. */
 	if (blob->active.num_pages == 0) {
 		/* Move on to the next step */
 		blob_persist_zero_pages(seq, ctx, 0);
 		return;
 	}
 
-	lba_count = bs_byte_to_lba(bs, bs->md_page_size);
+	lba_count = bs_byte_to_lba(bs, bs->md_page_size);	/* [한국어] md page 크기를 LBA 단위로. */
 
-	page = &ctx->pages[0];
+	page = &ctx->pages[0];	/* [한국어] 직렬화된 페이지 배열의 0번이 root. */
 	/* The first page in the metadata goes where the blobid indicates */
+	/* [한국어] root는 blobid가 지정한 고정 위치에 기록(체인 진입점). */
 	lba = bs_md_page_to_lba(bs, bs_blobid_to_page(blob->id));
 
+	/* [한국어] root 페이지 비동기 write — 완료 시 옛 페이지 zero 단계로(체인 교체 완료). */
 	bs_sequence_write_dev(seq, page, lba, lba_count,
 			      blob_persist_zero_pages, ctx);
 }
 
+/*
+ * [한국어]
+ * blob_persist_write_page_chain - root를 제외한 모든 메타데이터 페이지를 디스크에 일괄 기록
+ *
+ * @seq: persist 시퀀스(배치로 전환).
+ * @ctx: persist 컨텍스트(직렬화된 pages 배열 보유).
+ *
+ * 새 메타데이터 페이지 체인을 디스크에 커밋하는 단계. crash-consistency를 위해 root(0번)는 가장 마지막에
+ * 따로 쓰고(blob_persist_write_page_root), 여기서는 1번부터 끝까지의 비-root 페이지들을 배치로 한꺼번에
+ * 쓴다. 비-root 페이지들이 모두 안착해야 root가 가리키는 체인이 완전해진다.
+ *
+ * 실행 컨텍스트: blob 소유 metadata thread. 비동기 I/O(배치 close가 트리거).
+ *
+ * 호출 체인:
+ *   blob_persist_start 등 → [blob_persist_write_page_chain] → bs_batch_close → blob_persist_write_page_root
+ */
 static void
 blob_persist_write_page_chain(spdk_bs_sequence_t *seq, struct spdk_blob_persist_ctx *ctx)
 {
-	struct spdk_blob		*blob = ctx->blob;
-	struct spdk_blob_store		*bs = blob->bs;
-	uint64_t			lba;
-	uint32_t			lba_count;
-	struct spdk_blob_md_page	*page;
-	spdk_bs_batch_t			*batch;
-	size_t				i;
+	struct spdk_blob		*blob = ctx->blob;	/* [한국어] persist 대상 blob. */
+	struct spdk_blob_store		*bs = blob->bs;		/* [한국어] LBA 변환 파라미터 소유. */
+	uint64_t			lba;			/* [한국어] 각 페이지 디바이스 LBA. */
+	uint32_t			lba_count;		/* [한국어] 페이지 1장당 LBA 수. */
+	struct spdk_blob_md_page	*page;			/* [한국어] 현재 쓸 페이지. */
+	spdk_bs_batch_t			*batch;			/* [한국어] 페이지 write를 모을 배치. */
+	size_t				i;			/* [한국어] 페이지 순회 인덱스. */
 
 	/* Clusters don't move around in blobs. The list shrinks or grows
 	 * at the end, but no changes ever occur in the middle of the list.
 	 */
+	/* [한국어] 페이지 위치도 끝에서만 변하고 중간은 안정적이라는 불변식. */
 
-	lba_count = bs_byte_to_lba(bs, sizeof(*page));
+	lba_count = bs_byte_to_lba(bs, sizeof(*page));	/* [한국어] md page 구조체 크기를 LBA 단위로. */
 
+	/* [한국어] 시퀀스를 배치로 전환 — 완료 콜백은 write_page_root(이후 root 기록). */
 	batch = bs_sequence_to_batch(seq, blob_persist_write_page_root, ctx);
 
 	/* This starts at 1. The root page is not written until
 	 * all of the others are finished
 	 */
+	/* [한국어] i=1부터: root(0)는 모든 비-root 페이지 완료 후에야 쓴다(완전한 체인 보장). */
 	for (i = 1; i < blob->active.num_pages; i++) {
 		page = &ctx->pages[i];
-		assert(page->sequence_num == i);
+		assert(page->sequence_num == i);	/* [한국어] 직렬화 시 부여한 시퀀스 번호와 인덱스 일치 검증. */
 
-		lba = bs_md_page_to_lba(bs, blob->active.pages[i]);
+		lba = bs_md_page_to_lba(bs, blob->active.pages[i]);	/* [한국어] 이 페이지가 차지한 md page 슬롯의 LBA. */
 
-		bs_batch_write_dev(batch, page, lba, lba_count);
+		bs_batch_write_dev(batch, page, lba, lba_count);	/* [한국어] 배치에 페이지 write 추가. */
 	}
 
+	/* [한국어] 배치 닫기 → 비-root 페이지 일괄 발행, 완료 시 root 기록 콜백. */
 	bs_batch_close(batch);
 }
 
+/*
+ * [한국어]
+ * blob_resize - blob의 클러스터 수(논리 크기)를 sz로 조정(확장/축소)하는 메모리상 연산
+ *
+ * @blob: 크기를 바꿀 blob(메타데이터 thread 소유).
+ * @sz: 목표 클러스터 수.
+ * @return: 0 = 성공, -ENOSPC = 여유 클러스터/md page 부족, -ENOMEM = 배열 확장 실패.
+ *
+ * blob 크기 변경의 핵심 메모리 연산이다. 확장 시 thick-provisioned blob은 즉시 클러스터/extent page를
+ * 비트맵에서 claim하고, thin-provisioned blob은 배열만 키우고 실제 할당은 write 시점으로 미룬다. 축소는
+ * 배열을 줄이지 않고(실제 축소는 persist 단계에서) num_allocated_clusters만 보정한다. 디스크 I/O는 없고
+ * blob을 DIRTY로 표시만 하며, 실제 디스크 반영은 이후 sync/persist에서 일어난다.
+ *
+ * 실행 컨텍스트: blob 소유 metadata thread. 클러스터/md page 비트맵을 보는 동안 bs->used_lock 보유
+ * (free라고 판단한 자원이 claim 직전까지 free로 유지되도록 — 다른 채널과의 경쟁 방지).
+ *
+ * 호출 체인:
+ *   spdk_blob_resize 등 → [blob_resize] → bs_allocate_cluster
+ */
 static int
 blob_resize(struct spdk_blob *blob, uint64_t sz)
 {
-	uint64_t	i;
-	uint64_t	*tmp;
-	uint64_t	cluster;
-	uint32_t	lfmd; /*  lowest free md page */
-	uint64_t	num_clusters;
-	uint32_t	*ep_tmp;
-	uint64_t	new_num_ep = 0, current_num_ep = 0;
-	struct spdk_blob_store *bs;
-	int		rc;
+	uint64_t	i;			/* [한국어] 클러스터/extent page 순회 인덱스. */
+	uint64_t	*tmp;			/* [한국어] 클러스터 배열 realloc 임시 포인터. */
+	uint64_t	cluster;		/* [한국어] bs_allocate_cluster가 채울 할당 클러스터 LBA(인아웃). */
+	uint32_t	lfmd; /*  lowest free md page */	/* [한국어] 다음 검색 시작 md page 인덱스(할당 가속용 힌트). */
+	uint64_t	num_clusters;		/* [한국어] 비교 기준이 되는 현재 유효 클러스터 수. */
+	uint32_t	*ep_tmp;		/* [한국어] extent page 배열 realloc 임시 포인터. */
+	uint64_t	new_num_ep = 0, current_num_ep = 0;	/* [한국어] 목표/현재 extent page 개수(extent table 모드). */
+	struct spdk_blob_store *bs;		/* [한국어] 비트맵/free 카운터 소유 blobstore. */
+	int		rc;			/* [한국어] 반환 코드. */
 
 	bs = blob->bs;
 
+	/* [한국어] blob 소유 thread에서의 호출인지 검증(메타 연산 직렬성). */
 	blob_verify_md_op(blob);
 
+	/* [한국어] 이미 목표 크기면 할 일 없음. */
 	if (blob->active.num_clusters == sz) {
 		return 0;
 	}
@@ -2509,36 +3772,45 @@ blob_resize(struct spdk_blob *blob, uint64_t sz)
 		 * larger without syncing, then the cluster array already
 		 * contains spare assigned clusters we can use.
 		 */
+		/* [한국어] sync 없이 키웠다 줄였다 한 경우, 배열에 이미 claim된 여분 클러스터가 남아 재사용 가능 →
+		 * 비교 기준을 배열 크기와 sz 중 작은 값으로(중복 claim 방지). */
 		num_clusters = spdk_min(blob->active.cluster_array_size,
 					sz);
 	} else {
-		num_clusters = blob->active.num_clusters;
+		num_clusters = blob->active.num_clusters;	/* [한국어] 일반 케이스: 현재 논리 클러스터 수가 기준. */
 	}
 
 	if (blob->use_extent_table) {
 		/* Round up since every cluster beyond current Extent Table size,
 		 * requires new extent page. */
+		/* [한국어] extent table 모드: 클러스터 수를 SPDK_EXTENTS_PER_EP로 올림 나눗셈해 필요한 extent page 수 산출. */
 		new_num_ep = spdk_divide_round_up(sz, SPDK_EXTENTS_PER_EP);
 		current_num_ep = spdk_divide_round_up(num_clusters, SPDK_EXTENTS_PER_EP);
 	}
 
+	/* [한국어] 진입 시점엔 used_lock을 들고 있지 않아야 함(아래에서 필요 시 취득). */
 	assert(!spdk_spin_held(&bs->used_lock));
 
 	/* Check first that we have enough clusters and md pages before we start claiming them.
 	 * bs->used_lock is held to ensure that clusters we think are free are still free when we go
 	 * to claim them later in this function.
 	 */
+	/* [한국어] 확장 + thick인 경우에만: 실제 claim 전에 충분한 자원이 있는지 먼저 확인.
+	 * used_lock으로 확인~claim 사이 자원이 다른 곳에 뺏기지 않도록 보장. */
 	if (sz > num_clusters && spdk_blob_is_thin_provisioned(blob) == false) {
 		spdk_spin_lock(&bs->used_lock);
+		/* [한국어] 필요한 추가 클러스터 수가 여유 클러스터를 초과하면 -ENOSPC. */
 		if ((sz - num_clusters) > bs->num_free_clusters) {
 			rc = -ENOSPC;
 			goto out;
 		}
 		lfmd = 0;
+		/* [한국어] 새로 필요한 extent page마다 free md page가 실제 존재하는지 선검사. */
 		for (i = current_num_ep; i < new_num_ep ; i++) {
 			lfmd = spdk_bit_array_find_first_clear(blob->bs->used_md_pages, lfmd);
 			if (lfmd == UINT32_MAX) {
 				/* No more free md pages. Cannot satisfy the request */
+				/* [한국어] free md page가 더 없으면 요청 불가 → -ENOSPC. */
 				rc = -ENOSPC;
 				goto out;
 			}
@@ -2549,23 +3821,27 @@ blob_resize(struct spdk_blob *blob, uint64_t sz)
 		/* Expand the cluster array if necessary.
 		 * We only shrink the array when persisting.
 		 */
+		/* [한국어] 확장 케이스: 클러스터 배열을 sz로 키움(축소는 persist 때만 — 여기선 절대 줄이지 않음). */
 		tmp = realloc(blob->active.clusters, sizeof(*blob->active.clusters) * sz);
 		if (sz > 0 && tmp == NULL) {
 			rc = -ENOMEM;
 			goto out;
 		}
+		/* [한국어] 새로 늘어난 영역을 0(미할당)으로 초기화. */
 		memset(tmp + blob->active.cluster_array_size, 0,
 		       sizeof(*blob->active.clusters) * (sz - blob->active.cluster_array_size));
 		blob->active.clusters = tmp;
 		blob->active.cluster_array_size = sz;
 
 		/* Expand the extents table, only if enough clusters were added */
+		/* [한국어] extent table 모드이고 extent page 수가 늘어야 할 때만 extent page 배열도 확장. */
 		if (new_num_ep > current_num_ep && blob->use_extent_table) {
 			ep_tmp = realloc(blob->active.extent_pages, sizeof(*blob->active.extent_pages) * new_num_ep);
 			if (new_num_ep > 0 && ep_tmp == NULL) {
 				rc = -ENOMEM;
 				goto out;
 			}
+			/* [한국어] 새 extent page 슬롯들을 0(미할당)으로 초기화. */
 			memset(ep_tmp + blob->active.extent_pages_array_size, 0,
 			       sizeof(*blob->active.extent_pages) * (new_num_ep - blob->active.extent_pages_array_size));
 			blob->active.extent_pages = ep_tmp;
@@ -2573,8 +3849,10 @@ blob_resize(struct spdk_blob *blob, uint64_t sz)
 		}
 	}
 
+	/* [한국어] 크기가 바뀌었으므로 blob을 DIRTY로 — 다음 sync/persist에서 디스크에 반영 대상. */
 	blob->state = SPDK_BLOB_STATE_DIRTY;
 
+	/* [한국어] thick-provisioned면 확장된 클러스터들을 지금 즉시 실제 할당(claim). */
 	if (spdk_blob_is_thin_provisioned(blob) == false) {
 		cluster = 0;
 		lfmd = 0;
@@ -2586,21 +3864,25 @@ blob_resize(struct spdk_blob *blob, uint64_t sz)
 			 * bs_allocate_cluster will just start at that index
 			 * to find the next free md_page when needed.
 			 */
+			/* [한국어] lfmd는 여기서 증가시키지 않음 — bs_allocate_cluster가 새 extent page가 필요할 때
+			 * 내부에서 갱신하므로, 같은 값을 넘겨 다음 free md page 검색 시작점으로 재사용. */
 		}
 	}
 
 	/* If we are shrinking the blob, we must adjust num_allocated_clusters */
+	/* [한국어] 축소 케이스: 줄어드는 구간에서 실제 할당돼 있던(0 아님) 클러스터 수만큼 할당 카운터 감소. */
 	for (i = sz; i < num_clusters; i++) {
 		if (blob->active.clusters[i] != 0) {
 			blob->active.num_allocated_clusters--;
 		}
 	}
 
-	blob->active.num_clusters = sz;
-	blob->active.num_extent_pages = new_num_ep;
+	blob->active.num_clusters = sz;			/* [한국어] 논리 클러스터 수를 목표값으로 확정. */
+	blob->active.num_extent_pages = new_num_ep;	/* [한국어] extent page 수도 목표값으로(비-extent 모드면 0). */
 
 	rc = 0;
 out:
+	/* [한국어] 위에서 used_lock을 잡았으면 해제(모든 종료 경로 공통 정리). */
 	if (spdk_spin_held(&bs->used_lock)) {
 		spdk_spin_unlock(&bs->used_lock);
 	}
@@ -2608,27 +3890,47 @@ out:
 	return rc;
 }
 
+/*
+ * [한국어]
+ * blob_persist_generate_new_md - blob을 새 메타데이터 페이지로 직렬화하고 md page들을 claim
+ *
+ * @ctx: persist 컨텍스트(seq/blob 보유, 직렬화 결과 pages를 채움).
+ *
+ * 메모리상의 blob 상태(xattr/extent/flags 등)를 디스크 포맷 페이지 배열로 직렬화하고, 각 페이지가
+ * 들어갈 md page 슬롯을 used_md_pages 비트맵에서 claim한다. 페이지 간 next 링크와 CRC를 설정해
+ * 완전한 체인을 구성한 뒤, 마지막 페이지부터 root까지 쓰는 단계로 넘어간다. claim은 2-pass로:
+ * 1패스는 충분한 free 슬롯이 있는지만 검사(rollback 비용 제거), 2패스에서 실제 claim한다.
+ *
+ * 실행 컨텍스트: blob 소유 metadata thread. 비트맵 검사~claim 전 구간을 bs->used_lock으로 보호해
+ * 검사와 claim 사이에 다른 채널이 슬롯을 가져가지 못하게 한다(원자성).
+ *
+ * 호출 체인:
+ *   blob_persist_start → [blob_persist_generate_new_md]
+ *     → blob_serialize / bs_claim_md_page → blob_persist_write_page_chain
+ */
 static void
 blob_persist_generate_new_md(struct spdk_blob_persist_ctx *ctx)
 {
-	spdk_bs_sequence_t *seq = ctx->seq;
-	struct spdk_blob *blob = ctx->blob;
-	struct spdk_blob_store *bs = blob->bs;
-	uint64_t i;
-	uint32_t page_num;
-	void *tmp;
-	int rc;
+	spdk_bs_sequence_t *seq = ctx->seq;		/* [한국어] persist I/O 발행 시퀀스. */
+	struct spdk_blob *blob = ctx->blob;		/* [한국어] persist 대상 blob. */
+	struct spdk_blob_store *bs = blob->bs;		/* [한국어] used_md_pages 비트맵 소유. */
+	uint64_t i;					/* [한국어] 페이지 순회 인덱스. */
+	uint32_t page_num;				/* [한국어] 비트맵에서 찾은 free md page 번호(검색 커서 겸용). */
+	void *tmp;					/* [한국어] active.pages 캐시 realloc 임시 포인터. */
+	int rc;						/* [한국어] 직렬화 반환 코드. */
 
 	/* Generate the new metadata */
+	/* [한국어] blob을 디스크 포맷 페이지 배열로 직렬화 — 페이지 수가 num_pages로 결정됨. */
 	rc = blob_serialize(blob, &ctx->pages, &blob->active.num_pages);
 	if (rc < 0) {
 		blob_persist_complete(seq, ctx, rc);
 		return;
 	}
 
-	assert(blob->active.num_pages >= 1);
+	assert(blob->active.num_pages >= 1);	/* [한국어] 최소 root 페이지 1장은 항상 존재. */
 
 	/* Resize the cache of page indices */
+	/* [한국어] 각 페이지의 md page 번호를 저장할 active.pages 캐시를 새 페이지 수에 맞게 재할당. */
 	tmp = realloc(blob->active.pages, blob->active.num_pages * sizeof(*blob->active.pages));
 	if (!tmp) {
 		blob_persist_complete(seq, ctx, -ENOMEM);
@@ -2640,95 +3942,145 @@ blob_persist_generate_new_md(struct spdk_blob_persist_ctx *ctx)
 	 * enough pages and a second to actually claim them. The used_lock is held across
 	 * both passes to ensure things don't change in the middle.
 	 */
+	/* [한국어] 비트맵 검사~claim 전체를 used_lock으로 보호(중간에 슬롯 상태가 바뀌지 않게). */
 	spdk_spin_lock(&bs->used_lock);
 	page_num = 0;
 	/* Note that this loop starts at one. The first page location is fixed by the blobid. */
+	/* [한국어] 1패스(검사): i=1부터(root는 blobid 고정 위치라 별도 claim 불필요) free 슬롯이 충분한지만 확인. */
 	for (i = 1; i < blob->active.num_pages; i++) {
 		page_num = spdk_bit_array_find_first_clear(bs->used_md_pages, page_num);
 		if (page_num == UINT32_MAX) {
+			/* [한국어] free 슬롯 부족 → 아직 아무것도 claim하지 않았으므로 락만 풀고 -ENOMEM. */
 			spdk_spin_unlock(&bs->used_lock);
 			blob_persist_complete(seq, ctx, -ENOMEM);
 			return;
 		}
-		page_num++;
+		page_num++;	/* [한국어] 다음 검색은 방금 찾은 다음부터(중복 카운트 방지). */
 	}
 
 	page_num = 0;
-	blob->active.pages[0] = bs_blobid_to_page(blob->id);
+	blob->active.pages[0] = bs_blobid_to_page(blob->id);	/* [한국어] root(0번)는 blobid가 정한 고정 슬롯. */
+	/* [한국어] 2패스(실제 claim): 각 비-root 페이지에 free 슬롯을 배정하고 체인 링크/CRC 확정. */
 	for (i = 1; i < blob->active.num_pages; i++) {
 		page_num = spdk_bit_array_find_first_clear(bs->used_md_pages, page_num);
-		ctx->pages[i - 1].next = page_num;
+		ctx->pages[i - 1].next = page_num;	/* [한국어] 직전 페이지의 next를 이번 슬롯으로 연결(체인 형성). */
 		/* Now that previous metadata page is complete, calculate the crc for it. */
+		/* [한국어] next까지 채워진 직전 페이지의 CRC 확정(이후 변경 없음). */
 		ctx->pages[i - 1].crc = blob_md_page_calc_crc(&ctx->pages[i - 1]);
-		blob->active.pages[i] = page_num;
-		bs_claim_md_page(bs, page_num);
+		blob->active.pages[i] = page_num;	/* [한국어] 캐시에 이 페이지의 슬롯 번호 기록. */
+		bs_claim_md_page(bs, page_num);		/* [한국어] 비트맵에 슬롯을 사용 중으로 표시(실제 점유). */
 		SPDK_DEBUGLOG(blob, "Claiming page %u for blob 0x%" PRIx64 "\n", page_num,
 			      blob->id);
 		page_num++;
 	}
 	spdk_spin_unlock(&bs->used_lock);
+	/* [한국어] 마지막 페이지(체인 끝)의 CRC 확정 — next는 INVALID로 직렬화돼 있음. */
 	ctx->pages[i - 1].crc = blob_md_page_calc_crc(&ctx->pages[i - 1]);
 	/* Start writing the metadata from last page to first */
+	/* [한국어] 직렬화·claim 완료로 메모리 상태는 CLEAN 표시 후, 페이지 체인 쓰기(끝→root 순)로 진입. */
 	blob->state = SPDK_BLOB_STATE_CLEAN;
 	blob_persist_write_page_chain(seq, ctx);
 }
 
+/*
+ * [한국어]
+ * blob_persist_write_extent_pages - 변경된 extent page들을 한 장씩 디스크에 기록하는 비동기 반복 콜백
+ *
+ * @seq: persist 시퀀스(extent page write 발행). @cb_arg: spdk_blob_persist_ctx*. @bserrno: 직전 write 결과.
+ *
+ * blob 크기가 변해 extent table이 바뀌면, 변경된 extent page들을 디스크에 반영해야 한다. 이 함수는
+ * next_extent_page 인덱스로 진행하며 할당된 extent page를 1장씩 직렬화·CRC 계산 후 write하고 자기
+ * 자신을 콜백으로 재등록한다. 모든 extent page를 다 쓰면 메인 메타데이터 생성(generate_new_md)으로
+ * 넘어간다. 미할당(0) extent page는 thin blob에서 정상이며 건너뛴다.
+ *
+ * 실행 컨텍스트: blob 소유 metadata thread. 각 extent page write 완료마다 재진입.
+ *
+ * 호출 체인:
+ *   blob_persist_start → [blob_persist_write_extent_pages](자기 재귀) → blob_persist_generate_new_md
+ */
 static void
 blob_persist_write_extent_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
-	struct spdk_blob_persist_ctx	*ctx = cb_arg;
-	struct spdk_blob		*blob = ctx->blob;
-	size_t				i;
-	uint32_t			extent_page_id;
-	uint32_t                        page_count = 0;
-	int				rc;
+	struct spdk_blob_persist_ctx	*ctx = cb_arg;		/* [한국어] persist 컨텍스트. */
+	struct spdk_blob		*blob = ctx->blob;	/* [한국어] persist 대상 blob. */
+	size_t				i;			/* [한국어] extent page 순회 인덱스. */
+	uint32_t			extent_page_id;		/* [한국어] 현재 extent page가 차지한 md page 번호. */
+	uint32_t                        page_count = 0;		/* [한국어] blob_serialize_add_page용 페이지 카운터. */
+	int				rc;			/* [한국어] 직렬화 반환 코드. */
 
+	/* [한국어] 직전 진입에서 쓴 extent page 임시 버퍼가 남아 있으면 해제(매 장 재사용). */
 	if (ctx->extent_page != NULL) {
 		spdk_free(ctx->extent_page);
 		ctx->extent_page = NULL;
 	}
 
+	/* [한국어] 직전 extent page write 실패 시 persist 에러 마무리. */
 	if (bserrno != 0) {
 		blob_persist_complete(seq, ctx, bserrno);
 		return;
 	}
 
 	/* Only write out Extent Pages when blob was resized. */
+	/* [한국어] next_extent_page부터 남은 extent page를 순회 — 할당된 것만 직렬화·write. */
 	for (i = ctx->next_extent_page; i < blob->active.extent_pages_array_size; i++) {
 		extent_page_id = blob->active.extent_pages[i];
 		if (extent_page_id == 0) {
 			/* No Extent Page to persist */
+			/* [한국어] 미할당 extent page는 디스크에 쓸 게 없음 — thin blob에서만 정상. */
 			assert(spdk_blob_is_thin_provisioned(blob));
 			continue;
 		}
+		/* [한국어] 할당된 extent page는 used 비트맵에 반드시 표시돼 있어야 함(불변식). */
 		assert(spdk_bit_array_get(blob->bs->used_md_pages, extent_page_id));
-		ctx->next_extent_page = i + 1;
+		ctx->next_extent_page = i + 1;	/* [한국어] 다음 진입은 i+1부터(진행 위치 저장). */
+		/* [한국어] extent page 1장용 직렬화 버퍼 확보. */
 		rc = blob_serialize_add_page(ctx->blob, &ctx->extent_page, &page_count, &ctx->extent_page);
 		if (rc < 0) {
 			blob_persist_complete(seq, ctx, rc);
 			return;
 		}
 
-		blob->state = SPDK_BLOB_STATE_DIRTY;
+		blob->state = SPDK_BLOB_STATE_DIRTY;	/* [한국어] extent page 변경 중 — DIRTY 표시. */
+		/* [한국어] i번째 extent page가 담당하는 클러스터 구간을 페이지에 직렬화. */
 		blob_serialize_extent_page(blob, i * SPDK_EXTENTS_PER_EP, ctx->extent_page);
 
-		ctx->extent_page->crc = blob_md_page_calc_crc(ctx->extent_page);
+		ctx->extent_page->crc = blob_md_page_calc_crc(ctx->extent_page);	/* [한국어] CRC 계산해 무결성 보증. */
 
+		/* [한국어] 이 extent page를 디바이스에 비동기 write — 완료 시 자기 재진입(다음 장 처리). */
 		bs_sequence_write_dev(seq, ctx->extent_page, bs_md_page_to_lba(blob->bs, extent_page_id),
 				      bs_byte_to_lba(blob->bs, blob->bs->md_page_size),
 				      blob_persist_write_extent_pages, ctx);
 		return;
 	}
 
+	/* [한국어] 모든 extent page 기록 완료 → 메인 메타데이터 페이지 생성/claim 단계로. */
 	blob_persist_generate_new_md(ctx);
 }
 
+/*
+ * [한국어]
+ * blob_persist_start - persist 체인의 시작점. 크기 변화 양상에 따라 extent page 쓰기/생성 단계로 분기
+ *
+ * @seq: persist 시퀀스. @cb_arg: spdk_blob_persist_ctx*. @bserrno: 직전 단계(bs_mark_dirty) 결과.
+ *
+ * bs_mark_dirty(super를 dirty로 기록)가 끝난 뒤 호출되는 persist 본격 진입점이다. active 페이지가
+ * 0개면 삭제 시그널이라 곧장 정리(zero_pages)로 점프한다. 그 외에는 blob이 확장/축소/무변화 중
+ * 어느 경우인지 판단해, 변경된 extent page부터 다시 쓰도록 next_extent_page를 세팅하거나(크기 변화),
+ * 변화가 없으면 곧장 메인 메타데이터 생성으로 간다.
+ *
+ * 실행 컨텍스트: blob 소유 metadata thread.
+ *
+ * 호출 체인:
+ *   blob_persist → bs_mark_dirty → [blob_persist_start]
+ *     → blob_persist_zero_pages / blob_persist_write_extent_pages / blob_persist_generate_new_md
+ */
 static void
 blob_persist_start(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
-	struct spdk_blob_persist_ctx *ctx = cb_arg;
-	struct spdk_blob *blob = ctx->blob;
+	struct spdk_blob_persist_ctx *ctx = cb_arg;	/* [한국어] persist 컨텍스트. */
+	struct spdk_blob *blob = ctx->blob;		/* [한국어] persist 대상 blob. */
 
+	/* [한국어] super dirty 마킹 실패 시 더 진행하지 않고 에러 마무리. */
 	if (bserrno != 0) {
 		blob_persist_complete(seq, ctx, bserrno);
 		return;
@@ -2737,7 +4089,8 @@ blob_persist_start(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	if (blob->active.num_pages == 0) {
 		/* This is the signal that the blob should be deleted.
 		 * Immediately jump to the clean up routine. */
-		assert(blob->clean.num_pages > 0);
+		/* [한국어] active 페이지 0개 = 삭제 시그널 → 메타/클러스터 정리(zero_pages)로 직행. */
+		assert(blob->clean.num_pages > 0);	/* [한국어] 삭제 대상은 디스크에 clean 페이지가 있어야 함. */
 		blob->state = SPDK_BLOB_STATE_CLEAN;
 		blob_persist_zero_pages(seq, ctx, 0);
 		return;
@@ -2746,84 +4099,163 @@ blob_persist_start(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 	if (blob->clean.num_clusters < blob->active.num_clusters) {
 		/* Blob was resized up */
+		/* [한국어] 확장: 기존 마지막 extent page부터 다시 써야 함(경계 페이지 갱신). max(1,..)-1로 시작 인덱스 산출. */
 		assert(blob->clean.num_extent_pages <= blob->active.num_extent_pages);
 		ctx->next_extent_page = spdk_max(1, blob->clean.num_extent_pages) - 1;
 	} else if (blob->active.num_clusters < blob->active.cluster_array_size) {
 		/* Blob was resized down */
+		/* [한국어] 축소: 새 마지막 extent page부터 다시 써 truncate 경계를 반영. */
 		assert(blob->clean.num_extent_pages >= blob->active.num_extent_pages);
 		ctx->next_extent_page = spdk_max(1, blob->active.num_extent_pages) - 1;
 	} else {
 		/* No change in size occurred */
+		/* [한국어] 크기 무변화(메타데이터만 변경) → extent page 쓰기 생략하고 메인 메타 생성으로. */
 		blob_persist_generate_new_md(ctx);
 		return;
 	}
 
+	/* [한국어] 크기 변화가 있으면 변경된 extent page들부터 디스크에 기록 시작. */
 	blob_persist_write_extent_pages(seq, ctx, 0);
 }
 
+/*
+ * [한국어]
+ * struct spdk_bs_mark_dirty - blobstore super block을 "dirty"로 표시하는 비동기 작업의 컨텍스트
+ *
+ * blobstore가 깨끗(clean)하게 닫혀 있던 상태에서 첫 메타데이터 변경이 일어날 때, super block의 clean
+ * 플래그를 0으로 내려 디스크에 기록한다(비정상 종료 시 복구 필요성을 표시). 이 ctx가 super 읽기→검증→
+ * 기록의 짧은 비동기 체인 동안 상태를 운반한다.
+ */
 struct spdk_bs_mark_dirty {
 	struct spdk_blob_store		*bs;
+	/* [한국어] dirty로 표시할 blobstore.
+	 * 설정자: bs_mark_dirty() 진입 시. 읽는 자: 모든 단계가 bs->clean/dev에 접근 시.
+	 * 값 범위: 유효한 blobstore. 동기화: blobstore 소유 thread 전용. */
+
 	struct spdk_bs_super_block	*super;
+	/* [한국어] 디스크에서 읽어 clean=0으로 갱신 후 다시 쓸 super block DMA 버퍼.
+	 * 설정자: bs_mark_dirty()가 zmalloc. 읽는 자: validate/write 단계.
+	 * 값 범위: 4KB 정렬 DMA 메모리. 완료 시 spdk_free. */
+
 	spdk_bs_sequence_cpl		cb_fn;
+	/* [한국어] dirty 마킹 완료 시 호출할 콜백(보통 blob_persist_start).
+	 * 설정자: bs_mark_dirty() 진입 시. 읽는 자: bs_mark_dirty_write_cpl. */
+
 	void				*cb_arg;
+	/* [한국어] cb_fn에 전달할 컨텍스트(보통 persist ctx).
+	 * 설정자: bs_mark_dirty() 진입 시. 읽는 자: cb_fn 호출 시. */
 };
 
+/*
+ * [한국어]
+ * bs_mark_dirty_write_cpl - super block dirty 기록 완료 후 메모리 clean 플래그 갱신 + 사용자 콜백/정리
+ *
+ * @seq: 시퀀스. @cb_arg: spdk_bs_mark_dirty*. @bserrno: super write 결과(0=성공).
+ *
+ * super block을 디스크에 dirty로 쓴 뒤, 성공 시 메모리상 bs->clean도 0으로 맞추고 원래 콜백(persist
+ * 시작 등)을 호출한 다음 super 버퍼와 ctx를 해제한다. dirty 마킹 비동기 체인의 종착점.
+ *
+ * 실행 컨텍스트: blobstore 소유 metadata thread.
+ *
+ * 호출 체인:
+ *   bs_mark_dirty_write → bs_write_super → [bs_mark_dirty_write_cpl] → ctx->cb_fn
+ */
 static void
 bs_mark_dirty_write_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
-	struct spdk_bs_mark_dirty *ctx = cb_arg;
+	struct spdk_bs_mark_dirty *ctx = cb_arg;	/* [한국어] dirty 마킹 컨텍스트. */
 
+	/* [한국어] 디스크 기록 성공 시에만 메모리 clean 플래그를 0으로(디스크와 일관성 유지). */
 	if (bserrno == 0) {
 		ctx->bs->clean = 0;
 	}
 
+	/* [한국어] 원래 콜백 호출 — 성공/실패 코드를 그대로 전달(persist 체인이 이어받음). */
 	ctx->cb_fn(seq, ctx->cb_arg, bserrno);
 
+	/* [한국어] super DMA 버퍼와 ctx 해제(이후 ctx 접근 금지). */
 	spdk_free(ctx->super);
 	free(ctx);
 }
 
+/* [한국어] super block을 디스크에 쓰는 헬퍼 forward decl — 아래쪽에 정의됨. */
 static void bs_write_super(spdk_bs_sequence_t *seq, struct spdk_blob_store *bs,
 			   struct spdk_bs_super_block *super, spdk_bs_sequence_cpl cb_fn, void *cb_arg);
 
 
+/*
+ * [한국어]
+ * bs_mark_dirty_write - 읽어온 super block을 검증하고 clean=0으로 갱신해 다시 기록
+ *
+ * @seq: 시퀀스. @cb_arg: spdk_bs_mark_dirty*. @bserrno: super 읽기 결과.
+ *
+ * bs_mark_dirty가 디스크에서 읽어온 super block을 받아, 무결성/호환성을 검증한 뒤 clean 플래그를 내리고
+ * (필요 시 size도 채워) super를 디스크에 다시 쓴다. 읽고-수정-쓰는 패턴으로, 디스크의 다른 super 필드를
+ * 보존하면서 clean 비트만 안전하게 바꾼다.
+ *
+ * 실행 컨텍스트: blobstore 소유 metadata thread.
+ *
+ * 호출 체인:
+ *   bs_mark_dirty → bs_sequence_read_dev → [bs_mark_dirty_write] → bs_write_super
+ */
 static void
 bs_mark_dirty_write(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
-	struct spdk_bs_mark_dirty *ctx = cb_arg;
-	int rc;
+	struct spdk_bs_mark_dirty *ctx = cb_arg;	/* [한국어] dirty 마킹 컨텍스트. */
+	int rc;						/* [한국어] super 검증 반환 코드. */
 
+	/* [한국어] super 읽기 실패 시 바로 완료 콜백으로(에러 전파). */
 	if (bserrno != 0) {
 		bs_mark_dirty_write_cpl(seq, ctx, bserrno);
 		return;
 	}
 
+	/* [한국어] 읽어온 super가 유효한지 검증 — 손상된 super에 clean 비트만 바꿔 쓰는 사고 방지. */
 	rc = bs_super_validate(ctx->super, ctx->bs);
 	if (rc != 0) {
 		bs_mark_dirty_write_cpl(seq, ctx, rc);
 		return;
 	}
 
-	ctx->super->clean = 0;
+	ctx->super->clean = 0;	/* [한국어] clean 플래그 내림 — 비정상 종료 시 복구가 필요함을 디스크에 기록. */
+	/* [한국어] size가 아직 0(초기 미기록)이면 디바이스 전체 바이트 용량으로 채움. */
 	if (ctx->super->size == 0) {
 		ctx->super->size = ctx->bs->dev->blockcnt * ctx->bs->dev->blocklen;
 	}
 
+	/* [한국어] 갱신된 super를 디스크에 비동기 기록 — 완료 시 write_cpl. */
 	bs_write_super(seq, ctx->bs, ctx->super, bs_mark_dirty_write_cpl, ctx);
 }
 
+/*
+ * [한국어]
+ * bs_mark_dirty - blobstore가 clean 상태면 super를 dirty로 표시(아니면 즉시 통과)
+ *
+ * @seq: 시퀀스. @bs: 대상 blobstore. @cb_fn/@cb_arg: 완료 콜백/컨텍스트.
+ *
+ * 메타데이터 변경(persist) 직전에 호출되어, 디스크 super의 clean 플래그를 한 번만 내린다. 이미 dirty면
+ * I/O 없이 곧장 콜백을 호출한다(매 persist마다 super를 쓰지 않도록 — clean→dirty 전이 1회로 충분).
+ * dirty면 super 읽기→검증→clean=0 기록의 짧은 비동기 체인을 시작한다.
+ *
+ * 실행 컨텍스트: blobstore 소유 metadata thread.
+ *
+ * 호출 체인:
+ *   blob_persist / blob_persist_complete → [bs_mark_dirty] → bs_sequence_read_dev → bs_mark_dirty_write
+ */
 static void
 bs_mark_dirty(spdk_bs_sequence_t *seq, struct spdk_blob_store *bs,
 	      spdk_bs_sequence_cpl cb_fn, void *cb_arg)
 {
-	struct spdk_bs_mark_dirty *ctx;
+	struct spdk_bs_mark_dirty *ctx;		/* [한국어] dirty 마킹 컨텍스트(필요 시 할당). */
 
 	/* Blobstore is already marked dirty */
+	/* [한국어] 이미 dirty면 super를 다시 쓸 필요 없음 → I/O 없이 즉시 성공 콜백. */
 	if (bs->clean == 0) {
 		cb_fn(seq, cb_arg, 0);
 		return;
 	}
 
+	/* [한국어] 컨텍스트 할당 — 실패 시 즉시 -ENOMEM 콜백. */
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
 		cb_fn(seq, cb_arg, -ENOMEM);
@@ -2833,6 +4265,7 @@ bs_mark_dirty(spdk_bs_sequence_t *seq, struct spdk_blob_store *bs,
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
 
+	/* [한국어] super block용 4KB 정렬 DMA 버퍼 확보(디바이스 read/write 대상). */
 	ctx->super = spdk_zmalloc(sizeof(*ctx->super), 0x1000, NULL,
 				  SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
 	if (!ctx->super) {
@@ -2841,6 +4274,7 @@ bs_mark_dirty(spdk_bs_sequence_t *seq, struct spdk_blob_store *bs,
 		return;
 	}
 
+	/* [한국어] super block(페이지 0)을 디스크에서 비동기 read — 완료 시 검증·갱신 단계로. */
 	bs_sequence_read_dev(seq, ctx->super, bs_page_to_lba(bs, 0),
 			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
 			     bs_mark_dirty_write, ctx);

@@ -3,6 +3,58 @@
  *   All rights reserved.
  */
 
+/*
+ * [한국어 설명] FUSE 프로토콜 ↔ SPDK fsdev 변환 디스패처 (fuse_dispatcher.c)
+ *
+ * === 파일의 역할 ===
+ * 이 파일은 리눅스 커널 FUSE 프로토콜의 raw 메시지(fuse_in_header + op-specific arg
+ * payload)를 받아 SPDK fsdev 호출로 변환하고, fsdev 완료 결과를 다시 FUSE 응답
+ * (fuse_out_header + payload)으로 직렬화하여 호출자에게 전달하는 디스패처 레이어이다.
+ * virtiofs/vhost-user-fs/ublk-fs 같은 frontend가 FUSE 메시지를 SPDK fsdev로 처리하려고
+ * 할 때 사용한다. 주요 처리 단계:
+ *   1) Hello/Init/Destroy 같은 FUSE 세션 협상 처리 (FUSE_INIT/FUSE_DESTROY).
+ *   2) 클라이언트 아키텍처(X86/ARM/64-bit/32-bit)에 따라 open flags / stat 구조체 등을 변환.
+ *   3) FUSE opcode별 핸들러 분기 — do_lookup/do_getattr/do_read/do_write/do_open/do_release/
+ *      do_mkdir/do_rmdir/do_create/do_unlink/do_rename/do_readdir/do_setattr 등.
+ *   4) 각 핸들러는 fsdev 비동기 API를 호출하고, 완료 콜백에서 fuse_out_header + payload를
+ *      iovec으로 채워 호출자(virtio queue 등)에 반환.
+ *   5) fuse_kernel.h가 정의하는 wire 포맷 (fuse_*_in/_out 구조체)와 SPDK fsdev 인자 사이의
+ *      직렬화/역직렬화.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * 호출 체인 (virtiofs 예시):
+ *   QEMU/vhost-user-fs 클라이언트 → virtio queue avail ring에 FUSE 요청 push
+ *     → SPDK vhost-user-fs poller → iovec 추출 → spdk_fuse_dispatcher_submit_request
+ *     → 본 파일의 do_<op> 함수 → spdk_fsdev_<op> → fsdev 모듈 → 백엔드 (호스트 VFS 등)
+ *     → 완료 콜백 → 본 파일의 *_cb → fuse_out_header + payload 직렬화 → virtio queue used ring
+ *     → 클라이언트가 응답 수신.
+ * 실행 컨텍스트: 호출자 SPDK thread (보통 virtio poller가 도는 thread).
+ *
+ * === 타 모듈과의 연결 ===
+ * - linux/fuse_kernel.h: FUSE wire 프로토콜 정의 (fuse_in_header, opcode, fuse_*_in/_out).
+ * - spdk/fsdev.h: 모든 spdk_fsdev_* API 호출.
+ * - spdk_internal/fuse_dispatcher.h: spdk_fuse_dispatcher 객체와 public API.
+ * - spdk/thread.h, spdk/json.h: 스레드/JSON 유틸.
+ * 데이터 흐름:
+ *   FUSE iovec (in_iov: 헤더 + 인자, out_iov: 헤더 + 응답)
+ *     → opcode 디스패치 → spdk_fsdev_*
+ *     → 완료 시 out_iov에 fuse_out_header + 응답 payload 작성
+ *     → 호출자가 out_iov로 응답을 클라이언트에 전송.
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - spdk_fuse_dispatcher_create / delete: 디스패처 인스턴스 생성/소멸.
+ * - spdk_fuse_dispatcher_submit_request: FUSE 메시지를 디스패치 (opcode → do_*).
+ * - do_init / do_destroy: 세션 협상 (FUSE_INIT / FUSE_DESTROY).
+ * - do_lookup / do_forget / do_getattr / do_setattr / do_readlink / do_symlink /
+ *   do_mknod / do_mkdir / do_unlink / do_rmdir / do_rename / do_link / do_open /
+ *   do_read / do_write / do_statfs / do_release / do_fsync / do_setxattr / do_getxattr /
+ *   do_listxattr / do_removexattr / do_flush / do_opendir / do_readdir / do_releasedir /
+ *   do_fsyncdir / do_access / do_create / do_lseek 등: FUSE opcode별 핸들러.
+ * - fsdev_d2h_open_flags / fsdev_h2d_open_flags: 클라이언트 ↔ 호스트 open flag 변환
+ *   (X86/ARM/32-64bit 차이 흡수).
+ * - enum spdk_fuse_arch: 클라이언트 아키텍처 식별자.
+ */
+
 #include "spdk/stdinc.h"
 #include "spdk/event.h"
 #include "spdk/log.h"
@@ -113,118 +165,189 @@ fsdev_d2h_open_flags(enum spdk_fuse_arch fuse_arch, uint32_t flags, uint32_t *tr
 	return res;
 }
 
+/*
+ * [한국어]
+ * struct spdk_fuse_mgr — fuse_dispatcher 라이브러리 글로벌 매니저 (싱글톤).
+ * 모든 dispatcher 인스턴스가 공유하는 fuse_io 풀을 관리.
+ */
 struct spdk_fuse_mgr {
 	struct spdk_mempool *fuse_io_pool;
+	/* [한국어] fuse_io 객체 mempool — 모든 dispatcher가 공유.
+	 * 설정자: 첫 dispatcher 생성 시 lazy init. 해제: 마지막 dispatcher 종료 시. */
 	uint32_t ref_cnt;
+	/* [한국어] dispatcher 참조 카운트 — 0이 되면 fuse_io_pool 해제. */
 	pthread_mutex_t lock;
+	/* [한국어] ref_cnt와 fuse_io_pool 변경 보호 (cross-thread dispatcher 생성/소멸). */
 };
 
 static struct spdk_fuse_mgr g_fuse_mgr = {
+	/* [한국어] 글로벌 매니저 초기값. PTHREAD_MUTEX_INITIALIZER로 정적 초기화. */
 	.fuse_io_pool = NULL,
 	.ref_cnt = 0,
 	.lock = PTHREAD_MUTEX_INITIALIZER,
 };
 
+/*
+ * [한국어]
+ * struct fuse_forget_data — FUSE_FORGET 메시지의 inode + nlookup 페어.
+ * FUSE_BATCH_FORGET이 이 구조체 배열을 받음.
+ */
 struct fuse_forget_data {
 	uint64_t ino;
+	/* [한국어] 잊을 inode 번호. */
 	uint64_t nlookup;
+	/* [한국어] 감소시킬 lookup count (이 값만큼 inode의 ref가 줄어듦). */
 };
 
+/*
+ * [한국어]
+ * struct iov_offs — iovec 배열 내 현재 위치 추적 (iov 인덱스 + 그 안의 바이트 오프셋).
+ * FUSE 메시지를 SG buffer로 받을 때 부분 read/write 위치를 표시.
+ */
 struct iov_offs {
 	size_t iov_offs;
+	/* [한국어] 현재 iov[] 인덱스. */
 	size_t buf_offs;
+	/* [한국어] iov[iov_offs] 안의 바이트 오프셋. */
 };
 
+/*
+ * [한국어]
+ * struct fuse_io — 단일 FUSE 요청의 처리 컨텍스트.
+ * 풀에서 빌려와서 op별 union으로 진행 상태를 저장. 완료 시 cpl_cb로 호출자에 응답.
+ */
 struct fuse_io {
 	/** For SG buffer cases, array of iovecs for input. */
 	struct iovec *in_iov;
+	/* [한국어] 입력 iovec 배열 — FUSE 요청 헤더 + 인자가 분산 저장되어 들어옴. */
 
 	/** For SG buffer cases, number of iovecs in in_iov array. */
 	int in_iovcnt;
+	/* [한국어] in_iov 길이. */
 
 	/** For SG buffer cases, array of iovecs for output. */
 	struct iovec *out_iov;
+	/* [한국어] 출력 iovec 배열 — FUSE 응답 헤더 + 데이터를 여기에 직렬화. */
 
 	/** For SG buffer cases, number of iovecs in out_iov array. */
 	int out_iovcnt;
+	/* [한국어] out_iov 길이. */
 
 	struct iov_offs in_offs;
+	/* [한국어] in_iov 읽기 진행 위치. */
 	struct iov_offs out_offs;
+	/* [한국어] out_iov 쓰기 진행 위치. */
 
 	spdk_fuse_dispatcher_submit_cpl_cb cpl_cb;
+	/* [한국어] 호출자가 등록한 완료 콜백 — fsdev 완료 후 호출. */
 	void *cpl_cb_arg;
+	/* [한국어] cpl_cb 인자. */
 	struct spdk_io_channel *ch;
+	/* [한국어] dispatcher channel — fsdev 호출 시 사용. */
 	struct spdk_fuse_dispatcher *disp;
+	/* [한국어] 부모 dispatcher 포인터. */
 
 	struct fuse_in_header hdr;
+	/* [한국어] FUSE 요청 헤더 사본 (opcode, unique, nodeid 등). */
 	bool in_hdr_with_data;
+	/* [한국어] 헤더와 첫 데이터가 동일 iov에 있는지 (FUSE 클라이언트 구현 차이). */
 
 	union {
+		/* [한국어] op별 처리 상태 union — 활성 멤버는 opcode에 의해 결정. */
 		struct {
+			/* [한국어] FUSE_INIT 처리 상태. */
 			struct spdk_thread *thread;
+			/* [한국어] init 발생 thread — fsdev_thread를 설정하기 위해. */
 			struct fuse_init_in *in;
+			/* [한국어] 입력 init 인자 포인터. */
 			bool legacy_in;
+			/* [한국어] 레거시(7.6 이전) FUSE 클라이언트 식별. */
 			struct spdk_fsdev_mount_opts opts;
+			/* [한국어] fsdev에 전달할 마운트 옵션 (max_xfer_size, max_readahead 등). */
 			size_t out_len;
+			/* [한국어] 응답 길이. */
 			int error;
+			/* [한국어] 누적 에러. */
 		} init;
 		struct {
+			/* [한국어] FUSE_READDIR 처리 상태. */
 			bool plus;
+			/* [한국어] true면 READDIRPLUS (entry+attr 함께). */
 			uint32_t size;
+			/* [한국어] 클라이언트가 요청한 최대 응답 크기. */
 			char *writep;
+			/* [한국어] 응답 buffer 쓰기 포인터. */
 			uint32_t bytes_written;
+			/* [한국어] 누적 응답 바이트. */
 		} readdir;
 		struct {
+			/* [한국어] FUSE_BATCH_FORGET 처리 상태. */
 			uint32_t to_forget;
+			/* [한국어] 남은 forget 항목 수. */
 			int status;
+			/* [한국어] 진행 중 에러. */
 		} batch_forget;
 
 		struct {
+			/* [한국어] fsdev close 진행 상태 (destroy 시). */
 			int status;
 		} fsdev_close;
 	} u;
 };
 
+/*
+ * [한국어]
+ * struct spdk_fuse_dispatcher — FUSE 디스패처 인스턴스 (한 fsdev = 한 디스패처).
+ * spdk_fuse_dispatcher_create로 생성, delete로 소멸.
+ */
 struct spdk_fuse_dispatcher {
 	/**
 	 * fsdev descriptor
 	 */
 	struct spdk_fsdev_desc *desc;
+	/* [한국어] 대응하는 fsdev 디스크립터 — spdk_fsdev_open 결과. */
 
 	/**
 	 * fsdev thread
 	 */
 	struct spdk_thread *fsdev_thread;
+	/* [한국어] fsdev API를 호출해야 하는 thread (보통 FUSE_INIT가 발생한 thread). */
 
 	/**
 	 * Major version of the protocol (read-only)
 	 */
 	unsigned proto_major;
+	/* [한국어] 클라이언트 FUSE 프로토콜 major 버전 (FUSE_INIT 시 협상). */
 
 	/**
 	 * Minor version of the protocol (read-only)
 	 */
 	unsigned proto_minor;
+	/* [한국어] 클라이언트 FUSE 프로토콜 minor 버전. */
 
 	/**
 	 * FUSE request source's architecture
 	 */
 	enum spdk_fuse_arch fuse_arch;
+	/* [한국어] 클라이언트 아키텍처 (X86_64/ARM_64 등) — open flags 변환에 사용. */
 
 	/**
 	 * Root file object
 	 */
 	struct spdk_fsdev_file_object *root_fobject;
+	/* [한국어] 파일시스템 루트 inode 객체 — FUSE_INIT에서 lookup으로 획득. */
 
 	/**
 	 * Event callback
 	 */
 	spdk_fuse_dispatcher_event_cb event_cb;
+	/* [한국어] dispatcher 이벤트 콜백 (fsdev 제거 등 비동기 이벤트 통보). */
 
 	/**
 	 * Event callback's context
 	 */
 	void *event_ctx;
+	/* [한국어] event_cb의 사용자 컨텍스트. */
 
 	/**
 	 * Name of the underlying fsdev
@@ -232,10 +355,18 @@ struct spdk_fuse_dispatcher {
 	 * NOTE: must be last
 	 */
 	char fsdev_name[];
+	/* [한국어] fsdev 이름 (flexible array — 객체 끝에 따라옴).
+	 * 설정자: create 시 NUL-terminated copy. */
 };
 
+/*
+ * [한국어]
+ * struct spdk_fuse_dispatcher_channel — per-thread dispatcher 채널.
+ * 사용자가 spdk_fuse_dispatcher_get_io_channel을 호출하면 spdk_io_channel ctx에 따라붙음.
+ */
 struct spdk_fuse_dispatcher_channel {
 	struct spdk_io_channel *fsdev_io_ch;
+	/* [한국어] 같은 thread의 fsdev io_channel — fsdev API 호출 시 전달. */
 };
 
 #define __disp_to_io_dev(disp)	(((char *)disp) + 1)

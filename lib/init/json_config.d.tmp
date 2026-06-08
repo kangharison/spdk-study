@@ -1,0 +1,47 @@
+json_config.o: json_config.c \
+ /home/harison/company/spdk-study/include/spdk/stdinc.h \
+ /home/harison/company/spdk-study/include/spdk/init.h \
+ /home/harison/company/spdk-study/include/spdk/queue.h \
+ /home/harison/company/spdk-study/include/spdk/queue_extras.h \
+ /home/harison/company/spdk-study/include/spdk/log.h \
+ /home/harison/company/spdk-study/include/spdk/assert.h \
+ /home/harison/company/spdk-study/include/spdk/util.h \
+ /home/harison/company/spdk-study/include/spdk/fd.h \
+ /home/harison/company/spdk-study/include/spdk/file.h \
+ /home/harison/company/spdk-study/include/spdk/env.h \
+ /home/harison/company/spdk-study/include/spdk/pci_ids.h \
+ /home/harison/company/spdk-study/include/spdk/thread.h \
+ /home/harison/company/spdk-study/include/spdk/config.h \
+ /home/harison/company/spdk-study/include/spdk/fd_group.h \
+ /home/harison/company/spdk-study/include/spdk/cpuset.h \
+ /home/harison/company/spdk-study/include/spdk/likely.h \
+ /home/harison/company/spdk-study/include/spdk/jsonrpc.h \
+ /home/harison/company/spdk-study/include/spdk/json.h \
+ /home/harison/company/spdk-study/include/spdk/uuid.h \
+ /home/harison/company/spdk-study/include/spdk/rpc.h \
+ /home/harison/company/spdk-study/include/spdk/string.h \
+ /home/harison/company/spdk-study/include/spdk_internal/event.h \
+ /home/harison/company/spdk-study/include/spdk/event.h
+/home/harison/company/spdk-study/include/spdk/stdinc.h:
+/home/harison/company/spdk-study/include/spdk/init.h:
+/home/harison/company/spdk-study/include/spdk/queue.h:
+/home/harison/company/spdk-study/include/spdk/queue_extras.h:
+/home/harison/company/spdk-study/include/spdk/log.h:
+/home/harison/company/spdk-study/include/spdk/assert.h:
+/home/harison/company/spdk-study/include/spdk/util.h:
+/home/harison/company/spdk-study/include/spdk/fd.h:
+/home/harison/company/spdk-study/include/spdk/file.h:
+/home/harison/company/spdk-study/include/spdk/env.h:
+/home/harison/company/spdk-study/include/spdk/pci_ids.h:
+/home/harison/company/spdk-study/include/spdk/thread.h:
+/home/harison/company/spdk-study/include/spdk/config.h:
+/home/harison/company/spdk-study/include/spdk/fd_group.h:
+/home/harison/company/spdk-study/include/spdk/cpuset.h:
+/home/harison/company/spdk-study/include/spdk/likely.h:
+/home/harison/company/spdk-study/include/spdk/jsonrpc.h:
+/home/harison/company/spdk-study/include/spdk/json.h:
+/home/harison/company/spdk-study/include/spdk/uuid.h:
+/home/harison/company/spdk-study/include/spdk/rpc.h:
+/home/harison/company/spdk-study/include/spdk/string.h:
+/home/harison/company/spdk-study/include/spdk_internal/event.h:
+/home/harison/company/spdk-study/include/spdk/event.h:

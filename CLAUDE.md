@@ -986,6 +986,28 @@ list/tree 메모리 의미론 등) 모두 주석에 반영.
 - **전역 변수/매크로**: `g_raid_bdev_list`, `g_raid_modules`, `g_shutdown_started`, `g_opts`, `g_raid_if`, `g_raid_bdev_fn_table`, `RAID_OFFSET_BLOCKS_INVALID`, `RAID_BDEV_PROCESS_MAX_QD` 모두 §3/§4 완비.
 - **트레이스 등록**: `SPDK_TRACE_REGISTER_FN(bdev_raid_trace)` — BDEV_RAID_IO_START/DONE tpoint 및 parent↔child 관계 등록 주석 완비.
 
+### 완료 (module/bdev/raid/ 소형 파일 5개 — 2026-06-07 확정)
+
+`module/bdev/raid/` 아래 5개 파일에 대해 4섹션 상단 블록 + 모든 함수 §2 헤더
++ 모든 구조체/enum 필드 §4 멀티라인 + #include/매크로/실행 라인 §3 인라인을 완비했다.
+
+- **`bdev_raid_rpc.c`** (638 라인): RAID bdev JSON-RPC 핸들러 6종.
+  - `rpc_bdev_raid_get_bdevs.category` §4 완비 (설정자/읽는자/값범위/동기화).
+  - `rpc_bdev_raid_create_base_bdevs` 전 필드(num_base_bdevs/base_bdevs[]) §4 완비.
+  - `rpc_bdev_raid_create` 전 필드(name/strip_size_kb/level/base_bdevs/uuid/superblock_enabled) §4 완비.
+  - `rpc_bdev_raid_create_ctx` 전 필드(req/raid_bdev/request/remaining/status) §4 완비 — remaining 집계 패턴, 롤백 경로 설명 포함.
+  - `rpc_bdev_raid_delete.name` §4 완비. `rpc_bdev_raid_delete_ctx` 전 필드 §4 완비.
+  - `rpc_bdev_raid_add_base_bdev` 전 필드(base_bdev/raid_bdev) §4 완비.
+  - 모든 함수(free_rpc_*, decode_raid_level, decode_base_bdevs, 6종 RPC 핸들러, 콜백 5종) §2 헤더 + 실행 라인 인라인.
+  - 디코더 배열 5종(get_bdevs/create/add_base_bdev/remove_base_bdev/set_options) §3 인라인.
+  - `#define RPC_MAX_BASE_BDEVS 255` 인라인, 7개 #include 인라인.
+  - SPDK_RPC_REGISTER 3종(RUNTIME) + 1종(STARTUP|RUNTIME) 인라인.
+
+- **`raid1.c`** (1109 라인): 이미 완비(144건 한국어 주석). 검수 확인.
+- **`bdev_raid_sb.c`** (899 라인): 이미 완비(143건 한국어 주석). 검수 확인.
+- **`raid0.c`** (782 라인): 이미 완비(115건 한국어 주석). 검수 확인.
+- **`concat.c`** (728 라인): 이미 완비(126건 한국어 주석). 검수 확인.
+
 ### 완료 (module/bdev/nvme/ 소형 파일 5개 — 2026-06-07 확정)
 
 `module/bdev/nvme/` 아래 5개 소형 파일에 대해 4섹션 상단 블록 + 모든 함수 §2 헤더

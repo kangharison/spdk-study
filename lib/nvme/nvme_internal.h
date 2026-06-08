@@ -2291,10 +2291,40 @@ int	nvme_ns_construct(struct spdk_nvme_ns *ns, uint32_t id,
                                   /* [한국어] NS 객체 구성 — ctrlr 링크, NSID 저장, RB 트리 삽입 */
 void	nvme_ns_destruct(struct spdk_nvme_ns *ns);
                                   /* [한국어] NS 객체 해제 — RB 트리 제거, identify 데이터 free */
+/*
+ * [한국어] nvme_ns_cmd_zone_append_with_md - ZNS Zone Append (opcode 0x7D) 발행, contiguous buffer + metadata.
+ *
+ * @ns/qpair: 대상 namespace + 발행 큐.
+ * @buffer: 쓸 데이터 (host VA, DMA 가능 메모리).
+ * @metadata: PI metadata (NULL 가능). NS의 metadata size > 0 일 때만 의미.
+ * @zslba: zone start LBA — 호스트가 명시한 zone 의 시작 위치. zone 정렬 필수.
+ * @lba_count: 쓸 LBA 수 (0-based wire format 처리는 cmd 빌더가).
+ * @cb_fn/cb_arg: 완료 콜백 + 컨텍스트.
+ * @io_flags: PRACT/PRCHK_* 등 PI 옵션, FUA 등.
+ * @apptag_mask/apptag: PI metadata 의 Application Tag 필드 (T10 DIF).
+ * @return: 0 = 발행 성공 (비동기), 음수 errno.
+ *
+ * Zone Append (ZNS TP 4053): 호스트가 정확한 LBA 를 지정하는 일반 write 와 달리,
+ * "이 zone 의 다음 빈 슬롯에 추가" 의미. 컨트롤러가 할당한 실제 LBA 는 CQE 의
+ * cdw0 (ALBA — Assigned LBA) 로 반환된다. 동시 다중 append 가 lockless 가능 →
+ * ZNS sequential write 제약을 우회하면서도 SSD friendly.
+ */
 int	nvme_ns_cmd_zone_append_with_md(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 					void *buffer, void *metadata, uint64_t zslba,
 					uint32_t lba_count, spdk_nvme_cmd_cb cb_fn, void *cb_arg,
 					uint32_t io_flags, uint16_t apptag_mask, uint16_t apptag);
+
+/*
+ * [한국어] nvme_ns_cmd_zone_appendv_with_md - 위와 동일하나 SGL 기반 (벡터 IO).
+ *
+ * @reset_sgl_fn/next_sge_fn: 사용자가 등록하는 SGL iterator — SPDK 가 PRP/SGL 빌드 시 호출.
+ *   - reset_sgl_fn(cb_arg, offset): SGL 커서를 offset 으로 리셋 (재시도 시).
+ *   - next_sge_fn(cb_arg, &addr, &len): 다음 SGL 엔트리 (addr, len) 반환.
+ * 다른 파라미터는 zone_append_with_md 와 동일.
+ *
+ * appendv 가 _with_md 와 별도인 이유: contiguous buffer 가 cdata.sgls 미지원 컨트롤러에서도
+ * PRP 로 빌드 가능한 반면, SGL 호출은 컨트롤러 SGL 지원 필수.
+ */
 int nvme_ns_cmd_zone_appendv_with_md(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 				     uint64_t zslba, uint32_t lba_count,
 				     spdk_nvme_cmd_cb cb_fn, void *cb_arg, uint32_t io_flags,

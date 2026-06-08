@@ -315,11 +315,27 @@ nvme_ctrlr_set_bprsel(struct spdk_nvme_ctrlr *ctrlr, union spdk_nvme_bprsel_regi
 					      bprsel->raw);
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_set_bpmbl - BPMBL(Boot Partition Memory Buffer Location, 8 bytes) BAR0 레지스터 write
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @bpmbl_value: physical/IOVA 주소 — Boot Partition 데이터를 host 메모리 어디에 DMA 할지
+ * @return 0 성공, 음수 errno (트랜스포트 write 실패)
+ *
+ * NVMe 1.4 §3.1.20: BPMBL 은 BP read 시 데이터가 작성될 host buffer 의 base 주소.
+ * 호스트가 hugepage DMA 가능 영역의 IOVA 를 PRP-style 로 등록 후 BPRSEL.BPID 와 함께 BP read 트리거.
+ *
+ * 호출 체인:
+ *   spdk_nvme_ctrlr_read_boot_partition_start → [본 함수] → transport set_reg_8
+ *   → PCIe MMIO write 8B (BAR0 offset 0x40) / Fabrics property set
+ */
 int
 nvme_ctrlr_set_bpmbl(struct spdk_nvme_ctrlr *ctrlr, uint64_t bpmbl_value)
 {
 	return nvme_transport_ctrlr_set_reg_8(ctrlr, offsetof(struct spdk_nvme_registers, bpmbl),
 					      bpmbl_value);
+	                                  /* [한국어] BPMBL offset (=0x40) 에 8B write — DMA 대상 주소 등록. */
 }
 
 /*
@@ -359,6 +375,31 @@ nvme_ctrlr_multi_iocs_enabled(struct spdk_nvme_ctrlr *ctrlr)
 
 /* When the field in spdk_nvme_ctrlr_opts are changed and you change this function, please
  * also update the nvme_ctrl_opts_init function in nvme_ctrlr.c
+ */
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_get_default_ctrlr_opts - 컨트롤러 attach 옵션 기본값으로 채움 (공개 API)
+ *
+ * @opts: [out] 옵션 구조체. caller 가 alloc 후 전달.
+ * @opts_size: opts 의 실제 크기 (ABI 호환용 — SPDK 가 옵션 확장해도 구버전 호환).
+ *
+ * 동작: SET_FIELD 매크로로 ABI-safe 필드별 기본값 설정. 매크로는 offsetof + sizeof 검사로
+ * opts 크기 범위를 벗어나는 필드는 skip — 사용자가 sizeof(struct spdk_nvme_ctrlr_opts) 보다
+ * 작은 버전을 전달해도 안전.
+ *
+ * 주요 기본값:
+ *   - num_io_queues = DEFAULT_MAX_IO_QUEUES (1024) — 호스트가 원하는 최대 I/O qpair 수
+ *   - arb_mechanism = SPDK_NVME_CC_AMS_RR (Round Robin)
+ *   - keep_alive_timeout_ms = 0 (PCIe), 10초 (Fabrics) — Fabrics 는 의무
+ *   - admin_timeout_ms = NVME_MAX_ADMIN_TIMEOUT_IN_SECS × 1000 (30초)
+ *
+ * 사용 패턴:
+ *   struct spdk_nvme_ctrlr_opts opts;
+ *   spdk_nvme_ctrlr_get_default_ctrlr_opts(&opts, sizeof(opts));
+ *   opts.num_io_queues = 8;  // 사용자 override
+ *   spdk_nvme_probe(..., &opts);
+ *
+ * 동기화: opts 는 사용자 스택/heap 메모리라 잠금 불필요.
  */
 void
 spdk_nvme_ctrlr_get_default_ctrlr_opts(struct spdk_nvme_ctrlr_opts *opts, size_t opts_size)
@@ -1217,11 +1258,45 @@ nvme_ctrlr_construct_intel_support_log_page_list(struct spdk_nvme_ctrlr *ctrlr,
 	}
 }
 
+/*
+ * [한국어] struct intel_log_pages_ctx - Intel log page directory get 비동기 컨텍스트
+ *
+ * nvme_ctrlr_set_intel_support_log_pages 가 Intel vendor-specific log page directory(0xC0)
+ * read 발행 시 heap 할당하여 cb_arg 로 전달. 완료 콜백 done 에서 사용 후 free.
+ */
 struct intel_log_pages_ctx {
 	struct spdk_nvme_intel_log_page_directory log_page_directory;
+	/* [한국어] Intel log page directory 응답 버퍼 (DMA 대상).
+	 *  - 설정자: 디바이스가 DMA 로 채움 (admin get_log_page 완료 시점).
+	 *  - 읽는 자: nvme_ctrlr_construct_intel_support_log_page_list — 각 length 필드 검사 후
+	 *    해당 log page 의 log_page_supported[] 비트 set.
+	 *  - 값 범위: 각 log_len 필드는 해당 Intel log page 의 실제 크기 (0=미지원).
+	 *  - 동기화: 단일 admin completion thread 만 접근 — 별도 락 불요. */
+
 	struct spdk_nvme_ctrlr *ctrlr;
+	/* [한국어] 콜백에서 사용할 ctrlr 역참조.
+	 *  - 설정자: nvme_ctrlr_set_intel_support_log_pages 에서 set.
+	 *  - 읽는 자: done 콜백 — log_page_supported[] 비트맵 변경, 상태 전이 트리거.
+	 *  - 값 범위: 유효 ctrlr 포인터 (NULL 불가).
+	 *  - 동기화: ctx 수명 동안 ctrlr 가 destruct 되지 않음을 보장 (reset/destruct 가 ctx 정리 대기). */
 };
 
+/*
+ * [한국어]
+ * nvme_ctrlr_set_intel_support_log_pages_done - Intel log page directory get 완료 콜백
+ *
+ * @arg: intel_log_pages_ctx — log_page_directory 응답 + ctrlr 참조
+ * @cpl: 명령 완료 정보
+ *
+ * 동작:
+ *   - 성공이면 directory 분석하여 log_page_supported[] 비트맵의 Intel 항목 set.
+ *   - 실패해도 진행 — Intel log page 는 옵션 (스펙 외 벤더 확장).
+ *   - 다음 상태 SET_SUPPORTED_FEATURES 로 전이.
+ *   - ctx free.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_set_intel_support_log_pages (admin 발행) → admin 완료 → [본 콜백]
+ */
 static void
 nvme_ctrlr_set_intel_support_log_pages_done(void *arg, const struct spdk_nvme_cpl *cpl)
 {
@@ -1230,13 +1305,34 @@ nvme_ctrlr_set_intel_support_log_pages_done(void *arg, const struct spdk_nvme_cp
 
 	if (!spdk_nvme_cpl_is_error(cpl)) {
 		nvme_ctrlr_construct_intel_support_log_page_list(ctrlr, &ctx->log_page_directory);
+		                                  /* [한국어] directory 응답에서 사용 가능한 log page 비트 set. */
 	}
 
 	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_SET_SUPPORTED_FEATURES,
 			     ctrlr->opts.admin_timeout_ms);
-	free(ctx);
+	                                  /* [한국어] Intel log page 실패해도 다음 단계 진행. */
+	free(ctx);                    /* [한국어] heap 할당 ctx 해제 — directory buffer 포함. */
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_set_intel_support_log_pages - Intel 벤더 log page 지원 여부 비동기 조회
+ *
+ * @ctrlr: 대상 컨트롤러 (Identify 에서 VID=Intel 확인됨)
+ * @return 0 (실패해도 0 — 다음 상태로 진행 보장)
+ *
+ * Intel SSD 들이 노출하는 벤더-specific log page들(Read/Write Latency, Marketing
+ * Description, SMART Attributes 등) 의 지원 여부를 controller 의 log page directory(0xC0)
+ * 를 read 하여 확인하고 log_page_supported[] 비트맵에 반영.
+ *
+ * 비동기 모델: get_log_page admin 발행 → 완료 콜백이 directory 분석 + 다음 상태 전이.
+ *
+ * 호출 체인 (process_init 상태머신):
+ *   nvme_ctrlr_process_init (SET_SUPPORTED_INTEL_LOG_PAGES) → [본 함수]
+ *     → spdk_nvme_ctrlr_cmd_get_log_page (Intel directory)
+ *     → nvme_ctrlr_set_intel_support_log_pages_done
+ *     → 다음 상태 SET_SUPPORTED_FEATURES
+ */
 static int
 nvme_ctrlr_set_intel_support_log_pages(struct spdk_nvme_ctrlr *ctrlr)
 {
@@ -1269,6 +1365,29 @@ nvme_ctrlr_set_intel_support_log_pages(struct spdk_nvme_ctrlr *ctrlr)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_alloc_ana_log_page - ANA(Asymmetric Namespace Access) log page buffer 할당/재할당
+ *
+ * @ctrlr: 대상 컨트롤러 (NVMe-oF multipath 대상)
+ * @return 0 성공, -ENXIO / -ENOMEM 실패
+ *
+ * ANA(NVMe spec §8.20): 같은 subsystem 의 여러 컨트롤러가 동일 namespace 를 공유할 때, 각
+ * 컨트롤러를 통한 path 가 "optimized / non-optimized / inaccessible" 등 상태를 가지므로,
+ * 호스트가 multipath 결정에 사용. ANA log page (LID=0x0C) 로 이 상태를 조회.
+ *
+ * log page 크기는 동적: 헤더 + (NANAGRPID × 그룹 디스크립터) + (active_ns_count × NSID 배열).
+ * 활성 NS 수가 변경되면(NS Attribute Change AER) 버퍼도 재할당 필요. 본 함수가 이 동작을 캡슐화.
+ *
+ * 동작:
+ *   1) 필요 크기 계산.
+ *   2) 기존 버퍼보다 크면 realloc (기존 NULL 이면 calloc).
+ *   3) copied_ana_desc(파싱 임시 버퍼) 도 동일 크기로 재할당.
+ *   4) ctrlr->ana_log_page_size 업데이트.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_update_ana_log_page → [본 함수] → realloc/calloc
+ */
 static int
 nvme_ctrlr_alloc_ana_log_page(struct spdk_nvme_ctrlr *ctrlr)
 {
@@ -1316,6 +1435,24 @@ nvme_ctrlr_alloc_ana_log_page(struct spdk_nvme_ctrlr *ctrlr)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_update_ana_log_page - ANA log page 동기 read + 내부 캐시 갱신
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @return 0 성공, 음수 errno
+ *
+ * 동작:
+ *   1) buffer 크기 보장 (alloc_ana_log_page).
+ *   2) Get Log Page (LID=0x0C, NSID=0xFFFFFFFF global) admin 명령 발행.
+ *   3) 동기 polling 완료 대기.
+ *   4) ctrlr->ana_log_page 에 raw 데이터 저장 — 이후 parse_ana_log_page 가 사용.
+ *
+ * 호출 시점:
+ *   - Controller bring-up 후 1회 (initial state)
+ *   - ANA Change AER 수신 시 (path state 변경)
+ *   - 사용자 수동 호출 (drift 감지)
+ */
 static int
 nvme_ctrlr_update_ana_log_page(struct spdk_nvme_ctrlr *ctrlr)
 {
@@ -1351,30 +1488,74 @@ nvme_ctrlr_update_ana_log_page(struct spdk_nvme_ctrlr *ctrlr)
 	return rc;
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_update_ns_ana_states - ANA group descriptor 한 개를 NS 객체들에 반영
+ *
+ * @desc: ANA group descriptor (한 그룹의 ana_state + 포함된 NSID 리스트)
+ * @cb_arg: spdk_nvme_ctrlr * (parse 호출자가 전달)
+ * @return 0 (parse 계속 진행)
+ *
+ * parse_ana_log_page 의 per-descriptor 콜백으로 등록되어 호출됨. 한 group descriptor 의
+ * ana_group_id / ana_state 를 그 그룹에 속한 모든 NS 객체에 복사한다.
+ *
+ * 동작:
+ *   - 각 NSID 에 대해 spdk_nvme_ctrlr_get_ns (lazy alloc) 로 NS 객체 확보.
+ *   - ns->ana_group_id, ns->ana_state 갱신.
+ *
+ * NSID 검증: 0 또는 NN 초과는 skip — 잘못된 log page 데이터로부터 보호.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_parse_ana_log_page (각 그룹 디스크립터 순회) → [본 함수]
+ */
 static int
 nvme_ctrlr_update_ns_ana_states(const struct spdk_nvme_ana_group_descriptor *desc,
 				void *cb_arg)
 {
 	struct spdk_nvme_ctrlr *ctrlr = cb_arg;
+	                                  /* [한국어] cb_arg 를 ctrlr 로 캐스팅 — 등록 시 self 전달 규약. */
 	struct spdk_nvme_ns *ns;
 	uint32_t i, nsid;
 
 	for (i = 0; i < desc->num_of_nsid; i++) {
+	                                  /* [한국어] 이 그룹에 속한 NSID 개수만큼 순회. */
 		nsid = desc->nsid[i];
 		if (nsid == 0 || nsid > ctrlr->cdata.nn) {
+		                                  /* [한국어] 비정상 NSID — 무시하고 다음으로. (firmware bug 방어) */
 			continue;
 		}
 
 		ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
-		assert(ns != NULL);
+		                                  /* [한국어] NS 객체 lazy alloc 또는 기존 발견. */
+		assert(ns != NULL);       /* [한국어] NSID 범위 check 후라 NULL 비정상. */
 
 		ns->ana_group_id = desc->ana_group_id;
+		                                  /* [한국어] 그룹 식별자 — multipath 정책 키. */
 		ns->ana_state = desc->ana_state;
+		                                  /* [한국어] OPTIMIZED/NON_OPTIMIZED/INACCESSIBLE/PERSISTENT_LOSS/CHANGE. */
 	}
 
-	return 0;
+	return 0;                     /* [한국어] 0 = parse 계속 (모든 그룹 순회). */
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_parse_ana_log_page - ANA log page raw 데이터를 순회하며 사용자 콜백 호출 (내부 API)
+ *
+ * @ctrlr: ANA log page 가 캐시된 컨트롤러
+ * @cb_fn: 각 그룹 디스크립터마다 호출될 콜백 (return < 0 면 순회 중단)
+ * @cb_arg: 콜백 컨텍스트
+ * @return 0 성공, 음수 errno
+ *
+ * 동작:
+ *   1) ana_log_page 헤더 분석 (num_ana_group_desc)
+ *   2) 각 그룹 디스크립터를 copied_ana_desc 로 복사 (raw 가 packed 라 직접 접근 위험 → align 보장)
+ *   3) cb_fn(desc, cb_arg) 호출 — 사용자가 NS 상태 갱신 등 수행
+ *   4) desc->num_of_nsid 만큼 다음 디스크립터 위치로 전진
+ *
+ * 사용처: 사용자가 ANA 상태 변화를 인지하고 multipath 정책을 동적으로 조정할 때.
+ * SPDK 내부에서 nvme_ctrlr_update_ns_ana_states 가 등록됨.
+ */
 int
 nvme_ctrlr_parse_ana_log_page(struct spdk_nvme_ctrlr *ctrlr,
 			      spdk_nvme_parse_ana_log_page_cb cb_fn, void *cb_arg)
@@ -4594,26 +4775,98 @@ error:
 	return rc;
 }
 
+/*
+ * [한국어] enum nvme_active_ns_state - Active Namespace List 비동기 페이지 페치 진행 상태
+ *
+ * Identify (CNS=0x02) 는 NSID 1024개 한 페이지씩 반환 — 컨트롤러의 활성 NS 가 1024개를
+ * 넘으면 next_nsid 를 갱신하며 여러 페이지를 순차 페치한다. 이 상태머신은 그 순차 진행을 관리.
+ */
 enum nvme_active_ns_state {
 	NVME_ACTIVE_NS_STATE_IDLE,
+	/* [한국어] 초기 상태 — 아직 첫 페이지 admin 발행 전.
+	 *  - 설정자: nvme_active_ns_ctx_create (calloc 결과로 자동 IDLE=0).
+	 *  - 읽는 자: 첫 페이지 발행 직전. */
+
 	NVME_ACTIVE_NS_STATE_PROCESSING,
+	/* [한국어] 현재 페이지 admin 진행 중 (응답 대기).
+	 *  - 설정자: nvme_ctrlr_identify_active_ns_async — admin 발행 직후.
+	 *  - 읽는 자: deleter 가 본 상태에서는 호출 안 됨 (race 방지 가드). */
+
 	NVME_ACTIVE_NS_STATE_DONE,
+	/* [한국어] 모든 페이지 페치 완료 — new_ns_list 사용 가능.
+	 *  - 설정자: identify_active_ns_async_done — 마지막 페이지에서 0 sentinel 발견 또는
+	 *    next_nsid 가 NN 초과 도달 시.
+	 *  - 읽는 자: deleter — swap 진행. */
+
 	NVME_ACTIVE_NS_STATE_ERROR
+	/* [한국어] admin 실패 또는 alloc 실패 — caller 가 정리 후 ERROR 상태로 컨트롤러 전이.
+	 *  - 설정자: identify_active_ns_async_done (admin 에러), 또는 ctx_create 실패 시 직접 set. */
 };
 
 typedef void (*nvme_active_ns_ctx_deleter)(struct nvme_active_ns_ctx *);
+/* [한국어] active NS ctx 의 비동기 deleter 콜백 타입.
+ *  - async 페치가 끝나면 (DONE/ERROR) 호출됨. 동기 페치는 deleter=NULL 로 caller 가 직접 destroy. */
 
+/*
+ * [한국어] struct nvme_active_ns_ctx - Active NS List 비동기 페치의 진행 컨텍스트
+ *
+ * Identify (CNS=0x02) 명령은 한 번에 NSID 1024개의 페이지(4KB) 만 반환하므로, NN 이 큰
+ * 컨트롤러에서는 next_nsid 를 증가시키며 여러 admin 명령을 직렬로 발행해야 한다.
+ * 본 ctx 가 그 진행 상태를 보관 — page_count, next_nsid, status 등.
+ */
 struct nvme_active_ns_ctx {
 	struct spdk_nvme_ctrlr *ctrlr;
+	/* [한국어] 대상 컨트롤러 역참조.
+	 *  - 설정자: create 시 set, 이후 불변.
+	 *  - 읽는 자: deleter / done 콜백 — 다음 admin 발행, ns 트리 swap. */
+
 	uint32_t page_count;
+	/* [한국어] 지금까지 페치한 페이지 수 (=발행한 admin 명령 수).
+	 *  - 설정자: identify_active_ns_async — 페이지 완료 후 ++.
+	 *  - 읽는 자: deleter — new_ns_list 의 최대 슬롯 수 계산 (page_count × 1024). */
+
 	uint32_t next_nsid;
+	/* [한국어] 다음 페이지 페치 시작 NSID.
+	 *  - 설정자: done 콜백 — 마지막 페이지의 마지막 NSID + 1 로 갱신.
+	 *  - 읽는 자: 다음 admin 발행 — Identify cdw1 (NSID) 필드. */
+
 	uint32_t *new_ns_list;
+	/* [한국어] 누적 NSID 리스트 buffer — 페이지별 응답이 이어 붙음. 0 sentinel 로 종료.
+	 *  - 설정자: create 시 1페이지(4KB) alloc, 이후 페이지 추가 시 realloc.
+	 *  - 읽는 자: deleter (swap 대상). 컨트롤러 ns RB tree 와 swap 후 free.
+	 *  - 동기화: ctx 수명 동안 ctx 소유자(단일 admin completion thread) 만 접근. */
+
 	nvme_active_ns_ctx_deleter deleter;
+	/* [한국어] 페치 종료 시 호출할 cleanup 콜백.
+	 *  - 설정자: create 시 caller 가 지정 (async: _nvme_active_ns_ctx_deleter, 동기: NULL).
+	 *  - 읽는 자: identify_active_ns_async_done — DONE/ERROR 도달 시 호출. */
+
 	struct nvme_completion_poll_status status;
+	/* [한국어] 동기 페치(deleter=NULL) 의 admin 완료 polling 상태.
+	 *  - 설정자: nvme_completion_poll_cb 가 done=true, cpl 채움.
+	 *  - 읽는 자: nvme_wait_for_adminq_completion (동기 경로). */
 
 	enum nvme_active_ns_state state;
+	/* [한국어] 현재 페치 진행 상태머신.
+	 *  - 설정자: ctx_create=IDLE, async=PROCESSING, done 콜백=DONE/ERROR.
+	 *  - 읽는 자: deleter — DONE/ERROR 분기. 사용자 정의 deleter 가 이 값을 보고 정리 결정. */
 };
 
+/*
+ * [한국어]
+ * nvme_active_ns_ctx_create - Active NS List 페치 컨텍스트 할당 + 첫 페이지 buffer 준비
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @deleter: 비동기 종료 콜백 (동기 모드는 NULL)
+ * @return ctx 포인터, OOM 시 NULL
+ *
+ * 동작:
+ *   - ctx 자체 calloc — state=IDLE 자동 초기화.
+ *   - new_ns_list 4KB(spdk_nvme_ns_list 크기) zmalloc — DPDK hugepage shared (multi-process 공유)
+ *   - page_count=1 — 첫 페이지 buffer 확보됨을 표시.
+ *
+ * hugepage 사용 이유: Identify 응답이 DMA 로 들어오므로 IOVA 매핑 가능한 메모리 필요.
+ */
 static struct nvme_active_ns_ctx *
 nvme_active_ns_ctx_create(struct spdk_nvme_ctrlr *ctrlr, nvme_active_ns_ctx_deleter deleter)
 {
@@ -4642,13 +4895,34 @@ nvme_active_ns_ctx_create(struct spdk_nvme_ctrlr *ctrlr, nvme_active_ns_ctx_dele
 	return ctx;
 }
 
+/*
+ * [한국어]
+ * nvme_active_ns_ctx_destroy - active NS ctx 해제 (deleter 또는 동기 caller 가 호출)
+ *
+ * @ctx: 해제 대상 컨텍스트
+ *
+ * new_ns_list 는 hugepage 영역이라 spdk_free 사용, ctx 자체는 일반 heap 이라 free.
+ */
 static void
 nvme_active_ns_ctx_destroy(struct nvme_active_ns_ctx *ctx)
 {
-	spdk_free(ctx->new_ns_list);
-	free(ctx);
+	spdk_free(ctx->new_ns_list);  /* [한국어] hugepage 영역 해제 — DPDK rte_free. */
+	free(ctx);                    /* [한국어] heap calloc 결과 — 일반 free. */
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_destruct_namespace - 특정 NSID 의 NS 객체를 inactive 로 전환 (정리)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @nsid: 정리할 NSID
+ * @return 0 성공, -EINVAL (NSID 가 RB tree 에 없음)
+ *
+ * 호출 시점: identify_active_ns 결과가 "이 NSID 는 더 이상 활성 아님" 으로 판정될 때 (NS Attr
+ * Change AER 처리). RB tree 에서 노드 자체는 유지하되 active=false 로 표시 — 추후 재활성화 가능성 대비.
+ *
+ * 동작: ns_destruct → nsdata/id_desc/IOCS 데이터 모두 0 으로 clear → active=false set.
+ */
 static int
 nvme_ctrlr_destruct_namespace(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid)
 {
@@ -4658,32 +4932,48 @@ nvme_ctrlr_destruct_namespace(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid)
 
 	tmp.id = nsid;
 	ns = RB_FIND(nvme_ns_tree, &ctrlr->ns, &tmp);
+	                                  /* [한국어] RB tree 검색 — 존재하지 않으면 정리 불가 (이미 destroyed). */
 	if (ns == NULL) {
 		return -EINVAL;
 	}
 
-	nvme_ns_destruct(ns);
-	ns->active = false;
+	nvme_ns_destruct(ns);         /* [한국어] nsdata/id_desc/iocs-specific 모두 0 클리어. */
+	ns->active = false;           /* [한국어] active 비트 false — 사용자 get_first/next_active_ns 가 skip. */
 
 	return 0;
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_construct_namespace - 특정 NSID 의 NS 객체를 active 로 마킹 (lazy alloc)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @nsid: 활성화할 NSID
+ * @return 0 성공, -EINVAL (NSID 범위 밖), -ENOMEM (alloc 실패)
+ *
+ * 호출 시점: identify_active_ns 결과로부터 active NSID 가 발견될 때마다 호출.
+ * spdk_nvme_ctrlr_get_ns 의 lazy alloc 패턴을 활용 — 객체 미존재면 RB tree 에 추가.
+ *
+ * 주의: 이 함수는 ns->active 만 set. 실제 nsdata 채우기는 별도 identify_ns(CNS=0x00) 발행 필요.
+ */
 static int
 nvme_ctrlr_construct_namespace(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid)
 {
 	struct spdk_nvme_ns *ns;
 
 	if (nsid < 1 || nsid > ctrlr->cdata.nn) {
+	                                  /* [한국어] NSID 범위 검사 — 0 (invalid) 또는 NN 초과. */
 		return -EINVAL;
 	}
 
 	/* Namespaces are constructed on demand, so simply request it. */
+	/* [한국어] lazy alloc 패턴 — get_ns 가 RB_FIND 후 미발견 시 alloc + insert 수행. */
 	ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
 	if (ns == NULL) {
-		return -ENOMEM;
+		return -ENOMEM;       /* [한국어] OOM — alloc 실패. */
 	}
 
-	ns->active = true;
+	ns->active = true;            /* [한국어] active 비트 set — get_first/next_active_ns 에서 발견됨. */
 
 	return 0;
 }
@@ -4762,30 +5052,78 @@ nvme_ctrlr_identify_active_ns_swap(struct spdk_nvme_ctrlr *ctrlr, uint32_t *new_
 	ctrlr->active_ns_count = active_ns_count;
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_identify_active_ns_async_done -
+ *   CNS 0x02 (Active NS List) Identify admin 명령의 완료 콜백.
+ *
+ * @arg: nvme_active_ns_ctx — identify chain 상태 컨테이너 (active_ns_async 가
+ *       발행 시점에 등록).
+ * @cpl: NVMe Completion Queue Entry — 명령 결과 (status + cdw0/1).
+ * @return: void (콜백)
+ *
+ * 동작 (Active NS List paging):
+ *  NVMe 1.1+ 의 Identify CNS=0x02 는 한 번에 최대 1024개 NSID 만 반환한다.
+ *  네임스페이스 수가 더 많으면 마지막 NSID 를 다음 호출의 시작 NSID 로
+ *  넘겨 다음 1024개를 받는다 — "페이징" 패턴. 본 콜백이 그 페이징 루프의 핵심.
+ *  단계:
+ *   1. timed_out 이면 즉시 ctx 정리 (메모리 누수 방지). 이후 콜백 재진입 차단.
+ *   2. cpl 을 ctx->status.cpl 에 보관 (호출자 분석 가능). 에러면 ERROR 상태.
+ *   3. 직전 페이지의 마지막 슬롯 (`[1024 * page_count - 1]`) 을 read →
+ *      0 이면 "더 없음" 으로 페이징 종료 (DONE 상태). 비제로면 next_nsid.
+ *   4. 더 받아야 하면 page_count++ 하고 buffer realloc (페이지 1개 = 1024
+ *      uint32_t = 4KiB) — 컨트롤러 page_size 정렬 필수.
+ *   5. timeout_tsc 재계산 후 다음 페이지 발행 (재귀적으로 active_ns_async 호출).
+ *
+ * 실행 컨텍스트: admin 큐 완료를 폴링하는 reactor 스레드.
+ *   (spdk_nvme_ctrlr_process_admin_completions 가 트리거.)
+ * 에러 경로: ERROR/DONE 모두 `out:` 으로 점프해 ctx->deleter (보통
+ *   `_nvme_active_ns_ctx_deleter`) 호출 — 자원 정리·상태 전이 한 곳에서.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_cmd_identify(CNS=0x02) 완료 → [본 콜백]
+ *     → (계속) nvme_ctrlr_identify_active_ns_async (다음 페이지)
+ *     → (종료) ctx->deleter → _nvme_active_ns_ctx_deleter
+ *       → nvme_ctrlr_identify_active_ns_swap (실제 ns 트리 교체)
+ */
 static void
 nvme_ctrlr_identify_active_ns_async_done(void *arg, const struct spdk_nvme_cpl *cpl)
 {
+	/* [한국어] arg 캐스팅 — admin cmd 발행 시 ctx 를 cb_arg 로 등록했으므로 동일 객체. */
 	struct nvme_active_ns_ctx *ctx = arg;
 	uint32_t *new_ns_list = NULL;
+	/* [한국어] realloc 결과 임시 보관 — 실패해도 ctx->new_ns_list 는 유지(누수 방지). */
 
+	/* [한국어] timed_out 검사 우선 — 이미 호출자 측에서 timeout 처리됐을 수 있다.
+	 * 이 경우 ctx 의 유효성 보장이 깨졌으므로 즉시 destroy 후 반환.
+	 * (admin completion polling 이 늦게 도착한 경우 흔히 발생.) */
 	if (ctx->status.timed_out) {
 		nvme_active_ns_ctx_destroy(ctx);
 		return;
 	}
 
+	/* [한국어] cpl 사본 보관 — 호출자가 status.cpl 로 결과 코드 확인 가능. */
 	memcpy(&ctx->status.cpl, cpl, sizeof(*cpl));
+	/* [한국어] NVMe spec status 검사 — SC|SCT 가 0 이 아니면 에러. */
 	if (spdk_nvme_cpl_is_error(cpl)) {
 		ctx->state = NVME_ACTIVE_NS_STATE_ERROR;
 		goto out;
 	}
 
+	/* [한국어] 직전 페이지의 마지막 슬롯 = 다음 페이지의 starting NSID.
+	 * 1024 * page_count - 1 = 직전 페이지 끝 인덱스 (0-based).
+	 * NVMe 1.1+ 스펙: CNS 0x02 의 응답 마지막 NSID 가 0 = "더 없음", 비제로 = 다음 page 시작. */
 	ctx->next_nsid = ctx->new_ns_list[1024 * ctx->page_count - 1];
 	if (ctx->next_nsid == 0) {
+		/* [한국어] 페이징 완료 — 모든 active NS 수집 끝. */
 		ctx->state = NVME_ACTIVE_NS_STATE_DONE;
 		goto out;
 	}
 
+	/* [한국어] 추가 페이지 필요 — buffer 확장. */
 	ctx->page_count++;
+	/* [한국어] page_size 정렬 spdk_realloc — DMA 매핑 호환을 위해 컨트롤러 MPS 사용.
+	 * 실패 시 기존 buffer 유지 + ERROR 전이 (NULL 덮어쓰지 않음). */
 	new_ns_list = spdk_realloc(ctx->new_ns_list,
 				   ctx->page_count * sizeof(struct spdk_nvme_ns_list),
 				   ctx->ctrlr->page_size);
@@ -4796,18 +5134,55 @@ nvme_ctrlr_identify_active_ns_async_done(void *arg, const struct spdk_nvme_cpl *
 	}
 
 	ctx->new_ns_list = new_ns_list;
+	/* [한국어] 다음 페이지용 timeout_tsc 재설정 — admin_timeout_ms 단위.
+	 * ms → us → ticks 변환: ms * 1000 * (ticks/sec) / (us/sec=1e6) = ms * ticks_hz / 1000. */
 	ctx->status.timeout_tsc = spdk_get_ticks() + ctx->ctrlr->opts.admin_timeout_ms * 1000 *
 				  spdk_get_ticks_hz() / SPDK_SEC_TO_USEC;
+	/* [한국어] 재귀적으로 다음 페이지 발행 — 본 콜백이 다시 호출될 것임. */
 	nvme_ctrlr_identify_active_ns_async(ctx);
 	return;
 
 out:
+	/* [한국어] DONE 또는 ERROR 도달 시 공통 정리. */
 	ctx->status.done = true;
+	/* [한국어] deleter 가 등록돼 있으면 (비동기 경로의 경우) 호출 — 자원 정리 +
+	 * 상태 전이 (_nvme_active_ns_ctx_deleter 가 swap·destroy·set_state 수행).
+	 * 동기 경로 (nvme_ctrlr_identify_active_ns) 는 deleter=NULL 로 호출하므로
+	 * 호출자가 직접 정리. */
 	if (ctx->deleter) {
 		ctx->deleter(ctx);
 	}
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_identify_active_ns_async -
+ *   Active NS List (CNS 0x02) Identify 발행. 또는 컨트롤러가 미지원이면
+ *   "전체 NS 가 active" 라고 가정한 가짜 목록을 채워 동기 완료시킨다.
+ *
+ * @ctx: identify chain 상태 컨테이너. 호출자가 nvme_active_ns_ctx_create 로
+ *       만들어 전달. ctx->ctrlr / ctx->new_ns_list / ctx->next_nsid 사용.
+ * @return: void (비동기) — 결과는 콜백 또는 deleter 로.
+ *
+ * 동작:
+ *   1. cdata.nn == 0 (네임스페이스 없음) → DONE 직행.
+ *   2. 컨트롤러 버전 < NVMe 1.1 또는 NVME_QUIRK_IDENTIFY_CNS quirk 가 있으면
+ *      CNS 0x02 미지원으로 간주 → "1..nn 전체가 active" 라는 가짜 목록 생성
+ *      (마지막 슬롯에 0 sentinel) 후 DONE.
+ *   3. 그 외 → CNS 0x02 admin Identify 발행, 완료는 active_ns_async_done 콜백.
+ *
+ * 페이징과의 관계: 본 함수는 페이징 루프의 "한 페이지 발행" 단위. done 콜백이
+ * next_nsid 갱신 후 본 함수를 다시 호출 — 페이지가 모두 끝날 때까지 반복.
+ *
+ * 실행 컨텍스트: reactor 스레드 (admin 발행). state machine 전이는
+ *   PROCESSING ↔ DONE/ERROR.
+ *
+ * 호출 체인:
+ *   _nvme_ctrlr_identify_active_ns / nvme_ctrlr_identify_active_ns / done callback
+ *     → [본 함수]
+ *     → nvme_ctrlr_cmd_identify(CNS=0x02)
+ *     → (콜백) nvme_ctrlr_identify_active_ns_async_done
+ */
 static void
 nvme_ctrlr_identify_active_ns_async(struct nvme_active_ns_ctx *ctx)
 {
@@ -4815,17 +5190,22 @@ nvme_ctrlr_identify_active_ns_async(struct nvme_active_ns_ctx *ctx)
 	uint32_t i;
 	int rc;
 
+	/* [한국어] 네임스페이스 0개 → 발행할 것 없음. cdata.nn 은 직전 Identify
+	 * Controller 결과의 NN 필드 (네임스페이스 총 개수). */
 	if (ctrlr->cdata.nn == 0) {
 		ctx->state = NVME_ACTIVE_NS_STATE_DONE;
 		goto out;
 	}
 
+	/* [한국어] new_ns_list 는 ctx_create 가 1 페이지로 미리 할당해두므로 항상 비-NULL. */
 	assert(ctx->new_ns_list != NULL);
 
 	/*
 	 * If controller doesn't support active ns list CNS 0x02 dummy up
 	 * an active ns list, i.e. all namespaces report as active
 	 */
+	/* [한국어] NVMe 1.0 또는 quirk → CNS 0x02 미지원. 1..nn 을 그대로 active 목록으로
+	 * 채워준다 (전체 namespace 가 active 라고 가정). */
 	if (ctrlr->vs.raw < SPDK_NVME_VERSION(1, 1, 0) || ctrlr->quirks & NVME_QUIRK_IDENTIFY_CNS) {
 		uint32_t *new_ns_list;
 
@@ -4833,6 +5213,8 @@ nvme_ctrlr_identify_active_ns_async(struct nvme_active_ns_ctx *ctx)
 		 * Active NS list must always end with zero element.
 		 * So, we allocate for cdata.nn+1.
 		 */
+		/* [한국어] 0 sentinel 자리까지 포함해 nn+1 개 슬롯. 페이지 단위로 올림.
+		 * sizeof(ns_list)/sizeof(uint32_t) = 1024 — 페이지당 1024 NSID 슬롯. */
 		ctx->page_count = spdk_divide_round_up(ctrlr->cdata.nn + 1,
 						       sizeof(struct spdk_nvme_ns_list) / sizeof(new_ns_list[0]));
 		new_ns_list = spdk_realloc(ctx->new_ns_list,
@@ -4845,7 +5227,9 @@ nvme_ctrlr_identify_active_ns_async(struct nvme_active_ns_ctx *ctx)
 		}
 
 		ctx->new_ns_list = new_ns_list;
+		/* [한국어] nn 위치에 0 sentinel — done 콜백이 페이징 종료 판정에 쓰는 규약. */
 		ctx->new_ns_list[ctrlr->cdata.nn] = 0;
+		/* [한국어] NSID 는 1-based — 0..nn-1 인덱스에 1..nn 값을 채움. */
 		for (i = 0; i < ctrlr->cdata.nn; i++) {
 			ctx->new_ns_list[i] = i + 1;
 		}
@@ -4854,6 +5238,9 @@ nvme_ctrlr_identify_active_ns_async(struct nvme_active_ns_ctx *ctx)
 		goto out;
 	}
 
+	/* [한국어] 정상 경로 — CNS 0x02 admin Identify 발행.
+	 * - nsid=next_nsid: 페이징의 시작 NSID (첫 호출은 0, 이후엔 직전 page 의 last + 1 의미).
+	 * - 목적지 버퍼: new_ns_list 의 (page_count-1) 번째 페이지 슬롯 — page_count 가 항상 ≥1. */
 	ctx->state = NVME_ACTIVE_NS_STATE_PROCESSING;
 	rc = nvme_ctrlr_cmd_identify(ctrlr, SPDK_NVME_IDENTIFY_ACTIVE_NS_LIST, 0, ctx->next_nsid, 0,
 				     &ctx->new_ns_list[1024 * (ctx->page_count - 1)], sizeof(struct spdk_nvme_ns_list),
@@ -4866,69 +5253,162 @@ nvme_ctrlr_identify_active_ns_async(struct nvme_active_ns_ctx *ctx)
 	return;
 
 out:
+	/* [한국어] DONE 또는 ERROR 도달 시 deleter 호출 (등록돼 있을 때만).
+	 * deleter 없는 동기 경로는 호출자가 직접 정리. */
 	if (ctx->deleter) {
 		ctx->deleter(ctx);
 	}
 }
 
+/*
+ * [한국어]
+ * _nvme_active_ns_ctx_deleter -
+ *   active NS list 수집이 끝났을 때 호출되는 deleter 콜백.
+ *   ERROR/DONE 양쪽 분기 처리 + ns 트리 교체 + 다음 state 전이.
+ *
+ * @ctx: identify chain 상태 컨테이너.
+ *
+ * 동작:
+ *   1. ERROR 면: ctx 해제 + CTRLR_STATE_ERROR 전이 → init state machine 중단.
+ *   2. DONE 이면:
+ *      a. 기존 NS 트리의 각 ns 에 대해 iocs-specific 데이터 해제 (다음 단계에서
+ *         새로 받을 것이므로 stale 제거).
+ *      b. active_ns_swap 으로 ctrlr->ns 트리를 새 목록으로 교체.
+ *      c. ctx 해제.
+ *      d. CTRLR_STATE_IDENTIFY_NS 로 전이 — 다음 단계는 ns 1개씩 Identify NS.
+ *
+ * 비동기 경로 전용: ctx_create 에 deleter=본 함수로 등록한 경우만 호출.
+ * 동기 경로는 nvme_ctrlr_identify_active_ns 가 직접 swap·destroy 수행.
+ *
+ * 실행 컨텍스트: reactor 스레드 (admin completion 폴링 콜백 안에서).
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_identify_active_ns_async_done → ctx->deleter → [본 함수]
+ *     → nvme_ctrlr_identify_active_ns_swap (트리 교체)
+ *     → nvme_ctrlr_set_state(IDENTIFY_NS) — 다음 단계로 전이
+ */
 static void
 _nvme_active_ns_ctx_deleter(struct nvme_active_ns_ctx *ctx)
 {
 	struct spdk_nvme_ctrlr *ctrlr = ctx->ctrlr;
 	struct spdk_nvme_ns *ns;
 
+	/* [한국어] ERROR 면 정리 후 state machine 중단 — 이후 controller 사용 불가. */
 	if (ctx->state == NVME_ACTIVE_NS_STATE_ERROR) {
 		nvme_active_ns_ctx_destroy(ctx);
 		nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_ERROR, NVME_TIMEOUT_INFINITE);
 		return;
 	}
 
+	/* [한국어] state machine 불변식 — async 콜백은 DONE/ERROR 둘 중 하나만 도달. */
 	assert(ctx->state == NVME_ACTIVE_NS_STATE_DONE);
 
+	/* [한국어] 기존 ns 트리의 모든 ns 의 iocs-specific data 해제 — 다음 IDENTIFY_NS
+	 * 단계에서 새로 받을 것이므로 stale 데이터를 미리 비운다. RB_FOREACH 는 RB-tree
+	 * in-order traversal (NSID 오름차순). */
 	RB_FOREACH(ns, nvme_ns_tree, &ctrlr->ns) {
 		nvme_ns_free_iocs_specific_data(ns);
 	}
 
+	/* [한국어] 새 active NS 목록을 ctrlr->ns 트리에 반영 — 추가된 ns insert, 제거된 ns
+	 * delete. page_count * 1024 = 새 목록의 최대 슬롯 수 (마지막 0 sentinel 포함).
+	 * swap 함수 안에서 active_ns_count 도 갱신. */
 	nvme_ctrlr_identify_active_ns_swap(ctrlr, ctx->new_ns_list, ctx->page_count * 1024);
 	nvme_active_ns_ctx_destroy(ctx);
+	/* [한국어] 다음 단계: 각 active NS 에 대해 Identify Namespace (CNS 0x00) 발행.
+	 * 시작은 nvme_ctrlr_identify_namespaces 가 처리. */
 	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_IDENTIFY_NS, ctrlr->opts.admin_timeout_ms);
 }
 
+/*
+ * [한국어]
+ * _nvme_ctrlr_identify_active_ns -
+ *   state machine 의 IDENTIFY_ACTIVE_NS 진입점.
+ *
+ * @ctrlr: 대상 컨트롤러.
+ *
+ * 동작: ctx 객체 생성 → deleter 등록 → state 를 WAIT_FOR_IDENTIFY_ACTIVE_NS
+ * 로 전이 (timeout 감시 활성화) → 첫 페이지 발행. 이후 모든 후속 처리는
+ * async 콜백/deleter 체인이 이어 받는다.
+ *
+ * 실행 컨텍스트: state machine 처리 루프 (process_init).
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_process_init (state IDENTIFY_ACTIVE_NS)
+ *     → [본 함수]
+ *     → nvme_ctrlr_identify_active_ns_async (첫 페이지)
+ *     → (async 완료 chain)
+ *     → _nvme_active_ns_ctx_deleter → state IDENTIFY_NS
+ */
 static void
 _nvme_ctrlr_identify_active_ns(struct spdk_nvme_ctrlr *ctrlr)
 {
 	struct nvme_active_ns_ctx *ctx;
 
+	/* [한국어] deleter 콜백 등록 — 비동기 종료 시 자동 swap/state 전이 보장. */
 	ctx = nvme_active_ns_ctx_create(ctrlr, _nvme_active_ns_ctx_deleter);
 	if (!ctx) {
 		nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_ERROR, NVME_TIMEOUT_INFINITE);
 		return;
 	}
 
+	/* [한국어] WAIT_FOR_IDENTIFY_ACTIVE_NS 로 전이 — admin_timeout_ms 안에 끝나야 함. */
 	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_WAIT_FOR_IDENTIFY_ACTIVE_NS,
 			     ctrlr->opts.admin_timeout_ms);
+	/* [한국어] 첫 페이지 발행 — 후속은 콜백 chain. */
 	nvme_ctrlr_identify_active_ns_async(ctx);
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_identify_active_ns -
+ *   Active NS list 수집의 동기 버전. 결과를 ctrlr->ns 트리에 즉시 swap.
+ *
+ * @ctrlr: 대상 컨트롤러.
+ * @return: 0 성공. -ENOMEM (ctx 할당 실패) / -ENXIO (admin 명령 실패 또는 timeout).
+ *
+ * 차이점 (vs _nvme_ctrlr_identify_active_ns):
+ *   - 동기: 본 함수는 호출 즉시 nvme_wait_for_adminq_completion 으로 polling 완료까지 block.
+ *   - deleter=NULL: 호출자가 직접 swap·destroy 수행.
+ *   - state machine 전이 없음: spdk_nvme_ctrlr_reset 등 reset 경로에서 호출됨.
+ *
+ * 동기 폴링 패턴: nvme_wait_for_adminq_completion 이 timeout 또는 status.done=true
+ * 까지 admin completion 을 폴링한다. async 콜백 chain 이 status.done 을 세팅.
+ *
+ * 실행 컨텍스트: reset / NS rescan 등 동기 호출 경로 (reactor 스레드).
+ *
+ * 호출 체인:
+ *   spdk_nvme_ctrlr_reset / 외부 → [본 함수]
+ *     → nvme_ctrlr_identify_active_ns_async (first page)
+ *     → nvme_wait_for_adminq_completion (block until done)
+ *     → nvme_ctrlr_identify_active_ns_swap (swap directly)
+ */
 int
 nvme_ctrlr_identify_active_ns(struct spdk_nvme_ctrlr *ctrlr)
 {
 	struct nvme_active_ns_ctx *ctx;
 	int rc;
 
+	/* [한국어] deleter 없이 ctx 생성 — 동기 경로에서는 본 함수가 직접 정리. */
 	ctx = nvme_active_ns_ctx_create(ctrlr, NULL);
 	if (!ctx) {
 		return -ENOMEM;
 	}
 
+	/* [한국어] 첫 페이지 발행 — 컨트롤러가 NVMe 1.0 / quirk 면 즉시 DONE
+	 * (admin 명령 없이 가짜 목록 채움), 그 외에는 admin 명령이 in-flight 로. */
 	nvme_ctrlr_identify_active_ns_async(ctx);
 	if (ctx->state == NVME_ACTIVE_NS_STATE_ERROR) {
 		nvme_active_ns_ctx_destroy(ctx);
 		return -ENXIO;
 	}
 
+	/* [한국어] admin completion 폴링 — status.done 또는 timeout 까지 block.
+	 * 두 번째 인자 false = "command 자체의 status 검사는 호출자가 수행".
+	 * 페이징이 여러 번 발생해도 마지막 콜백이 status.done=true 로 세팅하면 빠져나옴. */
 	rc = nvme_wait_for_adminq_completion(ctrlr, &ctx->status, false);
 	if (rc || ctx->state == NVME_ACTIVE_NS_STATE_ERROR) {
+		/* [한국어] timed_out 이면 done 콜백이 ctx 를 이미 destroy 했을 수 있음 — 중복 destroy 금지. */
 		if (!ctx->status.timed_out) {
 			nvme_active_ns_ctx_destroy(ctx);
 		}
@@ -4938,12 +5418,39 @@ nvme_ctrlr_identify_active_ns(struct spdk_nvme_ctrlr *ctrlr)
 		return -ENXIO;
 	}
 
+	/* [한국어] 성공 — swap·destroy 직접 수행 (deleter 없는 동기 경로의 책임). */
 	assert(ctx->state == NVME_ACTIVE_NS_STATE_DONE);
 	nvme_ctrlr_identify_active_ns_swap(ctrlr, ctx->new_ns_list, ctx->page_count * 1024);
 	nvme_active_ns_ctx_destroy(ctx);
 	return rc;
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_identify_ns_async_done -
+ *   Identify Namespace (CNS 0x00) 완료 콜백. 한 ns 가 끝나면 다음 active ns 로 진행.
+ *
+ * @arg: 처리 중이던 spdk_nvme_ns. admin 발행 시 cb_arg 로 등록한 동일 객체.
+ * @cpl: 완료 entry.
+ *
+ * 동작 (per-ns identify chain):
+ *   1. handle_identify_ns_completion 으로 cpl 검사 + nsdata 후처리 (ABORT 등 분기).
+ *      실패면 controller ERROR 전이.
+ *   2. nvme_ns_set_identify_data 로 nsdata 의 필드를 ns 객체에 캐싱 (sector_size,
+ *      sectors, md_size, pi_type 등).
+ *   3. get_next_active_ns 로 다음 active NSID 조회. NULL 이면 모든 active ns 의
+ *      Identify Namespace 가 끝났다는 의미 → CTRLR_STATE_IDENTIFY_ID_DESCS 로 전이.
+ *   4. 다음 ns 가 있으면 nvme_ctrlr_identify_ns_async 재호출 — 다음 콜백이 본 함수.
+ *
+ * 결과적으로 본 함수는 "active NS 1개씩 순차 처리" 의 루프 본체 역할.
+ *
+ * 실행 컨텍스트: reactor 스레드 (admin completion).
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_cmd_identify(CNS=0x00) 완료 → [본 콜백]
+ *     → (next ns 있음) nvme_ctrlr_identify_ns_async → 다시 본 콜백
+ *     → (전부 끝) state IDENTIFY_ID_DESCS → nvme_ctrlr_identify_id_desc_async
+ */
 static void
 nvme_ctrlr_identify_ns_async_done(void *arg, const struct spdk_nvme_cpl *cpl)
 {
@@ -4952,45 +5459,100 @@ nvme_ctrlr_identify_ns_async_done(void *arg, const struct spdk_nvme_cpl *cpl)
 	uint32_t nsid;
 	int rc;
 
+	/* [한국어] cpl 검사 + nsdata 후처리 (lbaf/pi 등 도출). 실패면 controller 자체를 ERROR. */
 	if (nvme_ctrlr_handle_identify_ns_completion(ctrlr, ns, cpl)) {
 		nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_ERROR, NVME_TIMEOUT_INFINITE);
 		return;
 	}
 
+	/* [한국어] nsdata → ns 의 hot 필드들로 복사 (sector_size, extended_lba_size,
+	 * md_size, pi_type 등). bdev/io path 가 매번 nsdata 를 파싱하지 않게. */
 	nvme_ns_set_identify_data(ns);
 
 	/* move on to the next active NS */
+	/* [한국어] active NS 트리에서 다음 NSID 조회 — 0 = 더 없음. */
 	nsid = spdk_nvme_ctrlr_get_next_active_ns(ctrlr, ns->id);
 	ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
 	if (ns == NULL) {
+		/* [한국어] 모든 active NS 의 CNS=0x00 완료 — 다음 단계 IDENTIFY_ID_DESCS.
+		 * (NS ID descriptor list CNS=0x03 — NSID 의 NGUID/EUI64/UUID 조회) */
 		nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_IDENTIFY_ID_DESCS,
 				     ctrlr->opts.admin_timeout_ms);
 		return;
 	}
+	/* [한국어] 다음 ns 객체의 ctrlr/id 필드 재설정 (방어적 코딩 — get_ns 가 반환한
+	 * 객체는 이미 ctrlr/id 가 채워져 있어야 하지만 swap 직후 초기 상태 보장). */
 	ns->ctrlr = ctrlr;
 	ns->id = nsid;
 
+	/* [한국어] 다음 ns 의 Identify NS 발행 — 콜백이 본 함수로 재진입. */
 	rc = nvme_ctrlr_identify_ns_async(ns);
 	if (rc) {
 		nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_ERROR, NVME_TIMEOUT_INFINITE);
 	}
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_identify_ns_async -
+ *   주어진 ns 1개에 대해 Identify Namespace (CNS 0x00) admin 발행.
+ *
+ * @ns: 대상 ns. ns->id (NSID), ns->ctrlr (소속 컨트롤러), ns->nsdata
+ *      (결과 저장 버퍼 — 4096바이트) 사용.
+ * @return: 0 = 발행 성공 (비동기), 음수 = -errno.
+ *
+ * NVMe spec: CNS 0x00 = Identify Namespace, NSID 지정, 데이터 4096B.
+ * 결과 nsdata 에는 NSZE/NCAP/NUSE/NSFEAT/LBAF[16]/DPS/PI 등 ns 메타데이터.
+ *
+ * state 전이: 호출 시점에 WAIT_FOR_IDENTIFY_NS 로 전환 — admin_timeout_ms 안에
+ *   콜백이 도달해야 함. timeout 시 state machine 이 ERROR.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_identify_namespaces (첫 ns)
+ *   또는 nvme_ctrlr_identify_ns_async_done (다음 ns)
+ *     → [본 함수]
+ *     → nvme_ctrlr_cmd_identify(CNS=0x00)
+ *     → (콜백) nvme_ctrlr_identify_ns_async_done
+ */
 static int
 nvme_ctrlr_identify_ns_async(struct spdk_nvme_ns *ns)
 {
 	struct spdk_nvme_ctrlr *ctrlr = ns->ctrlr;
 	struct spdk_nvme_ns_data *nsdata;
 
+	/* [한국어] nsdata 는 ns 내부 4KiB 버퍼 — admin 응답을 직접 받음. */
 	nsdata = &ns->nsdata;
 
+	/* [한국어] state 전이 — 콜백이 도착하기 전까지 WAIT_FOR_IDENTIFY_NS.
+	 * admin_timeout_ms 가 지나면 process_init 가 timeout 처리. */
 	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_WAIT_FOR_IDENTIFY_NS,
 			     ctrlr->opts.admin_timeout_ms);
+	/* [한국어] CNS=0x00 발행 — NSID=ns->id, CSI=0 (NVM Command Set), CNTID 무시. */
 	return nvme_ctrlr_cmd_identify(ns->ctrlr, SPDK_NVME_IDENTIFY_NS, 0, ns->id, 0,
 				       nsdata, sizeof(*nsdata),
 				       nvme_ctrlr_identify_ns_async_done, ns);
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_identify_namespaces -
+ *   state machine 의 IDENTIFY_NS 진입점. 첫 active NS 에 대해 Identify NS 발행.
+ *
+ * @ctrlr: 대상 컨트롤러.
+ * @return: 0 = 발행 성공 또는 active NS 없음. 음수 = 발행 실패.
+ *
+ * 동작:
+ *   1. 첫 active NSID 조회 (active_ns 트리에서 최소값).
+ *   2. ns 가 없으면 (= active NS 0개) → IDENTIFY_ID_DESCS 로 건너뜀.
+ *   3. ns 가 있으면 → ctrlr/id 설정 후 identify_ns_async 호출.
+ *      이후 done 콜백 chain 이 모든 active ns 를 순회.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_process_init (state IDENTIFY_NS)
+ *     → [본 함수]
+ *     → nvme_ctrlr_identify_ns_async (첫 ns)
+ *     → (async chain) 모든 ns 완료 → state IDENTIFY_ID_DESCS
+ */
 static int
 nvme_ctrlr_identify_namespaces(struct spdk_nvme_ctrlr *ctrlr)
 {
@@ -4998,15 +5560,18 @@ nvme_ctrlr_identify_namespaces(struct spdk_nvme_ctrlr *ctrlr)
 	struct spdk_nvme_ns *ns;
 	int rc;
 
+	/* [한국어] active NS 트리의 최소 NSID. 0 = 없음. */
 	nsid = spdk_nvme_ctrlr_get_first_active_ns(ctrlr);
 	ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
 	if (ns == NULL) {
 		/* No active NS, move on to the next state */
+		/* [한국어] active NS 0개 — IDENTIFY_NS 단계 건너뛰고 IDENTIFY_ID_DESCS 로. */
 		nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_IDENTIFY_ID_DESCS,
 				     ctrlr->opts.admin_timeout_ms);
 		return 0;
 	}
 
+	/* [한국어] 첫 ns 의 ctrlr/id 세팅 후 async chain 시작. */
 	ns->ctrlr = ctrlr;
 	ns->id = nsid;
 
@@ -5018,6 +5583,32 @@ nvme_ctrlr_identify_namespaces(struct spdk_nvme_ctrlr *ctrlr)
 	return rc;
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_identify_namespaces_iocs_specific_next -
+ *   I/O Command Set Specific Identify Namespace (CNS 0x05 ZNS / 0x08 NVM-specific)
+ *   를 active NS 마다 순회 발행. ZNS·NVM 분기는 ns->csi 기반.
+ *
+ * @ctrlr: 대상 컨트롤러.
+ * @prev_nsid: 직전 처리한 NSID. 0 이면 첫 호출 (= first active ns 부터 시작).
+ * @return: 0 = 발행 성공 또는 처리 완료, 음수 = 발행 실패.
+ *
+ * 동작:
+ *   1. prev_nsid == 0 → get_first_active_ns, 그 외 → get_next_active_ns(prev_nsid).
+ *   2. 더 없으면 IDENTIFY_NS_IOCS_SPECIFIC 단계 종료 → SET_SUPPORTED_INTEL_LOG_PAGES 로.
+ *   3. ns->csi 에 따라 zns_specific_async 또는 nvm_specific_async 발행.
+ *   4. 각 콜백 (zns/nvm_specific_async_done) 이 본 함수를 prev_nsid=현재 ns->id 로 재호출.
+ *
+ * iterator 패턴 — 외부 chain 의 다음 단계로 넘어가기 전에 모든 active ns 의
+ * I/O command set specific data 를 수집한다.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_identify_namespaces_iocs_specific (chain 시작, prev_nsid=0)
+ *   또는 zns/nvm_specific_async_done (다음 ns)
+ *     → [본 함수]
+ *     → ns->csi 분기 → identify_ns_zns_specific_async / identify_ns_nvm_specific_async
+ *     → (async chain) 또는 다음 state 전이
+ */
 static int
 nvme_ctrlr_identify_namespaces_iocs_specific_next(struct spdk_nvme_ctrlr *ctrlr, uint32_t prev_nsid)
 {
@@ -6309,11 +6900,35 @@ nvme_ctrlr_configure_aer(struct spdk_nvme_ctrlr *ctrlr)
 	                                         *         WAIT_FOR_CONFIGURE_AER state 처리(노옵)하다가 콜백 발화 시 다음 state. */
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_get_process - 주어진 PID 의 active process 객체를 반환.
+ *
+ * @ctrlr: 대상 컨트롤러.
+ * @pid: 찾을 PID.
+ * @return: 일치하는 spdk_nvme_ctrlr_process*, 없으면 NULL.
+ *
+ * SPDK multi-process 모델: 하나의 NVMe 컨트롤러를 DPDK primary + secondary
+ * 프로세스 여러 개가 공유 가능. 각 프로세스마다 자신의 active_reqs, IO qpair
+ * 목록, AER 큐, ref count 등 per-process 상태를 보관 — `struct
+ * spdk_nvme_ctrlr_process` 가 그 단위. ctrlr->active_procs TAILQ 가 모든
+ * 활성 프로세스의 리스트.
+ *
+ * 동기화: 호출 측이 nvme_ctrlr_lock 보유 가정 (TAILQ 순회 중 다른 프로세스가
+ * add/remove 하면 corruption).
+ *
+ * 실행 컨텍스트: ctrlr_lock 안에서 호출. O(n) 선형 탐색 (n=프로세스 수 — 보통 1~2).
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_get_current_process / add_process(dup 검사) / proc_get_ref / put_ref
+ *     → [본 함수]
+ */
 struct spdk_nvme_ctrlr_process *
 nvme_ctrlr_get_process(struct spdk_nvme_ctrlr *ctrlr, pid_t pid)
 {
 	struct spdk_nvme_ctrlr_process	*active_proc;
 
+	/* [한국어] active_procs TAILQ 순회 — 보통 1~2 entries 라 O(n) 충분. */
 	TAILQ_FOREACH(active_proc, &ctrlr->active_procs, tailq) {
 		if (active_proc->pid == pid) {
 			return active_proc;
@@ -6323,17 +6938,43 @@ nvme_ctrlr_get_process(struct spdk_nvme_ctrlr *ctrlr, pid_t pid)
 	return NULL;
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_get_current_process - 현재 프로세스(getpid()) 의 ctrlr_process 객체 반환.
+ *
+ * 편의 함수 — 가장 흔한 패턴인 "이 프로세스 자신의 per-process state" 조회.
+ * 호출자 측에서 ctrlr_lock 보유 가정.
+ */
 struct spdk_nvme_ctrlr_process *
 nvme_ctrlr_get_current_process(struct spdk_nvme_ctrlr *ctrlr)
 {
 	return nvme_ctrlr_get_process(ctrlr, getpid());
 }
 
-/**
- * This function will be called when a process is using the controller.
- *  1. For the primary process, it is called when constructing the controller.
- *  2. For the secondary process, it is called at probing the controller.
- * Note: will check whether the process is already added for the same process.
+/*
+ * [한국어]
+ * nvme_ctrlr_add_process -
+ *   현재 프로세스를 컨트롤러의 active_procs 에 등록. multi-process 환경에서
+ *   각 프로세스가 컨트롤러를 attach 할 때 호출된다.
+ *
+ * @ctrlr: 대상 컨트롤러.
+ * @devhandle: PCIe transport 의 device handle (`spdk_pci_device*`) — secondary
+ *             process 에서 detach 시 해제하려면 보관 필요.
+ * @return: 0 성공 (또는 이미 등록), -1 메모리 할당 실패.
+ *
+ * 동작:
+ *   1. Primary 의 경우: controller construct 시점에 호출 (probe_internal 경로).
+ *   2. Secondary 의 경우: probe 시 attach 단계에서 호출.
+ *   3. 동일 PID 가 이미 등록돼 있으면 멱등 (no-op).
+ *   4. 새 ctrlr_process 객체를 SPDK_MALLOC_SHARE 로 할당 — DPDK 공유 메모리
+ *      (hugepage)에 두어 secondary process 가 같은 객체 보고 가능.
+ *   5. per-process 필드 초기화: is_primary, pid, active_reqs (큐 깊이 추적),
+ *      devhandle, ref=0, allocated_io_qpairs, async_events 큐.
+ *
+ * 동기화: 호출 측에서 ctrlr_lock 보유 가정.
+ *
+ * 호출 체인:
+ *   probe / attach 경로 → [본 함수] → spdk_zmalloc + TAILQ_INSERT_TAIL
  */
 int
 nvme_ctrlr_add_process(struct spdk_nvme_ctrlr *ctrlr, void *devhandle)
@@ -6342,11 +6983,15 @@ nvme_ctrlr_add_process(struct spdk_nvme_ctrlr *ctrlr, void *devhandle)
 	pid_t				pid = getpid();
 
 	/* Check whether the process is already added or not */
+	/* [한국어] 멱등성 — 같은 PID 의 등록 시도가 중복 호출이면 no-op. */
 	if (nvme_ctrlr_get_process(ctrlr, pid)) {
 		return 0;
 	}
 
 	/* Initialize the per process properties for this ctrlr */
+	/* [한국어] SPDK_MALLOC_SHARE — DPDK 공유 메모리 (hugepage) 풀에서 할당.
+	 * 이래야 secondary process 가 자기 가상주소 공간에서 같은 물리 페이지 접근 가능.
+	 * 64B alignment 는 캐시라인 정렬 + SPDK 관례. */
 	ctrlr_proc = spdk_zmalloc(sizeof(struct spdk_nvme_ctrlr_process),
 				  64, NULL, SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_SHARE);
 	if (ctrlr_proc == NULL) {
@@ -6355,22 +7000,42 @@ nvme_ctrlr_add_process(struct spdk_nvme_ctrlr *ctrlr, void *devhandle)
 		return -1;
 	}
 
-	ctrlr_proc->is_primary = spdk_process_is_primary();
+	/* [한국어] per-process 필드 초기화. */
+	ctrlr_proc->is_primary = spdk_process_is_primary();  /* DPDK primary 여부 */
 	ctrlr_proc->pid = pid;
-	STAILQ_INIT(&ctrlr_proc->active_reqs);
-	ctrlr_proc->devhandle = devhandle;
-	ctrlr_proc->ref = 0;
-	TAILQ_INIT(&ctrlr_proc->allocated_io_qpairs);
-	STAILQ_INIT(&ctrlr_proc->async_events);
+	STAILQ_INIT(&ctrlr_proc->active_reqs);    /* 발행 중인 admin/io request 추적 */
+	ctrlr_proc->devhandle = devhandle;        /* PCIe detach 시 사용 */
+	ctrlr_proc->ref = 0;                      /* 이 프로세스의 ref count 시작 */
+	TAILQ_INIT(&ctrlr_proc->allocated_io_qpairs);  /* 이 프로세스가 할당한 IO qpair */
+	STAILQ_INIT(&ctrlr_proc->async_events);   /* 이 프로세스용 AER 큐 */
 
+	/* [한국어] 컨트롤러의 active_procs TAILQ 끝에 추가. ctrlr_lock 으로 보호. */
 	TAILQ_INSERT_TAIL(&ctrlr->active_procs, ctrlr_proc, tailq);
 
 	return 0;
 }
 
-/**
- * This function will be called when the process detaches the controller.
- * Note: the ctrlr_lock must be held when calling this function.
+/*
+ * [한국어]
+ * nvme_ctrlr_remove_process -
+ *   정상 detach 경로 — 프로세스가 명시적으로 controller 를 떠날 때 호출.
+ *
+ * @ctrlr: 대상 컨트롤러.
+ * @proc: 제거할 ctrlr_process (자기 자신 또는 inactive 정리 대상).
+ *
+ * 동작 순서:
+ *   1. active_reqs 비어 있어야 함 (정상 detach 전제 — admin/io 완료).
+ *   2. 이 프로세스가 할당한 모든 IO qpair 를 해제 (spdk_nvme_ctrlr_free_io_qpair).
+ *   3. active_procs TAILQ 에서 제거.
+ *   4. PCIe transport 면 spdk_pci_device_detach 로 devhandle 해제 (DPDK
+ *      PCI 리소스 반환).
+ *   5. proc 자체 free (SPDK_MALLOC_SHARE 였으므로 hugepage 반환).
+ *
+ * 동기화: 호출 측이 ctrlr_lock 보유 가정 (다른 프로세스의 ref/list 조작과 race 방지).
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_proc_put_ref (ref=0 도달 + last 아님)
+ *     → [본 함수]
  */
 static void
 nvme_ctrlr_remove_process(struct spdk_nvme_ctrlr *ctrlr,
@@ -6378,26 +7043,53 @@ nvme_ctrlr_remove_process(struct spdk_nvme_ctrlr *ctrlr,
 {
 	struct spdk_nvme_qpair	*qpair, *tmp_qpair;
 
+	/* [한국어] 정상 detach 전제 — 발행 중인 request 없음. ungraceful 종료는
+	 * nvme_ctrlr_cleanup_process 가 처리. */
 	assert(STAILQ_EMPTY(&proc->active_reqs));
 
+	/* [한국어] 이 프로세스가 보유한 모든 IO qpair 해제. _SAFE 매크로로
+	 * iterator 무효화 회피 (free 가 qpair 를 free 하므로 다음 노드 미리 캐싱). */
 	TAILQ_FOREACH_SAFE(qpair, &proc->allocated_io_qpairs, per_process_tailq, tmp_qpair) {
 		spdk_nvme_ctrlr_free_io_qpair(qpair);
 	}
 
 	TAILQ_REMOVE(&ctrlr->active_procs, proc, tailq);
 
+	/* [한국어] PCIe transport 한정 — DPDK 의 PCI 디바이스 핸들 detach. Fabrics
+	 * (RDMA/TCP) 는 devhandle=NULL 이므로 해당 없음. */
 	if (ctrlr->trid.trtype == SPDK_NVME_TRANSPORT_PCIE) {
 		spdk_pci_device_detach(proc->devhandle);
 	}
 
+	/* [한국어] proc 자체 해제 (SPDK_MALLOC_SHARE 로 잡혔으므로 hugepage 반환). */
 	spdk_free(proc);
 }
 
-/**
- * This function will be called when the process exited unexpectedly
- *  in order to free any incomplete nvme request, allocated IO qpairs
- *  and allocated memory.
- * Note: the ctrlr_lock must be held when calling this function.
+/*
+ * [한국어]
+ * nvme_ctrlr_cleanup_process -
+ *   비정상 종료 (kill -9, SEGV 등) 한 프로세스의 자원 강제 정리.
+ *
+ * @proc: 비정상 종료된 프로세스의 ctrlr_process 객체.
+ *
+ * 동작:
+ *   1. 발행 중이던 모든 request 강제 free — 정상 detach 와 달리 대기 없이 즉시 정리.
+ *   2. 미수신 AER 이벤트 free.
+ *   3. 할당된 모든 IO qpair 해제 — in_completion_context 강제 0 으로 reset (프로세스가
+ *      completion 처리 중에 죽었을 수 있으므로). no_deletion_notification_needed=1
+ *      로 컨트롤러에 Delete IO Q admin 명령 skip (이미 죽은 프로세스 위해 발행 무의미).
+ *   4. proc 자체 free.
+ *
+ * normal vs cleanup 비교:
+ *   - remove_process: active_reqs 비어 있음 가정 (정상 detach).
+ *   - cleanup_process: active_reqs 강제 정리 (kill 등으로 in-flight 남음).
+ *
+ * 동기화: 호출 측이 ctrlr_lock 보유 가정. 보통 remove_inactive_proc 가
+ * `kill(pid, 0) == -1 && errno == ESRCH` 로 죽은 프로세스 감지 후 호출.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_remove_inactive_proc (PID 존재 확인 실패)
+ *     → [본 함수]
  */
 static void
 nvme_ctrlr_cleanup_process(struct spdk_nvme_ctrlr_process *proc)
@@ -6406,21 +7098,25 @@ nvme_ctrlr_cleanup_process(struct spdk_nvme_ctrlr_process *proc)
 	struct spdk_nvme_qpair	*qpair, *tmp_qpair;
 	struct spdk_nvme_ctrlr_aer_completion *event;
 
+	/* [한국어] 발행 중이던 request 들 강제 정리 — 콜백 호출 없이 그냥 free.
+	 * 프로세스가 죽었으므로 콜백 대상이 없다. */
 	STAILQ_FOREACH_SAFE(req, &proc->active_reqs, stailq, tmp_req) {
 		STAILQ_REMOVE(&proc->active_reqs, req, nvme_request, stailq);
 
 		assert(req->pid == proc->pid);
-		nvme_cleanup_user_req(req);
+		nvme_cleanup_user_req(req);   /* 사용자 버퍼 unmap 등 */
 		nvme_free_request(req);
 	}
 
 	/* Remove async event from each process objects event list */
+	/* [한국어] 이 프로세스가 받지 못한 AER 이벤트 큐 정리. */
 	while (!STAILQ_EMPTY(&proc->async_events)) {
 		event = STAILQ_FIRST(&proc->async_events);
 		STAILQ_REMOVE_HEAD(&proc->async_events, link);
 		spdk_free(event);
 	}
 
+	/* [한국어] 이 프로세스가 할당한 IO qpair 들 정리. */
 	TAILQ_FOREACH_SAFE(qpair, &proc->allocated_io_qpairs, per_process_tailq, tmp_qpair) {
 		TAILQ_REMOVE(&proc->allocated_io_qpairs, qpair, per_process_tailq);
 
@@ -6429,8 +7125,13 @@ nvme_ctrlr_cleanup_process(struct spdk_nvme_ctrlr_process *proc)
 		 *  completion context.  Clear that flag here to allow these IO
 		 *  qpairs to be deleted.
 		 */
+		/* [한국어] 죽은 시점에 completion 폴링 중이었다면 in_completion_context=1
+		 * 로 남아 있어 정상 free 가 거부됨 — 여기서 강제 reset. */
 		qpair->in_completion_context = 0;
 
+		/* [한국어] no_deletion_notification_needed=1 → Delete IOSQ/IOCQ admin
+		 * 명령 발행 skip. 이미 죽은 프로세스를 위해 컨트롤러에 알릴 필요 없음
+		 * (성능 + 죽은 프로세스의 qpair 가 어차피 사용 불가). */
 		qpair->no_deletion_notification_needed = 1;
 
 		spdk_nvme_ctrlr_free_io_qpair(qpair);
@@ -6486,6 +7187,26 @@ nvme_ctrlr_remove_inactive_proc(struct spdk_nvme_ctrlr *ctrlr)
 	return active_proc_count;
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_proc_get_ref -
+ *   현재 프로세스의 ref count 증가. multi-process 환경의 reference counting 진입.
+ *
+ * @ctrlr: 대상 컨트롤러.
+ *
+ * 동작:
+ *   1. ctrlr_lock 보유.
+ *   2. remove_inactive_proc 로 죽은 프로세스 정리 (housekeeping).
+ *   3. 현재 프로세스의 ctrlr_process 찾아 ref++.
+ *   4. ctrlr_lock 해제.
+ *
+ * 용도: bdev_nvme 등 상위 모듈이 컨트롤러를 사용하는 동안 ref 를 잡아 두어,
+ * 다른 프로세스가 detach 시도해도 자원이 일찍 회수되지 않게 한다.
+ * `nvme_ctrlr_proc_put_ref` 와 대칭 (acquire/release 패턴).
+ *
+ * 호출 체인:
+ *   bdev_nvme 등 → [본 함수] → ref++
+ */
 void
 nvme_ctrlr_proc_get_ref(struct spdk_nvme_ctrlr *ctrlr)
 {
@@ -6493,6 +7214,7 @@ nvme_ctrlr_proc_get_ref(struct spdk_nvme_ctrlr *ctrlr)
 
 	nvme_ctrlr_lock(ctrlr);
 
+	/* [한국어] 죽은 프로세스 정리 — get/put_ref 마다 호출되어 lazy cleanup. */
 	nvme_ctrlr_remove_inactive_proc(ctrlr);
 
 	active_proc = nvme_ctrlr_get_current_process(ctrlr);
@@ -6503,6 +7225,28 @@ nvme_ctrlr_proc_get_ref(struct spdk_nvme_ctrlr *ctrlr)
 	nvme_ctrlr_unlock(ctrlr);
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_proc_put_ref -
+ *   현재 프로세스의 ref count 감소. 0 도달 시 (단, 마지막 프로세스가 아니면)
+ *   process 객체 제거.
+ *
+ * @ctrlr: 대상 컨트롤러.
+ *
+ * 동작:
+ *   1. lock 보유.
+ *   2. 죽은 프로세스 정리 + 살아있는 프로세스 수 카운트.
+ *   3. 현재 프로세스의 ref-- + assert(ref >= 0) — under-flow 방지.
+ *   4. ref == 0 이고 proc_count != 1 (= 마지막 아님) 이면 remove_process 호출.
+ *      마지막 프로세스의 process 객체는 ctrlr destruct 시 일괄 처리.
+ *   5. lock 해제.
+ *
+ * "마지막은 남겨둠" 이유: 마지막 프로세스가 ref=0 으로 detach 하는 순간 컨트롤러
+ * 자체를 free 해야 하는데, 그 흐름은 spdk_nvme_detach 의 상위에서 처리.
+ *
+ * 호출 체인:
+ *   bdev_nvme 등 detach 시 → [본 함수] → ref-- → (last 아니면) remove_process
+ */
 void
 nvme_ctrlr_proc_put_ref(struct spdk_nvme_ctrlr *ctrlr)
 {
@@ -6511,6 +7255,7 @@ nvme_ctrlr_proc_put_ref(struct spdk_nvme_ctrlr *ctrlr)
 
 	nvme_ctrlr_lock(ctrlr);
 
+	/* [한국어] 죽은 프로세스 정리 — proc_count 는 정리 후 살아있는 프로세스 수. */
 	proc_count = nvme_ctrlr_remove_inactive_proc(ctrlr);
 
 	active_proc = nvme_ctrlr_get_current_process(ctrlr);
@@ -6522,6 +7267,8 @@ nvme_ctrlr_proc_put_ref(struct spdk_nvme_ctrlr *ctrlr)
 		 * The last active process will be removed at the end of
 		 * the destruction of the controller.
 		 */
+		/* [한국어] ref=0 도달 + 마지막 프로세스가 아닌 경우만 즉시 remove.
+		 * 마지막은 ctrlr destruct path 가 nvme_ctrlr_free_processes 로 처리. */
 		if (active_proc->ref == 0 && proc_count != 1) {
 			nvme_ctrlr_remove_process(ctrlr, active_proc);
 		}
@@ -7889,10 +8636,31 @@ spdk_nvme_ctrlr_process_admin_completions(struct spdk_nvme_ctrlr *ctrlr)
 	return num_completions;
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_get_data - Identify Controller 응답 데이터(4KB raw) 포인터 반환 (공개 API)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @return ctrlr->cdata 의 const 포인터 — 4KB struct spdk_nvme_ctrlr_data (Identify Ctrlr 응답 raw).
+ *
+ * NVMe Spec §5.15.2.2 Identify Controller 응답 구조 그대로:
+ *   - vid, ssvid: PCIe vendor/subsystem vendor ID
+ *   - mn, sn, fr: model name, serial number, firmware revision
+ *   - mdts: maximum data transfer size
+ *   - cntlid, ver: controller ID, NVMe version
+ *   - oacs, oncs, fuses: 지원 admin/IO/fused 명령 비트맵
+ *   - nn: number of namespaces (최대 NSID)
+ *   - vwc, awun, awupf: write cache, atomic write unit
+ *   - nvme-oF 추가 필드: ioccsz, iorcsz, icdoff, ctratt 등
+ *
+ * 사용처: bdev_nvme 가 SSD 모델/serial/펌웨어 표시, MDTS 기반 split 계산, 능력 비트 검사.
+ *
+ * 동기화: read-only, cdata 는 controller init 후 변경 없음 — 잠금 불필요.
+ */
 const struct spdk_nvme_ctrlr_data *
 spdk_nvme_ctrlr_get_data(struct spdk_nvme_ctrlr *ctrlr)
 {
-	return &ctrlr->cdata;
+	return &ctrlr->cdata;         /* [한국어] 4KB raw Identify Controller 응답 — read-only. */
 }
 
 union spdk_nvme_csts_register spdk_nvme_ctrlr_get_regs_csts(struct spdk_nvme_ctrlr *ctrlr)
@@ -7958,66 +8726,137 @@ union spdk_nvme_bpinfo_register spdk_nvme_ctrlr_get_regs_bpinfo(struct spdk_nvme
 	return bpinfo;
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_get_pmrsz - PMR(Persistent Memory Region) 크기(byte) 반환 (공개 API)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @return ctrlr->pmr_size — PMRCAP.PMRSZ 기반. PMR 미지원 / 미활성 컨트롤러는 0.
+ *
+ * PMR: NVMe 1.4+ — 컨트롤러가 BAR 영역에 노출하는 영구 메모리(non-volatile DIMM 등 backend).
+ * 호스트가 memcpy 로 직접 R/W 가능 (PCIe 64-bit BAR), 컨트롤러 reset 후에도 데이터 유지.
+ * 사용자가 PMR 영역을 사용할지 결정하기 위한 capability 조회.
+ */
 uint64_t
 spdk_nvme_ctrlr_get_pmrsz(struct spdk_nvme_ctrlr *ctrlr)
 {
-	return ctrlr->pmr_size;
+	return ctrlr->pmr_size;       /* [한국어] PMR 크기 직접 반환 — 미지원이면 0. */
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_get_num_ns - Identify Controller의 NN(Number of Namespaces) 필드 반환 (공개 API)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @return ctrlr->cdata.nn — 컨트롤러가 노출하는 최대 NSID (1-based 최대치).
+ *
+ * 주의: NN 은 *최대 NSID 값* 으로 실제 활성 NS 개수와 다를 수 있음 — NSID 가 sparse 하게 할당
+ * 가능 (예: NN=10 이지만 NSID 1, 3, 7 만 active). 활성 NS 순회는 get_first/next_active_ns 사용.
+ */
 uint32_t
 spdk_nvme_ctrlr_get_num_ns(struct spdk_nvme_ctrlr *ctrlr)
 {
-	return ctrlr->cdata.nn;
+	return ctrlr->cdata.nn;       /* [한국어] Identify Controller의 NN 필드 — 최대 NSID 값. */
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_is_active_ns - 특정 NSID 가 현재 active 상태인지 판정 (공개 API)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @nsid: 검사할 NSID (1-based)
+ * @return true = active, false = 비활성 or 미존재
+ *
+ * Active 의 의미: Identify Active Namespace List (CNS=0x02) 에 포함되어 있고 NS 객체가
+ * 정상 construct 되어 ns->active=true 인 상태. NS Attribute Notice AER 후 동적으로 변경 가능.
+ *
+ * 사용처: 사용자가 NSID 입력 후 "유효한가?" 확인. bdev_nvme 가 attach 시 NS 정렬.
+ *
+ * 동작: ns RB tree 에서 NSID 검색 → ns->active 비트 반환. 미발견은 false (한 번도 alloc 안 된 NSID).
+ */
 bool
 spdk_nvme_ctrlr_is_active_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid)
 {
-	struct spdk_nvme_ns tmp, *ns;
+	struct spdk_nvme_ns tmp, *ns;  /* [한국어] RB_FIND key 객체 + 검색 결과 */
 
-	tmp.id = nsid;
+	tmp.id = nsid;                /* [한국어] comparator 가 id 만 보므로 다른 필드 불필요 */
 	ns = RB_FIND(nvme_ns_tree, &ctrlr->ns, &tmp);
+	                                  /* [한국어] O(log n) 검색 — NSID 기반 정렬된 RB tree. */
 
 	if (ns != NULL) {
-		return ns->active;
+		return ns->active;    /* [한국어] NS 객체 존재 — active 비트 반환. */
 	}
 
-	return false;
+	return false;                 /* [한국어] NS 객체 없음 = 한 번도 alloc 안 됨 (lazy alloc 미발생) → 비활성으로 간주. */
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_get_first_active_ns - 가장 작은 NSID 의 active NS 반환 (공개 API)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @return active NS 의 NSID (1-based), 활성 NS 없으면 0
+ *
+ * 사용자 순회 패턴:
+ *   nsid = spdk_nvme_ctrlr_get_first_active_ns(ctrlr);
+ *   while (nsid != 0) {
+ *     // ... use nsid ...
+ *     nsid = spdk_nvme_ctrlr_get_next_active_ns(ctrlr, nsid);
+ *   }
+ *
+ * RB tree 의 in-order traversal 이라 NSID 오름차순으로 방문 — sparse NSID 환경에서도 안전.
+ *
+ * 동작: RB_MIN 으로 최소 NSID 노드 시작 → ns->active==true 까지 RB_NEXT 진행.
+ */
 uint32_t
 spdk_nvme_ctrlr_get_first_active_ns(struct spdk_nvme_ctrlr *ctrlr)
 {
-	struct spdk_nvme_ns *ns;
+	struct spdk_nvme_ns *ns;      /* [한국어] 순회 중 현재 위치 */
 
 	ns = RB_MIN(nvme_ns_tree, &ctrlr->ns);
+	                                  /* [한국어] RB tree 좌측 최소 — 가장 작은 NSID 의 NS. */
 	if (ns == NULL) {
-		return 0;
+		return 0;             /* [한국어] NS 가 하나도 alloc 되지 않은 컨트롤러. */
 	}
 
 	while (ns != NULL) {
 		if (ns->active) {
 			return ns->id;
+			                                  /* [한국어] 첫 active NS 발견 — NSID 반환. */
 		}
 
 		ns = RB_NEXT(nvme_ns_tree, &ctrlr->ns, ns);
+		                                  /* [한국어] in-order 다음 노드 — NSID 오름차순. */
 	}
 
-	return 0;
+	return 0;                     /* [한국어] 끝까지 active 발견 못 함 — 0 (= end-of-list). */
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_get_next_active_ns - prev_nsid 다음의 active NS 반환 (공개 API)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @prev_nsid: 이전에 반환받은 NSID (반드시 RB tree 에 존재해야 함)
+ * @return prev_nsid 다음의 active NSID, 더 없으면 0
+ *
+ * get_first_active_ns 와 짝을 이루는 순회 helper. prev_nsid 노드 자체는 skip 하고 그 다음부터
+ * active 검색. 사용자가 NSID 를 직접 +1 하지 않는 이유: NSID 가 sparse 일 수 있어 RB tree 의
+ * 실제 next 노드를 따라가야 정확함.
+ */
 uint32_t
 spdk_nvme_ctrlr_get_next_active_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t prev_nsid)
 {
-	struct spdk_nvme_ns tmp, *ns;
+	struct spdk_nvme_ns tmp, *ns; /* [한국어] key 객체 + 순회 변수 */
 
-	tmp.id = prev_nsid;
+	tmp.id = prev_nsid;           /* [한국어] 현재 위치 검색 key */
 	ns = RB_FIND(nvme_ns_tree, &ctrlr->ns, &tmp);
 	if (ns == NULL) {
-		return 0;
+		return 0;             /* [한국어] prev_nsid 가 tree 에 없음 — 잘못된 호출 시퀀스. */
 	}
 
 	ns = RB_NEXT(nvme_ns_tree, &ctrlr->ns, ns);
+	                                  /* [한국어] 한 칸 전진 — prev_nsid 자체는 skip. */
 	while (ns != NULL) {
 		if (ns->active) {
 			return ns->id;
@@ -8026,7 +8865,7 @@ spdk_nvme_ctrlr_get_next_active_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t prev_
 		ns = RB_NEXT(nvme_ns_tree, &ctrlr->ns, ns);
 	}
 
-	return 0;
+	return 0;                     /* [한국어] 더 이상 active NS 없음 — 0 (= end). */
 }
 
 /*
@@ -8114,49 +8953,119 @@ spdk_nvme_ctrlr_get_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid)
 	return ns;
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_get_pci_device - PCIe 컨트롤러의 DPDK PCI device 핸들 반환 (공개 API)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @return spdk_pci_device 포인터, PCIe 가 아니거나 NULL ctrlr 면 NULL
+ *
+ * SPDK 가 DPDK rte_pci_device 를 spdk_pci_device 로 래핑한 객체. 사용자가 PCIe BAR 직접 매핑,
+ * MSI-X 설정 등 lower-level 접근이 필요할 때 사용 (희소 사용처). 일반 사용자는 호출 불요.
+ *
+ * NVMe-oF 컨트롤러(RDMA/TCP/FC) 는 PCI 디바이스가 없으므로 NULL 반환.
+ */
 struct spdk_pci_device *
 spdk_nvme_ctrlr_get_pci_device(struct spdk_nvme_ctrlr *ctrlr)
 {
 	if (ctrlr == NULL) {
-		return NULL;
+		return NULL;          /* [한국어] NULL 인자 방어 — 일부 사용자가 ctrlr=NULL 로 호출. */
 	}
 
 	if (ctrlr->trid.trtype != SPDK_NVME_TRANSPORT_PCIE) {
-		return NULL;
+		return NULL;          /* [한국어] Fabrics 트랜스포트는 PCI 디바이스 없음. */
 	}
 
 	return nvme_ctrlr_proc_get_devhandle(ctrlr);
+	                                  /* [한국어] multi-process: 현재 프로세스의 ctrlr_process->devhandle 반환. */
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_get_numa_id - 컨트롤러가 attach 된 NUMA 노드 ID 반환 (공개 API)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @return NUMA node id (0~N-1) 또는 SPDK_ENV_NUMA_ID_ANY (불명)
+ *
+ * NUMA-aware 스케줄링에 사용: SPDK 사용자가 컨트롤러 가까운 코어에 reactor 를 배치해
+ * cross-socket memory 접근을 회피하고 IO 지연을 최소화한다.
+ *
+ * id_valid 비트로 unset 상태 구분 — NUMA 노드 0 도 유효 값이므로 단순히 0 = "미설정" 으로
+ * 해석하면 안 됨.
+ *
+ * PCIe: /sys/bus/pci/devices/<bdf>/numa_node 에서 결정.
+ * NVMe-oF: 일반적으로 ID_ANY (네트워크 트랜스포트는 NUMA 친화도 의미가 다름).
+ */
 int32_t
 spdk_nvme_ctrlr_get_numa_id(struct spdk_nvme_ctrlr *ctrlr)
 {
 	if (ctrlr->numa.id_valid) {
 		return ctrlr->numa.id;
+		                                  /* [한국어] valid 플래그 set 시에만 실제 ID 반환. */
 	} else {
 		return SPDK_ENV_NUMA_ID_ANY;
+		                                  /* [한국어] 미설정 sentinel — caller 는 어느 NUMA 든 OK 로 해석. */
 	}
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_get_id - 컨트롤러 식별자(CNTLID, 16-bit) 반환 (공개 API)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @return cdata.cntlid — NVMe-oF subsystem 내 controller 식별자. PCIe 에서는 일반적으로 0.
+ *
+ * NVMe-oF: 하나의 subsystem 에 여러 controller (각각 다른 host 의 view) 가 있을 수 있어
+ * cntlid 로 구분. discovery log page 등에 노출됨.
+ */
 uint16_t
 spdk_nvme_ctrlr_get_id(struct spdk_nvme_ctrlr *ctrlr)
 {
-	return ctrlr->cntlid;
+	return ctrlr->cntlid;         /* [한국어] Identify Controller 응답의 CNTLID 필드 (NVMe spec §5.15.2.2). */
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_get_max_xfer_size - 단일 NVMe 명령으로 전송 가능한 최대 바이트 수 (공개 API)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @return ctrlr->max_xfer_size — MDTS(Maximum Data Transfer Size, Identify Controller) 기반.
+ *
+ * bdev_nvme 가 split 결정에 사용. MDTS=0 (제한 없음) 컨트롤러도 SPDK 내부 PRP/SGL 자료구조
+ * 한도 안에서 최대 크기가 결정됨. max_xfer_size 초과 사용자 IO 는 SPDK 가 자동 split.
+ *
+ * 계산:
+ *   - MDTS != 0: 2^MDTS × CAP.MPSMIN (페이지 크기)
+ *   - MDTS == 0: SPDK 내부 한도 (보통 1MB ~ 수 MB)
+ *   - Fabrics: transport-specific 추가 한도 적용 (RDMA max_inline_data 등)
+ */
 uint32_t
 spdk_nvme_ctrlr_get_max_xfer_size(const struct spdk_nvme_ctrlr *ctrlr)
 {
-	return ctrlr->max_xfer_size;
+	return ctrlr->max_xfer_size;  /* [한국어] nvme_ctrlr_init_cap / transport_set_xfer 에서 계산된 캐시값. */
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_get_max_sges - 단일 명령에서 사용 가능한 최대 SGE(Scatter-Gather Element) 수 (공개 API)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @return SGL 지원: ctrlr->max_sges (트랜스포트 한도). 미지원: UINT16_MAX (즉 사실상 무한).
+ *
+ * bdev_nvme 가 사용자 IO 의 SGL 길이가 이 한도를 넘으면 split 또는 bounce buffer 로 처리.
+ *
+ * UINT16_MAX 반환 이유: SGL 미지원 컨트롤러는 PRP 만 사용 — PRP 의 페이지 한도가 별도로 적용되므로
+ * SGE 한도 자체는 무관. 사용자가 "PRP 모드면 무한"으로 해석하도록 sentinel 제공.
+ */
 uint16_t
 spdk_nvme_ctrlr_get_max_sges(const struct spdk_nvme_ctrlr *ctrlr)
 {
 	if (ctrlr->flags & SPDK_NVME_CTRLR_SGL_SUPPORTED) {
+	                                  /* [한국어] SGL_SUPPORTED 플래그: Identify Controller 의 SGLS 필드 기반. */
 		return ctrlr->max_sges;
+		                                  /* [한국어] 트랜스포트별 SGE 한도 (PCIe: 일반적으로 큰 값, RDMA: ibv 한도). */
 	} else {
-		return UINT16_MAX;
+		return UINT16_MAX;    /* [한국어] SGL 미지원 → SGE 한도 무관 sentinel. */
 	}
 }
 
@@ -8327,22 +9236,89 @@ spdk_nvme_ctrlr_register_timeout_callback(struct spdk_nvme_ctrlr *ctrlr,
 	nvme_ctrlr_unlock(ctrlr);
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_is_log_page_supported - 특정 log page ID 지원 여부 조회 (공개 API)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @log_page: 검사할 log page ID (0x00~0xFF)
+ * @return true=지원, false=미지원
+ *
+ * Identify Controller / Get Features 응답을 분석하여 nvme_ctrlr_set_supported_log_pages 에서
+ * log_page_supported[256] 비트맵을 채워둠. SMART(0x02), Error(0x01), Firmware Slot(0x03),
+ * Changed NS List(0x04), Commands Supported(0x05) 등 NVMe 표준 + Intel 벤더 log page 모두 포함.
+ *
+ * 사용처: nvme-cli 류 도구가 사용자에게 "이 log page 사용 가능?" 표시. bdev_nvme 가 SMART 폴링
+ * 활성화 여부 결정.
+ *
+ * 동기화: read-only — log_page_supported[] 는 init 이후 변경 없음 (락 불필요).
+ */
 bool
 spdk_nvme_ctrlr_is_log_page_supported(struct spdk_nvme_ctrlr *ctrlr, uint8_t log_page)
 {
 	/* No bounds check necessary, since log_page is uint8_t and log_page_supported has 256 entries */
+	/* [한국어] uint8_t 범위 = 0~255 = 배열 크기와 정확히 일치 — 별도 bounds check 불요. */
 	SPDK_STATIC_ASSERT(sizeof(ctrlr->log_page_supported) == 256, "log_page_supported size mismatch");
+	                                  /* [한국어] 컴파일 타임 assert — 배열 크기 변경 시 즉시 빌드 에러. */
 	return ctrlr->log_page_supported[log_page];
+	                                  /* [한국어] 비트맵 단순 lookup — bool 배열. */
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_is_feature_supported - 특정 Feature ID(FID) 지원 여부 조회 (공개 API)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @feature_code: 검사할 Feature ID (0x00~0xFF — NVMe spec §5.21)
+ * @return true=지원, false=미지원
+ *
+ * Get Features admin 명령으로 모든 FID 를 한 번씩 probe 한 결과를 feature_supported[256] 비트맵에
+ * 저장 (nvme_ctrlr_set_supported_features). SET=Arbitration, Power Mgmt, Temperature Threshold,
+ * Volatile Write Cache, Number of Queues 등.
+ *
+ * 사용처: 사용자가 spdk_nvme_ctrlr_cmd_set_feature 호출 전 사전 검증.
+ *
+ * 동기화: read-only — feature_supported[] 는 init 이후 변경 없음.
+ */
 bool
 spdk_nvme_ctrlr_is_feature_supported(struct spdk_nvme_ctrlr *ctrlr, uint8_t feature_code)
 {
 	/* No bounds check necessary, since feature_code is uint8_t and feature_supported has 256 entries */
+	/* [한국어] uint8_t 범위 = 배열 크기와 정확히 일치. */
 	SPDK_STATIC_ASSERT(sizeof(ctrlr->feature_supported) == 256, "feature_supported size mismatch");
 	return ctrlr->feature_supported[feature_code];
+	                                  /* [한국어] 비트맵 lookup — bool 배열. */
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_attach_ns -
+ *   Namespace Attachment (opcode 0x15, SEL=0x00) admin 동기 발행. 기존 namespace 를
+ *   특정 컨트롤러(들)에 binding. attach 완료 후 active_ns 재 수집 + 새 ns 객체 construct.
+ *
+ * @ctrlr: 대상 컨트롤러 (= attach 명령을 발행하는 컨트롤러; payload 의 list 와 별개).
+ * @nsid: attach 할 namespace ID. 0 금지.
+ * @payload: spdk_nvme_ctrlr_list — 이 namespace 를 attach 할 컨트롤러들의 CNTLID 리스트.
+ * @return: 0 성공, 음수 errno.
+ *
+ * NVMe Namespace Management 모델: namespace 는 "생성 (create_ns)" → "attach" 두 단계로 분리.
+ * 한 namespace 가 여러 컨트롤러에 attach 될 수 있음 (multi-controller subsystem, ANA 등 활용).
+ * attach 후에는 해당 컨트롤러의 active_ns 트리에 추가되고 호스트는 일반 IO 가능.
+ *
+ * 단계:
+ *   1. nsid==0 차단 (Namespace Attachment 의 unsupported NSID).
+ *   2. status tracker 할당 후 attach_ns admin (opcode 0x15, SEL=0x00 Controller Attach) 발행.
+ *   3. 동기 polling 완료 대기 (true = command status 검사).
+ *   4. nvme_ctrlr_identify_active_ns 호출 — active NS list (CNS 0x02) 재 수집해 트리 갱신.
+ *   5. 새 ns 객체 get_ns 로 찾은 뒤 nvme_ns_construct 로 nsdata 등 메타데이터 초기화.
+ *
+ * 호출 체인:
+ *   사용자/RPC nvme_attach_ns → [본 함수]
+ *     → nvme_ctrlr_cmd_attach_ns (opcode 0x15, SEL=0x00)
+ *     → nvme_wait_for_adminq_completion
+ *     → nvme_ctrlr_identify_active_ns (트리 재구성)
+ *     → nvme_ns_construct (ns 메타데이터 채움)
+ */
 int
 spdk_nvme_ctrlr_attach_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid,
 			  struct spdk_nvme_ctrlr_list *payload)
@@ -8351,6 +9327,7 @@ spdk_nvme_ctrlr_attach_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid,
 	struct spdk_nvme_ns			*ns;
 	int					res;
 
+	/* [한국어] NSID 0 은 attach 의미 없음 — 컨트롤러 자체 또는 broadcast 의미라 거부. */
 	if (nsid == 0) {
 		return -EINVAL;
 	}
@@ -8361,6 +9338,7 @@ spdk_nvme_ctrlr_attach_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid,
 		return -ENOMEM;
 	}
 
+	/* [한국어] Namespace Attachment admin 발행 — payload 가 attach 대상 컨트롤러 CNTLID 리스트. */
 	res = nvme_ctrlr_cmd_attach_ns(ctrlr, nsid, payload,
 				       nvme_completion_poll_cb, status);
 	if (res) {
@@ -8375,11 +9353,13 @@ spdk_nvme_ctrlr_attach_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid,
 		return res;
 	}
 
+	/* [한국어] attach 후 active NS 목록이 바뀌었으므로 동기적으로 재 수집 (트리 갱신). */
 	res = nvme_ctrlr_identify_active_ns(ctrlr);
 	if (res) {
 		return res;
 	}
 
+	/* [한국어] 새로 추가된 ns 객체를 찾아 nsdata/필드 초기화 — IO 발행 전제 준비. */
 	ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
 	if (ns == NULL) {
 		NVME_CTRLR_ERRLOG(ctrlr, "spdk_nvme_ctrlr_get_ns failed!\n");
@@ -8389,6 +9369,27 @@ spdk_nvme_ctrlr_attach_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid,
 	return nvme_ns_construct(ns, nsid, ctrlr);
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_detach_ns -
+ *   Namespace Attachment (opcode 0x15, SEL=0x01) admin 동기 발행. 기존 binding 해제.
+ *
+ * @ctrlr: 대상 컨트롤러.
+ * @nsid: detach 할 NSID.
+ * @payload: detach 할 컨트롤러들의 CNTLID 리스트.
+ * @return: 0 성공, 음수 errno.
+ *
+ * attach 와 대칭. detach 후에도 namespace 자체는 존재 (subsystem 보유) — delete_ns 와
+ * 구분. detach 된 컨트롤러에서는 더 이상 IO 발행 불가.
+ *
+ * detach 후 active_ns 재 수집 — 트리에서 해당 nsid 가 빠짐 (또는 다른 controller 에 여전히
+ * attach 돼 있으면 보존되지만 본 컨트롤러 트리에서는 제거).
+ *
+ * 호출 체인:
+ *   사용자/RPC → [본 함수]
+ *     → nvme_ctrlr_cmd_detach_ns (opcode 0x15, SEL=0x01)
+ *     → nvme_ctrlr_identify_active_ns (트리 갱신)
+ */
 int
 spdk_nvme_ctrlr_detach_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid,
 			  struct spdk_nvme_ctrlr_list *payload)
@@ -8406,6 +9407,7 @@ spdk_nvme_ctrlr_detach_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid,
 		return -ENOMEM;
 	}
 
+	/* [한국어] Namespace Attachment admin (SEL=0x01) — 1=Detach 의미. */
 	res = nvme_ctrlr_cmd_detach_ns(ctrlr, nsid, payload,
 				       nvme_completion_poll_cb, status);
 	if (res) {
@@ -8420,9 +9422,36 @@ spdk_nvme_ctrlr_detach_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid,
 		return res;
 	}
 
+	/* [한국어] detach 후 active NS 재 수집 — 본 컨트롤러 트리에서 해당 nsid 제거됨. */
 	return nvme_ctrlr_identify_active_ns(ctrlr);
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_create_ns -
+ *   Namespace Management (opcode 0x0D, SEL=0x00) admin 동기 발행. subsystem 에
+ *   새 namespace 를 생성. attach 와 분리 — 생성된 ns 는 어떤 컨트롤러에도 binding 안 됨.
+ *
+ * @ctrlr: 명령 발행 컨트롤러.
+ * @payload: 새 ns 의 spdk_nvme_ns_data (size, capacity, FLBAS, DPS 등 모든 메타데이터).
+ * @return: 생성된 NSID (>0) — admin 응답의 cdw0 에 담겨 옴. 실패 시 0.
+ *
+ * 반환 타입이 uint32_t (errno 아님) 이유: NVMe spec 이 NSID 를 cdw0 로 돌려주는 패턴.
+ * 0 = 실패, 양수 = 생성된 NSID. 호출자는 이 NSID 로 spdk_nvme_ctrlr_attach_ns 호출.
+ *
+ * 단계:
+ *   1. status tracker 할당.
+ *   2. cmd_create_ns 발행 (opcode 0x0D, SEL=0x00 = Create).
+ *   3. 비동기 polling — nvme_wait_for_adminq_completion(false) = command status 검사 안 함
+ *      (호출자가 직접 status->cpl.cdw0 으로 NSID 받음).
+ *   4. 응답의 cdw0 = 생성된 NSID. timeout 분기로 free 정책.
+ *   5. NSID 반환 (또는 0).
+ *
+ * 호출 체인:
+ *   사용자/RPC nvme_create_ns → [본 함수]
+ *     → nvme_ctrlr_cmd_create_ns (opcode 0x0D, SEL=0x00)
+ *     → cdw0 = NSID
+ */
 uint32_t
 spdk_nvme_ctrlr_create_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns_data *payload)
 {
@@ -8436,12 +9465,15 @@ spdk_nvme_ctrlr_create_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns_dat
 		return 0;
 	}
 
+	/* [한국어] Namespace Management create. payload 가 새 ns 의 모든 메타데이터. */
 	res = nvme_ctrlr_cmd_create_ns(ctrlr, payload, nvme_completion_poll_cb, status);
 	if (res) {
 		free(status);
 		return 0;
 	}
 
+	/* [한국어] false = command status 검사 안 함 (호출자가 cdw0 직접 사용).
+	 * cdw0 = 생성된 NSID, 실패 시 0. */
 	res = nvme_wait_for_adminq_completion(ctrlr, status, false);
 	nsid = status->cpl.cdw0;
 	if (!status->timed_out) {
@@ -8454,12 +9486,31 @@ spdk_nvme_ctrlr_create_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns_dat
 		return 0;
 	}
 
+	/* [한국어] 성공 시 nsid 는 항상 양수 (NVMe spec). */
 	assert(nsid > 0);
 
 	/* Return the namespace ID that was created */
 	return nsid;
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_delete_ns -
+ *   Namespace Management (opcode 0x0D, SEL=0x01) admin 동기 발행. subsystem 의
+ *   namespace 를 영구 삭제. delete 전에 모든 컨트롤러에서 detach 되어 있어야 함.
+ *
+ * @ctrlr: 명령 발행 컨트롤러.
+ * @nsid: 삭제할 NSID. 0 금지. 0xFFFFFFFF = 모든 namespace 삭제 (구현 지원 시).
+ * @return: 0 성공, 음수 errno.
+ *
+ * create_ns 의 역. delete 후 NSID 는 재 사용 가능 (다음 create_ns 가 같은 NSID 반환 가능).
+ * detach_ns 와의 차이: detach 는 binding 만 해제 (ns 자체는 보존), delete 는 ns 영구 삭제.
+ *
+ * 호출 체인:
+ *   사용자/RPC → [본 함수]
+ *     → nvme_ctrlr_cmd_delete_ns (opcode 0x0D, SEL=0x01)
+ *     → nvme_ctrlr_identify_active_ns (트리 갱신)
+ */
 int
 spdk_nvme_ctrlr_delete_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid)
 {
@@ -8476,6 +9527,7 @@ spdk_nvme_ctrlr_delete_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid)
 		return -ENOMEM;
 	}
 
+	/* [한국어] Namespace Management delete (SEL=0x01). */
 	res = nvme_ctrlr_cmd_delete_ns(ctrlr, nsid, nvme_completion_poll_cb, status);
 	if (res) {
 		free(status);
@@ -8489,9 +9541,40 @@ spdk_nvme_ctrlr_delete_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid)
 		return res;
 	}
 
+	/* [한국어] delete 후 active NS 재 수집 — 삭제된 nsid 가 트리에서 빠짐. */
 	return nvme_ctrlr_identify_active_ns(ctrlr);
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_format -
+ *   Format NVM (opcode 0x80) admin 명령 동기 발행 + 완료 후 컨트롤러 reset.
+ *
+ * @ctrlr: 대상 컨트롤러.
+ * @nsid: format 대상 NSID. 0xFFFFFFFF = 모든 namespace 일괄 (FNA bit 0 지원 시).
+ *        구체적 NSID 가능 여부는 FNA(Format NVM Attributes, cdata.fna) 비트 결정.
+ * @format: spdk_nvme_format 구조체 — lbaf(LBA Format index), ms(Metadata Settings),
+ *          pi(Protection Information type), pil(PI Location), ses(Secure Erase Settings).
+ * @return: 0 성공, 음수 errno.
+ *
+ * 동작:
+ *   1. status tracker (nvme_completion_poll_status) 동적 할당 — admin 완료 polling 용.
+ *   2. nvme_ctrlr_cmd_format 로 admin 명령 발행.
+ *   3. nvme_wait_for_adminq_completion 으로 polling 완료 대기 (timeout 시 free 책임 분기).
+ *   4. 성공 시 spdk_nvme_ctrlr_reset 호출 — format 은 namespace identify 결과를 무효화하므로
+ *      reset 후 다시 IDENTIFY chain 으로 namespace 메타데이터 재수집 필요.
+ *
+ * 주의: format 은 데이터 파괴적 명령. SES (Secure Erase Settings) 가 0=None 이면 metadata
+ * 영역만 다시 쓰고 사용자 데이터 보존, 1=User Data Erase, 2=Cryptographic Erase.
+ *
+ * 실행 컨텍스트: 호스트 응용 (CLI 도구). 동기 — admin 완료까지 block.
+ *
+ * 호출 체인:
+ *   사용자/RPC → [본 함수]
+ *     → nvme_ctrlr_cmd_format (opcode 0x80)
+ *     → nvme_wait_for_adminq_completion
+ *     → spdk_nvme_ctrlr_reset (format 후 명시적 reset 필수)
+ */
 int
 spdk_nvme_ctrlr_format(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid,
 		       struct spdk_nvme_format *format)
@@ -8499,12 +9582,18 @@ spdk_nvme_ctrlr_format(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid,
 	struct nvme_completion_poll_status	*status;
 	int					res;
 
+	/* [한국어] status tracker — 동기 polling 의 결과/타이밍 추적용. heap 에 두는 이유:
+	 * timeout 시 콜백이 늦게 도착해도 dangling 회피 — 스택이면 timeout 후 함수 반환 시
+	 * 스택 corruption 위험. nvme_wait_for_adminq_completion 이 timeout 시 status 보존 권한
+	 * 을 갖는다 (timed_out=true 면 호출자가 free 하지 않음). */
 	status = calloc(1, sizeof(*status));
 	if (!status) {
 		NVME_CTRLR_ERRLOG(ctrlr, "Failed to allocate status tracker\n");
 		return -ENOMEM;
 	}
 
+	/* [한국어] Format NVM admin 발행 — 비동기. completion 콜백은 nvme_completion_poll_cb
+	 * 가 status->done=true 로 세팅. */
 	res = nvme_ctrlr_cmd_format(ctrlr, nsid, format, nvme_completion_poll_cb,
 				    status);
 	if (res) {
@@ -8512,6 +9601,8 @@ spdk_nvme_ctrlr_format(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid,
 		return res;
 	}
 
+	/* [한국어] true 인자 = "command status 검사 위임" (호출자는 res 만 확인).
+	 * format 은 일반적으로 오래 걸리므로 admin_timeout_ms 충분히 커야 함. */
 	res = nvme_wait_for_adminq_completion(ctrlr, status, true);
 	if (res) {
 		NVME_CTRLR_ERRLOG(ctrlr, "wait for spdk_nvme_ctrlr_format failed: rc=%s\n",
@@ -8519,9 +9610,50 @@ spdk_nvme_ctrlr_format(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid,
 		return res;
 	}
 
+	/* [한국어] format 성공 후 reset — namespace 메타데이터 (LBA size, metadata size, PI
+	 * 등) 가 바뀌었을 수 있으므로 init state machine 을 다시 돌려 ns 트리 재구성. */
 	return spdk_nvme_ctrlr_reset(ctrlr);
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_update_firmware -
+ *   Firmware Image Download (opcode 0x11) 를 페이지 단위로 반복 + Firmware Commit
+ *   (opcode 0x10) 발행 후 컨트롤러 reset. NVMe spec §5.13 (Download) / §5.14 (Commit).
+ *
+ * @ctrlr: 대상 컨트롤러.
+ * @payload: 새 firmware 이미지의 host 메모리 버퍼.
+ * @size: 이미지 크기. 4-byte multiple 필수 (NVMe spec 규정).
+ * @slot: commit 할 firmware slot 번호 (1..FRMW.NOFS). 0 = 컨트롤러 선택.
+ * @commit_action: REPLACE_IMG (downloaded → slot, 활성화 X) 또는
+ *                  REPLACE_AND_ENABLE_IMG (downloaded → slot + 즉시 활성).
+ * @completion_status: out — commit 의 spdk_nvme_status (SCT/SC). 호출자가 추가 검사 가능.
+ * @return: 0 성공, 음수 errno (-EINVAL, -1, -ENOMEM, fw_commit 의 res 등).
+ *
+ * 전체 흐름:
+ *   1. 입력 검증: completion_status NULL 금지, size % 4 == 0, commit_action 화이트리스트.
+ *   2. 단일 status tracker 재사용으로 모든 admin 명령 polling.
+ *   3. Firmware Download 페이지 단위 (min_page_size 청크):
+ *      while (남음 > 0):
+ *        - 전송 크기 = min(남음, min_page_size)
+ *        - status zero-init → nvme_ctrlr_cmd_fw_image_download → wait
+ *        - 실패 시 timeout 분기 (timed_out 이면 status 보존 정책)
+ *        - p / offset / size_remaining 갱신
+ *   4. Firmware Commit (opcode 0x10): fw_commit { fs=slot, ca=commit_action } admin 발행.
+ *   5. commit 응답의 status 를 completion_status 에 복사.
+ *   6. NVM_RESET (commit 후 reset 요구) 외의 모든 에러 → 음수 반환.
+ *      - CONVENTIONAL_RESET 요구는 NOTICELOG 후 음수 반환 (호출자가 직접 PCIe reset).
+ *      - NVM_RESET 요구만 정상 경로로 진행 → spdk_nvme_ctrlr_reset 호출.
+ *
+ * 페이지 청킹 이유: 일부 컨트롤러는 한 번에 작은 단위만 받을 수 있어 ctrlr->min_page_size
+ * (보통 4KiB) 로 잘라 보낸다. NVMe spec 은 max FW transfer size 별도 정의 없음.
+ *
+ * 호출 체인:
+ *   사용자/RPC fw_update → [본 함수]
+ *     → loop: nvme_ctrlr_cmd_fw_image_download (opcode 0x11, NUMD/OFST 필드)
+ *     → nvme_ctrlr_cmd_fw_commit (opcode 0x10, FS/CA dword)
+ *     → spdk_nvme_ctrlr_reset (필요 시)
+ */
 int
 spdk_nvme_ctrlr_update_firmware(struct spdk_nvme_ctrlr *ctrlr, void *payload, uint32_t size,
 				int slot, enum spdk_nvme_fw_commit_action commit_action, struct spdk_nvme_status *completion_status)
@@ -8534,10 +9666,13 @@ spdk_nvme_ctrlr_update_firmware(struct spdk_nvme_ctrlr *ctrlr, void *payload, ui
 	unsigned int				transfer;
 	uint8_t					*p;
 
+	/* [한국어] 입력 검증 — completion_status out 포인터 필수. */
 	if (!completion_status) {
 		return -EINVAL;
 	}
 	memset(completion_status, 0, sizeof(struct spdk_nvme_status));
+	/* [한국어] NVMe spec 규정: firmware download 크기는 dword (4B) 정렬 필수.
+	 * NUMD 필드가 dword 단위로 길이를 인코딩하기 때문. */
 	if (size % 4) {
 		NVME_CTRLR_ERRLOG(ctrlr, "spdk_nvme_ctrlr_update_firmware invalid size!\n");
 		return -1;
@@ -8546,12 +9681,16 @@ spdk_nvme_ctrlr_update_firmware(struct spdk_nvme_ctrlr *ctrlr, void *payload, ui
 	/* Current support only for SPDK_NVME_FW_COMMIT_REPLACE_IMG
 	 * and SPDK_NVME_FW_COMMIT_REPLACE_AND_ENABLE_IMG
 	 */
+	/* [한국어] commit_action 화이트리스트 — ACTIVATE_NO_RESET 등 다른 action 미지원.
+	 * (활성 즉시 reset 필요한 동작만 본 API 가 처리, 그 외는 호출자가 직접 구성.) */
 	if ((commit_action != SPDK_NVME_FW_COMMIT_REPLACE_IMG) &&
 	    (commit_action != SPDK_NVME_FW_COMMIT_REPLACE_AND_ENABLE_IMG)) {
 		NVME_CTRLR_ERRLOG(ctrlr, "spdk_nvme_ctrlr_update_firmware invalid command!\n");
 		return -1;
 	}
 
+	/* [한국어] status tracker — 본 함수의 모든 admin 명령에서 재사용 (memset 으로 매번
+	 * 초기화). format 과 같은 heap 할당 이유. */
 	status = calloc(1, sizeof(*status));
 	if (!status) {
 		NVME_CTRLR_ERRLOG(ctrlr, "Failed to allocate status tracker\n");
@@ -8559,14 +9698,21 @@ spdk_nvme_ctrlr_update_firmware(struct spdk_nvme_ctrlr *ctrlr, void *payload, ui
 	}
 
 	/* Firmware download */
+	/* [한국어] 페이지 단위 download 루프 — payload 를 ctrlr->min_page_size (보통 4KiB)
+	 * 씩 잘라 NVMe 컨트롤러에 전달. 컨트롤러는 OFST 로 누적 위치 추적. */
 	size_remaining = size;
 	offset = 0;
 	p = payload;
 
 	while (size_remaining > 0) {
+		/* [한국어] 한 번에 보낼 양 = min(남음, 페이지 크기). */
 		transfer = spdk_min(size_remaining, ctrlr->min_page_size);
 
 		memset(status, 0, sizeof(*status));
+		/* [한국어] Firmware Image Download admin (opcode 0x11):
+		 *  - NUMD: transfer 의 dword 수
+		 *  - OFST: 누적 offset (dword)
+		 *  - 데이터 포인터: p */
 		res = nvme_ctrlr_cmd_fw_image_download(ctrlr, transfer, offset, p,
 						       nvme_completion_poll_cb,
 						       status);
@@ -8575,8 +9721,11 @@ spdk_nvme_ctrlr_update_firmware(struct spdk_nvme_ctrlr *ctrlr, void *payload, ui
 			return res;
 		}
 
+		/* [한국어] false = "command status 검사 안 함" (호출자가 직접 res 로 판단).
+		 * 본 함수는 res 만 보면 충분. */
 		res = nvme_wait_for_adminq_completion(ctrlr, status, false);
 		if (res) {
+			/* [한국어] timeout 시 status 보존 (콜백이 늦게 도착할 수 있음). */
 			if (!status->timed_out) {
 				free(status);
 			}
@@ -8586,12 +9735,17 @@ spdk_nvme_ctrlr_update_firmware(struct spdk_nvme_ctrlr *ctrlr, void *payload, ui
 			return res;
 		}
 
+		/* [한국어] 다음 페이지로 이동. */
 		p += transfer;
 		offset += transfer;
 		size_remaining -= transfer;
 	}
 
 	/* Firmware commit */
+	/* [한국어] Firmware Commit (opcode 0x10) — 다운로드된 이미지를 slot 에 영속 저장 또는 활성화.
+	 *  - fs (Firmware Slot, dword 10 비트 2:0): 어느 slot 에 commit
+	 *  - ca (Commit Action, dword 10 비트 5:3): REPLACE_IMG / REPLACE_AND_ENABLE / ACTIVATE_NO_RESET 등
+	 *  - bpid (Boot Partition ID, dword 10 비트 31): 0 (= boot partition 아님) */
 	memset(&fw_commit, 0, sizeof(struct spdk_nvme_fw_commit));
 	fw_commit.fs = slot;
 	fw_commit.ca = commit_action;
@@ -8604,6 +9758,7 @@ spdk_nvme_ctrlr_update_firmware(struct spdk_nvme_ctrlr *ctrlr, void *payload, ui
 		return res;
 	}
 
+	/* [한국어] commit 완료 대기 + 응답 status 를 호출자에게 전달 (호출자가 SCT/SC 직접 검사). */
 	res = nvme_wait_for_adminq_completion(ctrlr, status, false);
 	memcpy(completion_status, &status->cpl.status, sizeof(struct spdk_nvme_status));
 	if (!status->timed_out) {
@@ -8611,6 +9766,11 @@ spdk_nvme_ctrlr_update_firmware(struct spdk_nvme_ctrlr *ctrlr, void *payload, ui
 	}
 
 	if (res) {
+		/* [한국어] commit 의 일부 정상 응답은 "reset 요청" 으로 분류된다 (NVMe spec):
+		 *  - FIRMWARE_REQ_NVM_RESET (NVM Subsystem Reset 필요): 본 함수가 마지막에 reset 호출.
+		 *  - FIRMWARE_REQ_CONVENTIONAL_RESET (PCIe conventional reset 필요): 호스트가 PCIe
+		 *    레벨에서 처리해야 하므로 본 함수는 NOTICELOG 후 음수 반환 (호출자 책임).
+		 *  - 그 외 에러: 일반 실패 처리. */
 		if (completion_status->sct != SPDK_NVME_SCT_COMMAND_SPECIFIC ||
 		    completion_status->sc != SPDK_NVME_SC_FIRMWARE_REQ_NVM_RESET) {
 			if (completion_status->sct == SPDK_NVME_SCT_COMMAND_SPECIFIC  &&
@@ -8626,24 +9786,56 @@ spdk_nvme_ctrlr_update_firmware(struct spdk_nvme_ctrlr *ctrlr, void *payload, ui
 		}
 	}
 
+	/* [한국어] NVM_RESET 요청 또는 정상 commit → 컨트롤러 reset 으로 새 firmware 활성. */
 	return spdk_nvme_ctrlr_reset(ctrlr);
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_reserve_cmb -
+ *   Controller Memory Buffer (CMB) 의 사용 권한 확보 + 사이즈 반환.
+ *
+ * @ctrlr: 대상 컨트롤러.
+ * @return: 양수 = CMB 크기(바이트), -ENOTSUP = CMB 미지원 또는 R/W disable.
+ *
+ * CMB (NVMe 1.2+): NVMe 컨트롤러의 BAR 일부를 호스트가 메모리로 read/write 가능한 영역으로
+ * 노출. 용도: PRP/SQE/CQE 자체를 컨트롤러 내부 메모리에 두면 PCIe 왕복 1회 감소 (호스트
+ * 메모리 → BAR doorbell write → 컨트롤러가 호스트 메모리 fetch 대신, 모든 게 BAR 내).
+ *
+ * 단계:
+ *   1. CMBSZ 레지스터 read — RDS/WDS 비트로 R/W 지원 여부 확인. 둘 중 하나라도 0 이면 미지원.
+ *   2. CMB 크기 계산: sz * (0x1000 << (szu * 4))
+ *      - sz: SZU 단위 수.
+ *      - szu: Size Unit (0=4KB, 1=64KB, 2=1MB, 3=16MB, 4=256MB, 5=4GB).
+ *   3. transport ops 의 reserve_cmb 호출 — PCIe 의 경우 BAR 매핑 권한 확보.
+ *   4. 성공 시 크기 반환.
+ *
+ * 동기화: ctrlr_lock 으로 reserve 와 다른 transport 조작 직렬화.
+ *
+ * 호출 체인:
+ *   사용자 → [본 함수] → nvme_transport_ctrlr_reserve_cmb (transport-specific)
+ */
 int
 spdk_nvme_ctrlr_reserve_cmb(struct spdk_nvme_ctrlr *ctrlr)
 {
 	int rc, size;
 	union spdk_nvme_cmbsz_register cmbsz;
 
+	/* [한국어] CMBSZ (Controller Memory Buffer Size, offset 0x38) read. */
 	cmbsz = spdk_nvme_ctrlr_get_regs_cmbsz(ctrlr);
 
+	/* [한국어] RDS (Read Data Support) / WDS (Write Data Support) — 둘 다 1 이어야 IO data 용으로
+	 * 사용 가능. 하나만 지원하면 양방향 IO 발행 어렵다. */
 	if (cmbsz.bits.rds == 0 || cmbsz.bits.wds == 0) {
 		return -ENOTSUP;
 	}
 
+	/* [한국어] 크기 = sz * (4KB << szu*4).
+	 * szu=0 → 4KB, szu=1 → 64KB, szu=2 → 1MB, ... */
 	size = cmbsz.bits.sz * (0x1000 << (cmbsz.bits.szu * 4));
 
 	nvme_ctrlr_lock(ctrlr);
+	/* [한국어] transport 측 reserve — PCIe 면 BAR mapping 권한 확보 + 다른 사용자와 배제. */
 	rc = nvme_transport_ctrlr_reserve_cmb(ctrlr);
 	nvme_ctrlr_unlock(ctrlr);
 
@@ -8654,6 +9846,19 @@ spdk_nvme_ctrlr_reserve_cmb(struct spdk_nvme_ctrlr *ctrlr)
 	return size;
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_map_cmb - CMB BAR 영역을 호스트 가상주소 공간에 mmap.
+ *
+ * @ctrlr: 대상 컨트롤러.
+ * @size: out — 매핑된 영역 크기.
+ * @return: 호스트 가상주소 (성공) 또는 NULL.
+ *
+ * reserve_cmb 후 호출 — 사용자가 이 가상주소로 read/write 하면 BAR MMIO 발생.
+ * 호스트 입장에서는 일반 메모리처럼 보이지만 실제로는 PCIe write/read 트랜잭션.
+ *
+ * 호출 체인: 사용자 → [본 함수] → nvme_transport_ctrlr_map_cmb (PCIe BAR mmap)
+ */
 void *
 spdk_nvme_ctrlr_map_cmb(struct spdk_nvme_ctrlr *ctrlr, size_t *size)
 {
@@ -8666,6 +9871,12 @@ spdk_nvme_ctrlr_map_cmb(struct spdk_nvme_ctrlr *ctrlr, size_t *size)
 	return buf;
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_unmap_cmb - CMB 매핑 해제 (map 의 역).
+ *
+ * 호출자는 unmap 후 이전 가상주소 사용 금지 (segfault).
+ */
 void
 spdk_nvme_ctrlr_unmap_cmb(struct spdk_nvme_ctrlr *ctrlr)
 {
@@ -8674,6 +9885,20 @@ spdk_nvme_ctrlr_unmap_cmb(struct spdk_nvme_ctrlr *ctrlr)
 	nvme_ctrlr_unlock(ctrlr);
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_enable_pmr - Persistent Memory Region 활성화.
+ *
+ * @ctrlr: 대상 컨트롤러.
+ * @return: 0 성공, 음수 errno.
+ *
+ * PMR (NVMe 1.4+): 컨트롤러가 제공하는 persistent (전원 차단 시에도 보존되는) 메모리 영역.
+ * battery-backed 또는 NVRAM. 호스트가 가상주소로 mmap 해 사용 — 쓰기가 즉시 영속.
+ * 용도: high-performance journaling, lockless metadata 등.
+ *
+ * 호출 체인: 사용자 → [본 함수] → nvme_transport_ctrlr_enable_pmr
+ *   (PMRCTL.EN bit set + PMRSTS polling)
+ */
 int
 spdk_nvme_ctrlr_enable_pmr(struct spdk_nvme_ctrlr *ctrlr)
 {
@@ -8686,6 +9911,12 @@ spdk_nvme_ctrlr_enable_pmr(struct spdk_nvme_ctrlr *ctrlr)
 	return rc;
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_disable_pmr - PMR 비활성화 (enable 의 역).
+ *
+ * 호출자는 disable 후 PMR 매핑 가상주소 사용 금지.
+ */
 int
 spdk_nvme_ctrlr_disable_pmr(struct spdk_nvme_ctrlr *ctrlr)
 {
@@ -8698,6 +9929,17 @@ spdk_nvme_ctrlr_disable_pmr(struct spdk_nvme_ctrlr *ctrlr)
 	return rc;
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_map_pmr - PMR 영역 mmap.
+ *
+ * @ctrlr: 대상 컨트롤러 (enable_pmr 후).
+ * @size: out — 매핑된 크기.
+ * @return: 호스트 가상주소 또는 NULL.
+ *
+ * PMR 은 일반 메모리처럼 보이지만 write 가 즉시 persistent. fence/flush 도 PMR 컨트롤러가
+ * 적절히 처리.
+ */
 void *
 spdk_nvme_ctrlr_map_pmr(struct spdk_nvme_ctrlr *ctrlr, size_t *size)
 {
@@ -8710,6 +9952,12 @@ spdk_nvme_ctrlr_map_pmr(struct spdk_nvme_ctrlr *ctrlr, size_t *size)
 	return buf;
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_unmap_pmr - PMR 매핑 해제.
+ *
+ * @return: 0 성공, 음수 errno.
+ */
 int
 spdk_nvme_ctrlr_unmap_pmr(struct spdk_nvme_ctrlr *ctrlr)
 {
@@ -8722,6 +9970,36 @@ spdk_nvme_ctrlr_unmap_pmr(struct spdk_nvme_ctrlr *ctrlr)
 	return rc;
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_read_boot_partition_start -
+ *   Boot Partition 비동기 READ 트리거. BPMBL (Boot Partition Memory Buffer Location)
+ *   레지스터에 physical address 등록 + BPRSEL (Boot Partition Read Select) 에
+ *   bpid/bprof/bprsz 기록하면 컨트롤러가 DMA 로 호스트 메모리에 boot partition 복사.
+ *
+ * @ctrlr: 대상 컨트롤러.
+ * @payload: 호스트 메모리 버퍼 (DMA 대상). 물리적으로 연속이어야 함.
+ * @bprsz: Boot Partition Read Size (4KiB 단위 수).
+ * @bprof: Boot Partition Read Offset (4KiB 단위).
+ * @bpid: Boot Partition ID (0 또는 1, 컨트롤러 지원 시).
+ * @return: 0 = 트리거 성공 (read는 background 진행), 음수 errno.
+ *
+ * NVMe Boot Partition (NVMe spec §3.1.5.2): 컨트롤러가 두 개의 boot partition (BPID 0/1)
+ * 을 제공해 호스트가 부팅 firmware 를 직접 BAR-mapped DMA 로 read 가능. 인지 후에는
+ * BPINFO.BRS 레지스터를 polling 해 READ_SUCCESS 까지 기다린다 (read_boot_partition_poll).
+ *
+ * 동작:
+ *   1. CAP.BPS=0 이면 boot partition 미지원 → -ENOTSUP.
+ *   2. BPINFO 레지스터로 BRS (Boot Read Status) 검사 — IN_PROGRESS 면 -EALREADY.
+ *   3. payload 의 physical address 변환 (spdk_vtophys) — 4KiB * bprsz 바이트가 physically contiguous 인지 검증.
+ *   4. BPMBL (offset 0x30) 에 physical address write — 컨트롤러가 DMA 목적지로 사용.
+ *   5. BPRSEL (offset 0x28) 에 {bpid, bprof, bprsz} write — 이 write 가 read trigger.
+ *
+ * 동기화: ctrlr_lock 으로 BPMBL/BPRSEL write sequence 보호 — 다른 read 트리거와 race 방지.
+ *
+ * 호출 체인:
+ *   사용자/CLI → [본 함수] (트리거) → 호스트가 polling → read_boot_partition_poll
+ */
 int
 spdk_nvme_ctrlr_read_boot_partition_start(struct spdk_nvme_ctrlr *ctrlr, void *payload,
 		uint32_t bprsz, uint32_t bprof, uint32_t bpid)
@@ -8730,15 +10008,19 @@ spdk_nvme_ctrlr_read_boot_partition_start(struct spdk_nvme_ctrlr *ctrlr, void *p
 	union spdk_nvme_bpinfo_register bpinfo;
 	uint64_t bpmbl, bpmb_size;
 
+	/* [한국어] CAP.BPS (Boot Partition Support, bit 45) — boot partition 기능 가용성. */
 	if (ctrlr->cap.bits.bps == 0) {
 		return -ENOTSUP;
 	}
 
+	/* [한국어] BPINFO (Boot Partition Information) 읽어 현재 read status 확인.
+	 * BRS 필드: 0=NO_READ, 1=READ_IN_PROGRESS, 2=READ_SUCCESS, 3=READ_ERROR. */
 	if (nvme_ctrlr_get_bpinfo(ctrlr, &bpinfo)) {
 		NVME_CTRLR_ERRLOG(ctrlr, "get bpinfo failed\n");
 		return -EIO;
 	}
 
+	/* [한국어] 이미 진행 중이면 중복 트리거 금지 — 컨트롤러는 한 번에 하나만 처리. */
 	if (bpinfo.bits.brs == SPDK_NVME_BRS_READ_IN_PROGRESS) {
 		NVME_CTRLR_ERRLOG(ctrlr, "Boot Partition read already initiated\n");
 		return -EALREADY;
@@ -8746,6 +10028,8 @@ spdk_nvme_ctrlr_read_boot_partition_start(struct spdk_nvme_ctrlr *ctrlr, void *p
 
 	nvme_ctrlr_lock(ctrlr);
 
+	/* [한국어] payload 의 virtual → physical 주소 변환. DPDK hugepage 환경에서 동작.
+	 * bpmb_size 는 in/out — 호출 시 요청한 크기, 반환 시 실제 연속된 크기. */
 	bpmb_size = bprsz * 4096;
 	bpmbl = spdk_vtophys(payload, &bpmb_size);
 	if (bpmbl == SPDK_VTOPHYS_ERROR) {
@@ -8754,22 +10038,27 @@ spdk_nvme_ctrlr_read_boot_partition_start(struct spdk_nvme_ctrlr *ctrlr, void *p
 		return -EFAULT;
 	}
 
+	/* [한국어] 반환된 연속 크기가 요청 크기와 같지 않으면 = 중간에 물리 페이지가 끊김.
+	 * BPMBL 은 단일 base address 만 받으므로 PRP 같은 list 가 불가 — physically contiguous 필수. */
 	if (bpmb_size != bprsz * 4096) {
 		NVME_CTRLR_ERRLOG(ctrlr, "Boot Partition buffer is not physically contiguous\n");
 		nvme_ctrlr_unlock(ctrlr);
 		return -EFAULT;
 	}
 
+	/* [한국어] BPMBL 레지스터 write — 컨트롤러가 이 PA 로 DMA. */
 	if (nvme_ctrlr_set_bpmbl(ctrlr, bpmbl)) {
 		NVME_CTRLR_ERRLOG(ctrlr, "set_bpmbl() failed\n");
 		nvme_ctrlr_unlock(ctrlr);
 		return -EIO;
 	}
 
+	/* [한국어] BPRSEL 비트필드 채우기 — 어느 partition 의 어디서부터 얼마나 read. */
 	bprsel.bits.bpid = bpid;
 	bprsel.bits.bprof = bprof;
 	bprsel.bits.bprsz = bprsz;
 
+	/* [한국어] BPRSEL write = read trigger. write 자체가 DMA 시작 신호. */
 	if (nvme_ctrlr_set_bprsel(ctrlr, &bprsel)) {
 		NVME_CTRLR_ERRLOG(ctrlr, "set_bprsel() failed\n");
 		nvme_ctrlr_unlock(ctrlr);
@@ -8780,12 +10069,33 @@ spdk_nvme_ctrlr_read_boot_partition_start(struct spdk_nvme_ctrlr *ctrlr, void *p
 	return 0;
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_read_boot_partition_poll -
+ *   BPINFO.BRS 상태 폴링 — read_boot_partition_start 후 완료 여부 확인.
+ *
+ * @ctrlr: 대상 컨트롤러.
+ * @return: 0 = read 완료, -EAGAIN = 아직 진행 중 (다시 호출), -EIO/EINVAL = 에러.
+ *
+ * 호출자는 0 또는 -EAGAIN 이외의 음수가 나올 때까지 주기적으로 폴링한다.
+ * payload 버퍼는 0 반환 후에 안전하게 read 가능.
+ *
+ * BRS 상태 4가지:
+ *   - NO_READ (0): 미시작 → 호출자 실수, -EINVAL.
+ *   - READ_IN_PROGRESS (1): 진행 중 → -EAGAIN (계속 폴링).
+ *   - READ_ERROR (2): 컨트롤러 에러 → -EIO.
+ *   - READ_SUCCESS (3): 완료 → 0 (payload 사용 가능).
+ *
+ * 호출 체인:
+ *   사용자 polling loop → [본 함수] (until rc != -EAGAIN)
+ */
 int
 spdk_nvme_ctrlr_read_boot_partition_poll(struct spdk_nvme_ctrlr *ctrlr)
 {
 	int rc = 0;
 	union spdk_nvme_bpinfo_register bpinfo;
 
+	/* [한국어] BPINFO 매번 fresh read — BAR0 MMIO. */
 	if (nvme_ctrlr_get_bpinfo(ctrlr, &bpinfo)) {
 		NVME_CTRLR_ERRLOG(ctrlr, "get bpinfo failed\n");
 		return -EIO;
@@ -8793,21 +10103,26 @@ spdk_nvme_ctrlr_read_boot_partition_poll(struct spdk_nvme_ctrlr *ctrlr)
 
 	switch (bpinfo.bits.brs) {
 	case SPDK_NVME_BRS_NO_READ:
+		/* [한국어] start 호출 안 함 — 호출 순서 오류. */
 		NVME_CTRLR_ERRLOG(ctrlr, "Boot Partition read not initiated\n");
 		rc = -EINVAL;
 		break;
 	case SPDK_NVME_BRS_READ_IN_PROGRESS:
+		/* [한국어] 아직 DMA 중 — caller 가 다시 폴링하라는 의미로 -EAGAIN. */
 		NVME_CTRLR_DEBUGLOG(ctrlr, "Boot Partition read in progress\n");
 		rc = -EAGAIN;
 		break;
 	case SPDK_NVME_BRS_READ_ERROR:
+		/* [한국어] 컨트롤러가 DMA 중 에러 검출. payload 내용 신뢰 불가. */
 		NVME_CTRLR_ERRLOG(ctrlr, "Error completing Boot Partition read\n");
 		rc = -EIO;
 		break;
 	case SPDK_NVME_BRS_READ_SUCCESS:
+		/* [한국어] 완료 — payload 사용 가능. */
 		NVME_CTRLR_INFOLOG(ctrlr, "Boot Partition read completed successfully\n");
 		break;
 	default:
+		/* [한국어] spec 외 값 — 컨트롤러 firmware bug 가능. */
 		NVME_CTRLR_ERRLOG(ctrlr, "Invalid Boot Partition read status\n");
 		rc = -EINVAL;
 	}
@@ -8815,15 +10130,55 @@ spdk_nvme_ctrlr_read_boot_partition_poll(struct spdk_nvme_ctrlr *ctrlr)
 	return rc;
 }
 
+/*
+ * [한국어]
+ * nvme_write_boot_partition_cb -
+ *   write_boot_partition 의 4단계 state machine 콜백. 한 단계 admin 완료마다 호출되어
+ *   다음 단계로 전이.
+ *
+ * @arg: ctrlr (start 호출 시 self 등록).
+ * @cpl: 직전 admin 완료 entry.
+ *
+ * State machine (bp_ws):
+ *   DOWNLOADING ──────────> DOWNLOADED ──────────> REPLACE ──────────> ACTIVATE ──> 사용자 콜백
+ *      ↑    ↓                    ↓                     ↓                  ↓
+ *      └────┘ (다음 page)        ↓                     ↓                  ↓
+ *   page 단위 fw_image_download   ↓                     ↓                  ↓
+ *                       fw_commit(REPLACE_BOOT_PARTITION)                  ↓
+ *                                             fw_commit(ACTIVATE_BOOT_PARTITION)
+ *
+ * 동작:
+ *   1. 에러 검사: cpl 이 에러면 즉시 사용자 콜백 호출 후 종료.
+ *   2. DOWNLOADING:
+ *      - fw_payload/offset/size_remaining 갱신.
+ *      - 다음 chunk size = min(남음, min_page_size).
+ *      - 다음 fw_image_download 발행.
+ *      - 마지막 chunk (transfer_size < min_page_size) 면 DOWNLOADED 로 전이 예약.
+ *   3. DOWNLOADED: fw_commit (CA=REPLACE_BOOT_PARTITION) 발행 → REPLACE 전이.
+ *   4. REPLACE: fw_commit (CA=ACTIVATE_BOOT_PARTITION) 발행 → ACTIVATE 전이.
+ *   5. ACTIVATE: 사용자 콜백 호출 (성공).
+ *   6. 알 수 없는 state: 에러 콜백.
+ *
+ * 비동기 chain — 사용자는 콜백 1회만 받음 (성공 또는 첫 실패 시점). 중간 단계는 내부 처리.
+ *
+ * 실행 컨텍스트: admin completion polling 콜백 (reactor 스레드).
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_cmd_fw_image_download / fw_commit 완료
+ *     → [본 함수]
+ *     → 다음 단계 admin 발행 또는 사용자 콜백
+ */
 static void
 nvme_write_boot_partition_cb(void *arg, const struct spdk_nvme_cpl *cpl)
 {
 	int res;
 	struct spdk_nvme_ctrlr *ctrlr = arg;
 	struct spdk_nvme_fw_commit fw_commit;
+	/* [한국어] 내부 에러 시 사용자에게 전달할 합성 cpl — INTERNAL_DEVICE_ERROR. */
 	struct spdk_nvme_cpl err_cpl =
 	{.status = {.sct = SPDK_NVME_SCT_GENERIC, .sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR }};
 
+	/* [한국어] cpl 에러는 어느 단계든 즉시 사용자 콜백 + 종료. */
 	if (spdk_nvme_cpl_is_error(cpl)) {
 		NVME_CTRLR_ERRLOG(ctrlr, "Write Boot Partition failed\n");
 		ctrlr->bp_write_cb_fn(ctrlr->bp_write_cb_arg, cpl);
@@ -8832,9 +10187,11 @@ nvme_write_boot_partition_cb(void *arg, const struct spdk_nvme_cpl *cpl)
 
 	if (ctrlr->bp_ws == SPDK_NVME_BP_WS_DOWNLOADING) {
 		NVME_CTRLR_DEBUGLOG(ctrlr, "Boot Partition Downloading at Offset %d Success\n", ctrlr->fw_offset);
+		/* [한국어] 직전 chunk 가 성공했으므로 cursor 전진. */
 		ctrlr->fw_payload = (uint8_t *)ctrlr->fw_payload + ctrlr->fw_transfer_size;
 		ctrlr->fw_offset += ctrlr->fw_transfer_size;
 		ctrlr->fw_size_remaining -= ctrlr->fw_transfer_size;
+		/* [한국어] 다음 chunk — 남은 양이 page 크기보다 작으면 마지막 chunk. */
 		ctrlr->fw_transfer_size = spdk_min(ctrlr->fw_size_remaining, ctrlr->min_page_size);
 		res = nvme_ctrlr_cmd_fw_image_download(ctrlr, ctrlr->fw_transfer_size, ctrlr->fw_offset,
 						       ctrlr->fw_payload, nvme_write_boot_partition_cb, ctrlr);
@@ -8844,11 +10201,13 @@ nvme_write_boot_partition_cb(void *arg, const struct spdk_nvme_cpl *cpl)
 			return;
 		}
 
+		/* [한국어] 이 chunk 가 마지막 (page 크기 미만)이면 다음 콜백에서 DOWNLOADED state 처리. */
 		if (ctrlr->fw_transfer_size < ctrlr->min_page_size) {
 			ctrlr->bp_ws = SPDK_NVME_BP_WS_DOWNLOADED;
 		}
 	} else if (ctrlr->bp_ws == SPDK_NVME_BP_WS_DOWNLOADED) {
 		NVME_CTRLR_DEBUGLOG(ctrlr, "Boot Partition Download Success\n");
+		/* [한국어] download 끝 → REPLACE_BOOT_PARTITION commit 발행. */
 		memset(&fw_commit, 0, sizeof(struct spdk_nvme_fw_commit));
 		fw_commit.bpid = ctrlr->bpid;
 		fw_commit.ca = SPDK_NVME_FW_COMMIT_REPLACE_BOOT_PARTITION;
@@ -8864,6 +10223,7 @@ nvme_write_boot_partition_cb(void *arg, const struct spdk_nvme_cpl *cpl)
 		ctrlr->bp_ws = SPDK_NVME_BP_WS_REPLACE;
 	} else if (ctrlr->bp_ws == SPDK_NVME_BP_WS_REPLACE) {
 		NVME_CTRLR_DEBUGLOG(ctrlr, "Boot Partition Replacement Success\n");
+		/* [한국어] REPLACE 끝 → ACTIVATE_BOOT_PARTITION commit 발행 (새 partition 활성). */
 		memset(&fw_commit, 0, sizeof(struct spdk_nvme_fw_commit));
 		fw_commit.bpid = ctrlr->bpid;
 		fw_commit.ca = SPDK_NVME_FW_COMMIT_ACTIVATE_BOOT_PARTITION;
@@ -8879,14 +10239,44 @@ nvme_write_boot_partition_cb(void *arg, const struct spdk_nvme_cpl *cpl)
 		ctrlr->bp_ws = SPDK_NVME_BP_WS_ACTIVATE;
 	} else if (ctrlr->bp_ws == SPDK_NVME_BP_WS_ACTIVATE) {
 		NVME_CTRLR_DEBUGLOG(ctrlr, "Boot Partition Activation Success\n");
+		/* [한국어] 마지막 단계 — 사용자에게 성공 cpl 전달. */
 		ctrlr->bp_write_cb_fn(ctrlr->bp_write_cb_arg, cpl);
 	} else {
+		/* [한국어] bp_ws 가 예상 범위 밖 — 동시 호출 등 잘못된 사용. */
 		NVME_CTRLR_ERRLOG(ctrlr, "Invalid Boot Partition write state\n");
 		ctrlr->bp_write_cb_fn(ctrlr->bp_write_cb_arg, &err_cpl);
 		return;
 	}
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_write_boot_partition -
+ *   Boot Partition WRITE 비동기 발행. download → commit(REPLACE) → commit(ACTIVATE)
+ *   3단계가 콜백 chain 으로 자동 진행.
+ *
+ * @ctrlr: 대상 컨트롤러.
+ * @payload: 새 boot partition 이미지의 host buffer.
+ * @size: 이미지 크기.
+ * @bpid: 대상 Boot Partition ID (0 or 1).
+ * @cb_fn: 최종 완료 (성공/실패) 콜백.
+ * @cb_arg: 콜백 인자.
+ * @return: 0 = 첫 download admin 발행 성공, 음수 = 즉시 실패.
+ *
+ * 동작:
+ *   1. CAP.BPS=0 면 boot partition 미지원 → -ENOTSUP.
+ *   2. ctrlr 의 bp_* state 필드 초기화 (DOWNLOADING + 진행 변수들).
+ *   3. 첫 fw_image_download (min_page_size 또는 전체) 발행 — 콜백 chain 이 이어 받음.
+ *
+ * 비동기 모델: 호출자는 즉시 반환받고, 실제 진행은 nvme_write_boot_partition_cb 가
+ *   상태 변수 (bp_ws, fw_offset, fw_size_remaining) 보고 단계 진행. 사용자 콜백은
+ *   최종 1회만 호출 (성공 시 ACTIVATE 끝, 실패 시 발생 시점).
+ *
+ * 호출 체인:
+ *   사용자 → [본 함수] (첫 download)
+ *     → nvme_write_boot_partition_cb (DOWNLOADING → DOWNLOADED → REPLACE → ACTIVATE)
+ *     → 사용자 cb_fn (1회)
+ */
 int
 spdk_nvme_ctrlr_write_boot_partition(struct spdk_nvme_ctrlr *ctrlr,
 				     void *payload, uint32_t size, uint32_t bpid,
@@ -8898,6 +10288,8 @@ spdk_nvme_ctrlr_write_boot_partition(struct spdk_nvme_ctrlr *ctrlr,
 		return -ENOTSUP;
 	}
 
+	/* [한국어] state machine 초기 상태 + per-write 진행 변수 세팅.
+	 * 이 필드들은 ctrlr 에 상주 — 동시 write 금지 (state 가 단일이라). */
 	ctrlr->bp_ws = SPDK_NVME_BP_WS_DOWNLOADING;
 	ctrlr->bpid = bpid;
 	ctrlr->bp_write_cb_fn = cb_fn;
@@ -8905,31 +10297,88 @@ spdk_nvme_ctrlr_write_boot_partition(struct spdk_nvme_ctrlr *ctrlr,
 	ctrlr->fw_offset = 0;
 	ctrlr->fw_size_remaining = size;
 	ctrlr->fw_payload = payload;
+	/* [한국어] 첫 chunk 크기 — 보통 min_page_size, 이미지가 그보다 작으면 size. */
 	ctrlr->fw_transfer_size = spdk_min(ctrlr->fw_size_remaining, ctrlr->min_page_size);
 
+	/* [한국어] 첫 download admin 발행 — 이후는 콜백 체인. */
 	res = nvme_ctrlr_cmd_fw_image_download(ctrlr, ctrlr->fw_transfer_size, ctrlr->fw_offset,
 					       ctrlr->fw_payload, nvme_write_boot_partition_cb, ctrlr);
 
 	return res;
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_is_discovery - NVMe-oF Discovery Controller 여부 판정 (공개 API)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @return true = discovery controller, false = 일반 IO controller
+ *
+ * NVMe-oF Discovery Subsystem: subnqn 이 표준 NQN "nqn.2014-08.org.nvmexpress.discovery"
+ * 으로 시작하는 특수 컨트롤러. 사용자가 connect 후 Discovery Log Page (0x70) 만 read 가능하며
+ * 일반 IO 명령은 거부됨. SPDK 가 NVMe-oF target 의 가용 subsystem 목록을 조회할 때 사용.
+ *
+ * 동작: subnqn 의 앞쪽 길이가 표준 discovery NQN 과 일치하는지 prefix 비교.
+ * PCIe 컨트롤러는 subnqn 이 빈 문자열이라 항상 false.
+ */
 bool
 spdk_nvme_ctrlr_is_discovery(struct spdk_nvme_ctrlr *ctrlr)
 {
-	assert(ctrlr);
+	assert(ctrlr);                /* [한국어] NULL 인자 방어 — debug 빌드 즉시 abort. */
 
 	return !strncmp(ctrlr->trid.subnqn, SPDK_NVMF_DISCOVERY_NQN,
 			strlen(SPDK_NVMF_DISCOVERY_NQN));
+	                                  /* [한국어] subnqn prefix 매치 — strncmp == 0 면 discovery NQN 으로 시작.
+	                                   *         일반 IO subsystem 은 사용자 정의 NQN ("nqn.<date>.<...>") 사용. */
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_is_fabrics - NVMe-oF Fabrics 컨트롤러 여부 판정 (공개 API)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @return true = Fabrics(RDMA/TCP/FC), false = PCIe
+ *
+ * 트랜스포트 종류로 분기: PCIe 는 BAR MMIO 직접 접근, Fabrics 는 Property Get/Set 명령 경유.
+ * 호출자(bdev_nvme, 진단 코드 등)가 트랜스포트별 분기 처리 시 사용.
+ *
+ * 동작: trid.trtype 을 spdk_nvme_trtype_is_fabrics 헬퍼로 분류.
+ *   - PCIe(=0): false
+ *   - RDMA(=1), FC(=2), TCP(=3), VFIOUSER(=4): true (VFIOUSER 도 NVMe-oF 처럼 동작)
+ *   - CUSTOM: 트랜스포트 등록 시 명시
+ */
 bool
 spdk_nvme_ctrlr_is_fabrics(struct spdk_nvme_ctrlr *ctrlr)
 {
 	assert(ctrlr);
 
 	return spdk_nvme_trtype_is_fabrics(ctrlr->trid.trtype);
+	                                  /* [한국어] trtype 분류 함수 호출 — PCIe vs 그 외 분기. */
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_security_receive -
+ *   Security Receive (opcode 0x82) admin 명령 동기 발행. SPC-4 / TCG Opal SED 의
+ *   "device → host" 보안 데이터 전송 (challenge, response 등).
+ *
+ * @ctrlr: 대상 컨트롤러.
+ * @secp: Security Protocol (SPC-4 §7.7). 0x01=TCG, 0x02=SPDM, 0xEF=IEEE 1667 등.
+ * @spsp: Security Protocol Specific (16-bit). 프로토콜별 의미 (Opal 의 ComID 등).
+ * @nssf: NVMe Security Specific Field (NVMe 1.4+). 0 = unused.
+ * @payload: 응답 데이터 받을 host buffer. NVMe 컨트롤러가 DMA write.
+ * @size: 버퍼 크기 (bytes).
+ * @return: 0 성공 + payload 채워짐, 음수 errno.
+ *
+ * Security Send/Receive 는 SPC-4 의 SECURITY PROTOCOL IN/OUT 의 NVMe 매핑.
+ * Opal SED 의 unlock challenge-response, TCG Storage 명령 등 모든 보안 기능이
+ * 이 두 admin 으로 처리됨 (별도 NVMe-specific 명령 없음).
+ *
+ * 호출 체인:
+ *   사용자/Opal 라이브러리 → [본 함수]
+ *     → spdk_nvme_ctrlr_cmd_security_receive (opcode 0x82, dword 10 = SECP|SPSP|NSSF, dword 11 = size)
+ *     → nvme_wait_for_adminq_completion (동기 polling)
+ */
 int
 spdk_nvme_ctrlr_security_receive(struct spdk_nvme_ctrlr *ctrlr, uint8_t secp,
 				 uint16_t spsp, uint8_t nssf, void *payload, size_t size)
@@ -8937,12 +10386,14 @@ spdk_nvme_ctrlr_security_receive(struct spdk_nvme_ctrlr *ctrlr, uint8_t secp,
 	struct nvme_completion_poll_status	*status;
 	int					res;
 
+	/* [한국어] status tracker heap 할당 — format / firmware 와 동일 패턴. */
 	status = calloc(1, sizeof(*status));
 	if (!status) {
 		NVME_CTRLR_ERRLOG(ctrlr, "Failed to allocate status tracker\n");
 		return -ENOMEM;
 	}
 
+	/* [한국어] Security Receive 발행 — 비동기. cmd 빌더가 SECP/SPSP/NSSF 를 dword 10/11 에 패킹. */
 	res = spdk_nvme_ctrlr_cmd_security_receive(ctrlr, secp, spsp, nssf, payload, size,
 			nvme_completion_poll_cb, status);
 	if (res) {
@@ -8950,6 +10401,7 @@ spdk_nvme_ctrlr_security_receive(struct spdk_nvme_ctrlr *ctrlr, uint8_t secp,
 		return res;
 	}
 
+	/* [한국어] true = command status 검사 위임 — status->cpl.status 의 SCT/SC 가 0 이어야 성공. */
 	res = nvme_wait_for_adminq_completion(ctrlr, status, true);
 	if (res) {
 		NVME_CTRLR_ERRLOG(ctrlr, "wait for spdk_nvme_ctrlr_cmd_security_receive failed: rc=%s\n",
@@ -8959,6 +10411,30 @@ spdk_nvme_ctrlr_security_receive(struct spdk_nvme_ctrlr *ctrlr, uint8_t secp,
 	return res;
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_security_send -
+ *   Security Send (opcode 0x81) admin 명령 동기 발행. "host → device" 보안 데이터 전송.
+ *
+ * @ctrlr: 대상 컨트롤러.
+ * @secp: Security Protocol (security_receive 와 동일 의미).
+ * @spsp: Security Protocol Specific.
+ * @nssf: NVMe Security Specific Field.
+ * @payload: 전송할 데이터 (host buffer). NVMe 컨트롤러가 DMA read.
+ * @size: 데이터 크기.
+ * @return: 0 성공, 음수 errno.
+ *
+ * Security Send 의 페어 = Security Receive. Opal SED 의 명령 시퀀스는 보통
+ * Send (command) → Receive (response) 의 RPC 패턴.
+ *
+ * receive 와의 유일한 차이: DMA 방향 (host→device). nvme_ctrlr_cmd_security_send
+ * 가 PRP/SGL 설정을 SLBA(Send) opcode 에 맞게 구성.
+ *
+ * 호출 체인:
+ *   사용자/Opal 라이브러리 → [본 함수]
+ *     → spdk_nvme_ctrlr_cmd_security_send (opcode 0x81)
+ *     → nvme_wait_for_adminq_completion
+ */
 int
 spdk_nvme_ctrlr_security_send(struct spdk_nvme_ctrlr *ctrlr, uint8_t secp,
 			      uint16_t spsp, uint8_t nssf, void *payload, size_t size)
@@ -8972,6 +10448,7 @@ spdk_nvme_ctrlr_security_send(struct spdk_nvme_ctrlr *ctrlr, uint8_t secp,
 		return -ENOMEM;
 	}
 
+	/* [한국어] Security Send 발행 — host→device DMA. */
 	res = spdk_nvme_ctrlr_cmd_security_send(ctrlr, secp, spsp, nssf, payload, size,
 						nvme_completion_poll_cb,
 						status);
@@ -8989,61 +10466,180 @@ spdk_nvme_ctrlr_security_send(struct spdk_nvme_ctrlr *ctrlr, uint8_t secp,
 	return res;
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_get_flags - 컨트롤러의 SPDK 내부 capability flag 비트마스크 반환 (공개 API)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @return ctrlr->flags 의 직접 사본 (enum spdk_nvme_ctrlr_flags 비트들 — COMPARE_AND_WRITE_SUPPORTED,
+ *  SGL_SUPPORTED, SECURITY_SEND_RECV_SUPPORTED, DIRECTIVES_SUPPORTED 등 NVMe 확장 기능 지원 여부).
+ *
+ * 이 flag 비트들은 nvme_ctrlr_process_init 진행 중 Identify Controller / Get Features
+ * 응답을 분석하여 SPDK 가 채워둔다. 사용자(예: bdev_nvme)가 "이 컨트롤러가 SGL 사용 가능한가?"
+ * 같은 분기 판단 시 호출.
+ *
+ * 동기화: read-only, ctrlr_lock 불필요 (READY 이후엔 변경 없음).
+ *
+ * 호출 체인:
+ *   bdev_nvme / 사용자 → [본 함수] → ctrlr->flags (단순 read)
+ */
 uint64_t
 spdk_nvme_ctrlr_get_flags(struct spdk_nvme_ctrlr *ctrlr)
 {
 	return ctrlr->flags;
+                                  /* [한국어] flags 비트마스크 직접 반환 — 잠금 없는 단순 read. */
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_get_transport_id - 컨트롤러의 트랜스포트 식별자(trid) 포인터 반환 (공개 API)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @return &ctrlr->trid (struct spdk_nvme_transport_id) — trtype/traddr/trsvcid/subnqn 등.
+ *
+ * 사용자가 컨트롤러의 주소 정보를 원할 때 호출. 반환 포인터는 ctrlr 내부 메모리를 가리키므로
+ * ctrlr 수명 동안만 유효 (detach 후 사용 금지).
+ *
+ * PCIe: trid.trtype=PCIE, traddr="0000:01:00.0" (BDF 문자열)
+ * NVMe-oF: trid.trtype=RDMA/TCP/FC, traddr="192.168.1.10", trsvcid="4420", subnqn=...
+ *
+ * 호출 체인:
+ *   RPC handler / bdev_nvme 진단 → [본 함수] → 사용자 표시/로깅
+ */
 const struct spdk_nvme_transport_id *
 spdk_nvme_ctrlr_get_transport_id(struct spdk_nvme_ctrlr *ctrlr)
 {
-	return &ctrlr->trid;
+	return &ctrlr->trid;          /* [한국어] trid 포인터 그대로 노출 — 외부에서 read-only로 사용 */
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_alloc_qid - I/O queue ID 하나를 free_io_qids 비트맵에서 할당 (공개 API)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @return 할당된 qid (1 ~ opts.num_io_queues), 가용 qid 없으면 -1
+ *
+ * NVMe 스펙: qid 0 = admin queue (예약), 1~num_io_queues = I/O queue.
+ * free_io_qids 는 ctrlr_construct 에서 bit_array_create(opts.num_io_queues + 1) 로 생성되어
+ * qid 1..N 비트가 1(=free)로 초기화됨. find_first_set(.. ,1) 로 첫 1 비트(=가용 qid) 검색.
+ *
+ * 동기화: ctrlr_lock (multi-process / multi-thread 동시 alloc 방지 — 동일 qid 중복 할당 금지).
+ *
+ * 호출 체인:
+ *   spdk_nvme_ctrlr_alloc_io_qpair → [본 함수] → qid 결정
+ *     → nvme_transport_ctrlr_create_io_qpair (해당 qid 로 SQ/CQ 생성)
+ */
 int32_t
 spdk_nvme_ctrlr_alloc_qid(struct spdk_nvme_ctrlr *ctrlr)
 {
-	uint32_t qid;
+	uint32_t qid;                 /* [한국어] 할당될 qid 임시 저장 */
 
-	assert(ctrlr->free_io_qids);
-	nvme_ctrlr_lock(ctrlr);
+	assert(ctrlr->free_io_qids);  /* [한국어] free_io_qids 비트맵이 ctrlr_construct 에서 생성되었어야 함 */
+	nvme_ctrlr_lock(ctrlr);       /* [한국어] 비트맵 변경 직렬화 — robust mutex */
 	qid = spdk_bit_array_find_first_set(ctrlr->free_io_qids, 1);
+	                                  /* [한국어] qid 1 부터 검색 (qid 0 은 admin 으로 예약) — 첫 1 비트 위치 반환.
+	                                   *         가용 없으면 UINT32_MAX 반환. */
 	if (qid > ctrlr->opts.num_io_queues) {
+	                                  /* [한국어] num_io_queues 초과 = 가용 qid 없음 (UINT32_MAX 또는 옵션 초과). */
 		NVME_CTRLR_ERRLOG(ctrlr, "No free I/O queue IDs\n");
 		nvme_ctrlr_unlock(ctrlr);
 		return -1;
 	}
 
 	spdk_bit_array_clear(ctrlr->free_io_qids, qid);
+	                                  /* [한국어] 비트 0 으로 — "사용 중" 표시. 이후 free_qid 가 다시 1 로. */
 	nvme_ctrlr_unlock(ctrlr);
 	return qid;
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_free_qid - I/O queue ID 를 free_io_qids 비트맵으로 반납 (공개 API)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @qid: 반납할 queue ID (1 ~ opts.num_io_queues)
+ *
+ * spdk_nvme_ctrlr_free_io_qpair 등에서 qpair 자원 해제 시 호출. 이후 같은 qid 가 다른
+ * alloc 요청에 재사용된다.
+ *
+ * 안전 처리: free_io_qids 가 NULL 일 수 있음 (컨트롤러 destruct 진행 중) — 그 경우 무시.
+ *
+ * 동기화: ctrlr_lock — alloc 과 짝.
+ */
 void
 spdk_nvme_ctrlr_free_qid(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid)
 {
 	assert(qid <= ctrlr->opts.num_io_queues);
+	                                  /* [한국어] 잘못된 qid 반납 방지 — 디버그 빌드 assert. */
 
-	nvme_ctrlr_lock(ctrlr);
+	nvme_ctrlr_lock(ctrlr);       /* [한국어] 비트맵 변경 직렬화 */
 
 	if (spdk_likely(ctrlr->free_io_qids)) {
+	                                  /* [한국어] destruct 중이면 free_io_qids 가 NULL 가능 — race 안전. */
 		spdk_bit_array_set(ctrlr->free_io_qids, qid);
+		                                  /* [한국어] 비트 1 = free 표시. 이후 alloc_qid 에서 재발견. */
 	}
 
 	nvme_ctrlr_unlock(ctrlr);
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_get_memory_domains - 트랜스포트가 지원하는 memory domain 목록 조회 (공개 API)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @domains: [out] domain 포인터 배열
+ * @array_size: 배열 크기 (입력)
+ * @return 실제 도메인 수 (배열 크기 초과 시 array_size 까지만 채움). 음수면 에러.
+ *
+ * Memory domain: SPDK 추상화 — DMA 가능한 메모리의 종류 식별 (RDMA PD, GPU memory 등).
+ * bdev_nvme 가 "이 컨트롤러가 GPU 메모리로 직접 DMA 가능한가?" 같은 판단에 사용.
+ *
+ * 동작: 단순 트랜스포트 vtable 디스패치 — 트랜스포트별 구현이 도메인 enumeration 수행.
+ *  - PCIe: 일반 시스템 메모리 도메인만 (보통 1개)
+ *  - RDMA: ibv_pd 별로 1개씩
+ *  - TCP: 시스템 메모리만
+ *
+ * 호출 체인:
+ *   bdev_nvme_get_memory_domains → [본 함수] → nvme_transport_ctrlr_get_memory_domains
+ */
 int
 spdk_nvme_ctrlr_get_memory_domains(const struct spdk_nvme_ctrlr *ctrlr,
 				   struct spdk_memory_domain **domains, int array_size)
 {
 	return nvme_transport_ctrlr_get_memory_domains(ctrlr, domains, array_size);
+	                                  /* [한국어] 트랜스포트별 vtable 호출 — PCIe/RDMA/TCP 각자 enumeration. */
 }
 
+/*
+ * [한국어]
+ * spdk_nvme_ctrlr_authenticate - 컨트롤러 admin qpair 에 대한 DH-HMAC-CHAP 인증 시작 (공개 API)
+ *
+ * @ctrlr: 대상 컨트롤러
+ * @cb_fn: 인증 완료 콜백
+ * @cb_ctx: 콜백 컨텍스트
+ * @return 0 = 인증 시작 성공 (이후 비동기 진행), 음수 errno
+ *
+ * NVMe-oF (NVMe 2.0) in-band authentication: 연결된 qpair 위에서 challenge-response 인증을
+ * 수행하여 host/controller 의 정당성 검증. PCIe 에서는 일반적으로 무의미 (인증 불필요).
+ *
+ * 동작:
+ *   - admin qpair (ctrlr->adminq) 에 대해 spdk_nvme_qpair_authenticate 위임
+ *   - 내부에서 auth state machine 시작 (NEGOTIATE → AWAIT_CHALLENGE → ... → DONE)
+ *   - 진행은 spdk_nvme_qpair_process_completions 폴링 시 한 단계씩
+ *   - 완료 시 cb_fn 호출 (성공: status=0, 실패: status=음수 errno)
+ *
+ * 사용처: NVMe-oF discovery 후 첫 connect 시 controller 가 auth required 응답하면 호출.
+ *
+ * 호출 체인:
+ *   사용자 / bdev_nvme → [본 함수] → spdk_nvme_qpair_authenticate(adminq, ...)
+ *     → nvme_fabric_qpair_authenticate_async
+ */
 int
 spdk_nvme_ctrlr_authenticate(struct spdk_nvme_ctrlr *ctrlr,
 			     spdk_nvme_authenticate_cb cb_fn, void *cb_ctx)
 {
 	return spdk_nvme_qpair_authenticate(ctrlr->adminq, cb_fn, cb_ctx);
+	                                  /* [한국어] admin qpair (qid=0) 에 인증 위임 — 인증 자체는 qpair-level 동작.
+	                                   *         I/O qpair 도 별도 인증 필요한 경우 spdk_nvme_qpair_authenticate 직접 호출. */
 }

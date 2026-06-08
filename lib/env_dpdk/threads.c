@@ -73,8 +73,7 @@
 uint32_t
 spdk_env_get_core_count(void)
 {
-	return rte_lcore_count();
-	/* [한국어] DPDK가 부팅 시 결정한 활성 lcore 개수 반환(이후 변하지 않음). */
+	return rte_lcore_count(); /* [한국어] DPDK가 부팅 시 결정한 활성 lcore 개수 반환(이후 변하지 않음). */
 }
 
 /*
@@ -91,8 +90,7 @@ spdk_env_get_core_count(void)
 uint32_t
 spdk_env_get_current_core(void)
 {
-	return rte_lcore_id();
-	/* [한국어] TLS에 저장된 현재 lcore 반환. EAL이 등록하지 않은 스레드라면 LCORE_ID_ANY. */
+	return rte_lcore_id(); /* [한국어] TLS에 저장된 현재 lcore 반환. EAL이 등록하지 않은 스레드라면 LCORE_ID_ANY. */
 }
 
 /*
@@ -106,8 +104,7 @@ spdk_env_get_current_core(void)
 uint32_t
 spdk_env_get_main_core(void)
 {
-	return rte_get_main_lcore();
-	/* [한국어] DPDK 21.11 이상에서 rte_get_master_lcore가 rte_get_main_lcore로 명칭 변경됨. */
+	return rte_get_main_lcore(); /* [한국어] DPDK 21.11 이상에서 rte_get_master_lcore가 rte_get_main_lcore로 명칭 변경됨. */
 }
 
 /*
@@ -122,8 +119,7 @@ spdk_env_get_main_core(void)
 uint32_t
 spdk_env_get_first_core(void)
 {
-	return rte_get_next_lcore(-1, 0, 0);
-	/* [한국어] -1부터 시작 → 0,1,2... 순서로 첫 활성 lcore를 찾아 반환. */
+	return rte_get_next_lcore(-1, 0, 0); /* [한국어] -1부터 시작 → 0,1,2... 순서로 첫 활성 lcore를 찾아 반환. */
 }
 
 /*
@@ -138,20 +134,16 @@ spdk_env_get_first_core(void)
 uint32_t
 spdk_env_get_last_core(void)
 {
-	uint32_t i;
-	/* [한국어] 순회 임시 변수. */
-	uint32_t last_core = UINT32_MAX;
-	/* [한국어] sentinel — 순회 후에도 UINT32_MAX이면 활성 lcore가 0개라는 뜻. */
+	uint32_t i; /* [한국어] 순회 임시 변수. */
+	uint32_t last_core = UINT32_MAX; /* [한국어] sentinel — 순회 후에도 UINT32_MAX이면 활성 lcore가 0개라는 뜻. */
 
-	SPDK_ENV_FOREACH_CORE(i) {
-		/* [한국어] 활성 lcore를 ID 오름차순으로 모두 순회. 마지막에 본 값이 최대값. */
-		last_core = i;
+	SPDK_ENV_FOREACH_CORE(i) { /* [한국어] 활성 lcore를 ID 오름차순으로 모두 순회. */
+		last_core = i; /* [한국어] 마지막에 본 값이 최대값이 됨. */
 	}
 
-	assert(last_core != UINT32_MAX);
-	/* [한국어] 활성 lcore가 1개 이상이라는 사실을 디버그 빌드에서 검증. */
+	assert(last_core != UINT32_MAX); /* [한국어] 활성 lcore가 1개 이상이라는 사실을 디버그 빌드에서 검증. */
 
-	return last_core;
+	return last_core; /* [한국어] 가장 큰 lcore ID 반환. */
 }
 
 /*
@@ -166,16 +158,13 @@ spdk_env_get_last_core(void)
 uint32_t
 spdk_env_get_next_core(uint32_t prev_core)
 {
-	unsigned lcore;
-	/* [한국어] DPDK API 반환값 임시. */
+	unsigned lcore; /* [한국어] DPDK API 반환값 임시. */
 
-	lcore = rte_get_next_lcore(prev_core, 0, 0);
-	/* [한국어] wrap=0(끝나면 RTE_MAX_LCORE 반환), skip_main=0(main 포함). */
-	if (lcore == RTE_MAX_LCORE) {
-		/* [한국어] 더 이상 활성 lcore가 없을 때 SPDK 관례대로 UINT32_MAX 반환. */
-		return UINT32_MAX;
+	lcore = rte_get_next_lcore(prev_core, 0, 0); /* [한국어] wrap=0(끝나면 RTE_MAX_LCORE 반환), skip_main=0(main 포함). */
+	if (lcore == RTE_MAX_LCORE) { /* [한국어] 더 이상 활성 lcore가 없는 경우. */
+		return UINT32_MAX; /* [한국어] SPDK 관례대로 UINT32_MAX 반환. */
 	}
-	return lcore;
+	return lcore; /* [한국어] 유효한 다음 활성 lcore ID 반환. */
 }
 
 /*
@@ -190,13 +179,11 @@ spdk_env_get_next_core(uint32_t prev_core)
 int32_t
 spdk_env_get_numa_id(uint32_t core)
 {
-	if (core >= RTE_MAX_LCORE) {
-		/* [한국어] 범위 밖 입력에 대해 "어떤 NUMA든 OK"를 의미하는 sentinel 반환. */
-		return SPDK_ENV_NUMA_ID_ANY;
+	if (core >= RTE_MAX_LCORE) { /* [한국어] 범위 밖 lcore 번호인 경우(비-EAL 스레드 등). */
+		return SPDK_ENV_NUMA_ID_ANY; /* [한국어] "어떤 NUMA든 OK"를 의미하는 sentinel 반환. */
 	}
 
-	return rte_lcore_to_socket_id(core);
-	/* [한국어] DPDK가 부팅 시 sysfs에서 구한 코어→소켓 매핑 테이블 조회. */
+	return rte_lcore_to_socket_id(core); /* [한국어] DPDK가 부팅 시 sysfs에서 구한 코어→소켓 매핑 테이블 조회. */
 }
 
 /*
@@ -211,24 +198,28 @@ spdk_env_get_numa_id(uint32_t core)
 int32_t
 spdk_env_get_first_numa_id(void)
 {
-	assert(rte_socket_count() > 0);
-	/* [한국어] EAL init 후라면 항상 1 이상이어야 함. */
+	assert(rte_socket_count() > 0); /* [한국어] EAL init 후라면 항상 1 이상이어야 함. */
 
-	return rte_socket_id_by_idx(0);
+	return rte_socket_id_by_idx(0); /* [한국어] 활성 socket 배열의 0번 원소(첫 번째 NUMA 노드 ID). */
 }
 
 /*
  * [한국어]
  * spdk_env_get_last_numa_id - 활성 NUMA 중 마지막 ID 반환
+ *
+ * @return: 활성 NUMA 노드 목록 중 인덱스가 가장 큰 NUMA 노드 ID.
+ *
+ * rte_socket_id_by_idx(rte_socket_count()-1): EAL이 인식한 활성 socket 배열의
+ * 마지막 원소. 시스템에 NUMA 노드 0, 2만 활성이라면 마지막 노드 ID는 2이다.
+ *
+ * 호출 체인: SPDK_ENV_FOREACH_NUMA_ID 순회 → spdk_env_get_last_numa_id
  */
 int32_t
 spdk_env_get_last_numa_id(void)
 {
-	assert(rte_socket_count() > 0);
-	/* [한국어] 위와 동일한 사전조건 검사. */
+	assert(rte_socket_count() > 0); /* [한국어] EAL init 후라면 항상 1 이상이어야 함(first와 동일 전제). */
 
-	return rte_socket_id_by_idx(rte_socket_count() - 1);
-	/* [한국어] 마지막 인덱스의 socket ID. */
+	return rte_socket_id_by_idx(rte_socket_count() - 1); /* [한국어] 마지막 인덱스의 socket ID — 최대 NUMA 노드 ID. */
 }
 
 /*
@@ -253,12 +244,10 @@ spdk_env_get_next_numa_id(int32_t prev_numa_id)
 		}
 	}
 
-	if ((i + 1) < rte_socket_count()) {
-		/* [한국어] 다음 인덱스가 유효 범위면 그 socket ID 반환. */
-		return rte_socket_id_by_idx(i + 1);
-	} else {
-		/* [한국어] 끝에 도달 — sentinel 반환. */
-		return INT32_MAX;
+	if ((i + 1) < rte_socket_count()) { /* [한국어] 다음 인덱스가 유효 범위인 경우. */
+		return rte_socket_id_by_idx(i + 1); /* [한국어] 다음 socket ID 반환. */
+	} else { /* [한국어] 이미 마지막 NUMA 노드에 도달한 경우. */
+		return INT32_MAX; /* [한국어] 끝 도달 sentinel — SPDK_ENV_FOREACH_NUMA_ID 루프 종료 조건. */
 	}
 }
 
@@ -274,14 +263,11 @@ spdk_env_get_next_numa_id(int32_t prev_numa_id)
 void
 spdk_env_get_cpuset(struct spdk_cpuset *cpuset)
 {
-	uint32_t i;
-	/* [한국어] 순회 임시. */
+	uint32_t i; /* [한국어] 순회 임시. */
 
-	spdk_cpuset_zero(cpuset);
-	/* [한국어] 입력으로 받은 cpuset을 모두 0으로 초기화 — caller-side 잔여값 제거. */
-	SPDK_ENV_FOREACH_CORE(i) {
-		/* [한국어] 활성 lcore마다 비트를 1로 설정. */
-		spdk_cpuset_set_cpu(cpuset, i, true);
+	spdk_cpuset_zero(cpuset); /* [한국어] 입력으로 받은 cpuset을 모두 0으로 초기화 — caller-side 잔여값 제거. */
+	SPDK_ENV_FOREACH_CORE(i) { /* [한국어] 활성 lcore를 ID 오름차순으로 순회. */
+		spdk_cpuset_set_cpu(cpuset, i, true); /* [한국어] 각 활성 lcore 비트를 1로 세팅. */
 	}
 }
 
@@ -304,53 +290,36 @@ spdk_env_get_cpuset(struct spdk_cpuset *cpuset)
 static bool
 env_core_get_smt_cpuset(struct spdk_cpuset *cpuset, uint32_t core)
 {
-#ifdef __linux__
-	/* [한국어] Linux 한정 구현 — sysfs는 Linux에만 존재. */
-	struct spdk_cpuset smt_siblings;
-	/* [한국어] sysfs에서 파싱한 결과를 임시로 담을 로컬 cpuset. */
-	char path[PATH_MAX];
-	/* [한국어] sysfs 경로 버퍼. */
-	FILE *f;
-	/* [한국어] 파일 핸들. */
-	char *line = NULL;
-	/* [한국어] getline이 동적 할당한 줄 버퍼(반드시 free 필요). */
-	size_t len = 0;
-	/* [한국어] getline에 전달할 버퍼 크기 — 0이면 getline이 알아서 할당. */
-	ssize_t read;
-	/* [한국어] getline 결과 바이트 수(-1=실패). */
-	bool valid = false;
-	/* [한국어] 성공/실패 플래그. ret 라벨에서 자원 정리 후 그대로 반환. */
+#ifdef __linux__ /* [한국어] Linux 한정 구현 — sysfs는 Linux에만 존재. */
+	struct spdk_cpuset smt_siblings; /* [한국어] sysfs에서 파싱한 결과를 임시로 담을 로컬 cpuset. */
+	char path[PATH_MAX]; /* [한국어] sysfs 경로 버퍼. */
+	FILE *f; /* [한국어] 파일 핸들. */
+	char *line = NULL; /* [한국어] getline이 동적 할당한 줄 버퍼(반드시 free 필요). */
+	size_t len = 0; /* [한국어] getline에 전달할 버퍼 크기 — 0이면 getline이 알아서 할당. */
+	ssize_t read; /* [한국어] getline 결과 바이트 수(-1=실패). */
+	bool valid = false; /* [한국어] 성공/실패 플래그. ret 라벨에서 자원 정리 후 그대로 반환. */
 
-	snprintf(path, sizeof(path), THREAD_SIBLINGS_FILE, core);
-	/* [한국어] /sys/.../cpu<core>/topology/thread_siblings 경로 조립. */
-	f = fopen(path, "r");
-	/* [한국어] 읽기 전용으로 열기. /sys는 항상 ASCII 텍스트. */
-	if (f == NULL) {
-		/* [한국어] 일부 컨테이너/CPU offline 상태에서는 파일이 없을 수 있음. */
-		SPDK_ERRLOG("Could not fopen('%s'): %s\n", path, spdk_strerror(errno));
-		return false;
+	snprintf(path, sizeof(path), THREAD_SIBLINGS_FILE, core); /* [한국어] /sys/.../cpu<core>/topology/thread_siblings 경로 조립. */
+	f = fopen(path, "r"); /* [한국어] 읽기 전용으로 열기. /sys는 항상 ASCII 텍스트. */
+	if (f == NULL) { /* [한국어] 일부 컨테이너/CPU offline 상태에서는 파일이 없을 수 있음. */
+		SPDK_ERRLOG("Could not fopen('%s'): %s\n", path, spdk_strerror(errno)); /* [한국어] 운영자 디버깅 — 실패 경로 파일명과 에러 메시지 출력. */
+		return false; /* [한국어] 파일 열기 실패 → false 반환. */
 	}
-	read = getline(&line, &len, f);
-	/* [한국어] 한 줄 읽기. line 자동 할당. */
-	if (read == -1) {
-		/* [한국어] EOF 또는 read 에러. line은 그래도 free 해야 함(아래 ret로 점프). */
-		SPDK_ERRLOG("Could not getline() for '%s': %s\n", path, spdk_strerror(errno));
-		goto ret;
+	read = getline(&line, &len, f); /* [한국어] 한 줄 읽기. line 자동 할당. */
+	if (read == -1) { /* [한국어] EOF 또는 read 에러. line은 그래도 free 해야 함(아래 ret로 점프). */
+		SPDK_ERRLOG("Could not getline() for '%s': %s\n", path, spdk_strerror(errno)); /* [한국어] 읽기 실패 경로 로그. */
+		goto ret; /* [한국어] 자원 정리 후 false 반환. */
 	}
 
 	/* Remove trailing newline */
-	line[strlen(line) - 1] = 0;
-	/* [한국어] sysfs 줄 끝 '\n' 제거 — spdk_cpuset_parse는 깔끔한 비트맵 문자열을 기대. */
-	if (spdk_cpuset_parse(&smt_siblings, line)) {
-		/* [한국어] "0,16" 또는 "0-3" 같은 cpuset 표기 파싱. 비-0 반환은 실패. */
-		SPDK_ERRLOG("Could not parse '%s' from '%s'\n", line, path);
-		goto ret;
+	line[strlen(line) - 1] = 0; /* [한국어] sysfs 줄 끝 '\n' 제거 — spdk_cpuset_parse는 깔끔한 비트맵 문자열을 기대. */
+	if (spdk_cpuset_parse(&smt_siblings, line)) { /* [한국어] "0,16" 또는 "0-3" 같은 cpuset 표기 파싱. 비-0 반환은 실패. */
+		SPDK_ERRLOG("Could not parse '%s' from '%s'\n", line, path); /* [한국어] 파싱 실패 로그. */
+		goto ret; /* [한국어] 자원 정리 후 false 반환. */
 	}
 
-	valid = true;
-	/* [한국어] 파싱 성공 표시. */
-	spdk_cpuset_or(cpuset, &smt_siblings);
-	/* [한국어] 결과를 출력 cpuset에 OR로 누적. 호출자가 여러 코어에 대해 반복하면 합집합이 됨. */
+	valid = true; /* [한국어] 파싱 성공 표시. */
+	spdk_cpuset_or(cpuset, &smt_siblings); /* [한국어] 결과를 출력 cpuset에 OR로 누적. 호출자가 여러 코어에 대해 반복하면 합집합이 됨. */
 ret:
 	free(line);
 	/* [한국어] getline이 할당한 버퍼 해제. NULL 안전. */

@@ -708,12 +708,28 @@ spdk_rpc_server_close(struct spdk_rpc_server *server)
 	free(server);
 }
 
-/* [한국어] rpc_get_methods 요청 파라미터 디코딩 구조체.
- *   - current: true이면 현재 state에서 호출 가능한 method만 반환.
- *   - include_aliases: true이면 alias 항목도 함께 반환. */
+/*
+ * [한국어]
+ * struct rpc_get_methods — "rpc_get_methods" RPC의 입력 파라미터 디코딩 컨테이너.
+ *
+ * spdk_json_decode_object가 rpc_rpc_get_methods_decoders 테이블을 보고
+ * 입력 JSON 객체의 키를 본 구조체의 필드로 매핑한다. 두 필드 모두 선택적이며
+ * 기본값은 모두 false다.
+ */
 struct rpc_get_methods {
 	bool current;
+	/* [한국어] true이면 현재 RPC state (STARTUP/RUNTIME)에서 호출 가능한 method만 응답에 포함.
+	 * 설정자: spdk_json_decode_object가 입력의 "current" 키를 디코딩하여 채움.
+	 * 읽는 자: rpc_rpc_get_methods 본문에서 method.state_mask & g_rpc_state 검사.
+	 * 값 범위: true/false. 기본 false (=모든 state의 method를 노출).
+	 * 동기화: 단일 RPC 호출 범위. */
+
 	bool include_aliases;
+	/* [한국어] true이면 SPDK_RPC_ALIAS로 등록된 별칭 method도 응답에 포함.
+	 * 설정자: spdk_json_decode_object가 "include_aliases" 키 디코딩 시 채움.
+	 * 읽는_자: rpc_rpc_get_methods 본문 필터링 로직.
+	 * 값 범위: true/false. 기본 false (=정식 method 이름만).
+	 * 동기화: 단일 RPC 호출 범위. */
 };
 
 /* This ugly rpc_rpc_ double prefix is needed for linting and avoids deprecation of this popular RPC  */

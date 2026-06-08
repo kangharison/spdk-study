@@ -4,27 +4,85 @@
  *   All rights reserved.
  */
 
+/*
+ * [한국어 설명] SPDK accel 소프트웨어 폴백 모듈 (accel_sw.c)
+ *
+ * === 파일의 역할 ===
+ * 하드웨어 가속기가 없거나 특정 opcode를 다른 모듈이 지원하지 않을 때 사용되는
+ * CPU 기반 가속(소프트웨어) 모듈을 구현한다. memcpy/memset 같은 단순 op는 직접
+ * 처리하고, 복잡한 op(crc32c, compress/decompress, encrypt/decrypt, dif/dix)는
+ * ISA-L(Intel Storage Acceleration Library), ISA-L Crypto, LZ4 같은 CPU
+ * 라이브러리(가능하면 SIMD: SSE/AVX2/AVX512)로 처리한다. SW 모듈은 항상 등록되며
+ * accel framework의 마지막 폴백으로 동작한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * [accel 코어(accel.c)]
+ *   ↓ op → g_modules_opc[op].module = &g_sw_module (HW 미매핑 시 폴백)
+ * [sw module(이 파일)]
+ *   ↓ ISA-L / ISA-L Crypto / LZ4 / memcpy / spdk_xor / spdk_crc32c / spdk_dif
+ * [CPU SIMD instructions or scalar C]
+ * 채널별로 ISA-L의 isal_zstream/inflate_state 상태 객체, LZ4 stream, completion
+ * poller를 관리한다. 모든 task는 즉시 처리 후 tasks_to_complete 리스트에 넣고,
+ * completion_poller가 다음 poll 주기에서 일괄 cb_fn을 호출(인접 호출 방지).
+ *
+ * === 타 모듈과의 연결 ===
+ * - 의존: `spdk/accel_module.h`(submit_tasks 인터페이스), accel_internal.h,
+ *   `spdk/xor.h`(SW xor), `spdk/dif.h`(DIF/PI 계산), `spdk/crc32.h`,
+ *   ISA-L(`igzip_lib.h`), ISA-L Crypto(`aes_xts.h`), LZ4.
+ * - 의존하는 모듈: accel.c (모듈 등록 후 디스패치 시 호출).
+ * - 데이터 흐름: accel 코어가 submit_tasks(io_ch, task) → 본 모듈이 즉시 처리 →
+ *   _add_to_comp_list로 tasks_to_complete에 enqueue → completion_poller 가 dequeue →
+ *   spdk_accel_task_complete(status) 호출 → 사용자 cb_fn 도착.
+ * - 공유 자료구조: `g_sw_module`(전역 모듈 등록 객체)이 accel.c의
+ *   spdk_accel_module_list에 등록됨.
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - struct sw_accel_io_channel: SW 모듈의 채널 객체 (ISA-L stream, LZ4 stream,
+ *   completion poller, 완료 대기 task 리스트).
+ * - struct sw_accel_crypto_key_data: AES-XTS 키별 encrypt/decrypt 함수 포인터.
+ * - sw_accel_supports_opcode(): 지원 op 보고 (대부분의 op 지원).
+ * - sw_accel_submit_tasks(): 디스패치 진입점 — op_code별로 SW 처리.
+ * - sw_accel_compress/decompress(): ISA-L deflate / LZ4 기반 처리.
+ * - sw_accel_crypto_operation(): ISA-L Crypto AES-XTS encrypt/decrypt.
+ * - accel_comp_poll(): completion_poller — 큐에 쌓인 완료 task들을 cb_fn 호출.
+ */
+
+/* [한국어] 표준 SPDK 인클루드. */
 #include "spdk/stdinc.h"
 
+/* [한국어] accel 모듈 인터페이스. */
 #include "spdk/accel_module.h"
+/* [한국어] accel 라이브러리 내부 공용 헤더 (accel_stats 등). */
 #include "accel_internal.h"
 
+/* [한국어] DPDK 추상 (메모리 할당). */
 #include "spdk/env.h"
+/* [한국어] 분기 힌트 매크로. */
 #include "spdk/likely.h"
+/* [한국어] SPDK 로그 매크로. */
 #include "spdk/log.h"
+/* [한국어] poller 등록 (completion_poller). */
 #include "spdk/thread.h"
+/* [한국어] JSON writer (RPC dump_info 콜백). */
 #include "spdk/json.h"
+/* [한국어] SW CRC32C (Castagnoli 다항식). */
 #include "spdk/crc32.h"
+/* [한국어] spdk_min/max/divide_round_up. */
 #include "spdk/util.h"
+/* [한국어] spdk_xor — n개 소스의 XOR 결과를 dst에 저장. */
 #include "spdk/xor.h"
+/* [한국어] DIF/PI(Protection Information) 계산/검증. */
 #include "spdk/dif.h"
 
+/* [한국어] LZ4 압축 알고리즘 — 빌드시 활성화된 경우만 컴파일. */
 #ifdef SPDK_CONFIG_HAVE_LZ4
 #include <lz4.h>
 #endif
 
+/* [한국어] ISA-L (Intel Storage Acceleration Library) — deflate/CRC32C SIMD 구현. */
 #ifdef SPDK_CONFIG_ISAL
 #include "../isa-l/include/igzip_lib.h"
+/* [한국어] ISA-L Crypto — AES-XTS 등의 SIMD 암호 라이브러리. */
 #ifdef SPDK_CONFIG_ISAL_CRYPTO
 #include "../isa-l-crypto/include/isa-l_crypto/aes_xts.h"
 #include "../isa-l-crypto/include/isa-l_crypto/isal_crypto_api.h"
@@ -32,8 +90,11 @@
 #endif
 
 /* Per the AES-XTS spec, the size of data unit cannot be bigger than 2^20 blocks, 128b each block */
+/* [한국어] AES-XTS 단일 data unit 최대 크기 = 2^20 * 16B = 16MB.
+ *  NIST SP 800-38E 규격에 따른 제한. 이를 넘는 입력은 EINVAL로 거절. */
 #define ACCEL_AES_XTS_MAX_BLOCK_SIZE (1 << 24)
 
+/* [한국어] deflate 레벨 범위. ISA-L 빌드 시에만 의미 있음. */
 #ifdef SPDK_CONFIG_ISAL
 #define COMP_DEFLATE_MIN_LEVEL ISAL_DEF_MIN_LEVEL
 #define COMP_DEFLATE_MAX_LEVEL ISAL_DEF_MAX_LEVEL
@@ -42,56 +103,119 @@
 #define COMP_DEFLATE_MAX_LEVEL 0
 #endif
 
+/* [한국어] 지원 압축 레벨 수 (0..MAX 포함). 레벨별 작업 버퍼 배열의 크기 결정. */
 #define COMP_DEFLATE_LEVEL_NUM (COMP_DEFLATE_MAX_LEVEL + 1)
 
+/*
+ * [한국어] struct comp_deflate_level_buf — deflate 레벨별 ISA-L 작업 버퍼 슬라이스.
+ *  level_buf_mem 통짜를 size 단위로 잘라 각 레벨이 쓰는 메모리를 가리킨다.
+ */
 struct comp_deflate_level_buf {
 	uint32_t size;
+	/* [한국어] 이 레벨이 ISA-L에 요구하는 작업 버퍼 크기 (예: ISAL_DEF_LVL2_DEFAULT). */
+
 	uint8_t  *buf;
+	/* [한국어] 실제 작업 버퍼 포인터 (level_buf_mem 내부의 offset). */
 };
 
+/*
+ * [한국어] struct sw_accel_io_channel — SW accel 모듈의 채널.
+ *  스레드별로 1개씩 존재. ISA-L 스트리밍 압축 상태, LZ4 스트림, 완료 큐를 보유.
+ */
 struct sw_accel_io_channel {
 	/* for ISAL */
 #ifdef SPDK_CONFIG_ISAL
 	struct isal_zstream		stream;
+	/* [한국어] ISA-L deflate 압축 스트림 상태 객체. SW compress 호출마다 init→
+	 * deflate→reset 사이클을 돌린다. */
+
 	struct inflate_state		state;
+	/* [한국어] ISA-L inflate(압축 해제) 상태 객체. */
+
 	/* The array index corresponds to the algorithm level */
 	struct comp_deflate_level_buf   deflate_level_bufs[COMP_DEFLATE_LEVEL_NUM];
+	/* [한국어] 레벨별 ISA-L 작업 버퍼 슬라이스. level_buf_mem을 size 단위로 분할.
+	 * 압축 시 stream.level_buf/level_buf_size를 이 배열에서 골라 세팅한다. */
+
 	uint8_t                         level_buf_mem[ISAL_DEF_LVL0_DEFAULT + ISAL_DEF_LVL1_DEFAULT +
 					      ISAL_DEF_LVL2_DEFAULT + ISAL_DEF_LVL3_DEFAULT];
+	/* [한국어] 모든 레벨이 요구하는 작업 버퍼를 한 번에 잡아두는 통짜 배열.
+	 * 각 레벨이 자기 영역을 deflate_level_bufs[i].buf로 가리킨다. */
 #endif
 #ifdef SPDK_CONFIG_HAVE_LZ4
 	/* for lz4 */
 	LZ4_stream_t                    *lz4_stream;
+	/* [한국어] LZ4 압축 스트림 객체. */
+
 	LZ4_streamDecode_t              *lz4_stream_decode;
+	/* [한국어] LZ4 디코드 스트림 객체. */
 #endif
 	struct spdk_poller		*completion_poller;
+	/* [한국어] tasks_to_complete의 완료 task들을 주기적으로 dequeue해 cb_fn을 호출.
+	 * SW로 작업이 즉시 끝나도 호출 스택 너무 깊어지는 것을 막기 위해 poller로 분리. */
+
 	STAILQ_HEAD(, spdk_accel_task)	tasks_to_complete;
+	/* [한국어] 완료된 SW task들의 큐. completion_poller가 비울 때까지 보관. */
 };
 
+/*
+ * [한국어] sw_accel_crypto_op — ISA-L Crypto AES-XTS encrypt/decrypt 함수 포인터 타입.
+ *  k2: tweak 키, k1: 데이터 키, initial_tweak: tweak 초기값(LBA 등),
+ *  len_bytes: 입력 길이, in/out: 입력/출력 버퍼.
+ */
 typedef int (*sw_accel_crypto_op)(const uint8_t *k2, const uint8_t *k1,
 				  const uint8_t *initial_tweak, const uint64_t len_bytes,
 				  const void *in, void *out);
 
+/*
+ * [한국어] struct sw_accel_crypto_key_data — 키 사이즈/cipher에 따라 결정된
+ *  encrypt/decrypt 함수 포인터 쌍. spdk_accel_crypto_key->priv에 저장된다.
+ */
 struct sw_accel_crypto_key_data {
 	sw_accel_crypto_op encrypt;
+	/* [한국어] 이 키에 사용할 encrypt 함수 (128/256bit XTS 등에 따라 다른 ISA-L 함수). */
+
 	sw_accel_crypto_op decrypt;
+	/* [한국어] 이 키에 사용할 decrypt 함수. */
 };
 
+/* [한국어] SW 모듈의 글로벌 등록 객체. 파일 하단의 SPDK_ACCEL_MODULE_REGISTER로 등록. */
 static struct spdk_accel_module_if g_sw_module;
 
+/* [한국어] forward declarations — 모듈 등록 객체에서 콜백으로 참조되기 전 선언. */
 static void sw_accel_crypto_key_deinit(struct spdk_accel_crypto_key *_key);
 static int sw_accel_crypto_key_init(struct spdk_accel_crypto_key *key);
 static bool sw_accel_crypto_supports_tweak_mode(enum spdk_accel_crypto_tweak_mode tweak_mode);
 static bool sw_accel_crypto_supports_cipher(enum spdk_accel_cipher cipher, size_t key_size);
 
 /* Post SW completions to a list; processed by ->completion_poller. */
+/*
+ * [한국어]
+ * _add_to_comp_list - 완료된 task를 채널의 완료 큐(tasks_to_complete)에 enqueue.
+ *
+ * @sw_ch: SW 채널, @accel_task: 완료할 task, @status: 결과 코드.
+ *
+ * 직접 spdk_accel_task_complete을 호출하지 않고 큐로 미루는 이유:
+ *   - 같은 호출 스택에서 cb_fn이 또 submit을 하는 재귀 깊이 폭주 방지.
+ *   - 여러 task를 한 번에 dequeue → batch cb_fn 호출로 캐시 효율 향상.
+ */
 inline static void
 _add_to_comp_list(struct sw_accel_io_channel *sw_ch, struct spdk_accel_task *accel_task, int status)
 {
+	/* [한국어] status를 task에 보관 — completion_poller가 나중에 읽음. */
 	accel_task->status = status;
 	STAILQ_INSERT_TAIL(&sw_ch->tasks_to_complete, accel_task, link);
 }
 
+/*
+ * [한국어]
+ * sw_accel_supports_opcode - SW 모듈이 지원하는 opcode 보고.
+ *
+ * @opc: 검사 대상 opcode.
+ * @return: true면 지원, false면 미지원.
+ *
+ * accel 코어가 모듈 선택 시 호출. SW 모듈은 거의 모든 op를 지원(폴백 역할).
+ */
 static bool
 sw_accel_supports_opcode(enum spdk_accel_opcode opc)
 {

@@ -74,21 +74,44 @@ struct rpc_construct_aio {
 	 * 동기화: 한 번 설정되면 변경되지 않음. */
 
 	uint32_t block_size;
-	/* [한국어] 블록 크기 바이트 (선택). 0이면 백엔드의 기본값 사용
-	 *           (블록 디바이스는 BLKSSZGET, 일반 파일은 4096). */
+	/* [한국어] 블록 크기(바이트, 선택 필드). 0이면 백엔드 자동 감지값을 채택한다 — 블록
+	 * 디바이스에서는 ioctl(BLKSSZGET)로 논리 sector 크기, 일반 파일에서는 stat::st_blksize 또는
+	 * fs hint(보통 4096). 비-0이고 자동 감지값보다 작으면 create_aio_bdev가 거절(-EINVAL).
+	 * 설정자: spdk_json_decode_uint32 (optional=true).
+	 * 읽는 자: create_aio_bdev → fdisk->disk.blocklen / required_alignment 계산.
+	 * 값 범위: 0(자동) 또는 512 이상 2의 거듭제곱(예: 512/1024/2048/4096).
+	 * 동기화: 디코드 후 read-only로 사용 — 별도 락 불필요. */
 
 	bool readonly;
-	/* [한국어] true면 read-only 모드로 open (O_RDONLY). 기본 false. */
+	/* [한국어] true이면 백엔드 파일/디바이스를 O_RDONLY로 열고, write 요청은 즉시 FAILED로
+	 * 보고하도록 한다(bdev_aio.c::_bdev_aio_submit_request의 WRITE 분기). 기본 false → O_RDWR.
+	 * 설정자: spdk_json_decode_bool (optional, default false).
+	 * 읽는 자: create_aio_bdev → fdisk->readonly → bdev_aio_open의 io_flag,
+	 *           _bdev_aio_submit_request의 WRITE 거절 분기.
+	 * 동기화: 변경 불가 옵션 — 디코드 후 read-only. */
 
 	bool fallocate;
-	/* [한국어] true면 UNMAP/WRITE_ZEROES를 fallocate(PUNCH_HOLE) 호출로 매핑.
-	 *           파일 시스템이 지원해야 함. 블록 디바이스에는 무관. */
+	/* [한국어] true이면 UNMAP/WRITE_ZEROES bdev I/O를 fallocate(2) 시스템 호출로 매핑
+	 * (PUNCH_HOLE / ZERO_RANGE). 백엔드 파일 시스템이 해당 mode를 지원해야 함(ext4/xfs OK,
+	 * tmpfs 일부 한정). 블록 디바이스는 fallocate가 의미 없으므로 기능 노출이 무의미.
+	 * 설정자: spdk_json_decode_bool (optional, default false).
+	 * 읽는 자: create_aio_bdev → fdisk->fallocate → bdev_aio_io_type_supported가
+	 *           SPDK_BDEV_IO_TYPE_UNMAP/WRITE_ZEROES 지원 여부 응답에 사용.
+	 * 플랫폼: FreeBSD 빌드에서 true로 들어오면 create_aio_bdev가 -ENOTSUP로 거절. */
 
 	struct spdk_uuid uuid;
-	/* [한국어] bdev UUID (선택). 0이면 자동 할당. */
+	/* [한국어] bdev UUID (선택). 0(SPDK_UUID_ZERO)이면 spdk_bdev_register가 자동으로 새 UUID를
+	 * 생성. 명시 시 그 값을 그대로 보존해 재시작 후에도 동일한 UUID를 유지 가능.
+	 * 설정자: spdk_json_decode_uuid (optional). 읽는 자: create_aio_bdev → spdk_uuid_copy.
+	 * 값 범위: RFC 4122 형식의 16바이트 UUID. */
 
 	bool nowait;
-	/* [한국어] true면 open 시 O_NONBLOCK과 유사 동작 (백엔드가 차단되지 않도록). */
+	/* [한국어] true이면 open 후 io_prep_*에 RWF_NOWAIT 플래그를 사용 — 커널 block layer가 큐 태그
+	 * 부족 등으로 즉시 처리 불가하면 io_submit이 -EAGAIN을 반환해 backpressure를 가능하게 함.
+	 * RWF_NOWAIT은 블록 디바이스에서만 안전하므로 일반 파일에서는 bdev_aio_open이 거절.
+	 * 설정자: spdk_json_decode_bool (optional, default false).
+	 * 읽는 자: create_aio_bdev → bdev_aio_open(nowait) → fdisk->use_nowait → bdev_aio_submit_io.
+	 * 커널 의존: <linux/fs.h>의 RWF_NOWAIT 매크로와 SPDK_CONFIG_AIO_HAVE_RW_FLAGS 모두 필요. */
 };
 
 struct rpc_construct_aio_ctx {
@@ -258,8 +281,11 @@ SPDK_RPC_REGISTER("bdev_aio_create", rpc_bdev_aio_create, SPDK_RPC_RUNTIME)
 struct rpc_rescan_aio {
 	/* [한국어] "bdev_aio_rescan" 입력. 이름 1개. */
 	char *name;
-	/* [한국어] 다시 스캔할 AIO bdev 이름.
-	 * 설정자: 디코더. 읽는 자: bdev_aio_rescan. */
+	/* [한국어] 다시 스캔할 AIO bdev 이름. lib/bdev에 등록된 bdev 식별자와 일치해야 함.
+	 * 설정자: spdk_json_decode_string (strdup된 사본). 읽는 자: bdev_aio_rescan이
+	 * spdk_bdev_open_ext로 desc 획득 시 키로 사용.
+	 * 값 범위: 비-NULL ASCII 문자열. NULL이면 디코더가 SPDK_JSONRPC_ERROR_INTERNAL_ERROR.
+	 * 동기화: 디코드 후 read-only. 함수 종료 직전 free(req.name)로 해제. */
 };
 
 static const struct spdk_json_object_decoder rpc_bdev_aio_rescan_decoders[] = {
@@ -318,8 +344,12 @@ SPDK_RPC_REGISTER("bdev_aio_rescan", rpc_bdev_aio_rescan, SPDK_RPC_RUNTIME)
 struct rpc_delete_aio {
 	/* [한국어] "bdev_aio_delete" 입력. 이름 1개. */
 	char *name;
-	/* [한국어] 삭제 대상 bdev 이름.
-	 * 설정자: 디코더(strdup). 읽는 자: bdev_aio_delete. */
+	/* [한국어] 삭제 대상 bdev 이름. lib/bdev의 spdk_bdev_unregister_by_name에 키로 전달되고,
+	 * 모듈 매칭(aio_if)도 함께 검증되어 다른 모듈 소속의 bdev가 실수로 지워지는 것을 방지.
+	 * 설정자: spdk_json_decode_string (strdup된 사본). 읽는 자: bdev_aio_delete.
+	 * 값 범위: 비-NULL 문자열. 누락 시 디코더 실패 → INTERNAL_ERROR.
+	 * 라이프타임: bdev_aio_delete 내부에서 lookup 후 더 이상 참조하지 않으므로, 함수 반환 직후
+	 * free_rpc_delete_aio에서 안전하게 해제 가능(콜백이 더 늦게 와도 무관). */
 };
 
 /*

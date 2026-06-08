@@ -1481,6 +1481,7 @@ static void
 bdev_aio_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
 	if (_bdev_aio_submit_request(ch, bdev_io) < 0) {
+		/* [한국어] -1 = 미지원 타입(default 분기). 여기서 즉시 FAILED 완료 보고. */
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 	}
 }
@@ -1640,8 +1641,10 @@ static struct spdk_io_channel *
 bdev_aio_get_io_channel(void *ctx)
 {
 	struct file_disk *fdisk = ctx;
+	/* [한국어] ctx(=disk.ctxt)가 file_disk 포인터이며 디스크별 io_device 키로 등록됨. */
 
 	return spdk_get_io_channel(fdisk);
+	/* [한국어] reactor 로컬 채널 획득(첫 호출이면 bdev_aio_create_cb 트리거). */
 }
 
 
@@ -1660,12 +1663,19 @@ bdev_aio_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	spdk_json_write_named_object_begin(w, "aio");
 	/* [한국어] "aio" 키 아래에 옵션들을 객체로 출력. */
 	spdk_json_write_named_string(w, "filename", fdisk->filename);
+	/* [한국어] 백엔드 파일/디바이스 경로를 진단용으로 노출. */
 	spdk_json_write_named_bool(w, "block_size_override", fdisk->block_size_override);
+	/* [한국어] 블록 크기를 사용자가 명시했는지(true)/자동 감지했는지(false) 표시. */
 	spdk_json_write_named_bool(w, "readonly", fdisk->readonly);
+	/* [한국어] read-only로 열렸는지 여부. */
 	spdk_json_write_named_bool(w, "fallocate", fdisk->fallocate);
+	/* [한국어] UNMAP/WRITE_ZEROES를 fallocate로 지원하는지 여부. */
 	spdk_json_write_named_bool(w, "nowait", fdisk->use_nowait);
+	/* [한국어] RWF_NOWAIT 사용 여부. */
 	spdk_json_write_object_end(w);
+	/* [한국어] "aio" 객체 닫기. */
 	return 0;
+	/* [한국어] dump_info_json은 항상 0(성공) 반환. */
 }
 
 /*
@@ -1680,26 +1690,37 @@ bdev_aio_write_json_config(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w
 	/* [한국어] uuid는 bdev에서 직접 가져옴(생성 시 설정 또는 자동 생성). */
 
 	spdk_json_write_object_begin(w);
+	/* [한국어] 최상위 RPC 명령 객체 시작. */
 	spdk_json_write_named_string(w, "method", "bdev_aio_create");
 	/* [한국어] 재현용 RPC 메서드. */
 
 	spdk_json_write_named_object_begin(w, "params");
+	/* [한국어] "params" 객체 시작 — bdev_aio_create의 인자 묶음. */
 	spdk_json_write_named_string(w, "name", bdev->name);
+	/* [한국어] 재생성할 bdev 이름. */
 	if (fdisk->block_size_override) {
 		/* [한국어] 사용자가 block_size를 명시한 경우만 출력 — 자동 감지로 만든 디스크에서는 생략. */
 		spdk_json_write_named_uint32(w, "block_size", bdev->blocklen);
+		/* [한국어] 결정된 블록 크기를 그대로 직렬화. */
 	}
 	spdk_json_write_named_string(w, "filename", fdisk->filename);
+	/* [한국어] 백엔드 파일/디바이스 경로. */
 	spdk_json_write_named_bool(w, "readonly", fdisk->readonly);
+	/* [한국어] read-only 옵션 보존. */
 	spdk_json_write_named_bool(w, "fallocate", fdisk->fallocate);
+	/* [한국어] fallocate 옵션 보존. */
 	if (!spdk_uuid_is_null(uuid)) {
 		/* [한국어] 자동 생성된 UUID도 보존. NULL이면 생략. */
 		spdk_json_write_named_uuid(w, "uuid", uuid);
+		/* [한국어] UUID를 표준 문자열 형식으로 출력. */
 	}
 	spdk_json_write_named_bool(w, "nowait", fdisk->use_nowait);
+	/* [한국어] nowait 옵션 보존. */
 	spdk_json_write_object_end(w);
+	/* [한국어] "params" 객체 닫기. */
 
 	spdk_json_write_object_end(w);
+	/* [한국어] 최상위 명령 객체 닫기. */
 }
 
 /*
@@ -2137,11 +2158,14 @@ static void
 aio_bdev_unregister_cb(void *arg, int bdeverrno)
 {
 	struct delete_aio_bdev_ctx *ctx = arg;
+	/* [한국어] bdev_aio_delete가 alloc해 unregister에 넘긴 콜백 컨텍스트 회복. */
 
 	if (ctx->cb_fn) {
+		/* [한국어] 사용자 완료 콜백이 등록되어 있으면 unregister 결과 코드와 함께 호출. */
 		ctx->cb_fn(ctx->cb_arg, bdeverrno);
 	}
 	free(ctx);
+	/* [한국어] 컨텍스트 메모리 해제 — 이 콜백이 ctx 수명의 마지막 지점. */
 }
 
 /*

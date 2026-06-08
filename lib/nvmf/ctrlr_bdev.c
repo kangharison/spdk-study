@@ -897,6 +897,7 @@ nvmf_ctrlr_process_io_cmd_resubmit(void *arg)
 	struct spdk_nvmf_request *req = arg;
 	/* [한국어] 큐잉 시 전달된 요청 — 호스트 SQE/CPL 컨텍스트 보존. */
 	int rc;
+	/* [한국어] dispatch 재시도 반환값 — COMPLETE(동기 완료) 또는 ASYNCHRONOUS(비동기 진행 중). */
 
 	rc = nvmf_ctrlr_process_io_cmd(req);
 	/* [한국어] IO opcode dispatch 재시도 — opcode 분기 후 본 파일의 *_cmd 함수 중 하나가 다시
@@ -925,8 +926,9 @@ static void
 nvmf_ctrlr_process_admin_cmd_resubmit(void *arg)
 {
 	struct spdk_nvmf_request *req = arg;
-	/* [한국어] 큐잉 시 전달된 admin 요청. */
+	/* [한국어] 큐잉 시 전달된 admin 요청 — SQE/CPL 컨텍스트 보존. */
 	int rc;
+	/* [한국어] admin dispatch 재시도 반환값 — COMPLETE(동기 완료) 또는 ASYNCHRONOUS(비동기 진행 중). */
 
 	rc = nvmf_ctrlr_process_admin_cmd(req);
 	/* [한국어] admin opcode dispatch 재시도 — Identify/SetFeatures/Abort/passthru_admin 등. */
@@ -1446,7 +1448,9 @@ nvmf_bdev_ctrlr_flush_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 			  struct spdk_io_channel *ch, struct spdk_nvmf_request *req)
 {
 	struct spdk_nvme_cpl *response = &req->rsp->nvme_cpl;
+	/* [한국어] CPL 슬롯 — bdev flush 미지원 시 즉시 SUCCESS 기록, 지원 시 콜백에서 기록. */
 	int rc;
+	/* [한국어] spdk_bdev_flush_blocks 반환값 — 0(성공·비동기) / -ENOMEM(풀 고갈) / 기타 에러. */
 
 	/* As for NVMeoF controller, SPDK always set volatile write
 	 * cache bit to 1, return success for those block devices
@@ -1500,15 +1504,28 @@ struct nvmf_bdev_ctrlr_unmap {
 	 *  값 범위: 0 ~ nr (DSM range 총 수). */
 
 	struct spdk_bdev_desc		*desc;
-	/* [한국어] backing bdev descriptor — ENOMEM 재시도(unmap_resubmit) 시 인자로 사용.
-	 *  설정자: 컨텍스트 생성시 unmap() 이 채움.
-	 *  읽는 자: nvmf_bdev_ctrlr_unmap_resubmit() 이 다시 unmap() 호출할 때. */
+	/* [한국어] backing bdev 의 open descriptor — ENOMEM 재시도(unmap_resubmit) 시
+	 *  spdk_bdev_unmap_blocks() 의 첫 번째 인자로 재전달.
+	 *  설정자: 컨텍스트 생성 시 nvmf_bdev_ctrlr_unmap() 이 채움 (호출자가 전달한 desc).
+	 *  읽는 자: nvmf_bdev_ctrlr_unmap_resubmit() 이 nvmf_bdev_ctrlr_unmap() 재호출할 때.
+	 *  값 범위: 유효한 spdk_bdev_desc 포인터 — spdk_bdev_open_ext() 결과, NULL 불가.
+	 *  동기화: 단일 IO thread 에서만 사용 — 락 없음. */
 
 	struct spdk_bdev		*bdev;
-	/* [한국어] backing bdev — 동일 용도(재시도 인자). */
+	/* [한국어] backing bdev 인스턴스 — ENOMEM 재시도(nvmf_bdev_ctrlr_unmap_resubmit) 시
+	 *  spdk_bdev_queue_io_wait() 의 첫 번째 인자로 사용.
+	 *  설정자: 컨텍스트 생성 시 nvmf_bdev_ctrlr_unmap() 이 채움 (ns->bdev 에서 복사).
+	 *  읽는 자: nvmf_bdev_ctrlr_unmap_resubmit() 이 nvmf_bdev_ctrlr_unmap() 재호출할 때.
+	 *  값 범위: 유효한 spdk_bdev 포인터 (NULL 불가 — dsm_cmd 에서 검증 후 진입).
+	 *  동기화: 단일 IO thread 내에서만 참조되므로 락 없음. */
 
 	struct spdk_io_channel		*ch;
-	/* [한국어] thread-local io_channel — 동일 용도(재시도 인자). */
+	/* [한국어] backing bdev 의 thread-local io_channel — ENOMEM 재시도 시 스레드 재진입 없이
+	 *  동일 채널을 재사용하기 위해 컨텍스트에 저장.
+	 *  설정자: nvmf_bdev_ctrlr_unmap() 이 컨텍스트 생성 시 채움 (호출자가 전달한 ch).
+	 *  읽는 자: nvmf_bdev_ctrlr_unmap_resubmit() 이 nvmf_bdev_ctrlr_unmap() 재호출 시 전달.
+	 *  값 범위: 유효한 spdk_io_channel 포인터 — spdk_get_io_channel() 이 반환한 채널.
+	 *  동기화: io_channel 은 thread-local 이므로 이 컨텍스트를 소유한 IO thread 에서만 유효. */
 
 	uint32_t			range_index;
 	/* [한국어] 현재까지 처리(제출 시도)한 range 인덱스 — for 루프 진행 위치. ENOMEM 으로 중단 후
@@ -1536,11 +1553,15 @@ nvmf_bdev_ctrlr_unmap_cpl(struct spdk_bdev_io *bdev_io, bool success,
 			  void *cb_arg)
 {
 	struct nvmf_bdev_ctrlr_unmap *unmap_ctx = cb_arg;
-	/* [한국어] 공유 progress 컨텍스트. */
+	/* [한국어] 공유 progress 컨텍스트 — 여러 range 의 콜백이 동일 포인터를 cb_arg 로 공유. */
 	struct spdk_nvmf_request	*req = unmap_ctx->req;
+	/* [한국어] 호스트 DSM 요청 — 최종 응답 대상. */
 	struct spdk_nvme_cpl		*response = &req->rsp->nvme_cpl;
+	/* [한국어] CPL 슬롯 — first-failure 결과를 기록. */
 	int				sc, sct;
+	/* [한국어] 현재 range 의 Status Code / Status Code Type. */
 	uint32_t			cdw0;
+	/* [한국어] 현재 range 의 CDW0 — unmap 은 보통 0. */
 
 	unmap_ctx->count--;
 	/* [한국어] 콜백 1번 = range 1개 완료 — 미완료 카운터 감소. */
@@ -1788,15 +1809,18 @@ nvmf_bdev_ctrlr_copy_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 			 struct spdk_io_channel *ch, struct spdk_nvmf_request *req)
 {
 	struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
+	/* [한국어] 호스트 SQE — CDW10/11(SDLBA), CDW12(NR/DF/PI bits) 파싱 대상. */
 	struct spdk_nvme_cpl *response = &req->rsp->nvme_cpl;
+	/* [한국어] CPL 슬롯 — 동기 실패 시 SC/SCT 채움. */
 	uint64_t sdlba = ((uint64_t)cmd->cdw11 << 32) + cmd->cdw10;
 	/* [한국어] SDLBA(Destination LBA) — CDW10|CDW11 합성. NVMe-oF 와이어가 LE 라 cdw* 가 이미
 	 *  호스트 endian 이지만 read/write 의 from_le64 와 달리 직접 << 32 + add 로 합성. */
 	struct spdk_nvme_scc_source_range range = { 0 };
 	/* [한국어] 추출할 단일 source range descriptor (32B: SLBA 8B + NLB 4B + reserved + ELBAT/EILBRT). */
 	struct spdk_iov_xfer ix;
-	/* [한국어] payload iov reader. */
+	/* [한국어] payload iov reader — req->iov 에서 32B range 를 순차 추출. */
 	int rc;
+	/* [한국어] spdk_bdev_copy_blocks() 반환값 — 0(성공·비동기) / -ENOMEM / 기타. */
 
 	SPDK_DEBUGLOG(nvmf, "Copy command: SDLBA %lu, NR %u, desc format %u, PRINFOR %u, "
 		      "DTYPE %u, STCW %u, PRINFOW %u, FUA %u, LR %u\n",
@@ -1889,6 +1913,7 @@ nvmf_bdev_ctrlr_nvme_passthru_io(struct spdk_bdev *bdev, struct spdk_bdev_desc *
 				 struct spdk_io_channel *ch, struct spdk_nvmf_request *req)
 {
 	int rc;
+	/* [한국어] spdk_bdev_nvme_iov_passthru_md() 반환값 — 0(성공·비동기) / -ENOMEM / -ENOTSUP(non-nvme bdev). */
 
 	rc = spdk_bdev_nvme_iov_passthru_md(desc, ch, &req->cmd->nvme_cmd, req->iov, req->iovcnt,
 					    req->length, NULL, 0, nvmf_bdev_ctrlr_complete_cmd, req);
@@ -1939,6 +1964,7 @@ spdk_nvmf_bdev_ctrlr_nvme_passthru_admin(struct spdk_bdev *bdev, struct spdk_bde
 		spdk_nvmf_nvme_passthru_cmd_cb cb_fn)
 {
 	int rc;
+	/* [한국어] spdk_bdev_nvme_admin_passthru() 반환값 — 0(성공·비동기) / -ENOMEM / -ENOTSUP. */
 
 	if (spdk_unlikely(req->iovcnt > 1)) {
 		/* [한국어] admin passthru 는 단일 buffer 만 — host iov 1 개 초과 capsule 은 구현 단순화로
@@ -2036,6 +2062,7 @@ spdk_nvmf_bdev_ctrlr_abort_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *de
 			       struct spdk_nvmf_request *req_to_abort)
 {
 	int rc;
+	/* [한국어] spdk_bdev_abort() 반환값 — 0(성공·비동기) / -ENOMEM / 기타(-EINVAL 등). */
 
 	assert((req->rsp->nvme_cpl.cdw0 & 1U) != 0);
 	/* [한국어] 호출자가 cdw0.bit0=1 로 사전 설정해야 함 — 콜백에서 success 면 클리어 가능하게.
@@ -2086,10 +2113,13 @@ nvmf_bdev_ctrlr_get_dif_ctx(struct spdk_bdev_desc *desc, struct spdk_nvme_cmd *c
 			    struct spdk_dif_ctx *dif_ctx)
 {
 	uint32_t init_ref_tag, dif_check_flags = 0;
-	/* [한국어] init_ref_tag: Type 1 Ref Tag 초기값, dif_check_flags: GUARD/APPTAG/REFTAG 활성 비트. */
+	/* [한국어] init_ref_tag: Type 1 Ref Tag 초기값 (SLBA[31:0]).
+	 *  dif_check_flags: GUARD/APPTAG/REFTAG 활성 비트 조합 (SPDK_DIF_FLAGS_* 상수). */
 	int rc;
+	/* [한국어] spdk_dif_ctx_init() 반환값 — 0(성공) / 음수(잘못된 인자 조합). */
 	struct spdk_dif_ctx_init_ext_opts dif_opts;
-	/* [한국어] dif_ctx_init 의 확장 옵션 (16/32/64b Guard 포맷 지정). */
+	/* [한국어] dif_ctx_init 의 확장 옵션 — size(ABI 호환 partial-size) + dif_pi_format(16b Guard 고정).
+	 *  트랜스포트는 16b Guard 만 지원 (NVMe-oF 와이어 표준); 32/64b 는 bdev 레이어 전용. */
 
 	if (spdk_bdev_desc_get_md_size(desc) == 0) {
 		/* [한국어] desc 가 PI 없는 view — 트랜스포트 측 strip 불필요. false 반환으로 fast-path. */
@@ -2159,16 +2189,22 @@ nvmf_bdev_ctrlr_zcopy_start_complete(struct spdk_bdev_io *bdev_io, bool success,
 				     void *cb_arg)
 {
 	struct spdk_nvmf_request	*req = cb_arg;
-	/* [한국어] zcopy 활성 read/write 요청. */
+	/* [한국어] zcopy_start 가 비동기로 완료되면 이 요청에 buffer 를 연결하고 transport 에 알림. */
 	struct iovec *iov;
+	/* [한국어] bdev 가 노출한 backing storage buffer iov 포인터 — 호스트와 zero-copy 로 공유될
+	 *  실제 메모리 영역. spdk_bdev_io_get_iovec() 가 설정. */
 	int iovcnt = 0;
-	/* [한국어] bdev 가 노출한 buffer iov — 호스트와 직접 공유될 메모리. */
+	/* [한국어] bdev 가 노출한 iov 배열의 항목 수 — 0 초기화 후 get_iovec() 가 채움. */
 
 	if (spdk_unlikely(!success)) {
-		/* [한국어] zcopy_start 실패 — 일반 read/write 와 동일한 에러 변환 후 free. */
+		/* [한국어] zcopy_start 실패 — bdev 모듈이 backing buffer 노출 도중 I/O 오류(예: lvol
+		 *  cluster read 실패). 일반 read/write 와 동일한 에러 변환 후 bdev_io 즉시 해제. */
 		int                     sc = 0, sct = 0;
+		/* [한국어] NVMe 오류 상태 코드 — bdev_io 에서 추출. */
 		uint32_t                cdw0 = 0;
+		/* [한국어] CDW0 — zcopy_start 실패는 보통 0. */
 		struct spdk_nvme_cpl    *response = &req->rsp->nvme_cpl;
+		/* [한국어] CPL 슬롯 — 오류 상태 기록 대상. */
 		spdk_bdev_io_get_nvme_status(bdev_io, &cdw0, &sct, &sc);
 		/* [한국어] bdev 결과 → NVMe SC/SCT 추출. */
 
@@ -2228,11 +2264,17 @@ nvmf_bdev_ctrlr_zcopy_start(struct spdk_bdev *bdev,
 			    struct spdk_nvmf_request *req)
 {
 	struct spdk_nvme_cpl *rsp = &req->rsp->nvme_cpl;
+	/* [한국어] CPL 슬롯 — 동기 실패(LBA 범위 초과, SGL 부족) 시 SC/SCT 채움. */
 	uint64_t bdev_num_blocks = spdk_bdev_get_num_blocks(bdev);
+	/* [한국어] bdev 총 LBA — LBA 범위 검사용 상한. */
 	uint32_t block_size = spdk_bdev_desc_get_block_size(desc);
+	/* [한국어] desc 기준 block_size — SGL 길이(bytes) vs num_blocks*block_size 비교용. */
 	uint64_t start_lba;
+	/* [한국어] 추출된 SLBA — CDW10|CDW11 합성. */
 	uint64_t num_blocks;
+	/* [한국어] 추출된 NLB+1 — 실제 전송 블록 수. */
 	int rc;
+	/* [한국어] spdk_bdev_zcopy_start() 반환값 — 0(성공) / -ENOMEM / 기타. */
 
 	nvmf_bdev_ctrlr_get_rw_params(&req->cmd->nvme_cmd, &start_lba, &num_blocks);
 	/* [한국어] SLBA/NLB 추출 — read/write 와 동일. zcopy 는 ext_io_opts 미사용. */
@@ -2295,12 +2337,17 @@ nvmf_bdev_ctrlr_zcopy_end_complete(struct spdk_bdev_io *bdev_io, bool success,
 				   void *cb_arg)
 {
 	struct spdk_nvmf_request	*req = cb_arg;
+	/* [한국어] zcopy_start 시 등록한 요청 — commit/release 완료 후 응답 대상. */
 
 	if (spdk_unlikely(!success)) {
-		/* [한국어] commit 실패 — SC 변환. */
+		/* [한국어] commit 실패 — write zcopy end 에서 backing storage 기록 중 오류. read release 는
+		 *  항상 success 이므로 여기에 도달하지 않음. SC 변환 후 CPL 채움. */
 		int                     sc = 0, sct = 0;
+		/* [한국어] 실패 시 추출할 NVMe SC/SCT. */
 		uint32_t                cdw0 = 0;
+		/* [한국어] CDW0 — zcopy_end 실패는 일반적으로 0. */
 		struct spdk_nvme_cpl    *response = &req->rsp->nvme_cpl;
+		/* [한국어] CPL 슬롯 — 실패 결과 기록. */
 		spdk_bdev_io_get_nvme_status(bdev_io, &cdw0, &sct, &sc);
 
 		response->cdw0 = cdw0;
@@ -2336,6 +2383,8 @@ void
 nvmf_bdev_ctrlr_zcopy_end(struct spdk_nvmf_request *req, bool commit)
 {
 	int rc __attribute__((unused));
+	/* [한국어] spdk_bdev_zcopy_end() 의 반환값 — assert 용. release 빌드에서 assert 가 제거되면
+	 *  unused 변수 경고를 막기 위해 __attribute__((unused)) 붙임. */
 	/* [한국어] release 빌드에서 assert 가 빠지면 미사용 — unused 어노테이션으로 경고 차단. */
 
 	rc = spdk_bdev_zcopy_end(req->zcopy_bdev_io, commit, nvmf_bdev_ctrlr_zcopy_end_complete, req);

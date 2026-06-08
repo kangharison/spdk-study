@@ -2,55 +2,153 @@
  *   Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  */
 
+/*
+ * [한국어 설명] fsdev I/O 헬퍼 — 각 fsdev 연산을 spdk_fsdev_io로 포장 (fsdev_io.c)
+ *
+ * === 파일의 역할 ===
+ * 이 파일은 SPDK fsdev (filesystem device) 레이어가 노출하는 모든 파일시스템 op
+ * (lookup, getattr, read, write, open, opendir, readdir, mkdir, rmdir, mknod, link,
+ *  unlink, symlink, rename, statfs, fsync, setxattr, getxattr, etc.)을 공통 패턴으로
+ * 처리하기 위한 헬퍼 함수 모음이다. 각 spdk_fsdev_* 공개 API는:
+ *   1) 채널 풀(spdk_fsdev_channel)에서 fsdev_io 객체를 획득 (fsdev_io_get_and_fill).
+ *   2) op별 파라미터를 fsdev_io->u_in 또는 op-별 union 멤버에 패킹.
+ *   3) 사용자 콜백을 fsdev_io->internal.usr_cb_fn에 저장하고, 공통 완료 디스패처를
+ *      fsdev_io->internal.cb_fn에 설정.
+ *   4) fsdev_io_submit으로 fsdev 모듈(예: aio fsdev, virtiofs fsdev)에 위임.
+ * 완료 시 _spdk_fsdev_*_cb 디스패처가 op별로 다른 시그니처의 사용자 콜백을 호출한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * 호출 체인:
+ *   FUSE dispatcher / NVMe-FS / 사용자 앱
+ *     → spdk_fsdev_lookup / read / write / ... (공개 API)
+ *     → 이 파일의 spdk_fsdev_* 정의: fsdev_io_get_and_fill → 파라미터 패킹 → fsdev_io_submit
+ *     → fsdev 모듈의 submit_request 콜백 → 백엔드 (kernel VFS / virtiofs daemon / etc.)
+ *     → 완료 → _spdk_fsdev_*_cb → 사용자 콜백 호출 → fsdev_io_free (풀로 반환)
+ * 실행 컨텍스트: 호출한 SPDK thread (io_channel 소유 thread). 채널 풀이므로 동일 thread에서
+ * 발급/완료가 처리됨 → lockless.
+ *
+ * === 타 모듈과의 연결 ===
+ * - fsdev_internal.h: spdk_fsdev_io 정의 (u_in/u_out union으로 모든 op의 인자/결과 보관),
+ *   fsdev_channel_get_io / spdk_fsdev_free_io / fsdev_io_submit.
+ * - spdk/fsdev_module.h: 백엔드 모듈이 구현해야 할 ops 인터페이스.
+ * - spdk/fsdev.h: 공개 API와 콜백 시그니처 typedef.
+ * - fsdev.c: 본 파일의 헬퍼가 호출하는 fsdev_channel_get_io 등 코어 헬퍼 정의.
+ * 데이터 흐름:
+ *   사용자 read 요청(spdk_fsdev_read) → fsdev_io 풀에서 객체 획득 → fh/offset/size 패킹
+ *     → fsdev_io_submit → 모듈의 read 구현 → 완료 → _spdk_fsdev_read_cb → 사용자 콜백.
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - fsdev_io_get_and_fill: 채널 풀에서 fsdev_io 획득 + 공통 필드 초기화 (모든 spdk_fsdev_* API의 시작).
+ * - CALL_USR_CLB / CALL_USR_NO_STATUS_CLB 매크로: 완료 콜백 디스패치 — type cast로 op-별 시그니처 호출.
+ * - _spdk_fsdev_*_cb (수십 개): op별 완료 디스패처. fsdev_io에서 출력 파라미터 추출 → 사용자 콜백.
+ * - spdk_fsdev_* (수십 개): 각 파일시스템 op의 공개 API. 거의 단일 구조: get_and_fill → 파라미터 패킹 → submit.
+ */
+
 #include "spdk/stdinc.h"
+/* [한국어] SPDK 표준 헤더 묶음. */
 #include "spdk/fsdev.h"
+/* [한국어] fsdev 공개 API 시그니처. */
 #include "spdk/fsdev_module.h"
+/* [한국어] fsdev 모듈 콜백 인터페이스 — spdk_fsdev_free_io 등. */
 #include "fsdev_internal.h"
+/* [한국어] 내부 헤더 — fsdev_io_submit, fsdev_channel_get_io, __io_ch_to_fsdev_ch. */
 
 #define CALL_USR_CLB(_fsdev_io, ch, type, ...) \
 	do { \
 		type *usr_cb_fn = _fsdev_io->internal.usr_cb_fn; \
 		usr_cb_fn(_fsdev_io->internal.usr_cb_arg, ch, _fsdev_io->internal.status, ## __VA_ARGS__); \
 	} while (0)
+/* [한국어] 사용자 콜백 디스패처 매크로 (상태 코드 포함).
+ *   _fsdev_io: 완료된 IO 객체. ch: 사용자 채널. type: 콜백 함수 타입 (op별 다름).
+ *   ...: 추가 가변 인자 (예: 결과 attr, dirent, fobject 등).
+ * 동작: fsdev_io->internal.usr_cb_fn을 type*로 캐스팅 후 (usr_cb_arg, ch, status, ...) 시그니처로 호출.
+ * 사용처: _spdk_fsdev_<op>_cb 완료 핸들러 거의 전부. */
 
 #define CALL_USR_NO_STATUS_CLB(_fsdev_io, ch, type, ...) \
 	do { \
 		type *usr_cb_fn = _fsdev_io->internal.usr_cb_fn; \
 		usr_cb_fn(_fsdev_io->internal.usr_cb_arg, ch, ## __VA_ARGS__); \
 	} while (0)
+/* [한국어] 사용자 콜백 디스패처 매크로 (상태 코드 없음).
+ * 일부 op(예: forget류)는 결과 status가 의미 없어 status 인자를 생략. */
 
+/*
+ * [한국어]
+ * fsdev_io_get_and_fill - 채널 풀에서 fsdev_io 객체를 한 개 빌려 공통 필드를 초기화.
+ *
+ * @desc: 사용자가 open한 fsdev 디스크립터.
+ * @ch: 사용자 채널 (fsdev 채널 ctx 포함).
+ * @unique: FUSE-스타일 op 고유 ID (호출자가 부여, 추적/로깅용).
+ * @usr_cb_fn: op별 사용자 완료 콜백 (void*로 보관 후 dispatch 시 cast).
+ * @usr_cb_arg: usr_cb_fn 인자.
+ * @cb_fn: 내부 완료 디스패처 (예: _spdk_fsdev_<op>_cb).
+ * @cb_arg: cb_fn 인자 (보통 ch).
+ * @type: SPDK_FSDEV_IO_<op> enum 값.
+ * @return: 초기화된 fsdev_io 또는 NULL (풀 고갈).
+ *
+ * 모든 spdk_fsdev_<op> API의 첫 단계 — 풀에서 객체 획득, 공통 필드(fsdev/ch/desc/type/unique/콜백) 채움,
+ * status는 -ENOSYS로 초기화 (모듈이 미구현 op면 그대로 반환됨).
+ * 풀 고갈 시 NULL → 호출자가 -ENOBUFS 반환 → 사용자가 재시도해야 함.
+ *
+ * 호출 체인: spdk_fsdev_<op> → [fsdev_io_get_and_fill] → fsdev_channel_get_io → spdk_mempool_get
+ */
 static struct spdk_fsdev_io *
 fsdev_io_get_and_fill(struct spdk_fsdev_desc *desc, struct spdk_io_channel *ch, uint64_t unique,
 		      void *usr_cb_fn, void *usr_cb_arg, spdk_fsdev_io_completion_cb cb_fn, void *cb_arg,
 		      enum spdk_fsdev_io_type type)
 {
 	struct spdk_fsdev_io *fsdev_io;
+	/* [한국어] 결과 fsdev_io 포인터. */
 	struct spdk_fsdev_channel *channel = __io_ch_to_fsdev_ch(ch);
+	/* [한국어] spdk_io_channel → fsdev_channel ctx 캐스팅. */
 
 	fsdev_io = fsdev_channel_get_io(channel);
+	/* [한국어] 채널 풀에서 객체 획득 — per-thread cache 우선, 부족하면 global mempool. */
 	if (!fsdev_io) {
+		/* [한국어] 풀 고갈 — 호출자가 backpressure 처리. */
 		return NULL;
 	}
 
 	fsdev_io->fsdev = spdk_fsdev_desc_get_fsdev(desc);
+	/* [한국어] desc → fsdev 변환 후 저장. 모듈이 어디로 dispatch할지 결정에 사용. */
 	fsdev_io->internal.ch = channel;
+	/* [한국어] 채널 back-pointer. */
 	fsdev_io->internal.desc = desc;
+	/* [한국어] desc back-pointer. */
 	fsdev_io->internal.type = type;
+	/* [한국어] op 타입 — 모듈의 submit_request가 op별 분기에 사용. */
 	fsdev_io->internal.unique = unique;
+	/* [한국어] op 고유 ID 보관. */
 	fsdev_io->internal.usr_cb_fn = usr_cb_fn;
+	/* [한국어] 사용자 콜백 (void*로 저장 후 CALL_USR_CLB가 적절히 캐스팅). */
 	fsdev_io->internal.usr_cb_arg = usr_cb_arg;
+	/* [한국어] 사용자 콜백 인자. */
 	fsdev_io->internal.cb_arg = cb_arg;
+	/* [한국어] 내부 디스패처 인자. */
 	fsdev_io->internal.cb_fn = cb_fn;
+	/* [한국어] 내부 완료 디스패처 — spdk_fsdev_io_complete가 이를 호출. */
 	fsdev_io->internal.status = -ENOSYS;
+	/* [한국어] 기본 status — 모듈이 미구현이면 그대로 반환됨. */
 	fsdev_io->internal.in_submit_request = false;
+	/* [한국어] submit 중 플래그 — 동일 fsdev_io의 중복 submit 방지. */
 
 	return fsdev_io;
 }
 
+/*
+ * [한국어]
+ * fsdev_io_free - 완료된 fsdev_io를 풀에 반환 (인라인 래퍼).
+ *
+ * @fsdev_io: 사용자 콜백 호출 후 더 이상 필요 없는 객체.
+ *
+ * spdk_fsdev_free_io의 단순 래퍼이지만, 모든 _spdk_fsdev_<op>_cb에서 일관된 이름으로 호출하기 위해 분리.
+ * 풀이 thread-local cache이므로 같은 thread에서 빌린 객체를 반환 — cache hit 효과.
+ */
 static inline void
 fsdev_io_free(struct spdk_fsdev_io *fsdev_io)
 {
 	spdk_fsdev_free_io(fsdev_io);
+	/* [한국어] 풀에 반환. */
 }
 
 static void

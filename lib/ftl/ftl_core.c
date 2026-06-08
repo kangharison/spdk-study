@@ -1447,15 +1447,39 @@ ftl_stats_crc_error(struct spdk_ftl_dev *dev, enum ftl_stats_type type)
  */
 struct ftl_get_stats_ctx {
 	struct spdk_ftl_dev *dev;
-	/* [한국어] 통계를 가져올 디바이스. */
+	/* [한국어] 통계를 읽어올 대상 FTL 디바이스 포인터.
+	 * 설정자: spdk_ftl_get_stats()가 호출자 인자 dev를 그대로 보관.
+	 * 읽는 자: _ftl_get_stats()(dev 스레드 컨텍스트)가 dev->stats를 복사할 때 참조.
+	 * 값 범위: 유효한 spdk_ftl_dev 포인터(NULL 불가). 디바이스 수명 동안 유효.
+	 * 동기화: dev->stats 접근은 dev->core_thread에서만 일어나도록 메시지 패싱으로 고정 — 별도 락 불필요. */
+
 	struct ftl_stats *stats;
-	/* [한국어] 사용자가 제공한 출력 버퍼 — 결과 복사 대상. */
+	/* [한국어] 사용자가 제공한 출력 버퍼 — 복사된 통계 스냅샷이 기록될 곳.
+	 * 설정자: spdk_ftl_get_stats()가 호출자 인자 stats를 보관.
+	 * 읽는 자: _ftl_get_stats()가 *stats = dev->stats로 채우고, _ftl_get_stats_cb()가 cb_fn에 넘김.
+	 * 값 범위: 호출자 소유의 ftl_stats 버퍼(콜백이 끝날 때까지 유효해야 함).
+	 * 동기화: 쓰기는 dev 스레드에서, 읽기(콜백)는 호출자 스레드에서 — 메시지 순서로 happens-before 보장. */
+
 	struct spdk_thread *thread;
-	/* [한국어] 호출자 스레드 — 콜백을 호출자 컨텍스트에서 수행하기 위해. */
+	/* [한국어] 통계 조회를 시작한 호출자 스레드 핸들 — 콜백을 같은 스레드에서 발화하기 위해 저장.
+	 * 설정자: spdk_ftl_get_stats()에서 spdk_get_thread()로 현재 스레드 캡처.
+	 * 읽는 자: _ftl_get_stats()가 결과 복사 후 이 스레드로 spdk_thread_send_msg() 송신할 때 사용.
+	 * 값 범위: 유효한 spdk_thread 포인터. cross-thread 안전 패턴의 복귀 지점.
+	 * 동기화: SPDK 메시지 큐(lockless)를 통해 dev 스레드 → 이 스레드로 제어가 되돌아간다. */
+
 	spdk_ftl_stats_fn cb_fn;
-	/* [한국어] 사용자 콜백. */
+	/* [한국어] 통계 복사 완료 시 호출자에게 결과를 통보하는 사용자 콜백 함수 포인터.
+	 * 설정자: spdk_ftl_get_stats()가 호출자 인자 cb_fn 보관.
+	 * 읽는 자: _ftl_get_stats_cb()(호출자 스레드 컨텍스트)가 cb_fn(stats, cb_arg)로 호출.
+	 * 값 범위: 유효한 spdk_ftl_stats_fn(NULL 불가). 정확히 1회 호출됨.
+	 * 동기화: 호출자 스레드에서만 실행되므로 콜백 내부에서 별도 락 고려 불필요. */
+
 	void *cb_arg;
-	/* [한국어] 콜백 인자. */
+	/* [한국어] cb_fn에 그대로 전달되는 사용자 정의 불투명 인자.
+	 * 설정자: spdk_ftl_get_stats()가 호출자 인자 cb_arg 보관.
+	 * 읽는 자: _ftl_get_stats_cb()가 cb_fn(stats, cb_arg)의 두 번째 인자로 전달.
+	 * 값 범위: 사용자 임의 포인터(NULL 허용) — FTL 내부에서는 의미 해석하지 않음.
+	 * 동기화: FTL은 이 값을 역참조하지 않으므로 동기화 대상 아님. */
 };
 
 /*

@@ -532,12 +532,14 @@ struct nvmf_transport_create_ctx {
 	/* [한국어] 사용자가 spdk_nvmf_transport_create_async() 호출 시 넘긴 opaque cb_arg.
 	 *  설정자: 사용자(상위 nvmf 코드 또는 RPC 핸들러).
 	 *  읽는 자: 완료 시 ctx->cb_fn(ctx->cb_arg, transport) 로 사용자에게 전달.
-	 *  값 범위: 사용자 정의 (NULL 가능). */
+	 *  값 범위: 사용자 정의 포인터 (NULL 가능 — 호출자가 별도 상태 불필요 시).
+	 *  동기화: ctx 라이프사이클 동안 R/O — 완료 콜백 발사 전까지 변경 없음. */
 	spdk_nvmf_transport_create_done_cb cb_fn;
-	/* [한국어] 사용자 완료 콜백.
+	/* [한국어] 사용자 완료 콜백 (typedef: void (*)(void *cb_arg, struct spdk_nvmf_transport *)).
 	 *  설정자: 사용자가 spdk_nvmf_transport_create_async() 호출 시 지정.
 	 *  읽는 자: nvmf_transport_create_async_done() — 성공/실패 모두 호출 (실패 시 transport=NULL).
-	 *  실행 컨텍스트: 백엔드의 create_async 가 완료 통지하는 spdk_thread (보통 호출자와 동일 thread). */
+	 *  값 범위: 유효한 함수 포인터 (NULL 불가 — 호출자 계약. NULL 이면 nvmf_transport_create_async_done 에서 segfault).
+	 *  동기화: ctx 라이프사이클 동안 R/O. 콜백 자체는 create 를 호출한 spdk_thread 컨텍스트에서 실행. */
 };
 
 /*
@@ -1238,14 +1240,18 @@ struct nvmf_stop_listen_ctx {
 	 *  값 범위: NULL 또는 유효한 subsystem 포인터.
 	 *  동기화: R/O. */
 	spdk_nvmf_tgt_subsystem_listen_done_fn cb_fn;
-	/* [한국어] 모든 channel 순회 + stop_listen 완료 후 호출할 사용자 콜백.
-	 *  설정자: 사용자.
-	 *  읽는 자: nvmf_stop_listen_fini.
-	 *  값 범위: NULL 가능 (콜백 불필요 시). */
+	/* [한국어] 모든 channel 순회 + stop_listen 완료 후 호출할 사용자 콜백
+	 *  (typedef: void (*)(void *cb_arg, int status)).
+	 *  설정자: 사용자가 spdk_nvmf_transport_stop_listen_async() 호출 시 지정.
+	 *  읽는 자: nvmf_stop_listen_fini — spdk_nvmf_transport_stop_listen() 결과(rc)와 함께 호출.
+	 *  값 범위: 유효한 함수 포인터 또는 NULL (NULL 이면 fini 에서 if(ctx->cb_fn) 가드로 skip).
+	 *  동기화: ctx 라이프사이클 동안 R/O. 콜백은 fini 가 실행되는 reactor thread 에서 호출. */
 	void *cb_arg;
 	/* [한국어] cb_fn 의 opaque 인자.
-	 *  설정자: 사용자.
-	 *  읽는 자: cb_fn 호출 시. */
+	 *  설정자: 사용자가 stop_listen_async() 호출 시 지정.
+	 *  읽는 자: nvmf_stop_listen_fini 에서 ctx->cb_fn(ctx->cb_arg, rc) 로 사용자에게 전달.
+	 *  값 범위: 사용자 정의 포인터 (NULL 가능 — cb_fn 이 NULL 이면 cb_arg 도 미사용).
+	 *  동기화: ctx 라이프사이클 동안 R/O. */
 };
 
 /*

@@ -3290,36 +3290,77 @@ spdk_thread_get_trace_id(struct spdk_thread *thread)
 	return thread->trace_id;
 }
 
+/*
+ * [한국어] call_thread — spdk_for_each_thread 의 비동기 순회 컨텍스트.
+ * 모든 SPDK thread 를 차례로 hop 하면서 fn 을 실행하고, 끝나면 orig_thread 로 돌아가 cpl 콜백을 호출한다.
+ * 메모리는 calloc 으로 1번 할당 → 모든 hop 끝나면 _back_to_orig_thread 가 free.
+ */
 struct call_thread {
 	struct spdk_thread *cur_thread;
+	/* [한국어] 현재 hop 중인 thread 포인터. _on_thread 가 매 hop 마다 TAILQ_NEXT 로 전진.
+	 * 설정자: spdk_for_each_thread 가 g_threads head 로 초기화. 이후 _on_thread 가 갱신.
+	 * 읽는 자: _on_thread 가 NULL 검사 (모든 thread 순회 완료 여부).
+	 * 동기화: 한 시점에 하나의 thread 만 hop 중 — 자연스러운 직렬화. */
+
 	spdk_msg_fn fn;
+	/* [한국어] 각 thread 위에서 호출될 사용자 함수. (NULL 불가)
+	 * 설정자: spdk_for_each_thread 의 fn 인자. 읽는 자: 매 hop 의 _on_thread. */
+
 	void *ctx;
+	/* [한국어] fn 호출 시 인자로 전달되는 사용자 컨텍스트. cpl 에도 동일하게 전달. */
 
 	struct spdk_thread *orig_thread;
+	/* [한국어] 호출자 thread — 모든 순회가 끝나면 cpl 을 실행할 thread. spdk_for_each_thread 가
+	 * 호출 시점의 spdk_get_thread() 를 캡처. for_each_count 보호 카운터도 이 thread 에 증감. */
+
 	spdk_msg_fn cpl;
+	/* [한국어] 모든 thread 순회가 끝났을 때 orig_thread 컨텍스트에서 호출될 완료 콜백 (NULL 가능). */
 };
 
+/*
+ * [한국어]
+ * _back_to_orig_thread - 모든 thread 순회가 끝난 뒤 orig_thread 로 돌아와 cpl 호출 + 해제.
+ *
+ * @ctx: heap 에 잡힌 call_thread 구조체.
+ *
+ * 동기/배경: spdk_for_each_thread 의 fan-out 끝맺음 단계. orig_thread 에서 안전하게 cpl 호출 후 ctx free.
+ * 실행 컨텍스트: orig_thread (spdk_thread_send_msg 로 hop 됨).
+ */
 static void
 _back_to_orig_thread(void *ctx)
 {
 	struct call_thread *ct = ctx;
 
-	assert(ct->orig_thread->for_each_count > 0);
-	ct->orig_thread->for_each_count--;
+	assert(ct->orig_thread->for_each_count > 0); /* [한국어] orig_thread 에서 +1 해뒀던 카운터. */
+	ct->orig_thread->for_each_count--;            /* [한국어] in-flight 카운트 해제 — orig_thread exit 검사가 0 을 기다림. */
 
 	if (ct->cpl) {
-		ct->cpl(ct->ctx);
+		ct->cpl(ct->ctx);                      /* [한국어] 사용자 완료 콜백. */
 	}
-	free(ctx);
+	free(ctx);                                     /* [한국어] heap 컨텍스트 해제 — 마지막 사용자. */
 }
 
+/*
+ * [한국어]
+ * _on_thread - cur_thread 컨텍스트에서 fn 실행 후 다음 thread 로 hop.
+ *
+ * @ctx: call_thread heap 컨텍스트.
+ *
+ * 동기/배경: spdk_for_each_thread 의 핵심 — 매번 send_msg 로 다음 thread 에 hop 하므로
+ *           CPU 코어가 바뀌어도 안전 (각 thread 의 자기 컨텍스트로 진입).
+ * 동작 단계: (1) fn(ctx) 실행, (2) g_threads TAILQ 에서 다음 thread 검색 (RUNNING 만 대상),
+ *          (3) 다음 thread 있으면 send_msg, 없으면 _back_to_orig_thread 로 마감.
+ * 실행 컨텍스트: 매 hop 마다 다른 SPDK thread.
+ */
 static void
 _on_thread(void *ctx)
 {
 	struct call_thread *ct = ctx;
 
-	ct->fn(ct->ctx);
+	ct->fn(ct->ctx); /* [한국어] 현재 thread 컨텍스트에서 사용자 함수 실행 (예: 모듈별 통계 누적). */
 
+	/* [한국어] 다음 thread 검색 — devlist_mutex 안에서 TAILQ_NEXT 안전 순회.
+	 * 다음 노드가 RUNNING 이 아니면(EXITING/EXITED) 건너뜀 — fn 호출이 무의미하기 때문. */
 	pthread_mutex_lock(&g_devlist_mutex);
 	ct->cur_thread = TAILQ_NEXT(ct->cur_thread, tailq);
 	while (ct->cur_thread && ct->cur_thread->state != SPDK_THREAD_STATE_RUNNING) {
@@ -3330,10 +3371,12 @@ _on_thread(void *ctx)
 	pthread_mutex_unlock(&g_devlist_mutex);
 
 	if (!ct->cur_thread) {
+		/* [한국어] 모든 thread 순회 완료 — orig_thread 로 돌아가 cpl 호출. */
 		SPDK_DEBUGLOG(thread, "Completed thread iteration\n");
 
 		spdk_thread_send_msg(ct->orig_thread, _back_to_orig_thread, ctx);
 	} else {
+		/* [한국어] 다음 thread 로 hop — send_msg 가 lockless ring 에 enqueue + 필요 시 wakeup. */
 		SPDK_DEBUGLOG(thread, "Continuing thread iteration to %s\n",
 			      ct->cur_thread->name);
 
@@ -3341,14 +3384,29 @@ _on_thread(void *ctx)
 	}
 }
 
+/*
+ * [한국어]
+ * spdk_for_each_thread - 모든 SPDK thread 에 fn 을 차례로 디스패치 (비동기).
+ *
+ * @fn : 각 thread 위에서 호출될 함수.
+ * @ctx: fn / cpl 의 사용자 컨텍스트.
+ * @cpl: 모든 thread 순회가 끝난 뒤 orig_thread 에서 호출될 완료 콜백.
+ *
+ * 동기/배경: SPDK 의 lockless 모델에서 cross-thread 동작은 send_msg 체인으로만 가능.
+ *           이 함수는 g_threads TAILQ 의 head 부터 cur_thread 를 진행시키며 hop. orig_thread
+ *           의 for_each_count++ 로 in-flight 보호 (thread_exit 가 0 을 기다림).
+ * 실행 컨텍스트: 호출자 SPDK thread (orig_thread 로 저장됨).
+ * caller: bdev abort, NVMe-oF subsystem fan-out, RPC 통계 등 cross-thread 광역 작업.
+ */
 void
 spdk_for_each_thread(spdk_msg_fn fn, void *ctx, spdk_msg_fn cpl)
 {
 	struct call_thread *ct;
 	struct spdk_thread *thread;
 
-	ct = calloc(1, sizeof(*ct));
+	ct = calloc(1, sizeof(*ct)); /* [한국어] 비동기 흐름 내내 살아있는 heap 컨텍스트. */
 	if (!ct) {
+		/* [한국어] OOM — fan-out 자체는 불가능하므로 cpl 만 즉시 호출하고 종료. */
 		SPDK_ERRLOG("Unable to perform thread iteration\n");
 		cpl(ctx);
 		return;
@@ -3360,15 +3418,17 @@ spdk_for_each_thread(spdk_msg_fn fn, void *ctx, spdk_msg_fn cpl)
 
 	thread = _get_thread();
 	if (!thread) {
+		/* [한국어] 비-SPDK thread 에서 호출 — 잘못된 사용. cpl 만 호출 후 종료. */
 		SPDK_ERRLOG("No thread allocated\n");
 		free(ct);
 		cpl(ctx);
 		return;
 	}
-	ct->orig_thread = thread;
+	ct->orig_thread = thread; /* [한국어] 호출자 = 완료 콜백 실행 대상. */
 
-	ct->orig_thread->for_each_count++;
+	ct->orig_thread->for_each_count++; /* [한국어] in-flight 카운터 증가 — thread_exit 가 정리 가능 여부 판단에 사용. */
 
+	/* [한국어] g_threads TAILQ 의 head 부터 hop 시작. */
 	pthread_mutex_lock(&g_devlist_mutex);
 	ct->cur_thread = TAILQ_FIRST(&g_threads);
 	pthread_mutex_unlock(&g_devlist_mutex);
@@ -3376,14 +3436,23 @@ spdk_for_each_thread(spdk_msg_fn fn, void *ctx, spdk_msg_fn cpl)
 	SPDK_DEBUGLOG(thread, "Starting thread iteration from %s\n",
 		      ct->orig_thread->name);
 
-	spdk_thread_send_msg(ct->cur_thread, _on_thread, ct);
+	spdk_thread_send_msg(ct->cur_thread, _on_thread, ct); /* [한국어] 첫 thread 에 send_msg — _on_thread 가 자체 hop 체인 시작. */
 }
 
+/*
+ * [한국어]
+ * poller_set_interrupt_mode - 한 poller 의 interrupt 모드 전환 콜백 호출.
+ *
+ * @poller        : 대상 poller.
+ * @interrupt_mode: true=interrupt, false=polling.
+ *
+ * UNREGISTERED 상태면 noop. set_intr_cb_fn 이 설정되어 있을 때만 호출.
+ */
 static inline void
 poller_set_interrupt_mode(struct spdk_poller *poller, bool interrupt_mode)
 {
 	if (poller->state == SPDK_POLLER_STATE_UNREGISTERED) {
-		return;
+		return; /* [한국어] 곧 free 될 poller 는 모드 전환 의미 없음. */
 	}
 
 	if (poller->set_intr_cb_fn) {
@@ -3391,6 +3460,17 @@ poller_set_interrupt_mode(struct spdk_poller *poller, bool interrupt_mode)
 	}
 }
 
+/*
+ * [한국어]
+ * spdk_thread_set_interrupt_mode - 현재 thread 의 동작 모드를 polling↔interrupt 사이에서 전환.
+ *
+ * @enable_interrupt: true=interrupt 모드, false=polling 모드.
+ *
+ * 동기/배경: 일부 워크로드는 idle 구간이 길어 polling 의 CPU 점유가 비효율 — interrupt 로 전환하여
+ *           epoll 기반 sleep 가능. 동적 전환을 위해 timed/active/paused 모든 poller 의
+ *           set_intr_cb_fn 을 호출하여 timerfd/eventfd 등을 arm/disarm.
+ * 실행 컨텍스트: 자기 자신 thread 컨텍스트만 (cross-thread 전환 불가).
+ */
 void
 spdk_thread_set_interrupt_mode(bool enable_interrupt)
 {
@@ -3398,17 +3478,18 @@ spdk_thread_set_interrupt_mode(bool enable_interrupt)
 	struct spdk_poller *poller, *tmp;
 
 	assert(thread);
-	assert(spdk_interrupt_mode_is_enabled());
+	assert(spdk_interrupt_mode_is_enabled()); /* [한국어] spdk_interrupt_mode_enable() 이 부팅 시 호출되어야 함. */
 
 	SPDK_NOTICELOG("Set spdk_thread (%s) to %s mode from %s mode.\n",
 		       thread->name,  enable_interrupt ? "intr" : "poll",
 		       thread->in_interrupt ? "intr" : "poll");
 
 	if (thread->in_interrupt == enable_interrupt) {
-		return;
+		return; /* [한국어] 이미 원하는 모드 — 멱등성. */
 	}
 
 	/* Set pollers to expected mode */
+	/* [한국어] 모든 poller 의 set_intr_cb_fn 호출 — timerfd 를 arm/disarm 하거나 busy eventfd 를 write/read. */
 	RB_FOREACH_SAFE(poller, timed_pollers_tree, &thread->timed_pollers, tmp) {
 		poller_set_interrupt_mode(poller, enable_interrupt);
 	}
@@ -3416,23 +3497,49 @@ spdk_thread_set_interrupt_mode(bool enable_interrupt)
 		poller_set_interrupt_mode(poller, enable_interrupt);
 	}
 	/* All paused pollers will go to work in interrupt mode */
+	/* [한국어] paused poller 도 미리 모드 전환해 두어 나중에 resume 시 즉시 정상 동작. */
 	TAILQ_FOREACH_SAFE(poller, &thread->paused_pollers, tailq, tmp) {
 		poller_set_interrupt_mode(poller, enable_interrupt);
 	}
 
-	thread->in_interrupt = enable_interrupt;
+	thread->in_interrupt = enable_interrupt; /* [한국어] 마지막에 thread 자체 모드 플래그 set — 다음 spdk_thread_poll 라운드부터 새 모드. */
 	return;
 }
 
+/*
+ * [한국어]
+ * io_device_get - g_io_devices RB tree 에서 io_device 키로 검색.
+ *
+ * @io_device: 사용자 디바이스 식별자 (포인터 키).
+ * @return: 발견된 io_device* 또는 NULL.
+ *
+ * 호출자가 devlist_mutex 를 잡고 있어야 함 (caller responsibility).
+ */
 static struct io_device *
 io_device_get(void *io_device)
 {
 	struct io_device find = {};
 
-	find.io_device = io_device;
+	find.io_device = io_device; /* [한국어] RB tree 비교 키 — io_device 포인터 값. */
 	return RB_FIND(io_device_tree, &g_io_devices, &find);
 }
 
+/*
+ * [한국어]
+ * spdk_io_device_register - 새 io_device 등록 (이후 spdk_get_io_channel 호출 가능).
+ *
+ * @io_device : 사용자 디바이스 식별 키 (보통 bdev/qpair/blobstore 객체 포인터).
+ * @create_cb : 새 io_channel 의 trailing ctx 영역 초기화 콜백.
+ * @destroy_cb: io_channel 해제 시 호출되는 ctx 정리 콜백.
+ * @ctx_size  : io_channel 끝에 부착될 trailing ctx 크기.
+ * @name      : 디버그/로그용 이름 (NULL 가능 — dev 포인터 hex).
+ *
+ * 동기/배경: SPDK 의 per-thread channel 추상화 진입점. 같은 io_device 에 대해
+ *           각 thread 가 자기 채널을 만들고, 채널 trailing 영역에 모듈별 컨텍스트 저장.
+ * 동작 단계: (1) 인자 검증, (2) io_device calloc, (3) name/cb/ctx_size 저장,
+ *          (4) devlist_mutex 안에서 RB_INSERT (중복 키면 ERRLOG + free).
+ * 실행 컨텍스트: SPDK thread (보통 모듈 init 단계).
+ */
 void
 spdk_io_device_register(void *io_device, spdk_io_channel_create_cb create_cb,
 			spdk_io_channel_destroy_cb destroy_cb, uint32_t ctx_size,
@@ -3441,9 +3548,9 @@ spdk_io_device_register(void *io_device, spdk_io_channel_create_cb create_cb,
 	struct io_device *dev, *tmp;
 	struct spdk_thread *thread;
 
-	assert(io_device != NULL);
-	assert(create_cb != NULL);
-	assert(destroy_cb != NULL);
+	assert(io_device != NULL); /* [한국어] 키 NULL 금지 — RB tree 검색 불가. */
+	assert(create_cb != NULL); /* [한국어] 채널 생성 시 ctx 초기화 책임. */
+	assert(destroy_cb != NULL); /* [한국어] 채널 해제 시 ctx 정리 책임. */
 
 	thread = spdk_get_thread();
 	if (!thread) {
@@ -3452,17 +3559,17 @@ spdk_io_device_register(void *io_device, spdk_io_channel_create_cb create_cb,
 		return;
 	}
 
-	dev = calloc(1, sizeof(struct io_device));
+	dev = calloc(1, sizeof(struct io_device)); /* [한국어] 0-init — refcnt=0, threads RB 비어있음. */
 	if (dev == NULL) {
 		SPDK_ERRLOG("could not allocate io_device\n");
 		return;
 	}
 
-	dev->io_device = io_device;
+	dev->io_device = io_device; /* [한국어] 사용자 키 저장. */
 	if (name) {
 		snprintf(dev->name, sizeof(dev->name), "%s", name);
 	} else {
-		snprintf(dev->name, sizeof(dev->name), "%p", dev);
+		snprintf(dev->name, sizeof(dev->name), "%p", dev); /* [한국어] 미지정 이름 — dev 포인터 hex. */
 	}
 	dev->create_cb = create_cb;
 	dev->destroy_cb = destroy_cb;
@@ -3471,14 +3578,16 @@ spdk_io_device_register(void *io_device, spdk_io_channel_create_cb create_cb,
 	dev->for_each_count = 0;
 	dev->unregistered = false;
 	dev->refcnt = 0;
-	RB_INIT(&dev->threads);
+	RB_INIT(&dev->threads); /* [한국어] 어떤 thread 들에게 채널을 발급했는지 추적할 역방향 RB tree. */
 
 	SPDK_DEBUGLOG(thread, "Registering io_device %s (%p) on thread %s\n",
 		      dev->name, dev->io_device, thread->name);
 
+	/* [한국어] g_io_devices 글로벌 RB tree 에 삽입 — cross-thread 보호 mutex 필요. */
 	pthread_mutex_lock(&g_devlist_mutex);
 	tmp = RB_INSERT(io_device_tree, &g_io_devices, dev);
 	if (tmp != NULL) {
+		/* [한국어] 같은 io_device 키로 이미 등록된 경우 — 사용자 버그. 새 dev 는 폐기. */
 		SPDK_ERRLOG("io_device %p already registered (old:%s new:%s)\n",
 			    io_device, tmp->name, dev->name);
 		free(dev);
@@ -3487,6 +3596,16 @@ spdk_io_device_register(void *io_device, spdk_io_channel_create_cb create_cb,
 	pthread_mutex_unlock(&g_devlist_mutex);
 }
 
+/*
+ * [한국어]
+ * _finish_unregister - io_device 의 모든 채널 해제 후 unregister_cb 호출 + free.
+ *
+ * @arg: dev (send_msg 컨텍스트).
+ *
+ * 동기/배경: io_device_free 가 dev->unregister_thread 에게 send_msg 한 결과 — 등록자 thread 에서
+ *           안전하게 사용자 콜백 실행하고 메모리 회수.
+ * 실행 컨텍스트: dev->unregister_thread.
+ */
 static void
 _finish_unregister(void *arg)
 {
@@ -3494,31 +3613,54 @@ _finish_unregister(void *arg)
 	struct spdk_thread *thread;
 
 	thread = spdk_get_thread();
-	assert(thread == dev->unregister_thread);
+	assert(thread == dev->unregister_thread); /* [한국어] 올바른 thread 에서 호출됐는지 검증. */
 
 	SPDK_DEBUGLOG(thread, "Finishing unregistration of io_device %s (%p) on thread %s\n",
 		      dev->name, dev->io_device, thread->name);
 
-	assert(thread->pending_unregister_count > 0);
-	thread->pending_unregister_count--;
+	assert(thread->pending_unregister_count > 0); /* [한국어] unregister 시 ++해뒀던 카운터. */
+	thread->pending_unregister_count--;            /* [한국어] thread_exit 가 0 을 기다림. */
 
-	dev->unregister_cb(dev->io_device);
-	free(dev);
+	dev->unregister_cb(dev->io_device); /* [한국어] 사용자 정리 콜백 (NULL 아닌 경우만 _finish_unregister 호출됨). */
+	free(dev);                            /* [한국어] io_device 자체 메모리 회수. */
 }
 
+/*
+ * [한국어]
+ * io_device_free - io_device 해제. unregister_cb 가 있으면 비동기로 _finish_unregister 보냄.
+ *
+ * @dev: 해제할 io_device.
+ *
+ * 호출자: spdk_io_device_unregister (refcnt 0 즉시 해제), put_io_channel (마지막 채널 정리 시).
+ */
 static void
 io_device_free(struct io_device *dev)
 {
 	if (dev->unregister_cb == NULL) {
-		free(dev);
+		free(dev); /* [한국어] 콜백 없는 단순 케이스 — 즉시 free. */
 	} else {
-		assert(dev->unregister_thread != NULL);
+		assert(dev->unregister_thread != NULL); /* [한국어] unregister_thread 는 unregister 호출자가 캡처. */
 		SPDK_DEBUGLOG(thread, "io_device %s (%p) needs to unregister from thread %s\n",
 			      dev->name, dev->io_device, dev->unregister_thread->name);
+		/* [한국어] 등록자 thread 에서 콜백을 실행하도록 send_msg — thread-safe 사용자 ctx 보장. */
 		spdk_thread_send_msg(dev->unregister_thread, _finish_unregister, dev);
 	}
 }
 
+/*
+ * [한국어]
+ * spdk_io_device_unregister - io_device 등록 해제 (비동기 — 모든 채널 해제 후 콜백 호출).
+ *
+ * @io_device   : 해제할 디바이스 키.
+ * @unregister_cb: 모든 정리 끝난 뒤 호출될 사용자 콜백 (NULL 가능).
+ *
+ * 동기/배경: 즉시 free 불가 — 다른 thread 의 채널이 살아있을 수 있음. refcnt 가 0 이 될 때까지
+ *           대기 후 io_device_free 가 콜백 호출 + free.
+ *           for_each_channel 진행 중이면 pending_unregister 만 표시하고 끝낸 뒤 자동 재시도.
+ * 동작 단계: (1) devlist_mutex 잠금, (2) io_device 검색, (3) pending_unregister 검사,
+ *          (4) unregister_cb/thread 저장, (5) for_each 진행 중이면 pending 만 set,
+ *          (6) RB tree 에서 제거, (7) refcnt>0 이면 deferred, 0 이면 즉시 free.
+ */
 void
 spdk_io_device_unregister(void *io_device, spdk_io_device_unregister_cb unregister_cb)
 {
@@ -3546,6 +3688,7 @@ spdk_io_device_unregister(void *io_device, spdk_io_device_unregister_cb unregist
 	 * device a second time, from the internal call to this function that occurs
 	 * after the for_each_count reaches 0.
 	 */
+	/* [한국어] 이미 pending_unregister 가 set 되어 있고 for_each 가 진행 중이면 사용자 중복 호출 — 거부. */
 	if (dev->pending_unregister && dev->for_each_count > 0) {
 		SPDK_ERRLOG("io_device %p already has a pending unregister\n", io_device);
 		assert(false);
@@ -3553,52 +3696,85 @@ spdk_io_device_unregister(void *io_device, spdk_io_device_unregister_cb unregist
 		return;
 	}
 
-	dev->unregister_cb = unregister_cb;
-	dev->unregister_thread = thread;
+	dev->unregister_cb = unregister_cb;     /* [한국어] 정리 끝나면 호출될 사용자 콜백 저장. */
+	dev->unregister_thread = thread;         /* [한국어] 어느 thread 에서 콜백을 실행할지 — 등록자. */
 
 	if (dev->for_each_count > 0) {
+		/* [한국어] spdk_for_each_channel 이 진행 중 — 끝날 때까지 deferred. */
 		SPDK_WARNLOG("io_device %s (%p) has %u for_each calls outstanding\n",
 			     dev->name, io_device, dev->for_each_count);
-		dev->pending_unregister = true;
+		dev->pending_unregister = true; /* [한국어] for_each 완료 시 __pending_unregister 가 자동 재호출. */
 		pthread_mutex_unlock(&g_devlist_mutex);
 		return;
 	}
 
-	dev->unregistered = true;
-	RB_REMOVE(io_device_tree, &g_io_devices, dev);
-	refcnt = dev->refcnt;
+	dev->unregistered = true; /* [한국어] 새 채널 발급 차단. */
+	RB_REMOVE(io_device_tree, &g_io_devices, dev); /* [한국어] 글로벌 RB tree 에서 제거. */
+	refcnt = dev->refcnt; /* [한국어] 살아있는 채널 수 capture. */
 	pthread_mutex_unlock(&g_devlist_mutex);
 
 	SPDK_DEBUGLOG(thread, "Unregistering io_device %s (%p) from thread %s\n",
 		      dev->name, dev->io_device, thread->name);
 
 	if (unregister_cb) {
-		thread->pending_unregister_count++;
+		thread->pending_unregister_count++; /* [한국어] _finish_unregister 도달까지 thread_exit 차단. */
 	}
 
 	if (refcnt > 0) {
 		/* defer deletion */
+		/* [한국어] 살아있는 채널 있음 — 마지막 put_io_channel 이 dev->refcnt==0 되었을 때 io_device_free 호출. */
 		return;
 	}
 
-	io_device_free(dev);
+	io_device_free(dev); /* [한국어] 채널 없음 — 즉시 정리. */
 }
 
+/*
+ * [한국어]
+ * spdk_io_device_get_name - io_device 의 디버그용 이름 반환.
+ */
 const char *
 spdk_io_device_get_name(struct io_device *dev)
 {
 	return dev->name;
 }
 
+/*
+ * [한국어]
+ * thread_get_io_channel - thread 의 io_channels RB tree 에서 dev 키로 검색.
+ *
+ * 같은 (thread, dev) 조합의 채널이 이미 있는지 확인 — RB_FIND O(log n).
+ */
 static struct spdk_io_channel *
 thread_get_io_channel(struct spdk_thread *thread, struct io_device *dev)
 {
 	struct spdk_io_channel find = {};
 
-	find.dev = dev;
+	find.dev = dev; /* [한국어] RB tree 비교 키 — dev 포인터. */
 	return RB_FIND(io_channel_tree, &thread->io_channels, &find);
 }
 
+/*
+ * [한국어]
+ * spdk_get_io_channel - 현재 thread 에서 io_device 의 채널 획득 (없으면 생성).
+ *
+ * @io_device: spdk_io_device_register 시 등록한 키.
+ * @return: 채널 포인터 또는 NULL (할당 실패 / 디바이스 없음).
+ *
+ * 동기/배경: per-(thread, io_device) 채널 캐시. 동일 thread 에서 두 번째 호출 시 ref 만 증가.
+ *           cache miss 시 sizeof(spdk_io_channel) + ctx_size 만큼 단일 할당하여 trailing ctx 와 함께 생성.
+ *           dev->create_cb 가 trailing ctx 초기화 — 실패 시 모든 자원 rollback.
+ * 동작 단계:
+ *   (1) devlist_mutex 잠금 + io_device 검색.
+ *   (2) RB_FIND 로 cache 검색. hit 면 ref++ 후 반환.
+ *   (3) cache miss — calloc 으로 channel + ctx + thread_link 할당.
+ *   (4) channel 필드 채우고 RB_INSERT (io_channels 트리, thread_link tree).
+ *   (5) dev->refcnt++.
+ *   (6) mutex 해제 후 dev->create_cb 호출 (mutex 안에서 호출 금지 — race/deadlock 회피).
+ *   (7) create_cb 실패 시 rollback.
+ *
+ * 실행 컨텍스트: 채널을 사용할 SPDK thread (필수).
+ */
 struct spdk_io_channel *
 spdk_get_io_channel(void *io_device)
 {
@@ -3612,6 +3788,7 @@ spdk_get_io_channel(void *io_device)
 	pthread_mutex_lock(&g_devlist_mutex);
 	dev = io_device_get(io_device);
 	if (dev == NULL) {
+		/* [한국어] 등록 안 된 io_device — 사용자 사용 흐름 버그. */
 		SPDK_ERRLOG("could not find io_device %p\n", io_device);
 		pthread_mutex_unlock(&g_devlist_mutex);
 		return NULL;
@@ -3625,6 +3802,7 @@ spdk_get_io_channel(void *io_device)
 	}
 
 	if (spdk_unlikely(thread->state == SPDK_THREAD_STATE_EXITED)) {
+		/* [한국어] EXITED thread 에서 새 채널 발급 금지 — 즉시 leak 됨. */
 		SPDK_ERRLOG("Thread %s is marked as exited\n", thread->name);
 		pthread_mutex_unlock(&g_devlist_mutex);
 		return NULL;
@@ -3632,6 +3810,7 @@ spdk_get_io_channel(void *io_device)
 
 	ch = thread_get_io_channel(thread, dev);
 	if (ch != NULL) {
+		/* [한국어] cache hit — 동일 (thread, dev) 채널 이미 존재. ref 만 증가. */
 		ch->ref++;
 
 		SPDK_DEBUGLOG(thread, "Get io_channel %p for io_device %s (%p) on thread %s refcnt %u\n",
@@ -3647,6 +3826,7 @@ spdk_get_io_channel(void *io_device)
 		return ch;
 	}
 
+	/* [한국어] cache miss — channel + trailing ctx 단일 할당 (zero-init). */
 	ch = calloc(1, sizeof(*ch) + dev->ctx_size);
 	if (ch == NULL) {
 		SPDK_ERRLOG("could not calloc spdk_io_channel\n");
@@ -3654,6 +3834,7 @@ spdk_get_io_channel(void *io_device)
 		return NULL;
 	}
 
+	/* [한국어] thread_link 도 별도 할당 — dev->threads RB tree 의 노드. */
 	thr_link = calloc(1, sizeof(struct thread_link));
 	if (thr_link == NULL) {
 		free(ch);
@@ -3662,28 +3843,32 @@ spdk_get_io_channel(void *io_device)
 		return NULL;
 	}
 
-	ch->dev = dev;
-	ch->destroy_cb = dev->destroy_cb;
-	ch->thread = thread;
-	ch->ref = 1;
+	ch->dev = dev;                         /* [한국어] io_device 역참조 — destroy 시 dev->destroy_cb 호출. */
+	ch->destroy_cb = dev->destroy_cb;       /* [한국어] 모듈 측 trailing ctx 정리 콜백. */
+	ch->thread = thread;                    /* [한국어] thread affinity 불변식 — 채널은 이 thread 에서만 사용. */
+	ch->ref = 1;                            /* [한국어] 사용자 1 ref. */
 	ch->destroy_ref = 0;
-	RB_INSERT(io_channel_tree, &thread->io_channels, ch);
+	RB_INSERT(io_channel_tree, &thread->io_channels, ch); /* [한국어] thread 의 cache 트리에 삽입. */
 
 	SPDK_DEBUGLOG(thread, "Get io_channel %p for io_device %s (%p) on thread %s refcnt %u\n",
 		      ch, dev->name, dev->io_device, thread->name, ch->ref);
 
-	dev->refcnt++;
+	dev->refcnt++; /* [한국어] dev 의 살아있는 채널 수 증가. */
 
 	thr_link->thread = thread;
 	thr_link->id = thread->id;
+	/* [한국어] dev->threads RB tree 에 역방향 인덱스 추가 — for_each_channel 이 사용. */
 	if (RB_INSERT(thread_link_tree, &dev->threads, thr_link)) {
-		assert(false);
+		assert(false); /* [한국어] 같은 thread id 중복 삽입 — 불변식 위반. */
 	}
 
 	pthread_mutex_unlock(&g_devlist_mutex);
 
+	/* [한국어] dev->create_cb 는 mutex 밖에서 호출 — 콜백 안에서 다른 spdk_get_io_channel 등 재진입
+	 * 가능성이 있어 deadlock 회피. ctx 영역은 channel 끝 + sizeof. */
 	rc = dev->create_cb(io_device, (uint8_t *)ch + sizeof(*ch));
 	if (rc != 0) {
+		/* [한국어] create_cb 실패 — 모든 자원 rollback. */
 		pthread_mutex_lock(&g_devlist_mutex);
 		RB_REMOVE(io_channel_tree, &ch->thread->io_channels, ch);
 		dev->refcnt--;
@@ -3694,6 +3879,7 @@ spdk_get_io_channel(void *io_device)
 			    dev->name, io_device, spdk_strerror(-rc), rc);
 		if (dev->unregistered && dev->refcnt == 0) {
 			/* During invokation of create_cb dev was unregistered, but was not removed due to refcnt */
+			/* [한국어] mutex 밖에서 create_cb 가 도는 동안 누군가 unregister 했을 수 있음 — refcnt 0 이면 마저 정리. */
 			do_remove_dev = true;
 		}
 		pthread_mutex_unlock(&g_devlist_mutex);
@@ -3707,6 +3893,20 @@ spdk_get_io_channel(void *io_device)
 	return ch;
 }
 
+/*
+ * [한국어]
+ * put_io_channel - send_msg 로 deferred 된 채널 실제 해제 처리.
+ *
+ * @arg: 해제할 spdk_io_channel.
+ *
+ * 동기/배경: spdk_put_io_channel 이 ref==0 가 되면 destroy_ref++ 후 send_msg 로 본 함수를
+ *           자기 자신에게 보냄. 이렇게 deferred 한 이유 — destroy_cb 가 trailing ctx 의 비동기
+ *           자원(NVMe qpair 등) 해제를 시작할 수 있으므로, 호출 사이트에서 즉시 free 하면
+ *           use-after-free 가능. send_msg 우회로 호출 사이트의 모든 처리가 끝난 다음에 destroy.
+ * 동작 단계: (1) destroy_ref--, (2) ref>0 or destroy_ref>0 이면 부활 — 그냥 return,
+ *          (3) RB tree (io_channels, dev->threads) 에서 제거, (4) destroy_cb 호출 (mutex 밖),
+ *          (5) dev->refcnt--, unregistered & refcnt==0 이면 io_device_free.
+ */
 static void
 put_io_channel(void *arg)
 {
@@ -3726,7 +3926,7 @@ put_io_channel(void *arg)
 		      "Releasing io_channel %p for io_device %s (%p) on thread %s\n",
 		      ch, ch->dev->name, ch->dev->io_device, thread->name);
 
-	assert(ch->thread == thread);
+	assert(ch->thread == thread); /* [한국어] put_io_channel 메시지는 항상 채널 소유 thread 에 보내짐. */
 
 	ch->destroy_ref--;
 
@@ -3736,12 +3936,15 @@ put_io_channel(void *arg)
 		 *  after this message was sent but before it had a chance to
 		 *  execute.
 		 */
+		/* [한국어] destroy 진행 중 누군가 다시 get → 부활(resurrect). 그냥 return — 채널은 다시 활성. */
 		return;
 	}
 
+	/* [한국어] 글로벌 자료구조에서 채널 제거 — mutex 안. */
 	pthread_mutex_lock(&g_devlist_mutex);
-	RB_REMOVE(io_channel_tree, &ch->thread->io_channels, ch);
+	RB_REMOVE(io_channel_tree, &ch->thread->io_channels, ch); /* [한국어] thread 의 cache 트리. */
 	RB_FOREACH_SAFE(thr_link, thread_link_tree, &ch->dev->threads, ptmp) {
+		/* [한국어] dev->threads 역방향 인덱스에서도 제거. */
 		if (thr_link->thread == thread) {
 			RB_REMOVE(thread_link_tree, &ch->dev->threads, thr_link);
 			free(thr_link);
@@ -3751,27 +3954,39 @@ put_io_channel(void *arg)
 	pthread_mutex_unlock(&g_devlist_mutex);
 
 	/* Don't hold the devlist mutex while the destroy_cb is called. */
+	/* [한국어] destroy_cb 는 mutex 밖에서 호출 — 콜백이 다른 SPDK API 부를 수 있고, 그게 같은 mutex 를
+	 * 잡으면 deadlock. ctx 영역은 channel + sizeof. */
 	ch->destroy_cb(ch->dev->io_device, spdk_io_channel_get_ctx(ch));
 
 	pthread_mutex_lock(&g_devlist_mutex);
-	ch->dev->refcnt--;
+	ch->dev->refcnt--; /* [한국어] dev 의 살아있는 채널 수 감소. */
 
 	if (!ch->dev->unregistered) {
-		do_remove_dev = false;
+		do_remove_dev = false; /* [한국어] 아직 unregister 안 됐으면 dev 는 유지. */
 	}
 
 	if (ch->dev->refcnt > 0) {
-		do_remove_dev = false;
+		do_remove_dev = false; /* [한국어] 다른 thread 채널 살아있음 — dev 는 유지. */
 	}
 
 	pthread_mutex_unlock(&g_devlist_mutex);
 
 	if (do_remove_dev) {
+		/* [한국어] unregister 됐고 마지막 채널이었음 — io_device_free 가 _finish_unregister 송신. */
 		io_device_free(ch->dev);
 	}
-	free(ch);
+	free(ch); /* [한국어] 채널 + trailing ctx 단일 할당이라 한 번에 free. */
 }
 
+/*
+ * [한국어]
+ * spdk_put_io_channel - 채널 ref 감소. 0 도달 시 destroy 메시지 deferred.
+ *
+ * @ch: 해제할 채널.
+ *
+ * 동기/배경: 즉시 destroy 하지 않는 이유는 put_io_channel 주석 참고. ref==0 시 destroy_ref++
+ *           후 send_msg(put_io_channel) — 메시지가 처리될 때까지 부활 가능.
+ */
 void
 spdk_put_io_channel(struct spdk_io_channel *ch)
 {
@@ -3788,6 +4003,7 @@ spdk_put_io_channel(struct spdk_io_channel *ch)
 	}
 
 	if (ch->thread != thread) {
+		/* [한국어] thread affinity 위반 — cross-thread put 금지. */
 		wrong_thread(__func__, "ch", ch->thread, thread);
 		return;
 	}
@@ -3799,11 +4015,18 @@ spdk_put_io_channel(struct spdk_io_channel *ch)
 	ch->ref--;
 
 	if (ch->ref == 0) {
+		/* [한국어] 마지막 ref — destroy_ref++ 로 임시 보호하고 send_msg 로 deferred. */
 		ch->destroy_ref++;
 		spdk_thread_send_msg(thread, put_io_channel, ch);
 	}
 }
 
+/*
+ * [한국어]
+ * spdk_io_channel_ref - 채널 ref 증가 (수동 증가 — 보통 spdk_get_io_channel 이 자동).
+ *
+ * 같은 ctx 를 여러 콜백에 넘기는 동안 채널 수명을 연장할 때 사용.
+ */
 struct spdk_io_channel *
 spdk_io_channel_ref(struct spdk_io_channel *ch)
 {
@@ -3819,50 +4042,83 @@ spdk_io_channel_ref(struct spdk_io_channel *ch)
 	return ch;
 }
 
+/*
+ * [한국어]
+ * spdk_io_channel_from_ctx - trailing ctx 포인터로부터 채널 복원.
+ *
+ * spdk_io_channel_get_ctx 의 역연산 — ctx - sizeof(spdk_io_channel).
+ */
 struct spdk_io_channel *
 spdk_io_channel_from_ctx(void *ctx)
 {
 	return (struct spdk_io_channel *)((uint8_t *)ctx - sizeof(struct spdk_io_channel));
 }
 
+/* [한국어] 단순 getter — 채널 소유 thread 반환. */
 struct spdk_thread *
 spdk_io_channel_get_thread(struct spdk_io_channel *ch)
 {
 	return ch->thread;
 }
 
+/* [한국어] 채널이 가리키는 사용자 io_device 키 반환 (내부 io_device* 가 아님). */
 void *
 spdk_io_channel_get_io_device(struct spdk_io_channel *ch)
 {
 	return ch->dev->io_device;
 }
 
+/* [한국어] 채널의 io_device 이름. */
 const char *
 spdk_io_channel_get_io_device_name(struct spdk_io_channel *ch)
 {
 	return spdk_io_device_get_name(ch->dev);
 }
 
+/* [한국어] 채널 현재 ref count (디버그/모니터링). */
 int
 spdk_io_channel_get_ref_count(struct spdk_io_channel *ch)
 {
 	return ch->ref;
 }
 
+/*
+ * [한국어] spdk_io_channel_iter — spdk_for_each_channel 의 비동기 fan-out 컨텍스트.
+ *
+ * io_device 의 모든 thread channel 을 thread_link 트리 순회 (id 오름차순) 하면서 fn 디스패치.
+ * 각 hop 은 send_msg 로 cur_thread 전환 후 fn(i) 호출, 사용자 코드가 spdk_for_each_channel_continue
+ * 호출 시 다음 thread 로 진행. heap 에 1번 할당 → 모든 hop 후 _call_completion 이 free.
+ */
 struct spdk_io_channel_iter {
 	void *io_device;
+	/* [한국어] 사용자가 spdk_for_each_channel 에 전달한 io_device 키. spdk_io_channel_iter_get_io_device 가 노출. */
+
 	struct io_device *dev;
+	/* [한국어] 내부 io_device* — io_device_get 으로 검색해 둠. dev->threads 트리 순회용. */
+
 	spdk_channel_msg fn;
+	/* [한국어] 각 thread channel 위에서 호출될 사용자 함수 — 끝에 반드시 spdk_for_each_channel_continue 호출해야 함. */
+
 	int status;
+	/* [한국어] continue 시 사용자가 전달한 status — cpl 콜백에 그대로 전달. 보통 0 또는 -errno. */
+
 	void *ctx;
+	/* [한국어] fn 의 사용자 컨텍스트 — spdk_io_channel_iter_get_ctx 가 노출. */
+
 	struct spdk_io_channel *ch;
+	/* [한국어] 현재 hop 의 thread channel — _call_channel 이 lookup 후 set. fn 안에서 spdk_io_channel_iter_get_channel 로 접근. */
 
 	struct spdk_thread *cur_thread;
+	/* [한국어] 현재 hop 중인 thread. spdk_for_each_channel_continue 가 다음 thread 로 갱신. */
 
 	struct spdk_thread *orig_thread;
+	/* [한국어] 호출자 thread — 모든 hop 끝나면 cpl 을 실행할 thread. for_each_count++ 보호. */
+
 	spdk_channel_for_each_cpl cpl;
+	/* [한국어] 모든 thread channel 순회 완료 시 orig_thread 에서 호출될 완료 콜백. */
 };
 
+/* [한국어] iter getter API — fn 안에서 사용. */
 void *
 spdk_io_channel_iter_get_io_device(struct spdk_io_channel_iter *i)
 {
@@ -3881,20 +4137,35 @@ spdk_io_channel_iter_get_ctx(struct spdk_io_channel_iter *i)
 	return i->ctx;
 }
 
+/*
+ * [한국어]
+ * _call_completion - 모든 thread channel 순회가 끝난 뒤 orig_thread 에서 cpl 호출 + iter free.
+ *
+ * @ctx: spdk_io_channel_iter.
+ */
 static void
 _call_completion(void *ctx)
 {
 	struct spdk_io_channel_iter *i = ctx;
 
 	assert(i->orig_thread->for_each_count > 0);
-	i->orig_thread->for_each_count--;
+	i->orig_thread->for_each_count--; /* [한국어] in-flight 카운터 해제. */
 
 	if (i->cpl != NULL) {
-		i->cpl(i, i->status);
+		i->cpl(i, i->status); /* [한국어] 사용자 완료 콜백 — status 는 fn 이 continue 시 전달한 값. */
 	}
 	free(i);
 }
 
+/*
+ * [한국어]
+ * _call_channel - cur_thread 컨텍스트에서 thread channel 검색 후 fn 호출.
+ *
+ * @ctx: iter.
+ *
+ * 동기/배경: send_msg 로 cur_thread 에 도착한 직후 호출. thread_get_io_channel 로 채널 검색,
+ *           발견되면 i->ch 에 set 하고 fn 호출. 발견 안 되면 (cross-thread put 으로 사라짐) skip.
+ */
 static void
 _call_channel(void *ctx)
 {
@@ -3905,17 +4176,34 @@ _call_channel(void *ctx)
 	 *  message had a chance to execute.  If so, skip calling
 	 *  the fn() on this thread.
 	 */
+	/* [한국어] send_msg 가 ring 에 들어간 사이 채널이 사라졌을 가능성 — devlist_mutex 보호 lookup. */
 	pthread_mutex_lock(&g_devlist_mutex);
 	i->ch = thread_get_io_channel(i->cur_thread, i->dev);
 	pthread_mutex_unlock(&g_devlist_mutex);
 
 	if (i->ch) {
-		i->fn(i);
+		i->fn(i); /* [한국어] 채널 살아있음 — 사용자 fn 호출. fn 끝에 반드시 spdk_for_each_channel_continue. */
 	} else {
-		spdk_for_each_channel_continue(i, 0);
+		spdk_for_each_channel_continue(i, 0); /* [한국어] 채널 없음 — 자동으로 다음 thread 로 hop. */
 	}
 }
 
+/*
+ * [한국어]
+ * spdk_for_each_channel - io_device 의 모든 thread channel 에 fn 을 디스패치 (비동기 fan-out).
+ *
+ * @io_device: 대상 디바이스 키.
+ * @fn       : 각 thread channel 컨텍스트에서 호출될 함수 (끝에 반드시 spdk_for_each_channel_continue).
+ * @ctx      : fn / cpl 의 사용자 컨텍스트.
+ * @cpl      : 모든 thread channel 순회 후 orig_thread 에서 호출될 완료 콜백.
+ *
+ * 동기/배경: bdev abort, NVMe-oF subsystem fan-out, blobstore unmap 등이 사용. dev->threads RB tree
+ *           를 id 오름차순으로 순회 — _call_channel → fn → spdk_for_each_channel_continue → 다음 thread.
+ * 동작 단계: (1) iter calloc, (2) for_each_count++ 보호, (3) io_device 검색, (4) pending_unregister 검사,
+ *          (5) RB_MIN(threads) 첫 thread 로 send_msg(_call_channel), (6) 끝나면 _call_completion 으로 cpl.
+ *
+ * 실행 컨텍스트: 호출자 SPDK thread.
+ */
 void
 spdk_for_each_channel(void *io_device, spdk_channel_msg fn, void *ctx,
 		      spdk_channel_for_each_cpl cpl)
@@ -3923,7 +4211,7 @@ spdk_for_each_channel(void *io_device, spdk_channel_msg fn, void *ctx,
 	struct spdk_io_channel_iter *i;
 	struct thread_link *thr_link;
 
-	i = calloc(1, sizeof(*i));
+	i = calloc(1, sizeof(*i)); /* [한국어] 비동기 흐름 동안 살아있을 heap 컨텍스트. */
 	if (!i) {
 		SPDK_ERRLOG("Unable to allocate iterator\n");
 		assert(false);
@@ -3936,7 +4224,7 @@ spdk_for_each_channel(void *io_device, spdk_channel_msg fn, void *ctx,
 	i->cpl = cpl;
 	i->orig_thread = _get_thread();
 
-	i->orig_thread->for_each_count++;
+	i->orig_thread->for_each_count++; /* [한국어] orig_thread 의 in-flight 보호 — thread_exit 가 0 을 기다림. */
 
 	pthread_mutex_lock(&g_devlist_mutex);
 	i->dev = io_device_get(io_device);
@@ -3950,65 +4238,98 @@ spdk_for_each_channel(void *io_device, spdk_channel_msg fn, void *ctx,
 	/* Do not allow new for_each operations if we are already waiting to unregister
 	 * the device for other for_each operations to complete.
 	 */
+	/* [한국어] 이미 unregister 대기 중이면 새 for_each 시작 금지 — 정리 흐름 일관성. */
 	if (i->dev->pending_unregister) {
 		SPDK_ERRLOG("io_device %p has a pending unregister\n", io_device);
 		i->status = -ENODEV;
 		goto end;
 	}
 
-	thr_link = RB_MIN(thread_link_tree, &i->dev->threads);
+	thr_link = RB_MIN(thread_link_tree, &i->dev->threads); /* [한국어] 가장 작은 thread id 부터 시작. */
 	if (thr_link != NULL) {
-		i->dev->for_each_count++;
+		i->dev->for_each_count++; /* [한국어] dev 의 in-flight 카운터 — unregister 가 0 을 기다림. */
 		i->cur_thread = thr_link->thread;
-		spdk_thread_send_msg(i->cur_thread, _call_channel, i);
+		spdk_thread_send_msg(i->cur_thread, _call_channel, i); /* [한국어] 첫 thread 에 hop. */
 		pthread_mutex_unlock(&g_devlist_mutex);
 		return;
 	}
 
 end:
+	/* [한국어] 채널 없음 또는 에러 — 곧장 cpl. */
 	pthread_mutex_unlock(&g_devlist_mutex);
 
 	spdk_thread_send_msg(i->orig_thread, _call_completion, i);
 }
 
+/*
+ * [한국어]
+ * __pending_unregister - for_each 가 끝난 뒤 pending unregister 재시도.
+ *
+ * @arg: io_device.
+ */
 static void
 __pending_unregister(void *arg)
 {
 	struct io_device *dev = arg;
 
 	assert(dev->pending_unregister);
-	assert(dev->for_each_count == 0);
-	spdk_io_device_unregister(dev->io_device, dev->unregister_cb);
+	assert(dev->for_each_count == 0); /* [한국어] for_each 모두 끝났을 때만 호출. */
+	spdk_io_device_unregister(dev->io_device, dev->unregister_cb); /* [한국어] unregister 재시도 — 이번엔 pending 아니므로 정상 진행. */
 }
 
+/*
+ * [한국어]
+ * io_dev_get_next_thread - dev->threads RB tree 에서 thread 다음 노드의 thread 반환.
+ *
+ * @dev   : 디바이스.
+ * @thread: 현재 thread (이 thread 보다 큰 id 의 다음 thread 검색).
+ * @return: 다음 thread 또는 NULL (마지막).
+ *
+ * RB_NFIND(id+1) — id+1 이상의 첫 노드 — RB tree 정렬 순회.
+ */
 static struct spdk_thread *
 io_dev_get_next_thread(struct io_device *dev, struct spdk_thread *thread)
 {
 	struct thread_link find = {}, *res;
 
-	find.id = thread->id + 1;
-	res = RB_NFIND(thread_link_tree, &dev->threads, &find);
+	find.id = thread->id + 1; /* [한국어] 현재 thread 다음 id 부터 검색. */
+	res = RB_NFIND(thread_link_tree, &dev->threads, &find); /* [한국어] N=next/equal — id+1 이상 첫 노드. */
 	return res ? res->thread : NULL;
 }
 
+/*
+ * [한국어]
+ * spdk_for_each_channel_continue - fn 안에서 호출 — 다음 thread channel 로 hop 진행.
+ *
+ * @i     : iter.
+ * @status: 사용자 결과 (0 = 계속, non-zero = 즉시 종료 후 cpl 에 전달).
+ *
+ * 동기/배경: 사용자 fn 은 비동기 작업(예: bdev_io submit)을 마친 뒤에야 다음 thread 로 진행 가능하므로,
+ *           동기적으로 자동 진행하는 대신 사용자가 명시적으로 호출하는 패턴.
+ * 동작 단계: (1) status 저장, (2) status != 0 이면 즉시 cpl 으로 점프,
+ *          (3) io_dev_get_next_thread 로 다음 thread 검색, 있으면 send_msg(_call_channel),
+ *          (4) 없으면 dev->for_each_count--, _call_completion 으로 cpl,
+ *          (5) pending_unregister 가 있고 for_each_count==0 이면 __pending_unregister send_msg.
+ */
 void
 spdk_for_each_channel_continue(struct spdk_io_channel_iter *i, int status)
 {
 	struct spdk_thread *thread;
 	struct io_device *dev;
 
-	assert(i->cur_thread == spdk_get_thread());
+	assert(i->cur_thread == spdk_get_thread()); /* [한국어] 호출은 cur_thread 컨텍스트에서만. */
 
 	i->status = status;
 
 	pthread_mutex_lock(&g_devlist_mutex);
 	dev = i->dev;
 	if (status) {
-		goto end;
+		goto end; /* [한국어] non-zero status — 더 진행 안 하고 cpl 으로. */
 	}
 
 	thread = io_dev_get_next_thread(i->dev, i->cur_thread);
 	if (thread != NULL) {
+		/* [한국어] 다음 thread 존재 — hop. */
 		i->cur_thread = thread;
 		spdk_thread_send_msg(i->cur_thread, _call_channel, i);
 		pthread_mutex_unlock(&g_devlist_mutex);
@@ -4016,12 +4337,14 @@ spdk_for_each_channel_continue(struct spdk_io_channel_iter *i, int status)
 	}
 
 end:
-	dev->for_each_count--;
+	dev->for_each_count--; /* [한국어] dev 의 in-flight 카운터 해제. */
 	i->ch = NULL;
 	pthread_mutex_unlock(&g_devlist_mutex);
 
-	spdk_thread_send_msg(i->orig_thread, _call_completion, i);
+	spdk_thread_send_msg(i->orig_thread, _call_completion, i); /* [한국어] orig_thread 로 돌아가 cpl. */
 
+	/* [한국어] 만약 for_each 진행 중에 unregister 요청이 들어왔다면 (pending_unregister=true)
+	 * for_each_count==0 이 된 지금 다시 unregister 시도. dev->unregister_thread 에 send_msg. */
 	pthread_mutex_lock(&g_devlist_mutex);
 	if (dev->pending_unregister && dev->for_each_count == 0) {
 		spdk_thread_send_msg(dev->unregister_thread, __pending_unregister, dev);
@@ -4029,6 +4352,15 @@ end:
 	pthread_mutex_unlock(&g_devlist_mutex);
 }
 
+/*
+ * [한국어]
+ * thread_interrupt_destroy - thread 의 interrupt 자원(msg_fd eventfd + fd_group) 해제.
+ *
+ * @thread: 대상 thread.
+ *
+ * _free_thread 에서 호출 — interrupt 모드일 때만 의미 있음.
+ * fgrp 에서 msg_fd 제거 → close(msg_fd) → spdk_fd_group_destroy.
+ */
 static void
 thread_interrupt_destroy(struct spdk_thread *thread)
 {
@@ -4037,18 +4369,29 @@ thread_interrupt_destroy(struct spdk_thread *thread)
 	SPDK_INFOLOG(thread, "destroy fgrp for thread (%s)\n", thread->name);
 
 	if (thread->msg_fd < 0) {
-		return;
+		return; /* [한국어] interrupt 모드로 init 안 됨 — 정리할 자원 없음. */
 	}
 
-	spdk_fd_group_remove(fgrp, thread->msg_fd);
-	close(thread->msg_fd);
+	spdk_fd_group_remove(fgrp, thread->msg_fd); /* [한국어] epoll 등록 해제. */
+	close(thread->msg_fd);                       /* [한국어] eventfd 자체 close. */
 	thread->msg_fd = -1;
 
-	spdk_fd_group_destroy(fgrp);
+	spdk_fd_group_destroy(fgrp); /* [한국어] fd_group(=epoll fd) destroy. */
 	thread->fgrp = NULL;
 }
 
 #ifdef __linux__
+/*
+ * [한국어]
+ * thread_interrupt_msg_process - interrupt 모드의 msg_fd 가 readable 해질 때 호출되는 콜백.
+ *
+ * @arg: thread.
+ * @return: 0 idle, 1 busy.
+ *
+ * 동기/배경: spdk_thread_send_msg → write(msg_fd) → epoll wakeup → 본 함수.
+ *           polling 모드의 thread_poll 과 유사하지만 critical_msg + msg_queue_run_batch 만 처리.
+ *           처리 도중 poll 모드 전환되면 msg_fd counter 를 read 로 클리어.
+ */
 static int
 thread_interrupt_msg_process(void *arg)
 {
@@ -4061,9 +4404,11 @@ thread_interrupt_msg_process(void *arg)
 
 	assert(spdk_interrupt_mode_is_enabled());
 
+	/* [한국어] _interrupt_wrapper 처럼 thread 컨텍스트 swap — 콜백 안에서 spdk_get_thread() 정상 동작. */
 	orig_thread = spdk_get_thread();
 	spdk_set_thread(thread);
 
+	/* [한국어] critical_msg 처리 — atomic CAS 로 클리어. */
 	critical_msg = thread->critical_msg;
 	if (spdk_unlikely(critical_msg != NULL)) {
 		critical_msg(NULL);
@@ -4071,6 +4416,7 @@ thread_interrupt_msg_process(void *arg)
 		rc = 1;
 	}
 
+	/* [한국어] 메시지 ring batch 처리 — 0 패스로 SPDK_MSG_BATCH_SIZE=8 적용. */
 	msg_count = msg_queue_run_batch(thread, 0);
 	if (msg_count) {
 		rc = 1;
@@ -4081,16 +4427,29 @@ thread_interrupt_msg_process(void *arg)
 		/* The thread transitioned to poll mode in a msg during the above processing.
 		 * Clear msg_fd since thread messages will be polled directly in poll mode.
 		 */
+		/* [한국어] 콜백 처리 중 polling 모드로 전환됨 — eventfd counter 클리어해야 다음 폴링에서 spurious wakeup 안 일어남.
+		 * EAGAIN 은 정상(counter 이미 0). */
 		rc = read(thread->msg_fd, &notify, sizeof(notify));
 		if (rc < 0 && errno != EAGAIN) {
 			SPDK_ERRLOG("failed to acknowledge msg queue: %s.\n", spdk_strerror(errno));
 		}
 	}
 
-	spdk_set_thread(orig_thread);
+	spdk_set_thread(orig_thread); /* [한국어] TLS 복원. */
 	return rc;
 }
 
+/*
+ * [한국어]
+ * thread_interrupt_create - thread 의 interrupt 인프라(fgrp + msg_fd) 생성.
+ *
+ * @thread: 대상 thread.
+ * @return: 0 성공, 음수 errno 실패.
+ *
+ * 동작 단계: (1) spdk_fd_group_create — epoll fd 생성, (2) eventfd(0, NONBLOCK|CLOEXEC) — msg_fd,
+ *          (3) fgrp 에 msg_fd 등록 + thread_interrupt_msg_process 콜백.
+ *          이후 send_msg 시 eventfd write 가 epoll wakeup 트리거.
+ */
 static int
 thread_interrupt_create(struct spdk_thread *thread)
 {
@@ -4099,12 +4458,13 @@ thread_interrupt_create(struct spdk_thread *thread)
 
 	SPDK_INFOLOG(thread, "Create fgrp for thread (%s)\n", thread->name);
 
-	rc = spdk_fd_group_create(&thread->fgrp);
+	rc = spdk_fd_group_create(&thread->fgrp); /* [한국어] epoll fd 래핑 — 모든 interrupt fd 의 부모. */
 	if (rc) {
 		thread->msg_fd = -1;
 		return rc;
 	}
 
+	/* [한국어] eventfd(0, NONBLOCK|CLOEXEC) — counter 0 시작, non-block read/write, fork-exec close. */
 	thread->msg_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 	if (thread->msg_fd < 0) {
 		rc = -errno;
@@ -4117,10 +4477,12 @@ thread_interrupt_create(struct spdk_thread *thread)
 	spdk_fd_group_get_default_event_handler_opts(&opts, sizeof(opts));
 	opts.fd_type = SPDK_FD_TYPE_EVENTFD;
 
+	/* [한국어] fgrp 에 msg_fd 등록 — readable 시 thread_interrupt_msg_process(thread) 호출. */
 	return SPDK_FD_GROUP_ADD_EXT(thread->fgrp, thread->msg_fd,
 				     thread_interrupt_msg_process, thread, &opts);
 }
 #else
+/* [한국어] non-Linux: interrupt 모드 미지원 — 스텁. */
 static int
 thread_interrupt_create(struct spdk_thread *thread)
 {
@@ -4128,6 +4490,17 @@ thread_interrupt_create(struct spdk_thread *thread)
 }
 #endif
 
+/*
+ * [한국어]
+ * _interrupt_wrapper - fd_group 의 fd 가 readable 시 호출되는 SPDK 측 wrapper.
+ *
+ * @ctx: spdk_interrupt 구조체.
+ * @return: 사용자 fn 의 반환값.
+ *
+ * 동기/배경: fd_group 은 일반 epoll 콜백 인터페이스. SPDK 의 모든 콜백은 spdk_get_thread()
+ *           로 자기 thread 를 알 수 있어야 하므로, 매번 spdk_set_thread() 으로 컨텍스트 swap.
+ *           끝에 SPIN_ASSERT 로 spinlock holding 검사 — 안 풀린 spinlock 잡고 콜백 종료하면 fatal.
+ */
 static int
 _interrupt_wrapper(void *ctx)
 {
@@ -4138,20 +4511,26 @@ _interrupt_wrapper(void *ctx)
 	orig_thread = spdk_get_thread();
 	thread = intr->thread;
 
-	spdk_set_thread(thread);
+	spdk_set_thread(thread); /* [한국어] interrupt 등록 시점의 thread 컨텍스트 복원. */
 
 	SPDK_DTRACE_PROBE4(interrupt_fd_process, intr->name, intr->efd,
 			   intr->fn, intr->arg);
 
-	rc = intr->fn(intr->arg);
+	rc = intr->fn(intr->arg); /* [한국어] 사용자 콜백 실행 — fd 데이터 처리. */
 
 	SPIN_ASSERT(thread->lock_count == 0, SPIN_ERR_HOLD_DURING_SWITCH);
 
-	spdk_set_thread(orig_thread);
+	spdk_set_thread(orig_thread); /* [한국어] TLS 복원. */
 
 	return rc;
 }
 
+/*
+ * [한국어]
+ * spdk_interrupt_register - 기본 SPDK_INTERRUPT_EVENT_IN(읽기 가능) 이벤트로 인터럽트 등록.
+ *
+ * spdk_interrupt_register_for_events 의 단순 래퍼.
+ */
 struct spdk_interrupt *
 spdk_interrupt_register(int efd, spdk_interrupt_fn fn,
 			void *arg, const char *name)
@@ -4159,6 +4538,14 @@ spdk_interrupt_register(int efd, spdk_interrupt_fn fn,
 	return spdk_interrupt_register_for_events(efd, SPDK_INTERRUPT_EVENT_IN, fn, arg, name);
 }
 
+/*
+ * [한국어]
+ * spdk_interrupt_register_for_events - 지정 이벤트 마스크로 인터럽트 등록.
+ *
+ * @efd  : 감시할 fd.
+ * @events: 이벤트 마스크 (EVENT_IN/OUT/ERR 등).
+ * @fn/arg/name: 콜백·이름.
+ */
 struct spdk_interrupt *
 spdk_interrupt_register_for_events(int efd, uint32_t events, spdk_interrupt_fn fn, void *arg,
 				   const char *name)
@@ -4166,12 +4553,23 @@ spdk_interrupt_register_for_events(int efd, uint32_t events, spdk_interrupt_fn f
 	struct spdk_event_handler_opts opts = {};
 
 	spdk_fd_group_get_default_event_handler_opts(&opts, sizeof(opts));
-	opts.events = events;
+	opts.events = events; /* [한국어] EVENT_IN 외에도 EVENT_OUT/ERR/HUP 가능. */
 	opts.fd_type = SPDK_FD_TYPE_DEFAULT;
 
 	return spdk_interrupt_register_ext(efd, fn, arg, name, &opts);
 }
 
+/*
+ * [한국어]
+ * alloc_interrupt - spdk_interrupt 구조체 calloc + 기본 필드 채우기.
+ *
+ * @efd : interrupt fd (-1 if fgrp 모드).
+ * @fgrp: 중첩할 fd_group (NULL if efd 모드).
+ * @fn/arg/name: 콜백/인자/이름.
+ * @return: 새 intr 또는 NULL.
+ *
+ * 호출자: spdk_interrupt_register_ext (efd 모드), spdk_interrupt_register_fd_group (fgrp 모드).
+ */
 static struct spdk_interrupt *
 alloc_interrupt(int efd, struct spdk_fd_group *fgrp, spdk_interrupt_fn fn, void *arg,
 		const char *name)
@@ -4186,6 +4584,7 @@ alloc_interrupt(int efd, struct spdk_fd_group *fgrp, spdk_interrupt_fn fn, void 
 	}
 
 	if (spdk_unlikely(thread->state != SPDK_THREAD_STATE_RUNNING)) {
+		/* [한국어] EXITING/EXITED thread 에서 interrupt 등록 금지. */
 		SPDK_ERRLOG("thread %s is marked as exited\n", thread->name);
 		return NULL;
 	}
@@ -4197,21 +4596,33 @@ alloc_interrupt(int efd, struct spdk_fd_group *fgrp, spdk_interrupt_fn fn, void 
 	}
 
 	if (name) {
+		/* [한국어] 호출자가 이름을 준 경우 그대로 복사 (truncation 안전 — snprintf 가 NUL 보장). 디버그/trace 식별용. */
 		snprintf(intr->name, sizeof(intr->name), "%s", name);
 	} else {
+		/* [한국어] 이름 미지정 — 콜백 함수 포인터 값을 16진 문자열로 사용하여 최소한의 식별성 확보. */
 		snprintf(intr->name, sizeof(intr->name), "%p", fn);
 	}
 
-	assert(efd < 0 || fgrp == NULL);
+	assert(efd < 0 || fgrp == NULL); /* [한국어] efd 와 fgrp 는 상호배타. */
 	intr->efd = efd;
 	intr->fgrp = fgrp;
-	intr->thread = thread;
+	intr->thread = thread; /* [한국어] thread affinity 기록. */
 	intr->fn = fn;
 	intr->arg = arg;
 
 	return intr;
 }
 
+/*
+ * [한국어]
+ * spdk_interrupt_register_ext - 확장 옵션(events/fd_type)으로 인터럽트 등록.
+ *
+ * @efd : interrupt fd.
+ * @fn/arg/name: 콜백/인자/이름.
+ * @opts: event mask, fd_type 옵션.
+ *
+ * 동작: alloc_interrupt → spdk_fd_group_add_ext (fgrp 에 efd 등록 + _interrupt_wrapper).
+ */
 struct spdk_interrupt *
 spdk_interrupt_register_ext(int efd, spdk_interrupt_fn fn, void *arg, const char *name,
 			    struct spdk_event_handler_opts *opts)
@@ -4224,6 +4635,7 @@ spdk_interrupt_register_ext(int efd, spdk_interrupt_fn fn, void *arg, const char
 		return NULL;
 	}
 
+	/* [한국어] thread 의 fgrp 에 efd 등록 — _interrupt_wrapper 가 콜백 wrapper. */
 	ret = spdk_fd_group_add_ext(intr->thread->fgrp, efd,
 				    _interrupt_wrapper, intr, intr->name, opts);
 	if (ret != 0) {
@@ -4236,6 +4648,12 @@ spdk_interrupt_register_ext(int efd, spdk_interrupt_fn fn, void *arg, const char
 	return intr;
 }
 
+/*
+ * [한국어]
+ * interrupt_fd_group_wrapper - fd_group 중첩(nest) 시 사용되는 wrapper.
+ *
+ * spdk_interrupt_register_fd_group 으로 등록된 fd_group 의 콜백을 SPDK thread 컨텍스트로 swap 후 호출.
+ */
 static int
 interrupt_fd_group_wrapper(void *wrap_ctx, spdk_fd_fn cb_fn, void *cb_ctx)
 {
@@ -4243,28 +4661,40 @@ interrupt_fd_group_wrapper(void *wrap_ctx, spdk_fd_fn cb_fn, void *cb_ctx)
 	struct spdk_thread *orig_thread, *thread;
 	int rc;
 
-	orig_thread = spdk_get_thread();
-	thread = intr->thread;
+	orig_thread = spdk_get_thread(); /* [한국어] 호출 직전 hosting 중이던 thread 백업 (복원용). */
+	thread = intr->thread;           /* [한국어] 이 nested fgrp 가 바인딩된 SPDK thread (alloc_interrupt 에서 기록). */
 
-	spdk_set_thread(thread);
-	rc = cb_fn(cb_ctx);
+	spdk_set_thread(thread);         /* [한국어] 중첩 fgrp 콜백이 spdk_get_thread() 로 자기 thread 를 알 수 있도록 TLS swap. */
+	rc = cb_fn(cb_ctx);              /* [한국어] 중첩된 fd_group 의 실제 사용자 콜백 호출 (epoll readable fd 처리). */
+	/* [한국어] 콜백이 spinlock 을 잡은 채 빠져나오면 fatal — thread migration 시 데드락 위험. */
 	SPIN_ASSERT(thread->lock_count == 0, SPIN_ERR_HOLD_DURING_SWITCH);
-	spdk_set_thread(orig_thread);
+	spdk_set_thread(orig_thread);    /* [한국어] TLS 복원 — caller 컨텍스트로 귀환. */
 
-	return rc;
+	return rc;                       /* [한국어] 사용자 콜백 반환값 그대로 전달 (0=idle, 양수=busy). */
 }
 
+/*
+ * [한국어]
+ * spdk_interrupt_register_fd_group - 다른 fd_group 전체를 이 thread 의 fgrp 에 중첩 등록.
+ *
+ * @fgrp: 중첩할 fd_group.
+ * @name: 디버그 이름.
+ *
+ * 동기/배경: 모듈이 자기 fd_group 을 별도로 관리하다 SPDK thread 의 epoll loop 에 결합시키고 싶을 때.
+ *           SPDK epoll wakeup 시 중첩 fgrp 도 자동 검사.
+ */
 struct spdk_interrupt *
 spdk_interrupt_register_fd_group(struct spdk_fd_group *fgrp, const char *name)
 {
 	struct spdk_interrupt *intr;
 	int rc;
 
-	intr = alloc_interrupt(-1, fgrp, NULL, NULL, name);
+	intr = alloc_interrupt(-1, fgrp, NULL, NULL, name); /* [한국어] efd=-1 (fgrp 모드). */
 	if (intr == NULL) {
 		return NULL;
 	}
 
+	/* [한국어] 중첩 대상 fgrp 의 콜백 wrapper 를 SPDK thread swap 래퍼로 설정. */
 	rc = spdk_fd_group_set_wrapper(fgrp, interrupt_fd_group_wrapper, intr);
 	if (rc != 0) {
 		SPDK_ERRLOG("thread %s: failed to set wrapper for fd_group %d: %s\n",
@@ -4273,6 +4703,7 @@ spdk_interrupt_register_fd_group(struct spdk_fd_group *fgrp, const char *name)
 		return NULL;
 	}
 
+	/* [한국어] thread 의 fgrp 안에 다른 fgrp 를 nested epoll 로 등록. */
 	rc = spdk_fd_group_nest(intr->thread->fgrp, fgrp);
 	if (rc != 0) {
 		SPDK_ERRLOG("thread %s: failed to nest fd_group %d: %s\n",
@@ -4285,6 +4716,14 @@ spdk_interrupt_register_fd_group(struct spdk_fd_group *fgrp, const char *name)
 	return intr;
 }
 
+/*
+ * [한국어]
+ * spdk_interrupt_unregister - 인터럽트 등록 해제.
+ *
+ * @pintr: 해제할 intr 포인터의 포인터 (호출 후 NULL 로 set).
+ *
+ * efd 모드면 fgrp 에서 efd 제거, fgrp 모드면 unnest + wrapper 해제.
+ */
 void
 spdk_interrupt_unregister(struct spdk_interrupt **pintr)
 {
@@ -4293,10 +4732,10 @@ spdk_interrupt_unregister(struct spdk_interrupt **pintr)
 
 	intr = *pintr;
 	if (intr == NULL) {
-		return;
+		return; /* [한국어] 이미 unregister — 멱등성. */
 	}
 
-	*pintr = NULL;
+	*pintr = NULL; /* [한국어] caller 포인터 NULL 화 — use-after-free 방지. */
 
 	thread = spdk_get_thread();
 	if (!thread) {
@@ -4310,16 +4749,24 @@ spdk_interrupt_unregister(struct spdk_interrupt **pintr)
 	}
 
 	if (intr->fgrp != NULL) {
+		/* [한국어] fgrp 모드 — unnest + wrapper 클리어. */
 		assert(intr->efd < 0);
 		spdk_fd_group_unnest(thread->fgrp, intr->fgrp);
 		spdk_fd_group_set_wrapper(thread->fgrp, NULL, NULL);
 	} else {
+		/* [한국어] efd 모드 — fgrp 에서 efd 제거 (fd close 는 caller 책임). */
 		spdk_fd_group_remove(thread->fgrp, intr->efd);
 	}
 
 	free(intr);
 }
 
+/*
+ * [한국어]
+ * spdk_interrupt_set_event_types - 등록된 인터럽트의 event 마스크 변경 (예: IN→IN|OUT).
+ *
+ * efd 모드만 가능 (fgrp 모드는 -EINVAL). 내부적으로 spdk_fd_group_event_modify(epoll_ctl MOD).
+ */
 int
 spdk_interrupt_set_event_types(struct spdk_interrupt *intr,
 			       enum spdk_interrupt_event_types event_types)
@@ -4338,6 +4785,7 @@ spdk_interrupt_set_event_types(struct spdk_interrupt *intr,
 	}
 
 	if (intr->efd < 0) {
+		/* [한국어] fgrp 모드는 event mask 변경 불가 — caller 가 직접 fgrp API 사용해야 함. */
 		assert(false);
 		return -EINVAL;
 	}
@@ -4345,26 +4793,49 @@ spdk_interrupt_set_event_types(struct spdk_interrupt *intr,
 	return spdk_fd_group_event_modify(thread->fgrp, intr->efd, event_types);
 }
 
+/*
+ * [한국어]
+ * spdk_thread_get_interrupt_fd - thread 의 fd_group 의 epoll fd 반환.
+ *
+ * reactor 가 외부 event loop 와 결합할 때 사용 — 이 fd 가 readable 하면 spdk_thread_poll 필요.
+ */
 int
 spdk_thread_get_interrupt_fd(struct spdk_thread *thread)
 {
 	return spdk_fd_group_get_fd(thread->fgrp);
 }
 
+/*
+ * [한국어]
+ * spdk_thread_get_interrupt_fd_group - thread 의 fd_group 자체 반환.
+ *
+ * 외부 코드가 thread 의 fgrp 에 자기 fd 를 직접 등록하고 싶을 때 사용.
+ */
 struct spdk_fd_group *
 spdk_thread_get_interrupt_fd_group(struct spdk_thread *thread)
 {
 	return thread->fgrp;
 }
 
+/* [한국어] 글로벌 interrupt 모드 플래그. spdk_interrupt_mode_enable 이 부팅 시 set. */
 static bool g_interrupt_mode = false;
 
+/*
+ * [한국어]
+ * spdk_interrupt_mode_enable - 글로벌 interrupt 모드 활성화 (init 이전 1회만).
+ *
+ * @return: 0 성공, -1 thread lib 이미 init, -ENOTSUP non-Linux.
+ *
+ * 동기/배경: thread lib init 전에 호출되어야 spdk_thread_create 가 in_interrupt=true 로 시작.
+ *           DPDK EAL 위에서 polling/interrupt 중 선택 — 보통 vfio-pci interrupt 사용 시.
+ */
 int
 spdk_interrupt_mode_enable(void)
 {
 	/* It must be called once prior to initializing the threading library.
 	 * g_spdk_msg_mempool will be valid if thread library is initialized.
 	 */
+	/* [한국어] thread lib init 이후 호출 금지 — 이미 만든 thread 가 polling 모드로 만들어졌음. */
 	if (g_spdk_msg_mempool) {
 		SPDK_ERRLOG("Failed due to threading library is already initialized.\n");
 		return -1;
@@ -4381,25 +4852,47 @@ spdk_interrupt_mode_enable(void)
 #endif
 }
 
+/*
+ * [한국어]
+ * spdk_interrupt_mode_is_enabled - 현재 interrupt 모드 활성 여부 조회.
+ */
 bool
 spdk_interrupt_mode_is_enabled(void)
 {
 	return g_interrupt_mode;
 }
 
+/* [한국어] spinlock 호출 스택 캡처 깊이 — DEBUG 빌드에서만 사용. */
 #define SSPIN_DEBUG_STACK_FRAMES 16
 
+/*
+ * [한국어] sspin_stack — 한 시점의 호출 스택 캡처 (DEBUG 빌드).
+ * spdk_spin_init/lock/unlock 시점 각각의 backtrace 를 저장하여, 검증 실패 시 출력.
+ */
 struct sspin_stack {
 	void *addrs[SSPIN_DEBUG_STACK_FRAMES];
+	/* [한국어] backtrace() 가 채우는 PC(program counter) 주소 배열. backtrace_symbols 로 함수명 변환 가능. */
+
 	uint32_t depth;
+	/* [한국어] addrs 에 실제로 들어간 frame 수 (backtrace 반환값). */
 };
 
+/*
+ * [한국어] spdk_spinlock_internal — DEBUG 빌드의 spinlock 진단 메타데이터.
+ *
+ * release 빌드에서는 spdk_spinlock 의 internal 필드가 NULL — 추가 비용 0.
+ * DEBUG 빌드에서는 init/lock/unlock 의 호출 스택을 각각 저장하여 검증 실패 시 진단 출력.
+ */
 struct spdk_spinlock_internal {
-	struct sspin_stack init_stack;
-	struct sspin_stack lock_stack;
-	struct sspin_stack unlock_stack;
+	struct sspin_stack init_stack;   /* [한국어] spdk_spin_init 호출 시점 스택. */
+	struct sspin_stack lock_stack;   /* [한국어] 가장 최근 spdk_spin_lock 호출 시점 스택. */
+	struct sspin_stack unlock_stack; /* [한국어] 가장 최근 spdk_spin_unlock 호출 시점 스택. */
 };
 
+/*
+ * [한국어]
+ * sspin_init_internal - DEBUG 빌드에서만 internal 진단 메타 calloc.
+ */
 static void
 sspin_init_internal(struct spdk_spinlock *sspin)
 {
@@ -4408,6 +4901,10 @@ sspin_init_internal(struct spdk_spinlock *sspin)
 #endif
 }
 
+/*
+ * [한국어]
+ * sspin_fini_internal - DEBUG 빌드에서만 internal 진단 메타 free.
+ */
 static void
 sspin_fini_internal(struct spdk_spinlock *sspin)
 {
@@ -4417,6 +4914,7 @@ sspin_fini_internal(struct spdk_spinlock *sspin)
 #endif
 }
 
+/* [한국어] DEBUG 빌드 + execinfo.h 가 있으면 backtrace() 로 스택 캡처. release 는 noop. */
 #if defined(DEBUG) && defined(SPDK_HAVE_EXECINFO_H)
 #define SSPIN_GET_STACK(sspin, which) \
 	do { \
@@ -4429,6 +4927,15 @@ sspin_fini_internal(struct spdk_spinlock *sspin)
 #define SSPIN_GET_STACK(sspin, which) do { } while (0)
 #endif
 
+/*
+ * [한국어]
+ * sspin_stack_print - 한 스택 캡처를 ERRLOG 로 출력 (진단용).
+ *
+ * @title     : 헤더 문자열 ("Lock initialized at" 등).
+ * @sspin_stack: 출력할 스택.
+ *
+ * backtrace_symbols 가 PC → 함수명 변환. gdb 로 line number 추가 조회 가능.
+ */
 static void
 sspin_stack_print(const char *title, const struct sspin_stack *sspin_stack)
 {
@@ -4455,11 +4962,17 @@ sspin_stack_print(const char *title, const struct sspin_stack *sspin_stack)
 #endif /* SPDK_HAVE_EXECINFO_H */
 }
 
+/*
+ * [한국어]
+ * sspin_stacks_print - spinlock 의 init/lock/unlock 스택 3 개를 모두 출력.
+ *
+ * SPIN_ASSERT_LOG_STACKS 매크로가 검증 실패 시 호출 — 어디서 init/lock/unlock 됐는지 파악.
+ */
 static void
 sspin_stacks_print(const struct spdk_spinlock *sspin)
 {
 	if (sspin->internal == NULL) {
-		return;
+		return; /* [한국어] release 빌드는 internal=NULL — 출력할 게 없음. */
 	}
 	SPDK_ERRLOG("spinlock %p\n", sspin);
 	sspin_stack_print("Lock initialized at", &sspin->internal->init_stack);
@@ -4467,36 +4980,61 @@ sspin_stacks_print(const struct spdk_spinlock *sspin)
 	sspin_stack_print("Last unlocked at", &sspin->internal->unlock_stack);
 }
 
+/*
+ * [한국어]
+ * spdk_spin_init - SPDK spinlock 초기화 (pthread_spinlock 래퍼 + 검증 메타).
+ *
+ * @sspin: 초기화할 spinlock 객체.
+ *
+ * 동기/배경: pthread_spinlock 은 polling 모드 SPDK 에 적합 — futex(차단) 가 없어 reactor 멈춤 회피.
+ *           SPDK 는 여기에 thread 소유권 추적(thread, lock_count) + 호출 스택 캡처를 더해
+ *           cross-thread 오용, 데드락, 잡고 있는 채 yield 등을 즉시 abort 검출.
+ */
 void
 spdk_spin_init(struct spdk_spinlock *sspin)
 {
 	int rc;
 
 	memset(sspin, 0, sizeof(*sspin));
-	rc = pthread_spin_init(&sspin->spinlock, PTHREAD_PROCESS_PRIVATE);
+	rc = pthread_spin_init(&sspin->spinlock, PTHREAD_PROCESS_PRIVATE); /* [한국어] PRIVATE — 프로세스 내 thread 간 공유. */
 	SPIN_ASSERT_LOG_STACKS(rc == 0, SPIN_ERR_PTHREAD, sspin);
-	sspin_init_internal(sspin);
-	SSPIN_GET_STACK(sspin, init);
+	sspin_init_internal(sspin); /* [한국어] DEBUG 빌드만 internal 메타 alloc. */
+	SSPIN_GET_STACK(sspin, init); /* [한국어] init 시점 스택 캡처. */
 	sspin->initialized = true;
 }
 
+/*
+ * [한국어]
+ * spdk_spin_destroy - spinlock 해제. 잠긴 상태에서 호출하면 abort.
+ */
 void
 spdk_spin_destroy(struct spdk_spinlock *sspin)
 {
 	int rc;
 
-	SPIN_ASSERT_LOG_STACKS(!sspin->destroyed, SPIN_ERR_DESTROYED, sspin);
-	SPIN_ASSERT_LOG_STACKS(sspin->initialized, SPIN_ERR_NOT_INITIALIZED, sspin);
-	SPIN_ASSERT_LOG_STACKS(sspin->thread == NULL, SPIN_ERR_LOCK_HELD, sspin);
+	SPIN_ASSERT_LOG_STACKS(!sspin->destroyed, SPIN_ERR_DESTROYED, sspin); /* [한국어] 이중 destroy 금지. */
+	SPIN_ASSERT_LOG_STACKS(sspin->initialized, SPIN_ERR_NOT_INITIALIZED, sspin); /* [한국어] init 안 된 lock destroy 금지. */
+	SPIN_ASSERT_LOG_STACKS(sspin->thread == NULL, SPIN_ERR_LOCK_HELD, sspin); /* [한국어] 잡힌 채 destroy 금지 — 메모리 누수 위험. */
 
 	rc = pthread_spin_destroy(&sspin->spinlock);
 	SPIN_ASSERT_LOG_STACKS(rc == 0, SPIN_ERR_PTHREAD, sspin);
 
 	sspin_fini_internal(sspin);
 	sspin->initialized = false;
-	sspin->destroyed = true;
+	sspin->destroyed = true; /* [한국어] 재사용 차단. */
 }
 
+/*
+ * [한국어]
+ * spdk_spin_lock - spinlock 획득 (소유자 추적 + 데드락 검출).
+ *
+ * @sspin: 대상.
+ *
+ * 동기/배경: pthread_spin_lock 호출 전에 다음 검증:
+ *   (1) destroy 안 됨, (2) initialized, (3) SPDK thread 안에서 호출,
+ *   (4) 이미 같은 thread 가 보유 중이면 데드락 — abort.
+ * 성공 시 sspin->thread 에 소유자 기록, thread->lock_count++ (poller fn 종료 시 0 검사).
+ */
 void
 spdk_spin_lock(struct spdk_spinlock *sspin)
 {
@@ -4505,18 +5043,27 @@ spdk_spin_lock(struct spdk_spinlock *sspin)
 
 	SPIN_ASSERT_LOG_STACKS(!sspin->destroyed, SPIN_ERR_DESTROYED, sspin);
 	SPIN_ASSERT_LOG_STACKS(sspin->initialized, SPIN_ERR_NOT_INITIALIZED, sspin);
-	SPIN_ASSERT_LOG_STACKS(thread != NULL, SPIN_ERR_NOT_SPDK_THREAD, sspin);
-	SPIN_ASSERT_LOG_STACKS(thread != sspin->thread, SPIN_ERR_DEADLOCK, sspin);
+	SPIN_ASSERT_LOG_STACKS(thread != NULL, SPIN_ERR_NOT_SPDK_THREAD, sspin); /* [한국어] 비-SPDK thread 에서 호출 금지. */
+	SPIN_ASSERT_LOG_STACKS(thread != sspin->thread, SPIN_ERR_DEADLOCK, sspin); /* [한국어] 재진입 데드락 검출. */
 
-	rc = pthread_spin_lock(&sspin->spinlock);
+	rc = pthread_spin_lock(&sspin->spinlock); /* [한국어] 실제 spinlock 획득 (busy wait). */
 	SPIN_ASSERT_LOG_STACKS(rc == 0, SPIN_ERR_PTHREAD, sspin);
 
-	sspin->thread = thread;
-	sspin->thread->lock_count++;
+	sspin->thread = thread;       /* [한국어] 소유자 기록. */
+	sspin->thread->lock_count++;  /* [한국어] thread 의 보유 spinlock 수 — poller fn 종료 시 0 검사. */
 
-	SSPIN_GET_STACK(sspin, lock);
+	SSPIN_GET_STACK(sspin, lock); /* [한국어] lock 시점 스택 캡처. */
 }
 
+/*
+ * [한국어]
+ * spdk_spin_unlock - spinlock 해제 + 소유권 검증.
+ *
+ * @sspin: 대상.
+ *
+ * 동기/배경: 보유한 thread 만 unlock 가능 (다른 thread 에서 호출 시 abort).
+ *           lock_count-- 로 thread 의 보유 카운터 정합성 유지.
+ */
 void
 spdk_spin_unlock(struct spdk_spinlock *sspin)
 {
@@ -4526,18 +5073,22 @@ spdk_spin_unlock(struct spdk_spinlock *sspin)
 	SPIN_ASSERT_LOG_STACKS(!sspin->destroyed, SPIN_ERR_DESTROYED, sspin);
 	SPIN_ASSERT_LOG_STACKS(sspin->initialized, SPIN_ERR_NOT_INITIALIZED, sspin);
 	SPIN_ASSERT_LOG_STACKS(thread != NULL, SPIN_ERR_NOT_SPDK_THREAD, sspin);
-	SPIN_ASSERT_LOG_STACKS(thread == sspin->thread, SPIN_ERR_WRONG_THREAD, sspin);
+	SPIN_ASSERT_LOG_STACKS(thread == sspin->thread, SPIN_ERR_WRONG_THREAD, sspin); /* [한국어] 보유 thread 일치 검증. */
 
-	SPIN_ASSERT_LOG_STACKS(thread->lock_count > 0, SPIN_ERR_LOCK_COUNT, sspin);
+	SPIN_ASSERT_LOG_STACKS(thread->lock_count > 0, SPIN_ERR_LOCK_COUNT, sspin); /* [한국어] lock_count 정합성. */
 	thread->lock_count--;
-	sspin->thread = NULL;
+	sspin->thread = NULL; /* [한국어] 소유자 클리어 — 다음 lock 가능. */
 
-	SSPIN_GET_STACK(sspin, unlock);
+	SSPIN_GET_STACK(sspin, unlock); /* [한국어] unlock 시점 스택 캡처. */
 
-	rc = pthread_spin_unlock(&sspin->spinlock);
+	rc = pthread_spin_unlock(&sspin->spinlock); /* [한국어] 실제 spinlock 해제. */
 	SPIN_ASSERT_LOG_STACKS(rc == 0, SPIN_ERR_PTHREAD, sspin);
 }
 
+/*
+ * [한국어]
+ * spdk_spin_held - 현재 thread 가 이 spinlock 을 보유 중인지 확인 (assert/디버그용).
+ */
 bool
 spdk_spin_held(struct spdk_spinlock *sspin)
 {
@@ -4548,6 +5099,18 @@ spdk_spin_held(struct spdk_spinlock *sspin)
 	return sspin->thread == thread;
 }
 
+/*
+ * [한국어]
+ * spdk_thread_register_post_poller_handler - active poller 1개 실행 직후 호출될 핸들러 등록.
+ *
+ * @fn   : 핸들러 함수.
+ * @fn_arg: 인자.
+ *
+ * 동기/배경: 한 라운드 안에서 어떤 작업의 후속 처리를 모아서 하고 싶을 때 (예: bdev I/O completion 일괄 처리).
+ *           최대 SPDK_THREAD_MAX_POST_POLLER_HANDLERS(4) 개. 초과 시 ERRLOG (등록 실패).
+ *           thread_run_pp_handlers 가 호출 시 num_pp_handlers 를 MAX 로 임시 set 하므로,
+ *           핸들러 안에서의 재등록은 ERRLOG 로 거부됨.
+ */
 void
 spdk_thread_register_post_poller_handler(spdk_post_poller_fn fn, void *fn_arg)
 {
@@ -4556,13 +5119,14 @@ spdk_thread_register_post_poller_handler(spdk_post_poller_fn fn, void *fn_arg)
 	thr = _get_thread();
 	assert(thr);
 	if (spdk_unlikely(thr->num_pp_handlers == SPDK_THREAD_MAX_POST_POLLER_HANDLERS)) {
-		SPDK_ERRLOG("Too many handlers registered");
+		SPDK_ERRLOG("Too many handlers registered"); /* [한국어] 슬롯 full — 호출자가 너무 많이 등록. */
 		return;
 	}
 
-	thr->pp_handlers[thr->num_pp_handlers].fn = fn;
-	thr->pp_handlers[thr->num_pp_handlers].fn_arg = fn_arg;
-	thr->num_pp_handlers++;
+	thr->pp_handlers[thr->num_pp_handlers].fn = fn;          /* [한국어] 다음 빈 슬롯에 핸들러 함수 저장 — thread_run_pp_handlers 가 순서대로 호출. */
+	thr->pp_handlers[thr->num_pp_handlers].fn_arg = fn_arg;  /* [한국어] 핸들러 호출 시 전달할 사용자 인자. */
+	thr->num_pp_handlers++;                                  /* [한국어] 등록 수 증가 — 이번 라운드의 poller 실행 직후 일괄 호출 대상. */
 }
 
+/* [한국어] SPDK 로그 컴포넌트 "thread" 등록 — SPDK_DEBUGLOG(thread, ...) 가 이 이름을 키로 사용. */
 SPDK_LOG_REGISTER_COMPONENT(thread)

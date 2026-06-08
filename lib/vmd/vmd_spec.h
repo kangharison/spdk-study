@@ -3,68 +3,150 @@
  *   All rights reserved.
  */
 
+/*
+ * [한국어 설명] Intel VMD(Volume Management Device) HW 스펙 및 PCIe 표준 정의 헤더 (vmd_spec.h)
+ *
+ * === 파일의 역할 ===
+ * 이 헤더는 Intel VMD(Volume Management Device) PCIe controller가 노출하는
+ * "가상 PCIe 트리"를 SPDK가 직접 enumerate하기 위해 필요한 모든 HW/PCI 표준
+ * 정의를 모아둔다. VMD는 Xeon Scalable 이후의 PCH/Root Complex에 내장된 PCIe
+ * 도메인 컨트롤러로, 일반적으로 OS가 BIOS/UEFI를 통해 enumerate하는 NVMe SSD
+ * 들을 자신의 BAR 공간 안쪽의 별도 가상 PCIe 도메인으로 묶어둔다. SPDK는 OS
+ * 의 PCI 서브시스템을 거치지 않고 VMD BAR을 mmap한 뒤, 표준 PCI Configuration
+ * Space 매핑(CONFIG_OFFSET_ADDR 매크로의 bus/dev/func 인코딩)을 통해 그 안
+ * 슬롯들을 직접 enumerate하고 NVMe SSD를 추가 attach한다.
+ *
+ * 본 헤더에는 PCI Type 0/Type 1(브리지) Configuration Header, PCI Capability
+ * 헤더, MSI/MSI-X Capability 구조, PCI Express Capability 구조 전체(slot/link
+ * /root 레지스터 + bit-field), serial number capability 등이 정의되어 있다.
+ * 모두 표준 PCI 3.0 / PCIe 4.0 사양에 따라 비트-필드/오프셋이 결정된다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * 호출 체인:
+ *   [SPDK 사용자] → spdk_vmd_init() (공개 API)
+ *     → vmd.c가 spdk_pci_enumerate로 VMD 컨트롤러(class 0x010802) 발견
+ *     → vmd_enumerate_devices: VMD BAR을 mmap한 뒤 이 헤더의 매크로/구조체로
+ *        가상 트리 안의 root-port/switch/endpoint를 traversal
+ *     → 발견된 NVMe endpoint를 spdk_nvme_probe와 동일하게 attach
+ * 실행 컨텍스트: 호스트 유저스페이스 (메인 init 스레드).
+ *
+ * === 타 모듈과의 연결 ===
+ * - vmd.c / vmd_internal.h: 본 헤더의 모든 타입을 가져와 vmd_pci_device, vmd_adapter
+ *   등 SPDK 측 추상화로 래핑하고, VMD BAR offset 계산에 매크로(CONFIG_OFFSET_ADDR
+ *   등)를 사용한다.
+ * - lib/env_dpdk: 실제 BAR mmap, vfio-pci/uio 바인딩 제공.
+ * - lib/nvme: VMD가 enumerate한 NVMe endpoint에 대해 attach 콜백을 발화시킨다.
+ * 데이터 흐름: BIOS가 VMD BAR0(VMCFG_BAR) 안에 가상 PCI configuration space를
+ *   매핑 → 본 헤더의 매크로로 (bus,dev,func,reg) 4-tuple을 BAR offset으로 변환 →
+ *   읽기로 vendor/device/class id, BAR 등 통상 PCI enumeration 수행.
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - struct pci_header_common/zero/one : PCI Type 0(endpoint), Type 1(bridge),
+ *   공통 16 바이트 헤더 구조. (1바이트, 2바이트, 4바이트 필드의 정확한 오프셋과 의미)
+ * - struct pci_express_cap : PCIe Capability 전체 — device/link/slot/root 각각의
+ *   capability/control/status 레지스터(비트필드 union).
+ * - union express_slot_capabilities_register : 슬롯의 hotplug/MRL/attention/
+ *   power-indicator capability 비트.
+ * - union express_link_status_register : 링크 speed/width/training 상태.
+ * - struct pci_msi_cap / pci_msix_cap / pci_msix_capability / pci_msix_table_entry :
+ *   MSI/MSI-X interrupt capability와 vector table entry 정의.
+ * - struct serial_number_capability : Device Serial Number Extended Capability.
+ * - CONFIG_OFFSET_ADDR(bus,dev,func,reg) : VMD BAR 내부에서 한 endpoint의
+ *   configuration space 한 reg에 접근하는 byte offset 계산 매크로.
+ * - isHotPlugCapable(slotCap) : slot capability의 bit 6(=hotplug_capable) 검사.
+ * - MAX_VMD_SUPPORTED(48) : 시스템에 동시에 존재할 수 있는 VMD 컨트롤러 상한.
+ */
+
 #ifndef VMD_SPEC_H
 #define VMD_SPEC_H
 
+/* [한국어] 한 시스템에 존재 가능한 VMD 컨트롤러 최대 수 (실제 Xeon SP는 보통 ≤3개,
+ *  여유분 포함). 정적 배열 크기 한정에 사용. */
 #define MAX_VMD_SUPPORTED 48  /* max number of vmd controllers in a system - */
 
+/* [한국어] PCI config 공간 vendor_id 필드가 0xFFFF면 "디바이스 없음"을 의미 (PCI 표준). */
 #define PCI_INVALID_VENDORID 0xFFFF
+/* [한국어] 1 MiB 상수 — BAR 크기 계산 등에 사용. */
 #define ONE_MB (1<<20)
+/* [한국어] 구조체의 멤버 오프셋을 계산하는 표준 트릭(NULL 포인터를 캐스팅하여 멤버 주소 추출). */
 #define PCI_OFFSET_OF(object, member)  ((uint32_t)&((object*)0)->member)
+/* [한국어] 2의 보수 계산 — BAR mask로부터 BAR size 추출에 사용. */
 #define TWOS_COMPLEMENT(value) (~(value) + 1)
 
+/* [한국어] VMD 가상 트리에서 BAR base/limit이 "상위 4GB 너머"에 있음을 표시하는 signature 값.
+ *  PCI spec에서는 BAR base/limit 레지스터의 일부 비트로 이런 sentinel을 부호화한다. */
 #define VMD_UPPER_BASE_SIGNATURE  0xFFFFFFEF
 #define VMD_UPPER_LIMIT_SIGNATURE 0xFFFFFFED
 
 /* VMD Registers */
+/* [한국어] VMD 자체의 vendor-specific config 레지스터 — VMCAP은 케이퍼빌리티,
+ *  VMCONFIG는 enable 비트(0번 비트가 enable). spdk_pci_device_cfg_read*로 읽음. */
 #define PCI_VMD_VMCAP		0x40
 #define PCI_VMD_VMCONFIG	0x44
 
 /*
  *  BAR assignment constants
  */
-#define  PCI_DWORD_SHIFT            32
-#define  PCI_BASE_ADDR_MASK         0xFFFFFFF0
-#define  PCI_BAR_MEMORY_MASK        0x0000000F
-#define  PCI_BAR_MEMORY_MEM_IND     0x1
-#define  PCI_BAR_MEMORY_TYPE        0x6
-#define  PCI_BAR_MEMORY_PREFETCH    0x8
-#define  PCI_BAR_MEMORY_TYPE_32     0x0
-#define  PCI_BAR_MEMORY_TYPE_64     0x4
-#define  PCI_BAR_MB_MASK            0xFFFFF
-#define  PCI_PCI_BRIDGE_ADDR_DEF    0xFFF0
-#define  PCI_BRIDGE_MEMORY_MASK     0xFFF0
-#define  PCI_BRIDGE_PREFETCH_64     0x0001
-#define  PCI_BRIDGE_MEMORY_SHIFT    16
-#define  PCI_CONFIG_ACCESS_DELAY    500
+/* [한국어] BAR 비트필드/플래그 정의 — PCI Local Bus Spec 3.0의 BAR layout. */
+#define  PCI_DWORD_SHIFT            32  /* [한국어] 64bit BAR에서 상위 32비트로 이동하는 shift. */
+#define  PCI_BASE_ADDR_MASK         0xFFFFFFF0  /* [한국어] BAR의 base 주소 비트(하위 4비트는 flags). */
+#define  PCI_BAR_MEMORY_MASK        0x0000000F  /* [한국어] BAR의 하위 flags 4비트. */
+#define  PCI_BAR_MEMORY_MEM_IND     0x1         /* [한국어] BAR이 IO공간 인지(=1) 메모리(=0) 인지 indicator. */
+#define  PCI_BAR_MEMORY_TYPE        0x6         /* [한국어] BAR type 비트(32/64bit). */
+#define  PCI_BAR_MEMORY_PREFETCH    0x8         /* [한국어] prefetchable bit. */
+#define  PCI_BAR_MEMORY_TYPE_32     0x0         /* [한국어] 32-bit BAR. */
+#define  PCI_BAR_MEMORY_TYPE_64     0x4         /* [한국어] 64-bit BAR (2개 BAR 슬롯 사용). */
+#define  PCI_BAR_MB_MASK            0xFFFFF     /* [한국어] 1MB 단위 정렬 마스크. */
+#define  PCI_PCI_BRIDGE_ADDR_DEF    0xFFF0      /* [한국어] PCI-PCI 브리지의 memory base/limit 기본값. */
+#define  PCI_BRIDGE_MEMORY_MASK     0xFFF0      /* [한국어] 브리지 memory window 16비트 마스크. */
+#define  PCI_BRIDGE_PREFETCH_64     0x0001      /* [한국어] 브리지의 prefetch가 64bit임을 나타내는 비트. */
+#define  PCI_BRIDGE_MEMORY_SHIFT    16          /* [한국어] 브리지 memory window 값의 좌측 시프트(16비트가 상위). */
+#define  PCI_CONFIG_ACCESS_DELAY    500         /* [한국어] PCI config 쓰기 후 디바이스가 반영하는 대기 시간(usec). */
 
+/* [한국어] PCI Type 0 헤더 안에서 BAR0가 시작되는 byte offset (=0x10). */
 #define PCI_BAR0_OFFSET			0x10
+/* [한국어] BAR 한 개 크기는 4바이트(32bit). 64bit BAR은 2개 슬롯을 차지. */
 #define PCI_BAR_SIZE			4
+/* [한국어] BAR 값의 하위 4비트(flags)를 제거하고 주소부만 남기는 마스크. */
 #define PCI_BAR_MEMORY_ADDR_OFFSET	(~0xfull)
 
+/* [한국어] 한 PCI(Express) 디바이스의 extended configuration space 크기 (4KiB). */
 #define PCI_MAX_CFG_SIZE            0x1000
 
+/* [한국어] PCI 헤더의 header_type 필드 offset(=0x0e). 하위 7비트는 type, MSB는 multi-function. */
 #define PCI_HEADER_TYPE             0x0e
-#define PCI_HEADER_TYPE_NORMAL   0
-#define PCI_HEADER_TYPE_BRIDGE   1
-#define PCI_MULTI_FUNCTION 0x80
+#define PCI_HEADER_TYPE_NORMAL   0  /* [한국어] Type 0 — endpoint (NVMe SSD 등). */
+#define PCI_HEADER_TYPE_BRIDGE   1  /* [한국어] Type 1 — PCI-PCI 브리지(스위치 down/upstream port). */
+#define PCI_MULTI_FUNCTION 0x80     /* [한국어] header_type MSB=1이면 multi-function 디바이스. */
 
-#define PCI_COMMAND_MEMORY 0x2
-#define PCI_COMMAND_MASTER 0x4
+/* [한국어] PCI command register 의 비트들. enumerate 후 디바이스를 enable할 때 OR. */
+#define PCI_COMMAND_MEMORY 0x2   /* [한국어] memory space enable. */
+#define PCI_COMMAND_MASTER 0x4   /* [한국어] bus master enable (DMA 가능). */
 
-#define PCIE_TYPE_FLAGS 0xf0
+/* [한국어] PCIe Capability 의 device_type 필드 (express_cap.bit_field.device_type) 관련. */
+#define PCIE_TYPE_FLAGS 0xf0       /* [한국어] capability_register의 device_type 비트 위치(상위 4비트). */
 #define PCIE_TYPE_SHIFT 4
-#define PCIE_TYPE_ROOT_PORT 0x4
-#define PCIE_TYPE_DOWNSTREAM 0x6
+#define PCIE_TYPE_ROOT_PORT 0x4    /* [한국어] PCIe Root Port. */
+#define PCIE_TYPE_DOWNSTREAM 0x6   /* [한국어] PCIe Switch Downstream Port. */
 
+/* [한국어] NVMe 컨트롤러의 PCI class code. 24비트 (base=01 storage, sub=08 NVM, prog=02 NVMe). */
 #define PCI_CLASS_STORAGE_EXPRESS   0x010802
+/* [한국어] VMD enumerate 시 한 번에 처리할 디바이스 큐 크기 한정. */
 #define ADDR_ELEM_COUNT 32
+/* [한국어] PCI 버스 번호는 8비트이지만 VMD 내부 버스 공간 한도는 0x7F (계층 트리 깊이 제한). */
 #define PCI_MAX_BUS_NUMBER 0x7F
+/* [한국어] hotplug bridge용으로 예약된 버스 갯수 — 각 hotplug downstream 1개 슬롯에 1버스 예약. */
 #define RESERVED_HOTPLUG_BUSES 1
+/* [한국어] PCIe Slot Capability 레지스터의 bit 6(=hotplug_capable) 검사 매크로. */
 #define isHotPlugCapable(slotCap)  ((slotCap) & (1<<6))
+/* [한국어] VMD BAR 내부에서 (bus,device,function,reg)에 해당하는 config space byte offset 계산.
+ *  레이아웃: bus[26:20] | device[19:15] | function[14:12] | reg[11:0].
+ *  VMD BAR의 시작 + 이 offset = 해당 endpoint의 reg config 주소. */
 #define CONFIG_OFFSET_ADDR(bus, device, function, reg) (((bus)<<20) | (device)<<15 | (function<<12) | (reg))
+/* [한국어] PCI-PCI 브리지의 16비트 memory base/limit 레지스터에서 실제 주소를 추출. */
 #define BRIDGE_BASEREG(reg)  (0xFFF0 & ((reg)>>16))
 
+/* [한국어] VMD MISCCTRLSTS_0 vendor-specific register 오프셋과 ACPI hotplug enable 비트. */
 #define MISCCTRLSTS_0_OFFSET  0x188
 #define ENABLE_ACPI_MODE_FOR_HOTPLUG  (1 << 3)
 
@@ -93,36 +175,89 @@
 #define EXTENDED_CAPABILITY_OFFSET 0x100
 #define DEVICE_SERIAL_NUMBER_CAP_ID  0x3
 
+/* [한국어] 각 디바이스의 가상 BAR 영역 기본 크기 (1MiB). VMD 트리 enumerate 시 사용. */
 #define BAR_SIZE (1 << 20)
 
+/*
+ * [한국어] struct pci_enhanced_capability_header — PCIe 4.0의 Extended Capability
+ *  헤더 (configuration space 0x100 이후 영역 chain). 각 ext capability는 이 헤더로 시작.
+ */
 struct pci_enhanced_capability_header {
 	uint16_t capability_id;
+	/* [한국어] Extended capability ID (예: 0x0003 = Device Serial Number). PCIe 표 7-x 참조. */
+
 	uint16_t version: 4;
+	/* [한국어] capability 버전 (현재 보통 1). */
+
 	uint16_t next: 12;
+	/* [한국어] 다음 ext capability의 byte offset (0이면 chain 끝). */
 };
 
+/*
+ * [한국어] struct serial_number_capability — Device Serial Number Extended Capability
+ *  (PCIe spec 7.16). 64bit serial number를 (lo,hi) 로 노출.
+ */
 struct serial_number_capability {
 	struct pci_enhanced_capability_header hdr;
+	/* [한국어] capability_id=0x3, version=1을 기대. */
+
 	uint32_t sn_low;
+	/* [한국어] 시리얼 넘버 하위 32비트. */
+
 	uint32_t sn_hi;
+	/* [한국어] 시리얼 넘버 상위 32비트. */
 };
 
+/*
+ * [한국어] struct pci_header_common — PCI Configuration Space의 공통 상위 64바이트
+ *  (Type 0/1 공통 부분 + Type별 분기 직전까지). offset 0x00 ~ 0x3F.
+ *  실제 type 분기는 header_type 필드 (offset 0x0e)를 보고 pci_header_zero / one 으로 캐스팅.
+ */
 struct pci_header_common {
 	uint16_t  vendor_id;
+	/* [한국어] offset 0x00. 0xFFFF이면 디바이스 없음. */
+
 	uint16_t  device_id;
+	/* [한국어] offset 0x02. vendor 내부 디바이스 ID. */
+
 	uint16_t  command;
+	/* [한국어] offset 0x04. PCI command register (IO/MEM/MASTER enable 등). */
+
 	uint16_t  status;
+	/* [한국어] offset 0x06. PCI status (capabilities list, error 비트들). */
+
 	uint32_t  rev_class;
+	/* [한국어] offset 0x08. revision(8bit) + class code(24bit). 0x010802 = NVMe. */
+
 	uint8_t   cache_line_size;
+	/* [한국어] offset 0x0c. cache line 단위(DWORD 수). */
+
 	uint8_t   master_lat_timer;
+	/* [한국어] offset 0x0d. legacy PCI master latency timer (PCIe에서는 0). */
+
 	uint8_t   header_type;
+	/* [한국어] offset 0x0e. bit7=multifunction, bit[6:0]=0/1/2 type. */
+
 	uint8_t   BIST;
+	/* [한국어] offset 0x0f. Built-In Self-Test register (대부분 미사용). */
+
 	uint8_t   rsvd12[36];
+	/* [한국어] offset 0x10~0x33: type별 dependent area (BAR, bridge window 등) — 공통 view에서는 reserved. */
+
 	uint8_t   cap_pointer;
+	/* [한국어] offset 0x34. 첫 capability 의 byte offset (capability chain 시작점). */
+
 	uint8_t   rsvd53[7];
+	/* [한국어] offset 0x35~0x3B: 예약. */
+
 	uint8_t   int_line;
+	/* [한국어] offset 0x3c. legacy IRQ 라인 (PCIe MSI/MSI-X에서는 보통 0xFF). */
+
 	uint8_t   int_pin;
+	/* [한국어] offset 0x3d. INTx pin (A=1..D=4). */
+
 	uint8_t   rsvd62[2];
+	/* [한국어] offset 0x3e~0x3f: type 1 brigde의 경우 bridge_control이 위치하지만 공통 view에서는 reserved. */
 };
 
 struct pci_header_zero {

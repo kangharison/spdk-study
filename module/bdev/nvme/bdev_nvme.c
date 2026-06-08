@@ -980,441 +980,1019 @@ _nvme_ctrlr_delete(struct nvme_ctrlr *nvme_ctrlr)
 	bdev_nvme_fini_done();
 }
 
+/*
+ * [한국어]
+ * nvme_detach_poller - NVMe 컨트롤러 비동기 detach 진행을 폴링하는 poller 콜백
+ *
+ * @arg: SPDK_POLLER_REGISTER 시 등록한 컨텍스트. 여기서는 detach 대상 nvme_ctrlr.
+ * @return: 항상 SPDK_POLLER_BUSY(=1). poller가 매번 의미 있는 일을 했다고 보고하여
+ *          reactor의 idle 카운트 휴리스틱에 "바쁨"으로 집계되게 한다.
+ *
+ * 왜 필요한가: spdk_nvme_detach_async()는 PCIe 컨트롤러를 즉시 분리하지 않고
+ * 비동기 절차(qpair 해제, admin 큐 정리, 디바이스 reset 등)를 시작한다. 그 진행을
+ * 매 폴마다 spdk_nvme_detach_poll_async()로 한 스텝씩 밀어줘야 완료된다. 이 poller가
+ * 그 펌핑 역할을 한다.
+ *
+ * 동작 단계:
+ *   1) spdk_nvme_detach_poll_async()로 detach 상태머신을 한 스텝 진행.
+ *   2) 반환값이 -EAGAIN이면 아직 진행 중 → 다음 폴까지 대기(아무 것도 정리 안 함).
+ *   3) -EAGAIN이 아니면(0=완료 또는 그 외 에러) 더 폴링할 이유가 없으므로 poller를
+ *      해제하고 _nvme_ctrlr_delete()로 nvme_ctrlr 자체를 최종 해제한다.
+ *
+ * 실행 컨텍스트: app thread(주로 main thread)에서 1000us 주기로 도는 SPDK poller.
+ * nvme_ctrlr_delete()가 SPDK_POLLER_REGISTER로 등록한다. 단일 스레드에서만 돌므로
+ * detach_ctx/reset_detach_poller 접근에 별도 락 불필요.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_delete() → SPDK_POLLER_REGISTER(nvme_detach_poller)
+ *     → [nvme_detach_poller] → spdk_nvme_detach_poll_async() / _nvme_ctrlr_delete()
+ */
 static int
 nvme_detach_poller(void *arg)
 {
+	/* [한국어] poller 등록 시 넘긴 컨텍스트를 detach 대상 컨트롤러로 복원. */
 	struct nvme_ctrlr *nvme_ctrlr = arg;
 	int rc;
 
+	/* [한국어] NVMe 드라이버의 비동기 detach 상태머신을 한 스텝 진행시킨다.
+	 * detach_ctx는 spdk_nvme_detach_async()가 발급한 진행 컨텍스트 핸들.
+	 * 반환: -EAGAIN = 아직 진행 중(다음 폴 필요), 0 = 완료, 그 외 = 에러. */
 	rc = spdk_nvme_detach_poll_async(nvme_ctrlr->detach_ctx);
+	/* [한국어] -EAGAIN이 아니면 detach가 끝났거나(0) 더 진행할 수 없는 상태이므로
+	 * 정리 단계로 넘어간다. -EAGAIN이면 이 if를 건너뛰고 다음 폴을 기다린다. */
 	if (rc != -EAGAIN) {
+		/* [한국어] 이 poller 자신을 reactor에서 등록 해제(더 이상 폴링 불필요). */
 		spdk_poller_unregister(&nvme_ctrlr->reset_detach_poller);
+		/* [한국어] nvme_ctrlr 구조체와 부속 자원(mutex/key/메모리)을 최종 해제하고
+		 * bdev_nvme_fini_done()까지 호출하는 종착 함수. */
 		_nvme_ctrlr_delete(nvme_ctrlr);
 	}
 
+	/* [한국어] poller는 매 호출마다 "일을 했다"는 의미로 BUSY를 반환한다. */
 	return SPDK_POLLER_BUSY;
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_delete - nvme_ctrlr 파괴 절차의 본체: poller/interrupt 정리 후 비동기 detach 시작
+ *
+ * @nvme_ctrlr: 파괴할 컨트롤러. io_device unregister 콜백 경로를 통해 ref==0 + destruct
+ *              상태가 확정된 뒤 들어온다(즉 더 이상 I/O가 없음).
+ * @return: 없음. 실제 자원 해제는 detach 완료 후 nvme_detach_poller가 마무리한다.
+ *
+ * 왜 필요한가: 컨트롤러를 안전하게 제거하려면 (a) 이 컨트롤러에 걸린 각종 poller와
+ * interrupt 핸들러를 먼저 끊고, (b) 하드웨어 detach(qpair 정리, reset 등)를 비동기로
+ * 진행해야 한다. 이 함수는 (a)를 수행하고 (b)를 트리거한 뒤 곧장 반환한다 — 실제 완료는
+ * nvme_detach_poller가 폴링으로 이어받는다.
+ *
+ * 동작 단계:
+ *   1) reconnect 지연 타이머 poller 해제.
+ *   2) interrupt mode면 등록된 인터럽트 핸들러 해제.
+ *   3) adminq 타이머 poller 해제(driver가 detach 중 adminq를 직접 폴링하므로 먼저 끊음).
+ *   4) detach 진행용 poller(nvme_detach_poller) 1000us 주기로 등록.
+ *   5) spdk_nvme_detach_async()로 비동기 detach 시작.
+ *   6) 4)/5) 중 실패하면 error 라벨로 점프 — detach 없이라도 구조체는 해제한다.
+ *
+ * 실행 컨텍스트: app thread. spdk_io_device_unregister()의 unregister_cb 경로
+ * (nvme_ctrlr_unregister_cb)에서 호출되며, 이 시점에 채널이 모두 파괴되어 있다.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_unregister_cb() → [nvme_ctrlr_delete]
+ *     → spdk_nvme_detach_async() / SPDK_POLLER_REGISTER(nvme_detach_poller)
+ */
 static void
 nvme_ctrlr_delete(struct nvme_ctrlr *nvme_ctrlr)
 {
 	int rc;
 
+	/* [한국어] 재연결(reconnect) 대기용 지연 타이머 poller를 해제한다. 컨트롤러가
+	 * 사라지므로 더 이상 재연결을 시도할 이유가 없다. */
 	spdk_poller_unregister(&nvme_ctrlr->reconnect_delay_timer);
 
+	/* [한국어] interrupt mode(폴링 대신 eventfd/MSI-X 인터럽트로 깨우는 모드)일 때만
+	 * 등록된 인터럽트 핸들러가 존재한다. 해당 모드면 그 핸들러를 해제한다. */
 	if (spdk_interrupt_mode_is_enabled()) {
 		spdk_interrupt_unregister(&nvme_ctrlr->intr);
 	}
 
 	/* First, unregister the adminq poller, as the driver will poll adminq if necessary */
+	/* [한국어] admin 큐 타이머 poller를 가장 먼저 해제한다. detach 도중에는 NVMe
+	 * 드라이버 내부가 필요 시 adminq를 직접 폴링하므로, 우리 쪽 poller가 동시에
+	 * 돌면 충돌한다. 그래서 우선 끊는다. */
 	spdk_poller_unregister(&nvme_ctrlr->adminq_timer_poller);
 
 	/* If we got here, the reset/detach poller cannot be active */
+	/* [한국어] 여기 도달했다는 것은 reset이 진행 중이 아니라는 뜻이므로,
+	 * reset과 공용으로 쓰는 reset_detach_poller 슬롯이 비어 있어야 한다(불변식 검증). */
 	assert(nvme_ctrlr->reset_detach_poller == NULL);
+	/* [한국어] detach 진행을 펌핑할 poller를 1000us(=1ms) 주기로 등록한다.
+	 * 이후 nvme_detach_poller가 spdk_nvme_detach_poll_async()를 반복 호출하며 완료를 기다린다. */
 	nvme_ctrlr->reset_detach_poller = SPDK_POLLER_REGISTER(nvme_detach_poller,
 					  nvme_ctrlr, 1000);
+	/* [한국어] poller 등록 실패(메모리 부족 등) 시 detach를 폴링할 수단이 없으므로
+	 * error 경로로 가서 강제 정리한다. */
 	if (nvme_ctrlr->reset_detach_poller == NULL) {
 		NVME_CTRLR_ERRLOG(nvme_ctrlr, "Failed to register detach poller\n");
 		goto error;
 	}
 
+	/* [한국어] NVMe 드라이버에 비동기 detach를 요청한다. 진행 컨텍스트가
+	 * detach_ctx에 채워지고, 위 poller가 그 핸들로 진행을 폴링한다.
+	 * rc==0이면 detach 절차가 정상 시작됨. */
 	rc = spdk_nvme_detach_async(nvme_ctrlr->ctrlr, &nvme_ctrlr->detach_ctx);
+	/* [한국어] detach 시작 자체가 실패하면 폴링할 대상이 없으므로 error 경로로. */
 	if (rc != 0) {
 		NVME_CTRLR_ERRLOG(nvme_ctrlr, "Failed to detach the NVMe controller\n");
 		goto error;
 	}
 
+	/* [한국어] 정상 경로: detach가 시작되었고, 나머지는 poller가 처리하므로 반환. */
 	return;
 error:
 	/* We don't have a good way to handle errors here, so just do what we can and delete the
 	 * controller without detaching the underlying NVMe device.
 	 */
+	/* [한국어] 에러 복구 경로: 여기서는 마땅한 회복 수단이 없으므로, 등록되었을 수도 있는
+	 * detach poller를 해제하고(하드웨어 detach 없이) 구조체만이라도 해제한다.
+	 * 하드웨어를 detach하지 못하므로 디바이스가 깨끗하지 않은 상태로 남을 수 있다. */
 	spdk_poller_unregister(&nvme_ctrlr->reset_detach_poller);
 	_nvme_ctrlr_delete(nvme_ctrlr);
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_unregister_cb - io_device unregister 완료 콜백, 실제 파괴를 시작
+ *
+ * @io_device: spdk_io_device_unregister()에 넘긴 io_device 포인터. 여기서는
+ *             nvme_ctrlr 자신(컨트롤러를 io_device로 등록했었음).
+ * @return: 없음.
+ *
+ * 왜 필요한가: spdk_io_device_unregister()는 등록된 모든 채널이 파괴되기를 기다린 뒤
+ * 이 콜백을 호출한다. 즉 이 콜백이 불릴 때면 컨트롤러의 채널이 전부 사라진 안전한 시점이다.
+ * 그제서야 컨트롤러 본체 파괴(nvme_ctrlr_delete)를 시작한다.
+ *
+ * 실행 컨텍스트: app thread. SPDK io_device 프레임워크가 채널 파괴 완료 후 호출.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_unregister() → spdk_io_device_unregister(..., nvme_ctrlr_unregister_cb)
+ *     → [nvme_ctrlr_unregister_cb] → nvme_ctrlr_delete()
+ */
 static void
 nvme_ctrlr_unregister_cb(void *io_device)
 {
+	/* [한국어] io_device 포인터를 nvme_ctrlr로 복원(컨트롤러를 io_device로 등록했었음). */
 	struct nvme_ctrlr *nvme_ctrlr = io_device;
 
+	/* [한국어] 채널이 모두 정리된 안전한 시점이므로 컨트롤러 파괴 본체로 진입. */
 	nvme_ctrlr_delete(nvme_ctrlr);
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_unregister - 컨트롤러 io_device 등록 해제를 트리거(파괴 절차의 진입점)
+ *
+ * @ctx: 메시지 컨텍스트. nvme_ctrlr 포인터.
+ * @return: 없음.
+ *
+ * 왜 필요한가: 컨트롤러 파괴는 반드시 app thread에서 시작되어야 한다(io_device 등록을
+ * app thread가 소유). nvme_ctrlr_put_ref_ext()는 ref가 0이 되고 파괴 조건이 충족되면
+ * spdk_thread_send_msg(app_thread, nvme_ctrlr_unregister, ...)로 이 함수를 app thread에
+ * 디스패치한다. 이 함수는 io_device unregister를 호출해 채널 파괴 → unregister_cb 체인을 연다.
+ *
+ * 실행 컨텍스트: app thread(spdk_thread_send_msg를 통해 진입).
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_put_ref_ext() → spdk_thread_send_msg(app_thread, nvme_ctrlr_unregister)
+ *     → [nvme_ctrlr_unregister] → spdk_io_device_unregister() → nvme_ctrlr_unregister_cb()
+ */
 static void
 nvme_ctrlr_unregister(void *ctx)
 {
+	/* [한국어] 메시지 컨텍스트를 nvme_ctrlr로 복원. */
 	struct nvme_ctrlr *nvme_ctrlr = ctx;
 
+	/* [한국어] 컨트롤러를 io_device 레지스트리에서 제거 요청. 프레임워크가 모든 채널을
+	 * 파괴한 뒤 nvme_ctrlr_unregister_cb를 호출하도록 콜백을 등록한다. */
 	spdk_io_device_unregister(nvme_ctrlr, nvme_ctrlr_unregister_cb);
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_can_be_unregistered - 컨트롤러를 지금 unregister(파괴)해도 안전한지 판정
+ *
+ * @nvme_ctrlr: 판정 대상. 호출자가 mutex를 잡은 상태에서 들어와야 한다(아래 동기화 참고).
+ * @return: true = 파괴 가능(destruct 요청됨 + ref 0 + reset 미진행), false = 아직 불가.
+ *
+ * 왜 필요한가: 컨트롤러는 마지막 참조(ref)가 사라질 때 자동 파괴되는데, 단순히 ref==0만으로는
+ * 부족하다. (1) 누군가 파괴를 명시적으로 요청(destruct)했어야 하고, (2) reset 같은 진행 중
+ * 작업이 없어야 한다. 이 세 조건을 한 곳에서 검사해 race를 막는다.
+ *
+ * 동작 단계:
+ *   1) destruct 플래그가 안 서 있으면 파괴 요청 자체가 없으므로 false.
+ *   2) ref > 0이면 아직 사용 중이므로 false.
+ *   3) resetting 중이면 reset이 완료될 때 다시 판정되어야 하므로 지금은 false.
+ *   4) 모두 통과하면 ana_log_page_updating / io_path_cache_clearing 같은 임시 플래그가
+ *      절대 서 있지 않음을 assert로 보장(아래 동기화 주석 참조) 후 true.
+ *
+ * 실행 컨텍스트: 호출자(nvme_ctrlr_put_ref_ext)가 nvme_ctrlr->mutex를 잡은 채 호출.
+ *
+ * 동기화: ana_log_page_updating/io_path_cache_clearing 같은 플래그는 항상 ref를 get한 뒤
+ * 세우고 ref를 put하기 전에 지운다. 따라서 ref==0이 확인되면 이 플래그들이 false임이
+ * 보장되므로 위 3가지 검사만으로 충분하다(assert로 그 불변식을 문서화·검증).
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_put_ref_ext() → [nvme_ctrlr_can_be_unregistered]
+ */
 static bool
 nvme_ctrlr_can_be_unregistered(struct nvme_ctrlr *nvme_ctrlr)
 {
+	/* [한국어] 파괴(destruct)가 요청되지 않았으면 ref가 0이어도 살아있는 컨트롤러이므로
+	 * 파괴 불가. (예: 일시적으로 아무도 안 쓰지만 계속 존재해야 하는 경우) */
 	if (!nvme_ctrlr->destruct) {
 		return false;
 	}
 
+	/* [한국어] 아직 참조가 남아 있으면(채널/진행 중 작업) 파괴 불가. */
 	if (nvme_ctrlr->ref > 0) {
 		return false;
 	}
 
+	/* [한국어] reset이 진행 중이면 reset 완료 시점에 다시 put_ref가 불려 재판정되므로
+	 * 지금은 파괴를 보류한다. */
 	if (nvme_ctrlr->resetting) {
 		return false;
 	}
 
 	/* Flags are set after ref get and cleared before ref put, so the above check is sufficient. */
+	/* [한국어] 위 불변식(플래그는 ref get 후 set, ref put 전 clear) 하에서, ref==0이면
+	 * 이 두 임시 작업 플래그는 반드시 false여야 한다. 그렇지 않으면 버그이므로 assert로 검증. */
 	assert(!nvme_ctrlr->ana_log_page_updating);
 	assert(!nvme_ctrlr->io_path_cache_clearing);
+	/* [한국어] 모든 조건 충족 → 지금 안전하게 unregister/파괴 가능. */
 	return true;
 }
 
 /* Invokes cb_fn under the ctrlr’s lock but only if not scheduled to unregister. */
+/*
+ * [한국어]
+ * nvme_ctrlr_put_ref_ext - 컨트롤러 참조 카운트 1 감소, 0이 되어 파괴 가능하면 파괴 트리거
+ *
+ * @nvme_ctrlr: 참조를 놓을 컨트롤러.
+ * @cb_fn: 선택적 콜백. 참조를 줄였지만 아직 파괴되지 않을 때(=계속 살아있을 때) mutex를
+ *         잡은 채로 호출된다. NULL이면 호출 생략. (파괴로 넘어가는 경우엔 호출되지 않음)
+ * @return: 없음.
+ *
+ * 왜 필요한가: 컨트롤러는 ref 카운팅으로 수명을 관리한다. 마지막 참조가 놓이고 파괴 조건이
+ * 충족되면 자동으로 파괴 절차를 시작해야 한다. cb_fn은 "참조는 줄었지만 살아있을 때만"
+ * 어떤 후처리를 mutex 보호 하에 원자적으로 실행하기 위한 훅이다.
+ *
+ * 동작 단계:
+ *   1) mutex 잡고 DTrace probe로 (이름, 현재 ref) 기록.
+ *   2) ref가 양수임을 assert(underflow 방지)한 뒤 1 감소.
+ *   3) 파괴 불가 상태면: cb_fn이 있으면 호출하고, 락 풀고 반환(살려둠).
+ *   4) 파괴 가능 상태면: 락 풀고 app thread로 nvme_ctrlr_unregister 메시지를 보내 파괴 시작.
+ *
+ * 실행 컨텍스트: 임의의 SPDK thread에서 호출 가능. 파괴는 반드시 app thread에서 해야 하므로
+ * spdk_thread_send_msg로 디스패치한다(cross-thread 안전).
+ *
+ * 동기화: nvme_ctrlr->mutex(pthread_mutex)로 ref 감소와 파괴 판정을 원자적으로 묶는다.
+ * 파괴 메시지를 보내기 전 반드시 락을 해제한다(메시지 핸들러가 같은 락을 잡을 수 있어 deadlock 방지).
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_put_ref() / 각종 release 경로 → [nvme_ctrlr_put_ref_ext]
+ *     → cb_fn() 또는 spdk_thread_send_msg(app_thread, nvme_ctrlr_unregister)
+ */
 static void
 nvme_ctrlr_put_ref_ext(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_put_ref_cb cb_fn)
 {
+	/* [한국어] ref 감소와 파괴 판정을 원자적으로 처리하기 위해 컨트롤러 mutex 획득. */
 	pthread_mutex_lock(&nvme_ctrlr->mutex);
+	/* [한국어] DTrace 정적 프로브: 컨트롤러 이름과 (감소 전) ref 값을 추적 도구에 노출. */
 	SPDK_DTRACE_PROBE2(bdev_nvme_ctrlr_release, nvme_ctrlr->nbdev_ctrlr->name, nvme_ctrlr->ref);
 
+	/* [한국어] put이 get보다 많이 불리면 ref가 음수로 내려가는 버그이므로 양수임을 검증. */
 	assert(nvme_ctrlr->ref > 0);
+	/* [한국어] 참조 카운트 1 감소. mutex 보호 하의 단순 정수 연산. */
 	nvme_ctrlr->ref--;
 
+	/* [한국어] 감소 후에도 파괴 조건(destruct + ref==0 + !resetting)을 만족하지 못하면
+	 * 컨트롤러는 계속 살아있어야 한다. */
 	if (!nvme_ctrlr_can_be_unregistered(nvme_ctrlr)) {
+		/* [한국어] 살아있는 상태에서만 실행해야 하는 후처리 콜백이 있으면 락을 잡은 채 호출.
+		 * (예: 다음 작업 스케줄링 등 ref/상태와 원자적이어야 하는 동작) */
 		if (cb_fn) {
 			cb_fn(nvme_ctrlr);
 		}
 
+		/* [한국어] 락 해제 후 반환. 파괴로 넘어가지 않음. */
 		pthread_mutex_unlock(&nvme_ctrlr->mutex);
 		return;
 	}
 
+	/* [한국어] 파괴 가능 상태: 메시지 핸들러와의 deadlock 방지를 위해 먼저 락 해제. */
 	pthread_mutex_unlock(&nvme_ctrlr->mutex);
+	/* [한국어] 파괴는 app thread 소유 작업이므로, app thread로 nvme_ctrlr_unregister를
+	 * 비동기 메시지로 디스패치한다(lockless 메시지 패싱). */
 	spdk_thread_send_msg(spdk_thread_get_app_thread(), nvme_ctrlr_unregister, nvme_ctrlr);
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_put_ref - cb_fn 없이 참조를 놓는 단순 래퍼
+ *
+ * @nvme_ctrlr: 참조를 놓을 컨트롤러.
+ * @return: 없음.
+ *
+ * 후처리 콜백이 필요 없는 일반적인 release 경로에서 사용한다. 내부적으로 cb_fn=NULL로
+ * nvme_ctrlr_put_ref_ext()를 호출할 뿐이다.
+ *
+ * 호출 체인:
+ *   (각종 release 경로) → [nvme_ctrlr_put_ref] → nvme_ctrlr_put_ref_ext(.., NULL)
+ */
 static void
 nvme_ctrlr_put_ref(struct nvme_ctrlr *nvme_ctrlr)
 {
+	/* [한국어] 후처리 콜백 없이 참조만 1 감소시키는 일반 경로. */
 	nvme_ctrlr_put_ref_ext(nvme_ctrlr, NULL);
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_get_ref - 컨트롤러 참조 카운트를 1 증가시켜 수명을 연장
+ *
+ * @nvme_ctrlr: 참조를 얻을 컨트롤러. 호출 시점에 이미 ref>0(살아있음)이어야 한다.
+ * @return: 없음.
+ *
+ * 왜 필요한가: 컨트롤러를 사용하기 시작하는 주체(채널 생성, reset, ANA 갱신 등)가 사용 동안
+ * 컨트롤러가 파괴되지 않도록 참조를 올린다. 사용이 끝나면 짝이 되는 put_ref로 내린다.
+ *
+ * 실행 컨텍스트: 임의 SPDK thread. mutex로 보호되므로 cross-thread 안전.
+ *
+ * 동기화: nvme_ctrlr->mutex로 ref 증가를 원자화. assert(ref>0)는 "0에서 부활"하는
+ * use-after-free성 버그를 막는다(이미 죽은 컨트롤러를 되살릴 수 없음).
+ *
+ * 호출 체인:
+ *   (채널 생성/reset/ANA 등) → [nvme_ctrlr_get_ref]
+ */
 static void
 nvme_ctrlr_get_ref(struct nvme_ctrlr *nvme_ctrlr)
 {
+	/* [한국어] ref 증가를 원자화하기 위해 mutex 획득. */
 	pthread_mutex_lock(&nvme_ctrlr->mutex);
+	/* [한국어] 이미 살아있는(ref>0) 컨트롤러만 참조를 추가할 수 있다(0에서 부활 금지). */
 	assert(nvme_ctrlr->ref > 0);
+	/* [한국어] 참조 카운트 1 증가 — 사용 동안 파괴를 막는다. */
 	nvme_ctrlr->ref++;
+	/* [한국어] mutex 해제. */
 	pthread_mutex_unlock(&nvme_ctrlr->mutex);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_clear_current_io_path - 채널의 캐시된 현재 io_path와 라운드로빈 카운터를 무효화
+ *
+ * @nbdev_ch: 멀티패스 bdev 채널(코어/스레드별 I/O 채널 컨텍스트).
+ * @return: 없음.
+ *
+ * 왜 필요한가: nbdev_ch->current_io_path는 다음 I/O를 어느 경로로 보낼지 매번 재계산하지
+ * 않으려고 캐싱해 둔 "현재 선택된 경로"다. io_path 추가/삭제, ANA 상태 변화, 경로 장애 등으로
+ * 그 선택이 더 이상 유효하지 않을 때 캐시를 비워, 다음 I/O 발행 시 경로를 새로 고르게 한다.
+ *
+ * 실행 컨텍스트: 해당 채널을 소유한 SPDK thread(reactor). 채널은 스레드에 고정(affinity)
+ * 되어 단일 스레드에서만 접근하므로 락 없이 안전(lockless).
+ *
+ * 호출 체인:
+ *   _bdev_nvme_add_io_path() / _bdev_nvme_delete_io_path() 등 → [bdev_nvme_clear_current_io_path]
+ */
 static void
 bdev_nvme_clear_current_io_path(struct nvme_bdev_channel *nbdev_ch)
 {
+	/* [한국어] 캐시된 현재 경로 포인터를 비워 다음 I/O 때 경로를 재선택하도록 강제. */
 	nbdev_ch->current_io_path = NULL;
+	/* [한국어] 라운드로빈 선택 카운터도 0으로 리셋 — 경로 집합이 바뀌면 RR 위치도 무의미. */
 	nbdev_ch->rr_counter = 0;
 }
 
+/*
+ * [한국어]
+ * _bdev_nvme_get_io_path - 채널의 io_path 리스트에서 특정 namespace에 대응하는 경로를 검색
+ *
+ * @nbdev_ch: 멀티패스 bdev 채널.
+ * @nvme_ns: 찾고자 하는 namespace(컨트롤러 경로 식별자 역할).
+ * @return: 해당 nvme_ns를 가리키는 nvme_io_path 포인터. 없으면 NULL.
+ *
+ * 왜 필요한가: 하나의 논리 bdev(namespace)에 여러 물리 경로(컨트롤러)가 연결될 수 있다.
+ * 특정 namespace에 대한 경로가 이미 채널에 존재하는지 확인할 때 사용한다(중복 추가/삭제 판단).
+ *
+ * 동작: io_path_list를 선형 순회하며 io_path->nvme_ns == nvme_ns인 항목을 찾는다.
+ * STAILQ_FOREACH가 끝까지 돌면 io_path는 NULL이 되어 "없음"을 자연스럽게 반환한다.
+ *
+ * 실행 컨텍스트: 채널 소유 스레드. 단일 스레드 접근이므로 lockless.
+ *
+ * 호출 체인:
+ *   bdev_nvme_add_io_path()/delete 경로 등 → [_bdev_nvme_get_io_path]
+ */
 static struct nvme_io_path *
 _bdev_nvme_get_io_path(struct nvme_bdev_channel *nbdev_ch, struct nvme_ns *nvme_ns)
 {
 	struct nvme_io_path *io_path;
 
+	/* [한국어] 채널의 모든 io_path를 선형 순회(STAILQ: singly-linked tail queue). */
 	STAILQ_FOREACH(io_path, &nbdev_ch->io_path_list, stailq) {
+		/* [한국어] 찾는 namespace를 가리키는 경로를 만나면 루프 종료(io_path가 결과). */
 		if (io_path->nvme_ns == nvme_ns) {
 			break;
 		}
 	}
 
+	/* [한국어] 일치 항목을 찾았으면 그 포인터, 끝까지 못 찾았으면 NULL을 반환. */
 	return io_path;
 }
 
+/*
+ * [한국어]
+ * nvme_io_path_alloc - 새 nvme_io_path 객체를 힙에서 할당하고 (옵션) per-path 통계 버퍼까지 준비한다.
+ *
+ * @return: 성공 시 0으로 초기화된 io_path 포인터, 실패 시 NULL.
+ *
+ * nvme_io_path는 "특정 IO 채널(=특정 스레드)에서, 특정 nvme_ns로 가는 하나의 경로"를
+ * 나타내는 멀티패스 핵심 자료구조다. 한 namespace에 여러 컨트롤러(path)가 붙은 경우
+ * 채널마다 path 개수만큼 io_path가 생긴다. 이 함수는 그 객체 한 개를 만든다.
+ * g_opts.io_path_stat가 켜져 있으면 경로별 IO 통계(spdk_bdev_io_stat)도 같이 할당하고
+ * MAXMIN(min/max latency 추적) 모드로 리셋한다.
+ * 실행 컨텍스트: bdev 채널 생성 콜백(해당 채널 스레드)에서 호출되는 lockless 경로.
+ *
+ * 호출 체인:
+ *   _bdev_nvme_add_io_path → [nvme_io_path_alloc] → calloc / spdk_bdev_reset_io_stat
+ */
 static struct nvme_io_path *
 nvme_io_path_alloc(void)
 {
-	struct nvme_io_path *io_path;
+	struct nvme_io_path *io_path;        /* [한국어] 새로 만들 경로 객체 포인터. */
 
+	/* [한국어] calloc으로 0초기화 할당 — 모든 포인터/플래그가 NULL/0에서 시작하도록. */
 	io_path = calloc(1, sizeof(*io_path));
 	if (io_path == NULL) {
+		/* [한국어] 메모리 부족: 경로 생성 불가 → 호출자가 -ENOMEM으로 처리. */
 		SPDK_ERRLOG("Failed to alloc io_path.\n");
 		return NULL;
 	}
 
+	/* [한국어] 경로별 통계 수집 옵션이 켜진 경우에만 별도 stat 버퍼를 추가 할당. */
 	if (g_opts.io_path_stat) {
 		io_path->stat = calloc(1, sizeof(struct spdk_bdev_io_stat));
 		if (io_path->stat == NULL) {
+			/* [한국어] stat 할당 실패 시 이미 잡은 io_path를 되돌려야 누수가 없다. */
 			free(io_path);
 			SPDK_ERRLOG("Failed to alloc io_path stat.\n");
 			return NULL;
 		}
+		/* [한국어] 통계 카운터를 0으로, min/max latency 추적(MAXMIN)을 활성화. */
 		spdk_bdev_reset_io_stat(io_path->stat, SPDK_BDEV_RESET_STAT_MAXMIN);
 	}
 
+	/* [한국어] 준비된 경로 객체 반환 — 호출자가 nbdev_ch/qpair 리스트에 연결한다. */
 	return io_path;
 }
 
+/*
+ * [한국어]
+ * nvme_io_path_free - nvme_io_path 객체와 부속 통계 버퍼를 해제한다.
+ *
+ * @io_path: 해제할 경로 객체. 어느 리스트에도 더 이상 연결되어 있지 않아야 안전.
+ *
+ * stat 버퍼는 NULL일 수 있으나 free(NULL)은 무해하므로 무조건 호출한다.
+ * 주의: 경로 삭제(_bdev_nvme_delete_io_path)에서 바로 free하지 않고, 연관 qpair가
+ * 해제되는 시점까지 미뤄 free하는 정책이 있다(use-after-free 방지). 이 함수는 그
+ * 안전 시점에 호출되는 최종 해제기다.
+ *
+ * 호출 체인:
+ *   qpair 해제 경로 / add 실패 롤백 → [nvme_io_path_free] → free
+ */
 static void
 nvme_io_path_free(struct nvme_io_path *io_path)
 {
-	free(io_path->stat);
-	free(io_path);
+	free(io_path->stat);    /* [한국어] 경로별 통계 버퍼 해제(없으면 NULL이라 무해). */
+	free(io_path);          /* [한국어] 경로 객체 본체 해제. */
 }
 
+/*
+ * [한국어]
+ * _bdev_nvme_add_io_path - 주어진 nvme_ns로 가는 새 경로를 이 bdev 채널에 연결한다.
+ *
+ * @nbdev_ch: 경로를 추가받을 nvme_bdev 채널(특정 스레드 소유).
+ * @nvme_ns: 이 경로가 향하는 namespace(특정 컨트롤러에 속함).
+ * @return: 성공 0, 메모리 부족 시 -ENOMEM.
+ *
+ * 멀티패스 토폴로지: 하나의 nvme_bdev(논리 디스크)는 여러 nvme_ns(=여러 컨트롤러
+ * 경로)를 가질 수 있다. 채널이 생성되거나 새 path가 attach될 때, 이 함수가 채널 안에
+ * io_path를 만들어 (1) 해당 컨트롤러의 IO 채널을 잡고 → (2) 그 채널의 qpair를 경로에
+ * 연결하고 → (3) qpair의 io_path_list와 채널의 io_path_list 양쪽에 등록한다.
+ * 두 리스트에 동시에 거는 이유: qpair 단위(disconnect/free)와 채널 단위(path 선택)에서
+ * 각각 역참조가 필요하기 때문이다.
+ * 실행 컨텍스트: nbdev_ch를 소유한 스레드. spdk_get_io_channel은 현재 스레드의 채널을 반환.
+ *
+ * 호출 체인:
+ *   bdev_nvme_create_bdev_channel_cb / path 추가 경로 → [_bdev_nvme_add_io_path]
+ *     → spdk_get_io_channel → TAILQ/STAILQ_INSERT → bdev_nvme_clear_current_io_path
+ */
 static int
 _bdev_nvme_add_io_path(struct nvme_bdev_channel *nbdev_ch, struct nvme_ns *nvme_ns)
 {
-	struct nvme_io_path *io_path;
-	struct spdk_io_channel *ch;
-	struct nvme_ctrlr_channel *ctrlr_ch;
-	struct nvme_qpair *nvme_qpair;
+	struct nvme_io_path *io_path;          /* [한국어] 새로 만들 경로 객체. */
+	struct spdk_io_channel *ch;            /* [한국어] 컨트롤러 io_device에서 얻은 IO 채널. */
+	struct nvme_ctrlr_channel *ctrlr_ch;   /* [한국어] ch의 컨텍스트(컨트롤러 채널). */
+	struct nvme_qpair *nvme_qpair;         /* [한국어] 이 채널/스레드가 소유한 NVMe qpair. */
 
+	/* [한국어] 경로 객체 할당(통계 포함 가능). 실패하면 즉시 -ENOMEM. */
 	io_path = nvme_io_path_alloc();
 	if (io_path == NULL) {
 		return -ENOMEM;
 	}
 
+	/* [한국어] 이 경로가 향하는 namespace 기록 — IO 발행 시 nvme_ns->ns로 명령 빌드. */
 	io_path->nvme_ns = nvme_ns;
 
+	/* [한국어] namespace가 속한 컨트롤러(io_device)에 대한 현재 스레드의 IO 채널 획득.
+	 * 이 호출이 컨트롤러 채널을 1 참조하므로, 경로 삭제 시 짝맞춰 put 해야 한다. */
 	ch = spdk_get_io_channel(nvme_ns->ctrlr);
 	if (ch == NULL) {
+		/* [한국어] 채널 할당 실패: 이미 잡은 io_path를 되돌리고 -ENOMEM. */
 		nvme_io_path_free(io_path);
 		NVME_NS_ERRLOG(nvme_ns, "Failed to alloc io_channel.\n");
 		return -ENOMEM;
 	}
 
+	/* [한국어] 채널 컨텍스트를 컨트롤러 채널 구조체로 해석. */
 	ctrlr_ch = spdk_io_channel_get_ctx(ch);
 
+	/* [한국어] 컨트롤러 채널이 보유한 qpair를 경로에 연결. 채널 생성 시 qpair가 만들어졌어야 함. */
 	nvme_qpair = ctrlr_ch->qpair;
 	assert(nvme_qpair != NULL);
 
+	/* [한국어] 경로 → qpair 역참조 설정 + qpair의 io_path_list에 등록(qpair 해제 시 경로 정리용). */
 	io_path->qpair = nvme_qpair;
 	TAILQ_INSERT_TAIL(&nvme_qpair->io_path_list, io_path, tailq);
 
+	/* [한국어] 경로 → 채널 역참조 + 채널의 io_path_list에 등록(path 선택 순회 대상). */
 	io_path->nbdev_ch = nbdev_ch;
 	STAILQ_INSERT_TAIL(&nbdev_ch->io_path_list, io_path, stailq);
 
+	/* [한국어] 경로 집합이 바뀌었으므로 캐시된 current_io_path 무효화 → 다음 IO 때 재선택. */
 	bdev_nvme_clear_current_io_path(nbdev_ch);
 
-	return 0;
+	return 0;     /* [한국어] 경로 추가 성공. */
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_clear_retry_io_path - 삭제될 경로를 참조하는 재시도 대기 IO들의 경로 캐시를 끊는다.
+ *
+ * @nbdev_ch: 재시도 큐(retry_io_list)를 가진 bdev 채널.
+ * @io_path: 곧 삭제될 경로 — 이 경로를 가리키는 모든 대기 IO의 io_path를 NULL로.
+ *
+ * 재시도 대기 중인 bdev_nvme_io는 직전에 시도한 io_path를 기억해 둔다(다음에 다른
+ * 경로를 고르기 위한 힌트). 그 경로가 삭제되면 dangling 포인터가 되므로, 미리
+ * NULL로 비워 다음 재시도 때 경로를 처음부터 재선택하도록 한다(use-after-free 방지).
+ * 실행 컨텍스트: nbdev_ch 소유 스레드. 재시도 큐도 같은 스레드에서만 다뤄져 lockless.
+ *
+ * 호출 체인:
+ *   _bdev_nvme_delete_io_path → [bdev_nvme_clear_retry_io_path]
+ */
 static void
 bdev_nvme_clear_retry_io_path(struct nvme_bdev_channel *nbdev_ch,
 			      struct nvme_io_path *io_path)
 {
-	struct nvme_bdev_io *bio;
+	struct nvme_bdev_io *bio;    /* [한국어] 재시도 큐를 순회할 IO 객체. */
 
+	/* [한국어] 채널의 모든 재시도 대기 IO를 선형 순회. */
 	TAILQ_FOREACH(bio, &nbdev_ch->retry_io_list, retry_link) {
+		/* [한국어] 이 IO가 삭제될 경로를 기억하고 있으면 그 참조를 끊는다. */
 		if (bio->io_path == io_path) {
 			bio->io_path = NULL;
 		}
 	}
 }
 
+/*
+ * [한국어]
+ * _bdev_nvme_delete_io_path - 채널에서 한 경로를 떼어내고 컨트롤러 채널 참조를 반납한다.
+ *
+ * @nbdev_ch: 경로가 속한 bdev 채널.
+ * @io_path: 제거할 경로.
+ *
+ * 핵심 주의: 경로를 채널 리스트에서 빼고 컨트롤러 IO 채널을 put 하지만, io_path 객체
+ * 자체는 여기서 free 하지 않는다. 이미 발행된 IO가 완료되면서 io_path->stat을 갱신할
+ * 수 있어, 지금 free 하면 use-after-free가 난다. 그래서 free는 연관 qpair가 해제되는
+ * 시점(모든 IO 완료가 보장된 때)으로 미룬다. qpair의 io_path_list에는 여전히 남겨둔다.
+ * 실행 컨텍스트: nbdev_ch 소유 스레드.
+ *
+ * 호출 체인:
+ *   _bdev_nvme_delete_io_paths / path 제거 경로 → [_bdev_nvme_delete_io_path]
+ *     → spdk_put_io_channel
+ */
 static void
 _bdev_nvme_delete_io_path(struct nvme_bdev_channel *nbdev_ch, struct nvme_io_path *io_path)
 {
-	struct spdk_io_channel *ch;
-	struct nvme_qpair *nvme_qpair;
-	struct nvme_ctrlr_channel *ctrlr_ch;
+	struct spdk_io_channel *ch;            /* [한국어] 반납할 컨트롤러 IO 채널 핸들. */
+	struct nvme_qpair *nvme_qpair;         /* [한국어] 경로가 쓰던 qpair. */
+	struct nvme_ctrlr_channel *ctrlr_ch;   /* [한국어] qpair가 속한 컨트롤러 채널. */
 
+	/* [한국어] 경로가 가리키던 qpair 확보(채널 참조 반납 대상 추적용). */
 	nvme_qpair = io_path->qpair;
 	assert(nvme_qpair != NULL);
 
+	/* [한국어] 캐시된 현재 경로/재시도 IO의 경로 참조를 모두 무효화(dangling 방지). */
 	bdev_nvme_clear_current_io_path(nbdev_ch);
 	bdev_nvme_clear_retry_io_path(nbdev_ch, io_path);
 
+	/* [한국어] 채널의 경로 리스트에서만 제거(qpair 리스트는 남겨 둠 → 지연 free). */
 	STAILQ_REMOVE(&nbdev_ch->io_path_list, io_path, nvme_io_path, stailq);
-	io_path->nbdev_ch = NULL;
+	io_path->nbdev_ch = NULL;     /* [한국어] 채널 역참조 끊기. */
 
+	/* [한국어] qpair → 컨트롤러 채널 → io_channel 핸들로 거슬러 올라가 add 시 잡은 참조를 반납. */
 	ctrlr_ch = nvme_qpair->ctrlr_ch;
 	assert(ctrlr_ch != NULL);
 
 	ch = spdk_io_channel_from_ctx(ctrlr_ch);
-	spdk_put_io_channel(ch);
+	spdk_put_io_channel(ch);      /* [한국어] _add에서 spdk_get_io_channel 한 것과 짝맞춤. */
 
 	/* After an io_path is removed, I/Os submitted to it may complete and update statistics
 	 * of the io_path. To avoid heap-use-after-free error from this case, do not free the
 	 * io_path here but free the io_path when the associated qpair is freed. It is ensured
 	 * that all I/Os submitted to the io_path are completed when the associated qpair is freed.
 	 */
+	/* [한국어] (위 영어 주석) 경로 제거 후에도 in-flight IO가 stat을 갱신할 수 있어,
+	 * free는 qpair 해제 시점으로 지연한다 — 그때는 모든 IO 완료가 보장된다. */
 }
 
+/*
+ * [한국어]
+ * _bdev_nvme_delete_io_paths - 채널의 모든 경로를 한꺼번에 제거한다(채널 파괴 시).
+ *
+ * @nbdev_ch: 모든 경로를 떼어낼 bdev 채널.
+ *
+ * 채널이 파괴되거나, 경로 추가 중 실패해 롤백할 때 호출된다. _SAFE 변형을 쓰는 이유는
+ * 순회 중 현재 노드를 리스트에서 제거하기 때문(다음 포인터를 미리 보관).
+ * 실행 컨텍스트: nbdev_ch 소유 스레드.
+ *
+ * 호출 체인:
+ *   bdev_nvme_destroy_bdev_channel_cb / add 실패 롤백 → [_bdev_nvme_delete_io_paths]
+ *     → _bdev_nvme_delete_io_path
+ */
 static void
 _bdev_nvme_delete_io_paths(struct nvme_bdev_channel *nbdev_ch)
 {
-	struct nvme_io_path *io_path, *tmp_io_path;
+	struct nvme_io_path *io_path, *tmp_io_path;    /* [한국어] 순회 커서와 다음 노드 보관용. */
 
+	/* [한국어] 제거-안전 순회: 각 경로를 차례로 채널에서 떼어낸다. */
 	STAILQ_FOREACH_SAFE(io_path, &nbdev_ch->io_path_list, stailq, tmp_io_path) {
 		_bdev_nvme_delete_io_path(nbdev_ch, io_path);
 	}
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_create_bdev_channel_cb - nvme_bdev의 per-thread IO 채널을 초기화하는 콜백.
+ *
+ * @io_device: spdk_io_device_register에 등록된 nvme_bdev 포인터.
+ * @ctx_buf: SPDK가 채널마다 할당해 주는 컨텍스트 메모리(= nvme_bdev_channel).
+ * @return: 성공 0, 경로 생성 실패 시 음수(채널 생성 자체가 실패).
+ *
+ * spdk_bdev_get_io_channel()이 처음 이 스레드에서 호출될 때 SPDK 프레임워크가 채널
+ * 컨텍스트를 만들고 이 콜백을 부른다. 여기서 채널의 경로 리스트/재시도 큐를 초기화하고,
+ * nvme_bdev에 속한 모든 namespace 각각에 대해 io_path를 생성한다. 멀티패스 정책 필드
+ * (mp_policy/mp_selector/rr_min_io)는 부모 nvme_bdev에서 채널로 복사해, IO 경로 선택을
+ * 채널-로컬(lockless)로 수행할 수 있게 한다.
+ * 실행 컨텍스트: 이 채널을 만드는 스레드. nbdev->mutex로 nvme_ns_list 순회를 보호
+ * (path attach/detach가 다른 스레드에서 리스트를 변경할 수 있으므로).
+ *
+ * 호출 체인:
+ *   spdk_bdev_get_io_channel → SPDK 코어 → [bdev_nvme_create_bdev_channel_cb]
+ *     → _bdev_nvme_add_io_path (namespace 수만큼)
+ */
 static int
 bdev_nvme_create_bdev_channel_cb(void *io_device, void *ctx_buf)
 {
-	struct nvme_bdev_channel *nbdev_ch = ctx_buf;
-	struct nvme_bdev *nbdev = io_device;
-	struct nvme_ns *nvme_ns;
-	int rc;
+	struct nvme_bdev_channel *nbdev_ch = ctx_buf;     /* [한국어] 초기화할 채널 컨텍스트. */
+	struct nvme_bdev *nbdev = io_device;              /* [한국어] 이 채널이 속한 논리 bdev. */
+	struct nvme_ns *nvme_ns;                          /* [한국어] 순회용 namespace 커서. */
+	int rc;                                           /* [한국어] 경로 추가 결과 코드. */
 
+	/* [한국어] 채널-로컬 자료구조 초기화: 활성 경로 리스트와 재시도 대기 큐. */
 	STAILQ_INIT(&nbdev_ch->io_path_list);
 	TAILQ_INIT(&nbdev_ch->retry_io_list);
 
+	/* [한국어] namespace 리스트와 멀티패스 정책 필드를 읽는 동안 변경되지 않도록 락. */
 	pthread_mutex_lock(&nbdev->mutex);
 
-	nbdev_ch->mp_policy = nbdev->mp_policy;
-	nbdev_ch->mp_selector = nbdev->mp_selector;
-	nbdev_ch->rr_min_io = nbdev->rr_min_io;
+	/* [한국어] 멀티패스 정책을 채널로 스냅샷 — 이후 경로 선택은 락 없이 채널 값으로 수행. */
+	nbdev_ch->mp_policy = nbdev->mp_policy;       /* [한국어] active-active / active-passive. */
+	nbdev_ch->mp_selector = nbdev->mp_selector;   /* [한국어] round-robin / queue-depth 등. */
+	nbdev_ch->rr_min_io = nbdev->rr_min_io;       /* [한국어] RR 전환 전 최소 IO 수. */
 
+	/* [한국어] bdev에 속한 모든 namespace(=path)마다 채널 내 io_path를 만든다. */
 	TAILQ_FOREACH(nvme_ns, &nbdev->nvme_ns_list, tailq) {
 		rc = _bdev_nvme_add_io_path(nbdev_ch, nvme_ns);
 		if (rc != 0) {
+			/* [한국어] 하나라도 실패하면 채널을 만들 수 없다 → 락 풀고 롤백 후 에러. */
 			pthread_mutex_unlock(&nbdev->mutex);
 
 			_bdev_nvme_delete_io_paths(nbdev_ch);
 			return rc;
 		}
 	}
-	pthread_mutex_unlock(&nbdev->mutex);
+	pthread_mutex_unlock(&nbdev->mutex);     /* [한국어] 리스트 순회 완료 → 락 해제. */
 
-	return 0;
+	return 0;     /* [한국어] 모든 경로 생성 성공 → 채널 사용 가능. */
 }
 
 /* If cpl != NULL, complete the bdev_io with nvme status based on 'cpl'.
  * If cpl == NULL, complete the bdev_io with bdev status based on 'status'.
  */
+/*
+ * [한국어]
+ * __bdev_nvme_io_complete - bdev_io를 bdev 코어로 완료 보고하는 최종 헬퍼.
+ *
+ * @bdev_io: 완료시킬 사용자 IO 요청.
+ * @status: cpl이 NULL일 때 사용할 bdev 레벨 상태(SUCCESS/FAILED 등).
+ * @cpl: NULL이 아니면 NVMe 컨트롤러가 반환한 CPL — 정확한 SCT/SC 코드를 그대로 전달.
+ *
+ * NVMe 경로에서 온 IO는 디바이스가 준 16바이트 CPL의 cdw0/sct/sc를 그대로 bdev 코어에
+ * 넘겨, 상위 사용자가 NVMe 상태 코드까지 확인할 수 있게 한다(complete_nvme_status).
+ * reset/abort처럼 NVMe CPL이 없는 경우엔 cpl=NULL로 bdev 레벨 상태만 보고한다.
+ * 완료 직전 trace point(TRACE_BDEV_NVME_IO_DONE)를 찍어 IO 수명 추적을 남긴다.
+ * 실행 컨텍스트: IO를 발행한 채널 스레드(완료 콜백은 같은 스레드에서 폴링됨).
+ *
+ * 호출 체인:
+ *   bdev_nvme_*_done 완료 콜백들 → [__bdev_nvme_io_complete]
+ *     → spdk_bdev_io_complete[_nvme_status] → 사용자 콜백
+ */
 static inline void
 __bdev_nvme_io_complete(struct spdk_bdev_io *bdev_io, enum spdk_bdev_io_status status,
 			const struct spdk_nvme_cpl *cpl)
 {
+	/* [한국어] IO 완료 trace point 기록(driver_ctx와 bdev_io 포인터를 인자로). */
 	spdk_trace_record(TRACE_BDEV_NVME_IO_DONE, 0, 0, (uintptr_t)bdev_io->driver_ctx,
 			  (uintptr_t)bdev_io);
 	if (cpl) {
+		/* [한국어] NVMe CPL 보유: cdw0 + 상태 코드 타입(sct)/상태 코드(sc)를 그대로 전달. */
 		spdk_bdev_io_complete_nvme_status(bdev_io, cpl->cdw0, cpl->status.sct, cpl->status.sc);
 	} else {
+		/* [한국어] NVMe CPL 없음(reset/abort 등): bdev 레벨 상태로만 완료. */
 		spdk_bdev_io_complete(bdev_io, status);
 	}
 }
 
+/* [한국어] 재시도 큐의 모든 IO를 취소하는 함수의 전방 선언(아래에서 정의). */
 static void bdev_nvme_abort_retry_ios(struct nvme_bdev_channel *nbdev_ch);
 
+/*
+ * [한국어]
+ * bdev_nvme_destroy_bdev_channel_cb - nvme_bdev IO 채널을 파괴하는 콜백.
+ *
+ * @io_device: nvme_bdev 포인터(미사용 — 시그니처 일치용).
+ * @ctx_buf: 파괴할 nvme_bdev_channel 컨텍스트.
+ *
+ * spdk_put_io_channel의 마지막 참조가 떨어지면 SPDK 프레임워크가 이 콜백을 호출한다.
+ * 채널이 사라지기 전에 (1) 재시도 대기 중인 IO들을 모두 취소(완료 보고)하고
+ * (2) 채널의 모든 io_path를 떼어 컨트롤러 채널 참조를 반납한다.
+ * 실행 컨텍스트: 이 채널을 소유한 스레드.
+ *
+ * 호출 체인:
+ *   spdk_put_io_channel(마지막 참조) → SPDK 코어 → [bdev_nvme_destroy_bdev_channel_cb]
+ */
 static void
 bdev_nvme_destroy_bdev_channel_cb(void *io_device, void *ctx_buf)
 {
-	struct nvme_bdev_channel *nbdev_ch = ctx_buf;
+	struct nvme_bdev_channel *nbdev_ch = ctx_buf;    /* [한국어] 파괴할 채널 컨텍스트. */
 
-	bdev_nvme_abort_retry_ios(nbdev_ch);
-	_bdev_nvme_delete_io_paths(nbdev_ch);
+	bdev_nvme_abort_retry_ios(nbdev_ch);     /* [한국어] 재시도 대기 IO 전부 취소. */
+	_bdev_nvme_delete_io_paths(nbdev_ch);    /* [한국어] 모든 경로 제거 + 채널 참조 반납. */
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_io_type_is_admin - 이 IO 타입이 admin 큐(컨트롤러 단위) 처리를 요하는지 판별.
+ *
+ * @io_type: bdev IO 타입(READ/WRITE/RESET/NVME_ADMIN/ABORT 등).
+ * @return: admin 성격(RESET/NVME_ADMIN/ABORT)이면 true, 일반 IO면 false.
+ *
+ * 일반 R/W는 per-thread IO qpair로 가지만, reset/admin/abort는 컨트롤러 전체에
+ * 영향을 주므로 IO 채널이 아닌 컨트롤러 단위 경로(admin qpair, app 스레드 조율)로
+ * 라우팅해야 한다. 이 판별이 그 분기점에서 쓰인다.
+ * 실행 컨텍스트: 호출 스레드 무관(순수 함수).
+ *
+ * 호출 체인:
+ *   bdev_nvme_submit_request / io_type_supported 등 → [bdev_nvme_io_type_is_admin]
+ */
 static inline bool
 bdev_nvme_io_type_is_admin(enum spdk_bdev_io_type io_type)
 {
 	switch (io_type) {
-	case SPDK_BDEV_IO_TYPE_RESET:
-	case SPDK_BDEV_IO_TYPE_NVME_ADMIN:
-	case SPDK_BDEV_IO_TYPE_ABORT:
+	case SPDK_BDEV_IO_TYPE_RESET:        /* [한국어] 컨트롤러 reset — admin 성격. */
+	case SPDK_BDEV_IO_TYPE_NVME_ADMIN:   /* [한국어] raw NVMe admin 명령. */
+	case SPDK_BDEV_IO_TYPE_ABORT:        /* [한국어] 진행 중 IO 취소 — admin 성격. */
 		return true;
 	default:
-		break;
+		break;     /* [한국어] 그 외(R/W/unmap/flush 등)는 일반 IO 경로. */
 	}
 
 	return false;
 }
 
+/*
+ * [한국어]
+ * nvme_ns_is_active - namespace가 지금 IO를 발행해도 되는 "활성" 상태인지 판별.
+ *
+ * @nvme_ns: 검사할 namespace 경로 객체.
+ * @return: ANA 갱신 중이 아니고 실제 ns 핸들이 살아 있으면 true.
+ *
+ * ANA(Asymmetric Namespace Access) 상태를 갱신하는 도중(ana_state_updating)이면
+ * 경로 상태가 불확정이라 IO를 보류해야 한다. 또한 namespace가 detach되어 ns 핸들이
+ * NULL이면 발행 대상이 없다. 두 경우 모두 비활성으로 본다.
+ * 실행 컨텍스트: IO 발행 경로(채널 스레드)에서 hot-path로 호출 → inline.
+ *
+ * 호출 체인:
+ *   nvme_ns_is_accessible / _bdev_nvme_find_io_path_min_qd → [nvme_ns_is_active]
+ */
 static inline bool
 nvme_ns_is_active(struct nvme_ns *nvme_ns)
 {
+	/* [한국어] ANA 상태 갱신 중이면 경로 상태가 불확정 → 비활성 처리(IO 보류). */
 	if (spdk_unlikely(nvme_ns->ana_state_updating)) {
 		return false;
 	}
 
+	/* [한국어] 실제 NVMe namespace 핸들이 없으면(detach됨) 발행 불가 → 비활성. */
 	if (spdk_unlikely(nvme_ns->ns == NULL)) {
 		return false;
 	}
 
-	return true;
+	return true;     /* [한국어] 갱신 중 아님 + ns 존재 → 활성. */
 }
 
+/*
+ * [한국어]
+ * nvme_ns_is_accessible - namespace가 활성이면서 ANA 상태상 IO를 받을 수 있는지 판별.
+ *
+ * @nvme_ns: 검사할 namespace 경로.
+ * @return: 활성 + ANA가 OPTIMIZED/NON_OPTIMIZED면 true.
+ *
+ * nvme_ns_is_active(살아 있음) 위에 ANA 접근 가능성을 더한 판정이다. ANA 상태가
+ * INACCESSIBLE/PERSISTENT_LOSS/CHANGE 등이면 그 경로로는 IO를 보내면 안 되고,
+ * OPTIMIZED(최적 경로) 또는 NON_OPTIMIZED(차선 경로)일 때만 접근 가능으로 본다.
+ * 실행 컨텍스트: 경로 선택 hot-path → inline.
+ *
+ * 호출 체인:
+ *   nvme_io_path_is_available → [nvme_ns_is_accessible] → nvme_ns_is_active
+ */
 static inline bool
 nvme_ns_is_accessible(struct nvme_ns *nvme_ns)
 {
+	/* [한국어] 먼저 살아 있고 갱신 중이 아닌 활성 상태인지 확인. */
 	if (spdk_unlikely(!nvme_ns_is_active(nvme_ns))) {
 		return false;
 	}
 
+	/* [한국어] ANA 접근 상태 판정: 최적/차선 경로만 IO 수용. */
 	switch (nvme_ns->ana_state) {
-	case SPDK_NVME_ANA_OPTIMIZED_STATE:
-	case SPDK_NVME_ANA_NON_OPTIMIZED_STATE:
+	case SPDK_NVME_ANA_OPTIMIZED_STATE:       /* [한국어] 최적 경로 — 접근 가능. */
+	case SPDK_NVME_ANA_NON_OPTIMIZED_STATE:   /* [한국어] 차선 경로 — 접근 가능. */
 		return true;
 	default:
-		break;
+		break;     /* [한국어] INACCESSIBLE/LOSS/CHANGE 등 → 접근 불가. */
 	}
 
 	return false;
 }
 
+/*
+ * [한국어]
+ * nvme_qpair_is_connected - 이 qpair가 지금 IO를 발행할 수 있는 정상 연결 상태인지 판별.
+ *
+ * @nvme_qpair: 검사할 qpair 래퍼.
+ * @return: 실제 qpair 존재 + 실패 사유 없음 + reset 진행 중 아님이면 true.
+ *
+ * IO를 보내기 전 경로의 전송 채널(qpair)이 건강한지 확인한다. 세 가지를 본다:
+ *   1) qpair->qpair(lib/nvme의 실제 qpair) 핸들 존재 — disconnect되면 NULL.
+ *   2) 전송 실패 사유 없음 — fabrics link down 등이면 FAILURE_*가 셋됨.
+ *   3) 이 컨트롤러 채널이 reset 순회(reset_iter) 중이 아님 — reset 중엔 발행 금지.
+ * 실행 컨텍스트: 경로 선택 hot-path → inline.
+ *
+ * 호출 체인:
+ *   nvme_io_path_is_available / _bdev_nvme_find_io_path_min_qd → [nvme_qpair_is_connected]
+ *     → spdk_nvme_qpair_get_failure_reason
+ */
 static inline bool
 nvme_qpair_is_connected(struct nvme_qpair *nvme_qpair)
 {
+	/* [한국어] 실제 lib/nvme qpair 핸들이 없으면(미연결/disconnect) 발행 불가. */
 	if (spdk_unlikely(nvme_qpair->qpair == NULL)) {
 		return false;
 	}
 
+	/* [한국어] 전송 계층이 실패 사유를 보고했으면(예: fabrics link loss) 발행 불가. */
 	if (spdk_unlikely(spdk_nvme_qpair_get_failure_reason(nvme_qpair->qpair) !=
 			  SPDK_NVME_QPAIR_FAILURE_NONE)) {
 		return false;
 	}
 
+	/* [한국어] 컨트롤러 채널이 reset 채널 순회 중이면 일시적으로 발행을 막는다. */
 	if (spdk_unlikely(nvme_qpair->ctrlr_ch->reset_iter != NULL)) {
 		return false;
 	}
 
-	return true;
+	return true;     /* [한국어] 세 조건 모두 통과 → 연결 정상. */
 }
 
+/*
+ * [한국어]
+ * nvme_io_path_is_available - 경로(qpair+ns)가 지금 IO를 받을 수 있는지 종합 판정.
+ *
+ * @io_path: 검사할 경로.
+ * @return: qpair 연결 정상 AND namespace 접근 가능이면 true.
+ *
+ * 경로 가용성 = 전송 채널(qpair) 건강 + 목적지 namespace(ANA) 접근 가능. 둘 다
+ * 만족해야 그 경로로 IO를 보낼 수 있다. 경로 선택 루프에서 후보를 거르는 1차 필터.
+ * 실행 컨텍스트: 경로 선택 hot-path → inline.
+ *
+ * 호출 체인:
+ *   _bdev_nvme_find_io_path → [nvme_io_path_is_available]
+ *     → nvme_qpair_is_connected / nvme_ns_is_accessible
+ */
 static inline bool
 nvme_io_path_is_available(struct nvme_io_path *io_path)
 {
+	/* [한국어] 전송 qpair가 연결 정상이 아니면 경로 사용 불가. */
 	if (spdk_unlikely(!nvme_qpair_is_connected(io_path->qpair))) {
 		return false;
 	}
 
+	/* [한국어] 목적지 namespace가 ANA상 접근 불가면 경로 사용 불가. */
 	if (spdk_unlikely(!nvme_ns_is_accessible(io_path->nvme_ns))) {
 		return false;
 	}
 
-	return true;
+	return true;     /* [한국어] 둘 다 OK → 경로 가용. */
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_is_failed - 컨트롤러가 "복구 불가/실패"로 간주되어야 하는지 판별.
+ *
+ * @nvme_ctrlr: 검사할 컨트롤러.
+ * @return: 실패(더 이상 정상화를 기대할 수 없음)면 true.
+ *
+ * 경로가 회복 가능성이 있는지(any_io_path_may_become_available) 판단할 때 쓰인다.
+ * 판정 우선순위:
+ *   - destruct(파괴 중) → 실패.
+ *   - fast_io_fail_timedout(빠른 실패 타임아웃 경과) → 실패.
+ *   - resetting(reset 중): reconnect_delay_sec가 설정돼 있으면 재연결을 기대 → 미실패,
+ *     아니면 reset 실패 시 회복 수단이 없으므로 실패로 본다.
+ *   - reconnect_is_delayed(재연결 지연 대기): 곧 재시도하므로 미실패.
+ *   - disabled(사용자가 비활성화) → 실패로 취급(IO 받지 않음).
+ *   - 그 외엔 lib/nvme의 ctrlr 실패 플래그를 그대로 따른다.
+ * 실행 컨텍스트: 경로 회복 가능성 판정 경로(채널 스레드) → inline.
+ *
+ * 호출 체인:
+ *   any_io_path_may_become_available → [nvme_ctrlr_is_failed]
+ *     → spdk_nvme_ctrlr_is_failed
+ */
 static inline bool
 nvme_ctrlr_is_failed(struct nvme_ctrlr *nvme_ctrlr)
 {
+	/* [한국어] 파괴 진행 중이면 회복 불가 → 실패. */
 	if (nvme_ctrlr->destruct) {
 		return true;
 	}
 
+	/* [한국어] fast I/O fail 타임아웃 경과: 빠른 실패 정책상 더는 기다리지 않음 → 실패. */
 	if (nvme_ctrlr->fast_io_fail_timedout) {
 		return true;
 	}
 
+	/* [한국어] reset 진행 중: 재연결 지연이 설정돼 있으면 회복 기대 → 미실패. */
 	if (nvme_ctrlr->resetting) {
 		if (nvme_ctrlr->opts.reconnect_delay_sec != 0) {
 			return false;
 		} else {
+			/* [한국어] 재연결 정책이 없으면 reset 실패 = 회복 불가 → 실패. */
 			return true;
 		}
 	}
 
+	/* [한국어] 재연결 지연 대기 중: 곧 재시도하므로 아직 실패 아님. */
 	if (nvme_ctrlr->reconnect_is_delayed) {
 		return false;
 	}
 
+	/* [한국어] 사용자가 명시적으로 disable한 컨트롤러는 IO를 받지 않음 → 실패 취급. */
 	if (nvme_ctrlr->disabled) {
 		return true;
 	}
 
+	/* [한국어] 위 어디에도 해당 없으면 lib/nvme의 컨트롤러 실패 상태를 그대로 따른다. */
 	if (spdk_nvme_ctrlr_is_failed(nvme_ctrlr->ctrlr)) {
 		return true;
 	} else {
@@ -1422,139 +2000,254 @@ nvme_ctrlr_is_failed(struct nvme_ctrlr *nvme_ctrlr)
 	}
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_is_available - 컨트롤러가 지금 당장 정상 사용 가능한 상태인지 판별.
+ *
+ * @nvme_ctrlr: 검사할 컨트롤러.
+ * @return: 파괴/실패/reset/재연결지연/disabled 어디에도 해당 없으면 true.
+ *
+ * nvme_ctrlr_is_failed가 "회복 가능성"까지 포함한 판정이라면, 이 함수는 "지금
+ * 이 순간 정상 동작 중인가"의 더 엄격한 판정이다. reset 중이거나 재연결 대기 중이면
+ * 아직 사용 불가로 본다(failed 판정에선 미실패로 분류되더라도). attach 완료/AER
+ * 처리 등에서 컨트롤러를 건드려도 되는지 확인할 때 쓰인다.
+ * 실행 컨텍스트: 다양한 컨트롤러 op 경로(주로 app/컨트롤러 스레드).
+ *
+ * 호출 체인:
+ *   각종 컨트롤러 op/AER 핸들러 → [nvme_ctrlr_is_available] → spdk_nvme_ctrlr_is_failed
+ */
 static bool
 nvme_ctrlr_is_available(struct nvme_ctrlr *nvme_ctrlr)
 {
+	/* [한국어] 파괴 진행 중이면 사용 불가. */
 	if (nvme_ctrlr->destruct) {
 		return false;
 	}
 
+	/* [한국어] lib/nvme이 실패로 마킹했으면 사용 불가. */
 	if (spdk_nvme_ctrlr_is_failed(nvme_ctrlr->ctrlr)) {
 		return false;
 	}
 
+	/* [한국어] reset 진행 중이거나 재연결 지연 대기 중이면 아직 사용 불가. */
 	if (nvme_ctrlr->resetting || nvme_ctrlr->reconnect_is_delayed) {
 		return false;
 	}
 
+	/* [한국어] 사용자가 비활성화한 컨트롤러는 사용 불가. */
 	if (nvme_ctrlr->disabled) {
 		return false;
 	}
 
-	return true;
+	return true;     /* [한국어] 모든 배제 조건 통과 → 현재 정상 사용 가능. */
 }
 
 /* Simulate circular linked list. */
+/*
+ * [한국어]
+ * nvme_io_path_get_next - 경로 리스트(STAILQ)를 원형으로 순회하기 위해 다음 경로를 반환.
+ *
+ * @nbdev_ch: 경로 리스트를 가진 채널.
+ * @prev_path: 직전 경로(NULL이면 처음부터).
+ * @return: prev 다음 경로, 끝이면 리스트 첫 경로(원형 wrap).
+ *
+ * STAILQ는 단방향 큐라 원형 구조가 아니지만, 라운드로빈/active-passive 경로 탐색에서는
+ * 마지막 경로 다음에 다시 첫 경로로 돌아가는 원형 순회가 필요하다. 이 헬퍼가 "다음이
+ * 없으면 처음으로" 규칙으로 원형 링크드 리스트를 흉내 낸다.
+ * 실행 컨텍스트: 경로 선택 hot-path → inline.
+ *
+ * 호출 체인:
+ *   _bdev_nvme_find_io_path → [nvme_io_path_get_next]
+ */
 static inline struct nvme_io_path *
 nvme_io_path_get_next(struct nvme_bdev_channel *nbdev_ch, struct nvme_io_path *prev_path)
 {
-	struct nvme_io_path *next_path;
+	struct nvme_io_path *next_path;    /* [한국어] 반환할 다음 경로 후보. */
 
+	/* [한국어] 직전 경로가 있으면 그 다음 노드를 시도. */
 	if (prev_path != NULL) {
 		next_path = STAILQ_NEXT(prev_path, stailq);
 		if (next_path != NULL) {
-			return next_path;
+			return next_path;     /* [한국어] 다음 노드 존재 → 그대로 반환. */
 		}
 	}
 
+	/* [한국어] prev가 NULL이거나 끝에 도달 → 리스트 첫 경로로 wrap(원형 흉내). */
 	return STAILQ_FIRST(&nbdev_ch->io_path_list);
 }
 
+/*
+ * [한국어]
+ * _bdev_nvme_find_io_path - ANA 상태 기반으로 다음 사용할 경로를 선택한다(RR/active-passive 공용).
+ *
+ * @nbdev_ch: 경로 후보를 가진 채널.
+ * @return: OPTIMIZED 경로(있으면 우선), 없으면 NON_OPTIMIZED 경로, 없으면 NULL.
+ *
+ * current_io_path 다음부터 원형으로 한 바퀴 돌며 가용 경로를 찾는다. ANA OPTIMIZED를
+ * 만나면 즉시 선택·캐시하고, 그게 없으면 처음 만난 NON_OPTIMIZED를 후보로 들고 있다가
+ * 한 바퀴 끝나면 그것을 캐시·반환한다. current부터 시작하는 이유는 라운드로빈 분산
+ * (active-active)과 직전 경로 우선(active-passive)을 동시에 자연스럽게 구현하기 위함.
+ * non_optimized도 캐시하는 이유: 더 나은 경로가 생기면 ANA 이벤트가 와서 캐시를 비운다.
+ * 실행 컨텍스트: IO 발행 경로(채널 스레드), lockless.
+ *
+ * 호출 체인:
+ *   bdev_nvme_find_io_path → [_bdev_nvme_find_io_path]
+ *     → nvme_io_path_get_next / nvme_io_path_is_available
+ */
 static struct nvme_io_path *
 _bdev_nvme_find_io_path(struct nvme_bdev_channel *nbdev_ch)
 {
-	struct nvme_io_path *io_path, *start, *non_optimized = NULL;
+	struct nvme_io_path *io_path, *start, *non_optimized = NULL;    /* [한국어] 순회 커서/시작점/차선 후보. */
 
+	/* [한국어] 직전 선택 경로 다음부터 시작(라운드로빈/직전 경로 우선 동작의 출발점). */
 	start = nvme_io_path_get_next(nbdev_ch, nbdev_ch->current_io_path);
 
 	io_path = start;
 	do {
+		/* [한국어] 가용한 경로만 후보로 고려(qpair 연결 + ns 접근 가능). */
 		if (spdk_likely(nvme_io_path_is_available(io_path))) {
 			switch (io_path->nvme_ns->ana_state) {
 			case SPDK_NVME_ANA_OPTIMIZED_STATE:
+				/* [한국어] 최적 경로 발견 → 즉시 캐시하고 반환(최우선). */
 				nbdev_ch->current_io_path = io_path;
 				return io_path;
 			case SPDK_NVME_ANA_NON_OPTIMIZED_STATE:
+				/* [한국어] 차선 경로는 처음 만난 것만 후보로 보관(최적이 없을 때 대비). */
 				if (non_optimized == NULL) {
 					non_optimized = io_path;
 				}
 				break;
 			default:
+				/* [한국어] is_accessible이 걸렀어야 할 상태 — 도달 불가 가정. */
 				assert(false);
 				break;
 			}
 		}
+		/* [한국어] 다음 경로로 진행(원형). */
 		io_path = nvme_io_path_get_next(nbdev_ch, io_path);
-	} while (io_path != start);
+	} while (io_path != start);     /* [한국어] 시작점으로 돌아오면 한 바퀴 완료. */
 
 	/* We come here only if there is no optimized path. Cache even non_optimized
 	 * path. If any path becomes optimized, ANA event will be received and
 	 * cache will be cleared.
 	 */
+	/* [한국어] (위 영어 주석) 최적 경로가 없을 때만 도달. 차선 경로도 캐시한다 —
+	 * 어떤 경로가 최적이 되면 ANA 이벤트가 와서 캐시를 비워 재선택을 유도. */
 	nbdev_ch->current_io_path = non_optimized;
 
-	return non_optimized;
+	return non_optimized;     /* [한국어] 차선 경로(또는 NULL) 반환. */
 }
 
+/*
+ * [한국어]
+ * _bdev_nvme_find_io_path_min_qd - 큐 깊이가 가장 얕은 경로를 선택한다(queue-depth selector).
+ *
+ * @nbdev_ch: 경로 후보를 가진 채널.
+ * @return: 최소 outstanding 요청을 가진 OPTIMIZED 경로 우선, 없으면 NON_OPTIMIZED, 없으면 NULL.
+ *
+ * BDEV_NVME_MP_SELECTOR_QUEUE_DEPTH 정책 구현. 모든 가용 경로를 훑어 각 qpair의
+ * outstanding 요청 수를 비교하고, ANA 등급별(최적/차선)로 가장 한가한 경로를 고른다.
+ * 부하가 적은 경로로 IO를 보내 latency를 균등화한다. RR과 달리 매번 전체를 비교하므로
+ * 결과를 캐시하지 않는다(큐 깊이는 매 순간 바뀌므로 캐시가 무의미).
+ * 실행 컨텍스트: IO 발행 경로(채널 스레드), lockless.
+ *
+ * 호출 체인:
+ *   bdev_nvme_find_io_path → [_bdev_nvme_find_io_path_min_qd]
+ *     → spdk_nvme_qpair_get_num_outstanding_reqs
+ */
 static struct nvme_io_path *
 _bdev_nvme_find_io_path_min_qd(struct nvme_bdev_channel *nbdev_ch)
 {
-	struct nvme_io_path *io_path;
-	struct nvme_io_path *optimized = NULL, *non_optimized = NULL;
-	uint32_t opt_min_qd = UINT32_MAX, non_opt_min_qd = UINT32_MAX;
-	uint32_t num_outstanding_reqs;
+	struct nvme_io_path *io_path;                                    /* [한국어] 순회 커서. */
+	struct nvme_io_path *optimized = NULL, *non_optimized = NULL;    /* [한국어] 등급별 최소 큐 경로. */
+	uint32_t opt_min_qd = UINT32_MAX, non_opt_min_qd = UINT32_MAX;   /* [한국어] 등급별 현재 최소 큐 깊이. */
+	uint32_t num_outstanding_reqs;                                  /* [한국어] 현재 경로 qpair의 미완료 요청 수. */
 
+	/* [한국어] 모든 경로를 선형 순회하며 가장 한가한 경로를 찾는다. */
 	STAILQ_FOREACH(io_path, &nbdev_ch->io_path_list, stailq) {
 		if (spdk_unlikely(!nvme_qpair_is_connected(io_path->qpair))) {
 			/* The device is currently resetting. */
+			/* [한국어] qpair 미연결(reset 중 등) → 후보에서 제외. */
 			continue;
 		}
 
+		/* [한국어] namespace가 비활성이면 후보 제외(ANA 등급은 아래에서 별도 판정). */
 		if (spdk_unlikely(!nvme_ns_is_active(io_path->nvme_ns))) {
 			continue;
 		}
 
+		/* [한국어] 이 경로 qpair에 현재 발행되어 완료 대기 중인 요청 수 조회(큐 깊이). */
 		num_outstanding_reqs = spdk_nvme_qpair_get_num_outstanding_reqs(io_path->qpair->qpair);
 		switch (io_path->nvme_ns->ana_state) {
 		case SPDK_NVME_ANA_OPTIMIZED_STATE:
+			/* [한국어] 최적 등급 내에서 더 한가한 경로면 갱신. */
 			if (num_outstanding_reqs < opt_min_qd) {
 				opt_min_qd = num_outstanding_reqs;
 				optimized = io_path;
 			}
 			break;
 		case SPDK_NVME_ANA_NON_OPTIMIZED_STATE:
+			/* [한국어] 차선 등급 내에서 더 한가한 경로면 갱신(최적이 없을 때 대비). */
 			if (num_outstanding_reqs < non_opt_min_qd) {
 				non_opt_min_qd = num_outstanding_reqs;
 				non_optimized = io_path;
 			}
 			break;
 		default:
-			break;
+			break;     /* [한국어] 접근 불가 ANA 상태는 무시. */
 		}
 	}
 
 	/* don't cache io path for BDEV_NVME_MP_SELECTOR_QUEUE_DEPTH selector */
+	/* [한국어] (위 영어 주석) 큐 깊이는 매 순간 변하므로 결과를 current_io_path에 캐시하지 않는다. */
 	if (optimized != NULL) {
-		return optimized;
+		return optimized;     /* [한국어] 최적 등급의 최소 큐 경로 우선 반환. */
 	}
 
-	return non_optimized;
+	return non_optimized;     /* [한국어] 최적이 없으면 차선의 최소 큐 경로(또는 NULL). */
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_find_io_path - 멀티패스 정책에 따라 이번 IO에 쓸 경로를 결정하는 진입점.
+ *
+ * @nbdev_ch: 경로 선택 대상 채널.
+ * @return: 선택된 io_path, 가용 경로가 없으면 NULL.
+ *
+ * 경로 선택의 fast-path 최적화 + 정책 디스패치를 함께 한다:
+ *   1) 캐시된 current_io_path가 있으면 —
+ *      - active-passive: 그대로 재사용(같은 경로 고수).
+ *      - round-robin: rr_counter를 올려 rr_min_io 도달 전엔 캐시 경로 재사용,
+ *        도달하면 카운터를 리셋하고 아래에서 다음 경로를 새로 고른다.
+ *   2) 캐시가 없거나 RR 전환 시점이면 정책별 탐색 함수로 위임:
+ *      - active-passive 또는 RR → _bdev_nvme_find_io_path(ANA 우선 순회).
+ *      - queue-depth → _bdev_nvme_find_io_path_min_qd(최소 큐).
+ * RR에서 rr_min_io만큼 같은 경로를 연속 사용하는 이유: 경로 전환 비용/캐시 효율 때문.
+ * 실행 컨텍스트: IO 발행 hot-path(채널 스레드) → inline, lockless.
+ *
+ * 호출 체인:
+ *   bdev_nvme_submit_request → [bdev_nvme_find_io_path]
+ *     → _bdev_nvme_find_io_path / _bdev_nvme_find_io_path_min_qd
+ */
 static inline struct nvme_io_path *
 bdev_nvme_find_io_path(struct nvme_bdev_channel *nbdev_ch)
 {
+	/* [한국어] 캐시된 경로가 있으면 정책에 따라 재사용 여부 판정(전체 탐색 회피). */
 	if (spdk_likely(nbdev_ch->current_io_path != NULL)) {
 		if (nbdev_ch->mp_policy == BDEV_NVME_MP_POLICY_ACTIVE_PASSIVE) {
+			/* [한국어] active-passive: 현재 경로를 계속 고수. */
 			return nbdev_ch->current_io_path;
 		} else if (nbdev_ch->mp_selector == BDEV_NVME_MP_SELECTOR_ROUND_ROBIN) {
+			/* [한국어] RR: rr_min_io 횟수까지는 같은 경로 유지, 그 전까진 캐시 재사용. */
 			if (++nbdev_ch->rr_counter < nbdev_ch->rr_min_io) {
 				return nbdev_ch->current_io_path;
 			}
+			/* [한국어] 임계 도달 → 카운터 리셋하고 아래에서 다음 경로 재선택. */
 			nbdev_ch->rr_counter = 0;
 		}
 	}
 
+	/* [한국어] 정책별 탐색 함수로 위임: ANA 순회(active-passive/RR) vs 최소 큐(queue-depth). */
 	if (nbdev_ch->mp_policy == BDEV_NVME_MP_POLICY_ACTIVE_PASSIVE ||
 	    nbdev_ch->mp_selector == BDEV_NVME_MP_SELECTOR_ROUND_ROBIN) {
 		return _bdev_nvme_find_io_path(nbdev_ch);
@@ -1574,151 +2267,294 @@ bdev_nvme_find_io_path(struct nvme_bdev_channel *nbdev_ch)
  * when starting to reset it but it is set to failed when the reset failed. Hence, if
  * a ctrlr is unfailed, it is likely that it works fine or is resetting.
  */
+/*
+ * [한국어]
+ * any_io_path_may_become_available - 지금은 못 쓰지만 곧 가용해질 경로가 있는지 판정.
+ *
+ * @nbdev_ch: 검사할 채널.
+ * @return: 회복 가능성 있는 경로가 하나라도 있으면 true, 전부 가망 없으면 false.
+ *
+ * find_io_path()가 NULL을 반환했을 때 IO를 즉시 실패시킬지, 아니면 재시도 큐에 넣고
+ * 기다릴지를 결정하는 핵심 판정이다. 위 영어 주석의 논리:
+ *   - qpair가 연결되어 있으면(하지만 ns가 INACCESSIBLE이라 선택 안 됨) → ANA가 바뀌어
+ *     접근 가능해질 수 있으므로 회복 가능.
+ *   - ctrlr가 failed가 아니면(=정상이거나 reset 중) → reset이 성공할 수 있으므로 회복 가능.
+ * 채널이 reset 중(nbdev_ch->resetting)이거나 모든 경로의 ANA 전이가 타임아웃됐으면
+ * 가망 없음으로 본다.
+ * 실행 컨텍스트: IO 발행 실패 후 재시도 결정 경로(채널 스레드).
+ *
+ * 호출 체인:
+ *   bdev_nvme_submit_request / _bdev_nvme_submit_request → [any_io_path_may_become_available]
+ *     → nvme_qpair_is_connected / nvme_ctrlr_is_failed
+ */
 static bool
 any_io_path_may_become_available(struct nvme_bdev_channel *nbdev_ch)
 {
-	struct nvme_io_path *io_path;
+	struct nvme_io_path *io_path;    /* [한국어] 경로 순회 커서. */
 
+	/* [한국어] 채널 자체가 reset 중이면 경로들이 정리되는 중 → 회복 기대 안 함. */
 	if (nbdev_ch->resetting) {
 		return false;
 	}
 
+	/* [한국어] 각 경로에 대해 회복 가능성을 검사. */
 	STAILQ_FOREACH(io_path, &nbdev_ch->io_path_list, stailq) {
+		/* [한국어] ANA 전이가 이미 타임아웃된 경로는 회복 가망 없음 → 건너뜀. */
 		if (io_path->nvme_ns->ana_transition_timedout) {
 			continue;
 		}
 
+		/* [한국어] qpair 연결됨(ANA 변화 기대) 또는 ctrlr 미실패(reset 성공 기대) → 회복 가능. */
 		if (nvme_qpair_is_connected(io_path->qpair) ||
 		    !nvme_ctrlr_is_failed(io_path->qpair->ctrlr)) {
 			return true;
 		}
 	}
 
-	return false;
+	return false;     /* [한국어] 모든 경로가 가망 없음 → IO를 실패시켜야 함. */
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_retry_io - 재시도 큐에서 꺼낸 IO를 적절한 경로로 다시 발행한다.
+ *
+ * @nbdev_ch: IO가 속한 채널.
+ * @bdev_io: 재발행할 사용자 IO.
+ *
+ * 이전에 시도했던 경로(nbdev_io->io_path)가 아직 가용하면 그 경로로 빠르게 재제출
+ * (_bdev_nvme_submit_request, 경로 재선택 생략). 그 경로가 사라졌거나 불가하면
+ * 전체 제출 경로(bdev_nvme_submit_request)로 들어가 경로를 처음부터 다시 고른다.
+ * 실행 컨텍스트: 재시도 poller(채널 스레드)에서 호출.
+ *
+ * 호출 체인:
+ *   bdev_nvme_retry_ios(poller) → [bdev_nvme_retry_io]
+ *     → _bdev_nvme_submit_request / bdev_nvme_submit_request
+ */
 static void
 bdev_nvme_retry_io(struct nvme_bdev_channel *nbdev_ch, struct spdk_bdev_io *bdev_io)
 {
-	struct nvme_bdev_io *nbdev_io = (struct nvme_bdev_io *)bdev_io->driver_ctx;
-	struct spdk_io_channel *ch;
+	struct nvme_bdev_io *nbdev_io = (struct nvme_bdev_io *)bdev_io->driver_ctx;    /* [한국어] bdev_io에 묶인 모듈 컨텍스트. */
+	struct spdk_io_channel *ch;    /* [한국어] 전체 제출 경로로 갈 때 필요한 채널 핸들. */
 
+	/* [한국어] 직전 경로가 살아 있으면 경로 재선택 없이 바로 그 경로로 재제출(빠른 경로). */
 	if (nbdev_io->io_path != NULL && nvme_io_path_is_available(nbdev_io->io_path)) {
 		_bdev_nvme_submit_request(nbdev_ch, bdev_io);
 	} else {
+		/* [한국어] 직전 경로 불가 → 채널 핸들 복원 후 전체 제출 경로로 재선택. */
 		ch = spdk_io_channel_from_ctx(nbdev_ch);
 		bdev_nvme_submit_request(ch, bdev_io);
 	}
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_retry_ios - 만료된 재시도 IO들을 재발행하고 다음 재시도 타이머를 다시 건다.
+ *
+ * @arg: nvme_bdev_channel 포인터(poller 등록 시 넘긴 컨텍스트).
+ * @return: 항상 SPDK_POLLER_BUSY(매 호출마다 작업 수행으로 간주).
+ *
+ * 재시도 큐(retry_io_list)는 retry_ticks 오름차순으로 정렬되어 있다. 현재 tsc(now)를
+ * 지난 IO들을 앞에서부터 꺼내 재발행하고, 아직 시각이 안 된 IO를 만나면 중단한다.
+ * 그 후 기존 타이머 poller를 해제하고, 큐에 남은 가장 이른 IO가 있으면 그 시각까지의
+ * 지연(delay_us)으로 타이머 poller를 다시 등록한다(self-rearming oneshot 패턴).
+ * 실행 컨텍스트: 채널 스레드의 poller. 큐는 같은 스레드에서만 접근 → lockless.
+ *
+ * 호출 체인:
+ *   SPDK reactor poller 루프 → [bdev_nvme_retry_ios] → bdev_nvme_retry_io
+ */
 static int
 bdev_nvme_retry_ios(void *arg)
 {
-	struct nvme_bdev_channel *nbdev_ch = arg;
-	struct nvme_bdev_io *bio, *tmp_bio;
-	uint64_t now, delay_us;
+	struct nvme_bdev_channel *nbdev_ch = arg;    /* [한국어] 재시도 큐를 가진 채널. */
+	struct nvme_bdev_io *bio, *tmp_bio;          /* [한국어] 순회 커서 + 제거 안전용 다음 노드. */
+	uint64_t now, delay_us;                      /* [한국어] 현재 tsc, 다음 타이머 지연(us). */
 
-	now = spdk_get_ticks();
+	now = spdk_get_ticks();    /* [한국어] 현재 TSC 틱 — retry_ticks와 비교 기준. */
 
+	/* [한국어] 재시도 시각이 도래한 IO를 앞에서부터 꺼내 재발행. */
 	TAILQ_FOREACH_SAFE(bio, &nbdev_ch->retry_io_list, retry_link, tmp_bio) {
+		/* [한국어] 정렬되어 있으므로, 아직 시각 안 된 IO를 만나면 이후는 모두 미래 → 중단. */
 		if (bio->retry_ticks > now) {
 			break;
 		}
 
+		/* [한국어] 큐에서 제거 후 재발행. */
 		TAILQ_REMOVE(&nbdev_ch->retry_io_list, bio, retry_link);
 
 		bdev_nvme_retry_io(nbdev_ch, spdk_bdev_io_from_ctx(bio));
 	}
 
+	/* [한국어] 현재 타이머 poller 해제(oneshot이므로 매번 재등록). */
 	spdk_poller_unregister(&nbdev_ch->retry_io_poller);
 
+	/* [한국어] 큐에 남은 가장 이른 IO가 있으면 그 시각까지 지연 타이머를 다시 건다. */
 	bio = TAILQ_FIRST(&nbdev_ch->retry_io_list);
 	if (bio != NULL) {
+		/* [한국어] (retry_ticks - now) 틱을 마이크로초로 환산: ×1e6 / ticks_hz. */
 		delay_us = (bio->retry_ticks - now) * SPDK_SEC_TO_USEC / spdk_get_ticks_hz();
 
+		/* [한국어] delay_us 후 한 번 깨어나는 타이머 poller 재등록. */
 		nbdev_ch->retry_io_poller = SPDK_POLLER_REGISTER(bdev_nvme_retry_ios, nbdev_ch,
 					    delay_us);
 	}
 
-	return SPDK_POLLER_BUSY;
+	return SPDK_POLLER_BUSY;    /* [한국어] poller에 "일을 했다"고 보고. */
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_queue_retry_io - 일시 실패한 IO를 delay_ms 후 재시도하도록 정렬 큐에 삽입한다.
+ *
+ * @nbdev_ch: 재시도 큐를 가진 채널.
+ * @bio: 재시도 대기시킬 IO.
+ * @delay_ms: 지금부터 몇 ms 뒤에 재시도할지.
+ *
+ * retry_ticks를 (현재 + delay)로 계산하고, 큐를 retry_ticks 오름차순으로 유지하기 위해
+ * 뒤에서부터 역방향 순회하며 자기보다 이른(또는 같은) IO 뒤에 삽입한다. 더 이른 IO가
+ * 전혀 없으면 새 head가 되며, 이 경우 타이머 poller를 delay_ms로 다시 건다(가장 이른
+ * IO가 바뀌었으므로). head가 아니면 기존 타이머가 더 이르므로 재설정하지 않는다.
+ * 실행 컨텍스트: IO 발행 중 일시 실패를 감지한 채널 스레드. lockless.
+ *
+ * 호출 체인:
+ *   bdev_nvme_io_complete_nvme_status / submit 실패 경로 → [bdev_nvme_queue_retry_io]
+ */
 static void
 bdev_nvme_queue_retry_io(struct nvme_bdev_channel *nbdev_ch,
 			 struct nvme_bdev_io *bio, uint64_t delay_ms)
 {
-	struct nvme_bdev_io *tmp_bio;
+	struct nvme_bdev_io *tmp_bio;    /* [한국어] 삽입 위치를 찾기 위한 역방향 순회 커서. */
 
+	/* [한국어] 재시도 절대 시각 = 현재 TSC + delay_ms를 틱으로 환산. */
 	bio->retry_ticks = spdk_get_ticks() + delay_ms * spdk_get_ticks_hz() / 1000ULL;
 
+	/* [한국어] 큐를 뒤에서부터 훑어 자기보다 이르거나 같은 IO 바로 뒤에 끼워 정렬 유지. */
 	TAILQ_FOREACH_REVERSE(tmp_bio, &nbdev_ch->retry_io_list, retry_io_head, retry_link) {
 		if (tmp_bio->retry_ticks <= bio->retry_ticks) {
 			TAILQ_INSERT_AFTER(&nbdev_ch->retry_io_list, tmp_bio, bio,
 					   retry_link);
-			return;
+			return;     /* [한국어] head가 아니므로 타이머 재설정 불필요. */
 		}
 	}
 
 	/* No earlier I/Os were found. This I/O must be the new head. */
+	/* [한국어] (위 영어 주석) 더 이른 IO가 없으면 이 IO가 새 head → 타이머도 갱신해야 함. */
 	TAILQ_INSERT_HEAD(&nbdev_ch->retry_io_list, bio, retry_link);
 
+	/* [한국어] 기존 타이머 해제 후, 더 이른 새 head 시각(delay_ms)으로 타이머 재등록. */
 	spdk_poller_unregister(&nbdev_ch->retry_io_poller);
 
 	nbdev_ch->retry_io_poller = SPDK_POLLER_REGISTER(bdev_nvme_retry_ios, nbdev_ch,
 				    delay_ms * 1000ULL);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_abort_retry_ios - 재시도 큐의 모든 IO를 ABORTED로 완료시킨다(채널 파괴 등).
+ *
+ * @nbdev_ch: 재시도 큐를 비울 채널.
+ *
+ * 채널이 파괴되거나 더 이상 재시도가 무의미할 때, 대기 중인 모든 IO를 큐에서 빼고
+ * SPDK_BDEV_IO_STATUS_ABORTED로 사용자에게 완료 보고한다(영구 누락 방지). 마지막에
+ * 타이머 poller도 해제한다.
+ * 실행 컨텍스트: 채널 스레드(파괴 콜백 등).
+ *
+ * 호출 체인:
+ *   bdev_nvme_destroy_bdev_channel_cb 등 → [bdev_nvme_abort_retry_ios]
+ *     → __bdev_nvme_io_complete
+ */
 static void
 bdev_nvme_abort_retry_ios(struct nvme_bdev_channel *nbdev_ch)
 {
-	struct nvme_bdev_io *bio, *tmp_bio;
+	struct nvme_bdev_io *bio, *tmp_bio;    /* [한국어] 순회 커서 + 제거 안전용 다음 노드. */
 
+	/* [한국어] 큐의 모든 IO를 제거하며 ABORTED로 완료(cpl=NULL → bdev 레벨 상태). */
 	TAILQ_FOREACH_SAFE(bio, &nbdev_ch->retry_io_list, retry_link, tmp_bio) {
 		TAILQ_REMOVE(&nbdev_ch->retry_io_list, bio, retry_link);
 		__bdev_nvme_io_complete(spdk_bdev_io_from_ctx(bio), SPDK_BDEV_IO_STATUS_ABORTED, NULL);
 	}
 
-	spdk_poller_unregister(&nbdev_ch->retry_io_poller);
+	spdk_poller_unregister(&nbdev_ch->retry_io_poller);    /* [한국어] 더 처리할 게 없으니 타이머 해제. */
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_abort_retry_io - 재시도 큐에서 특정 한 IO만 찾아 ABORTED로 완료시킨다.
+ *
+ * @nbdev_ch: 재시도 큐를 가진 채널.
+ * @bio_to_abort: 취소 대상 IO.
+ * @return: 큐에서 찾아 취소했으면 0, 큐에 없으면 -ENOENT.
+ *
+ * 사용자가 ABORT 명령으로 특정 IO를 취소할 때, 그 IO가 아직 재시도 대기 중이면
+ * 여기서 처리한다. 큐에 없으면(-ENOENT) 이미 디바이스에 발행된 상태이므로 호출자는
+ * NVMe Abort 명령 경로로 넘어간다.
+ * 실행 컨텍스트: 채널 스레드.
+ *
+ * 호출 체인:
+ *   bdev_nvme_abort(ABORT IO 처리) → [bdev_nvme_abort_retry_io]
+ *     → __bdev_nvme_io_complete
+ */
 static int
 bdev_nvme_abort_retry_io(struct nvme_bdev_channel *nbdev_ch,
 			 struct nvme_bdev_io *bio_to_abort)
 {
-	struct nvme_bdev_io *bio;
+	struct nvme_bdev_io *bio;    /* [한국어] 큐 순회 커서. */
 
+	/* [한국어] 큐를 훑어 대상 IO를 찾는다. */
 	TAILQ_FOREACH(bio, &nbdev_ch->retry_io_list, retry_link) {
 		if (bio == bio_to_abort) {
+			/* [한국어] 발견: 큐에서 제거하고 ABORTED로 완료 후 성공 반환. */
 			TAILQ_REMOVE(&nbdev_ch->retry_io_list, bio, retry_link);
 			__bdev_nvme_io_complete(spdk_bdev_io_from_ctx(bio), SPDK_BDEV_IO_STATUS_ABORTED, NULL);
 			return 0;
 		}
 	}
 
-	return -ENOENT;
+	return -ENOENT;    /* [한국어] 큐에 없음 → 이미 디바이스 발행됨(상위가 NVMe Abort 시도). */
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_update_nvme_error_stat - 에러 CPL을 받았을 때 NVMe 상태 코드별 통계를 누적한다.
+ *
+ * @bdev_io: 에러로 완료된 IO(소속 nbdev로 통계 위치 추적).
+ * @cpl: 디바이스가 반환한 에러 CPL(sct/sc 포함).
+ *
+ * 진단/모니터링용으로, 에러의 상태 코드 타입(SCT)별 카운트와 (SCT, SC) 2차원
+ * 카운트를 누적한다. SCT는 GENERIC/COMMAND_SPECIFIC/MEDIA_ERROR/PATH 4종에 한해
+ * 2차원 카운트를 기록(그 외 벤더 특정 등은 타입 카운트만). err_stat 배열은 여러
+ * 채널 스레드가 동시에 갱신할 수 있어 nbdev->mutex로 보호한다.
+ * 실행 컨텍스트: IO 완료 콜백(채널 스레드). 통계 배열 공유 → mutex 필요.
+ *
+ * 호출 체인:
+ *   bdev_nvme_io_complete_nvme_status(에러 경로) → [bdev_nvme_update_nvme_error_stat]
+ */
 static void
 bdev_nvme_update_nvme_error_stat(struct spdk_bdev_io *bdev_io, const struct spdk_nvme_cpl *cpl)
 {
-	struct nvme_bdev *nbdev;
-	uint16_t sct, sc;
+	struct nvme_bdev *nbdev;    /* [한국어] 통계를 보관하는 논리 bdev. */
+	uint16_t sct, sc;           /* [한국어] 상태 코드 타입과 상태 코드. */
 
+	/* [한국어] 이 함수는 에러 CPL에만 호출되어야 함 — 불변식 검증. */
 	assert(spdk_nvme_cpl_is_error(cpl));
 
+	/* [한국어] bdev 컨텍스트에서 nvme_bdev 복원(통계 배열 소유자). */
 	nbdev = bdev_io->bdev->ctxt;
 
+	/* [한국어] 에러 통계 수집이 비활성(배열 미할당)이면 아무것도 안 함. */
 	if (nbdev->err_stat == NULL) {
 		return;
 	}
 
-	sct = cpl->status.sct;
-	sc = cpl->status.sc;
+	sct = cpl->status.sct;    /* [한국어] Status Code Type (NVMe spec §4.6.1.2.1). */
+	sc = cpl->status.sc;      /* [한국어] Status Code. */
 
+	/* [한국어] 통계 배열은 다중 채널에서 동시 갱신 가능 → 락 보호. */
 	pthread_mutex_lock(&nbdev->mutex);
 
+	/* [한국어] SCT별 발생 횟수 누적(타입 단위 집계). */
 	nbdev->err_stat->status_type[sct]++;
 	switch (sct) {
+	/* [한국어] 표준 SCT 4종에 한해 (SCT, SC) 2차원 세부 카운트 기록. */
 	case SPDK_NVME_SCT_GENERIC:
 	case SPDK_NVME_SCT_COMMAND_SPECIFIC:
 	case SPDK_NVME_SCT_MEDIA_ERROR:
@@ -1726,33 +2562,52 @@ bdev_nvme_update_nvme_error_stat(struct spdk_bdev_io *bdev_io, const struct spdk
 		nbdev->err_stat->status[sct][sc]++;
 		break;
 	default:
-		break;
+		break;     /* [한국어] 벤더 특정 등은 타입 카운트만 유지. */
 	}
 
-	pthread_mutex_unlock(&nbdev->mutex);
+	pthread_mutex_unlock(&nbdev->mutex);    /* [한국어] 통계 갱신 완료 → 락 해제. */
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_update_io_path_stat - 완료된 IO의 바이트 수/연산 수/지연을 경로별 통계에 누적한다.
+ *
+ * @bio: 막 완료된 IO의 모듈 컨텍스트.
+ *
+ * g_opts.io_path_stat가 켜져 경로별 stat 버퍼가 있을 때만 동작한다. submit_tsc부터
+ * 지금까지의 틱 차(tsc_diff)를 지연으로 계산하고, IO 타입(READ/WRITE/UNMAP/ZCOPY/COPY)
+ * 별로 바이트/op 카운트와 누적/최대/최소 지연을 갱신한다. ZCOPY는 start 단계에서만,
+ * populate면 read로 아니면 write로 집계한다. stat은 경로 소유 스레드에서만 갱신되어
+ * lockless다(경로 삭제 후에도 in-flight IO가 갱신할 수 있어 지연 free 정책과 짝).
+ * 실행 컨텍스트: IO 완료 콜백(경로 소유 채널 스레드) → inline.
+ *
+ * 호출 체인:
+ *   bdev_nvme_io_complete_nvme_status(성공 경로) → [bdev_nvme_update_io_path_stat]
+ */
 static inline void
 bdev_nvme_update_io_path_stat(struct nvme_bdev_io *bio)
 {
-	struct spdk_bdev_io *bdev_io = spdk_bdev_io_from_ctx(bio);
-	uint64_t num_blocks = bdev_io->u.bdev.num_blocks;
-	uint32_t blocklen = bdev_io->bdev->blocklen;
-	struct spdk_bdev_io_stat *stat;
-	uint64_t tsc_diff;
+	struct spdk_bdev_io *bdev_io = spdk_bdev_io_from_ctx(bio);    /* [한국어] 완료된 사용자 IO. */
+	uint64_t num_blocks = bdev_io->u.bdev.num_blocks;            /* [한국어] 전송 블록 수. */
+	uint32_t blocklen = bdev_io->bdev->blocklen;                /* [한국어] 블록당 바이트(바이트 환산용). */
+	struct spdk_bdev_io_stat *stat;                             /* [한국어] 갱신 대상 경로 통계. */
+	uint64_t tsc_diff;                                          /* [한국어] 발행~완료 지연(틱). */
 
+	/* [한국어] 경로별 통계가 비활성이면 아무것도 안 함. */
 	if (bio->io_path->stat == NULL) {
 		return;
 	}
 
-	tsc_diff = spdk_get_ticks() - bio->submit_tsc;
+	tsc_diff = spdk_get_ticks() - bio->submit_tsc;    /* [한국어] 지연 = 현재 틱 - 발행 시점 틱. */
 	stat = bio->io_path->stat;
 
+	/* [한국어] IO 타입별로 바이트/연산수/지연(누적·최대·최소)을 누적. */
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
-		stat->bytes_read += num_blocks * blocklen;
-		stat->num_read_ops++;
-		stat->read_latency_ticks += tsc_diff;
+		stat->bytes_read += num_blocks * blocklen;     /* [한국어] 읽은 바이트 누적. */
+		stat->num_read_ops++;                          /* [한국어] 읽기 연산 수 +1. */
+		stat->read_latency_ticks += tsc_diff;          /* [한국어] 읽기 누적 지연. */
+		/* [한국어] 최대/최소 read 지연 갱신(꼬리 지연 추적). */
 		if (stat->max_read_latency_ticks < tsc_diff) {
 			stat->max_read_latency_ticks = tsc_diff;
 		}
@@ -1761,6 +2616,7 @@ bdev_nvme_update_io_path_stat(struct nvme_bdev_io *bio)
 		}
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE:
+		/* [한국어] 쓰기 바이트/연산수/지연(누적·최대·최소) 갱신. */
 		stat->bytes_written += num_blocks * blocklen;
 		stat->num_write_ops++;
 		stat->write_latency_ticks += tsc_diff;
@@ -1772,6 +2628,7 @@ bdev_nvme_update_io_path_stat(struct nvme_bdev_io *bio)
 		}
 		break;
 	case SPDK_BDEV_IO_TYPE_UNMAP:
+		/* [한국어] UNMAP(deallocate) 바이트/연산수/지연 갱신. */
 		stat->bytes_unmapped += num_blocks * blocklen;
 		stat->num_unmap_ops++;
 		stat->unmap_latency_ticks += tsc_diff;
@@ -1784,10 +2641,13 @@ bdev_nvme_update_io_path_stat(struct nvme_bdev_io *bio)
 		break;
 	case SPDK_BDEV_IO_TYPE_ZCOPY:
 		/* Track the data in the start phase only */
+		/* [한국어] zero-copy는 start 단계에서만 데이터량을 집계(end는 메타 처리). */
 		if (!bdev_io->u.bdev.zcopy.start) {
 			break;
 		}
+		/* [한국어] populate(디바이스→호스트 채움)면 read, 아니면 write로 집계. */
 		if (bdev_io->u.bdev.zcopy.populate) {
+			/* [한국어] populate = 디바이스에서 데이터를 읽어 채움 → read 통계. */
 			stat->bytes_read += num_blocks * blocklen;
 			stat->num_read_ops++;
 			stat->read_latency_ticks += tsc_diff;
@@ -1798,6 +2658,7 @@ bdev_nvme_update_io_path_stat(struct nvme_bdev_io *bio)
 				stat->min_read_latency_ticks = tsc_diff;
 			}
 		} else {
+			/* [한국어] populate 아님 = 호스트 데이터를 디바이스에 씀 → write 통계. */
 			stat->bytes_written += num_blocks * blocklen;
 			stat->num_write_ops++;
 			stat->write_latency_ticks += tsc_diff;
@@ -1810,6 +2671,7 @@ bdev_nvme_update_io_path_stat(struct nvme_bdev_io *bio)
 		}
 		break;
 	case SPDK_BDEV_IO_TYPE_COPY:
+		/* [한국어] COPY(SCC, simple copy) 바이트/연산수/지연 갱신. */
 		stat->bytes_copied += num_blocks * blocklen;
 		stat->num_copy_ops++;
 		stat->copy_latency_ticks += tsc_diff;
@@ -1821,40 +2683,70 @@ bdev_nvme_update_io_path_stat(struct nvme_bdev_io *bio)
 		}
 		break;
 	default:
-		break;
+		break;     /* [한국어] flush/reset 등 데이터 없는 IO는 통계 미집계. */
 	}
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_check_retry_io - 에러로 끝난 IO를 재시도해야 하는지, 한다면 지연을 얼마로 할지 결정.
+ *
+ * @bio: 에러로 완료된 IO.
+ * @cpl: 에러 CPL.
+ * @nbdev_ch: IO가 속한 채널.
+ * @_delay_ms: [out] 재시도까지 대기할 ms.
+ * @return: 재시도 가능하면 true(+ *_delay_ms 설정), 재시도 무의미하면 false(즉시 실패).
+ *
+ * 두 갈래로 나뉜다:
+ *   (A) 경로/컨트롤러 문제(path error, SQ deletion, 경로/컨트롤러 비가용): 현재 경로를
+ *       버리고(clear current + bio->io_path=NULL) 다른 경로로 옮기려 시도한다. ANA 에러면
+ *       ANA log를 다시 읽어 상태를 갱신 표시한다. 회복 가능 경로가 하나도 없으면 false.
+ *       있으면 지연 0(즉시 다른 경로로 재시도).
+ *   (B) 그 외 일시적 에러: 같은 경로로 재시도하되 retry_count를 올리고, 컨트롤러가 알려준
+ *       Command Retry Delay(CRD index → crdt[idx]×100ms)를 지연으로 사용한다(없으면 0).
+ * 실행 컨텍스트: IO 완료 콜백(채널 스레드).
+ *
+ * 호출 체인:
+ *   bdev_nvme_io_complete_nvme_status → [bdev_nvme_check_retry_io]
+ *     → nvme_ctrlr_read_ana_log_page / any_io_path_may_become_available
+ */
 static bool
 bdev_nvme_check_retry_io(struct nvme_bdev_io *bio,
 			 const struct spdk_nvme_cpl *cpl,
 			 struct nvme_bdev_channel *nbdev_ch,
 			 uint64_t *_delay_ms)
 {
-	struct nvme_io_path *io_path = bio->io_path;
-	struct nvme_ctrlr *nvme_ctrlr = io_path->qpair->ctrlr;
-	const struct spdk_nvme_ctrlr_data *cdata;
+	struct nvme_io_path *io_path = bio->io_path;                    /* [한국어] 실패한 IO가 쓰던 경로. */
+	struct nvme_ctrlr *nvme_ctrlr = io_path->qpair->ctrlr;          /* [한국어] 그 경로의 컨트롤러. */
+	const struct spdk_nvme_ctrlr_data *cdata;                       /* [한국어] CRD 조회용 컨트롤러 데이터. */
 
+	/* [한국어] (A) 경로/컨트롤러 차원의 실패: 다른 경로로 옮겨야 하는 상황. */
 	if (spdk_nvme_cpl_is_path_error(cpl) ||
 	    spdk_nvme_cpl_is_aborted_sq_deletion(cpl) ||
 	    !nvme_io_path_is_available(io_path) ||
 	    !nvme_ctrlr_is_available(nvme_ctrlr)) {
+		/* [한국어] 캐시된 현재 경로와 이 IO의 경로 기억을 모두 비워 재선택 유도. */
 		bdev_nvme_clear_current_io_path(nbdev_ch);
 		bio->io_path = NULL;
+		/* [한국어] ANA 에러면 최신 ANA log를 다시 읽고, 성공 시 갱신 중 표시. */
 		if (spdk_nvme_cpl_is_ana_error(cpl)) {
 			if (nvme_ctrlr_read_ana_log_page(nvme_ctrlr) == 0) {
 				io_path->nvme_ns->ana_state_updating = true;
 			}
 		}
+		/* [한국어] 회복 가능 경로가 전무하면 재시도 의미 없음 → false(즉시 실패). */
 		if (!any_io_path_may_become_available(nbdev_ch)) {
 			return false;
 		}
-		*_delay_ms = 0;
+		*_delay_ms = 0;    /* [한국어] 다른 경로가 있으니 지연 없이 즉시 재시도. */
 	} else {
+		/* [한국어] (B) 일시적 에러: 같은 경로 재시도, 횟수 증가. */
 		bio->retry_count++;
 
+		/* [한국어] 컨트롤러가 권고한 재시도 지연(CRD)을 조회. */
 		cdata = spdk_nvme_ctrlr_get_data(nvme_ctrlr->ctrlr);
 
+		/* [한국어] CRD index가 있으면 crdt[index]×100ms를 지연으로, 없으면 0. */
 		if (cpl->status.crd != 0) {
 			*_delay_ms = cdata->crdt[cpl->status.crd] * 100;
 		} else {
@@ -1862,19 +2754,41 @@ bdev_nvme_check_retry_io(struct nvme_bdev_io *bio,
 		}
 	}
 
-	return true;
+	return true;    /* [한국어] 재시도 진행. */
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_io_complete_nvme_status - NVMe IO 완료 CPL을 받아 성공/재시도/실패를 결정하고 처리.
+ *
+ * @bio: 완료된 IO의 모듈 컨텍스트.
+ * @cpl: 디바이스가 반환한 CPL.
+ *
+ * 일반 R/W류 IO(admin 제외)의 완료 진입점. 흐름:
+ *   1) 성공이면 경로 통계 갱신 후 즉시 완료(complete).
+ *   2) 실패면 에러 통계를 먼저 누적(재시도와 무관하게 카운트).
+ *   3) DNR(Do Not Retry) 비트, 사용자 abort, 재시도 횟수 초과면 더 시도 않고 완료.
+ *   4) accel_sequence가 걸려 있으면 실행 성공 여부를 알 수 없어 재시도 불가 → 완료.
+ *   5) 그 외엔 check_retry_io로 재시도 가능성/지연을 판단해, 가능하면 재시도 큐에 넣고 반환.
+ * complete 라벨에서는 accel_sequence를 비우고 CPL 상태로 bdev 완료를 보고한다.
+ * 실행 컨텍스트: lib/nvme 완료 콜백(채널 스레드) → inline.
+ *
+ * 호출 체인:
+ *   bdev_nvme_readv_done 등 완료 콜백 → [bdev_nvme_io_complete_nvme_status]
+ *     → bdev_nvme_check_retry_io / bdev_nvme_queue_retry_io / __bdev_nvme_io_complete
+ */
 static inline void
 bdev_nvme_io_complete_nvme_status(struct nvme_bdev_io *bio,
 				  const struct spdk_nvme_cpl *cpl)
 {
-	struct spdk_bdev_io *bdev_io = spdk_bdev_io_from_ctx(bio);
-	struct nvme_bdev_channel *nbdev_ch;
-	uint64_t delay_ms;
+	struct spdk_bdev_io *bdev_io = spdk_bdev_io_from_ctx(bio);    /* [한국어] 완료할 사용자 IO. */
+	struct nvme_bdev_channel *nbdev_ch;                          /* [한국어] 재시도 큐가 필요할 때의 채널. */
+	uint64_t delay_ms;                                          /* [한국어] 재시도 지연(ms). */
 
+	/* [한국어] 이 경로는 일반 IO 전용 — admin류는 별도 완료 함수로 가야 함. */
 	assert(!bdev_nvme_io_type_is_admin(bdev_io->type));
 
+	/* [한국어] 성공: 경로 통계만 갱신하고 바로 완료. */
 	if (spdk_likely(spdk_nvme_cpl_is_success(cpl))) {
 		bdev_nvme_update_io_path_stat(bio);
 		goto complete;
@@ -1883,8 +2797,11 @@ bdev_nvme_io_complete_nvme_status(struct nvme_bdev_io *bio,
 	/* Update error counts before deciding if retry is needed.
 	 * Hence, error counts may be more than the number of I/O errors.
 	 */
+	/* [한국어] (위 영어 주석) 재시도 판단 전에 에러 통계를 먼저 누적 — 재시도되는
+	 * 에러도 카운트되므로 에러 카운트가 실제 IO 실패 수보다 클 수 있다. */
 	bdev_nvme_update_nvme_error_stat(bdev_io, cpl);
 
+	/* [한국어] DNR 비트(재시도 금지) / 사용자 abort / 재시도 한도 초과 → 더 시도 않고 완료. */
 	if (cpl->status.dnr != 0 || spdk_nvme_cpl_is_aborted_by_request(cpl) ||
 	    (g_opts.bdev_retry_count != -1 && bio->retry_count >= g_opts.bdev_retry_count)) {
 		goto complete;
@@ -1892,45 +2809,71 @@ bdev_nvme_io_complete_nvme_status(struct nvme_bdev_io *bio,
 
 	/* At this point we don't know whether the sequence was successfully executed or not, so we
 	 * cannot retry the IO */
+	/* [한국어] (위 영어 주석) accel 시퀀스가 걸린 IO는 실행 성공 여부 불확실 → 재시도 불가. */
 	if (bdev_io->u.bdev.accel_sequence != NULL) {
 		goto complete;
 	}
 
+	/* [한국어] 채널 컨텍스트 확보(재시도 큐 삽입 대상). */
 	nbdev_ch = spdk_io_channel_get_ctx(spdk_bdev_io_get_io_channel(bdev_io));
 
+	/* [한국어] 재시도 가능하면 지연 후 재시도 큐에 넣고 여기서 반환(완료 보고 안 함). */
 	if (bdev_nvme_check_retry_io(bio, cpl, nbdev_ch, &delay_ms)) {
 		bdev_nvme_queue_retry_io(nbdev_ch, bio, delay_ms);
 		return;
 	}
 
 complete:
-	bdev_io->u.bdev.accel_sequence = NULL;
-	__bdev_nvme_io_complete(bdev_io, 0, cpl);
+	bdev_io->u.bdev.accel_sequence = NULL;    /* [한국어] 완료 전 accel 시퀀스 참조 정리. */
+	__bdev_nvme_io_complete(bdev_io, 0, cpl); /* [한국어] CPL 상태 그대로 bdev 코어로 완료. */
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_io_complete - lib/nvme 제출 단계의 정수형 rc로 IO를 완료(또는 재시도)한다.
+ *
+ * @bio: 완료할 IO.
+ * @rc: 제출/처리 결과 코드(0 성공, -ENOMEM, -ENXIO, 그 외 실패).
+ *
+ * CPL 없이 정수 rc만 있을 때 사용하는 완료 경로(주로 제출 자체 실패). rc 매핑:
+ *   0      → SUCCESS.
+ *   -ENOMEM → NOMEM(bdev 코어가 자원 회복 후 재제출하도록).
+ *   -ENXIO  → 디바이스/경로 사라짐: 재시도 한도 내면 현재 경로를 버리고, 회복 가능
+ *             경로가 있으면 1초 후 재시도 큐에 넣고 반환. 없으면 아래 default로 떨어짐.
+ *   기타    → FAILED. R/W면 걸려 있던 accel 시퀀스를 abort하고 정리.
+ * 실행 컨텍스트: 제출/완료 경로(채널 스레드) → inline.
+ *
+ * 호출 체인:
+ *   bdev_nvme_*_done(rc 경로) → [bdev_nvme_io_complete]
+ *     → bdev_nvme_queue_retry_io / __bdev_nvme_io_complete
+ */
 static inline void
 bdev_nvme_io_complete(struct nvme_bdev_io *bio, int rc)
 {
-	struct spdk_bdev_io *bdev_io = spdk_bdev_io_from_ctx(bio);
-	struct nvme_bdev_channel *nbdev_ch;
-	enum spdk_bdev_io_status io_status;
+	struct spdk_bdev_io *bdev_io = spdk_bdev_io_from_ctx(bio);    /* [한국어] 완료할 사용자 IO. */
+	struct nvme_bdev_channel *nbdev_ch;                          /* [한국어] -ENXIO 재시도 시 채널. */
+	enum spdk_bdev_io_status io_status;                         /* [한국어] bdev 코어에 보고할 상태. */
 
+	/* [한국어] 일반 IO 전용 경로 — admin류는 별도 함수. */
 	assert(!bdev_nvme_io_type_is_admin(bdev_io->type));
 
 	switch (rc) {
 	case 0:
-		io_status = SPDK_BDEV_IO_STATUS_SUCCESS;
+		io_status = SPDK_BDEV_IO_STATUS_SUCCESS;    /* [한국어] 성공. */
 		break;
 	case -ENOMEM:
-		io_status = SPDK_BDEV_IO_STATUS_NOMEM;
+		io_status = SPDK_BDEV_IO_STATUS_NOMEM;      /* [한국어] 자원 부족 → bdev 코어가 후에 재제출. */
 		break;
 	case -ENXIO:
+		/* [한국어] 디바이스/경로 소실: 재시도 한도 내면 경로를 옮겨 재시도 시도. */
 		if (g_opts.bdev_retry_count == -1 || bio->retry_count < g_opts.bdev_retry_count) {
 			nbdev_ch = spdk_io_channel_get_ctx(spdk_bdev_io_get_io_channel(bdev_io));
 
+			/* [한국어] 죽은 경로 캐시/기억을 비워 다른 경로로 재선택되도록. */
 			bdev_nvme_clear_current_io_path(nbdev_ch);
 			bio->io_path = NULL;
 
+			/* [한국어] 회복 가능 경로가 있으면 1초 후 재시도 예약 후 반환. */
 			if (any_io_path_may_become_available(nbdev_ch)) {
 				bdev_nvme_queue_retry_io(nbdev_ch, bio, 1000ULL);
 				return;
@@ -1938,149 +2881,295 @@ bdev_nvme_io_complete(struct nvme_bdev_io *bio, int rc)
 		}
 
 	/* fallthrough */
+	/* [한국어] (재시도 불가하면 그대로 실패 처리로 낙하) */
 	default:
+		/* [한국어] R/W였다면 진행 중이던 accel 시퀀스를 취소·정리(중간 상태 누수 방지). */
 		if (bdev_io->type == SPDK_BDEV_IO_TYPE_READ || bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE) {
 			spdk_accel_sequence_abort(bdev_io->u.bdev.accel_sequence);
 			bdev_io->u.bdev.accel_sequence = NULL;
 		}
-		io_status = SPDK_BDEV_IO_STATUS_FAILED;
+		io_status = SPDK_BDEV_IO_STATUS_FAILED;    /* [한국어] 최종 실패. */
 		break;
 	}
 
-	__bdev_nvme_io_complete(bdev_io, io_status, NULL);
+	__bdev_nvme_io_complete(bdev_io, io_status, NULL);    /* [한국어] bdev 레벨 상태로 완료(cpl=NULL). */
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_admin_complete - admin류 IO(raw admin/reset/abort)를 정수 rc로 완료한다.
+ *
+ * @bio: 완료할 admin IO.
+ * @rc: 결과 코드.
+ *
+ * 일반 IO와 달리 admin 경로는 멀티패스 재시도 로직이 없다(컨트롤러 단위 명령이라
+ * 경로를 옮길 수 없음). rc를 단순히 SUCCESS/NOMEM/FAILED로 매핑해 완료한다.
+ * 실행 컨텍스트: admin 완료 콜백(컨트롤러/채널 스레드) → inline.
+ *
+ * 호출 체인:
+ *   admin 완료 콜백들 → [bdev_nvme_admin_complete] → __bdev_nvme_io_complete
+ */
 static inline void
 bdev_nvme_admin_complete(struct nvme_bdev_io *bio, int rc)
 {
-	struct spdk_bdev_io *bdev_io = spdk_bdev_io_from_ctx(bio);
-	enum spdk_bdev_io_status io_status;
+	struct spdk_bdev_io *bdev_io = spdk_bdev_io_from_ctx(bio);    /* [한국어] 완료할 admin IO. */
+	enum spdk_bdev_io_status io_status;                         /* [한국어] 보고할 상태. */
 
 	switch (rc) {
 	case 0:
-		io_status = SPDK_BDEV_IO_STATUS_SUCCESS;
+		io_status = SPDK_BDEV_IO_STATUS_SUCCESS;    /* [한국어] 성공. */
 		break;
 	case -ENOMEM:
-		io_status = SPDK_BDEV_IO_STATUS_NOMEM;
+		io_status = SPDK_BDEV_IO_STATUS_NOMEM;      /* [한국어] 자원 부족 → 후에 재제출. */
 		break;
 	case -ENXIO:
 	/* fallthrough */
 	default:
-		io_status = SPDK_BDEV_IO_STATUS_FAILED;
+		io_status = SPDK_BDEV_IO_STATUS_FAILED;     /* [한국어] 그 외 모두 실패(재시도 없음). */
 		break;
 	}
 
-	__bdev_nvme_io_complete(bdev_io, io_status, NULL);
+	__bdev_nvme_io_complete(bdev_io, io_status, NULL);    /* [한국어] bdev 레벨 상태로 완료. */
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_clear_io_path_caches_done - 모든 채널의 경로 캐시 비우기가 끝난 뒤 호출되는 완료 콜백.
+ *
+ * @nvme_ctrlr: 캐시 비우기를 수행한 컨트롤러.
+ * @ctx: 미사용.
+ * @status: 채널 순회 결과(미사용 — 캐시 비우기는 실패하지 않음).
+ *
+ * for_each_channel 순회가 끝나면 진행 플래그(io_path_cache_clearing)를 내리고, 순회를
+ * 시작할 때 잡았던 컨트롤러 참조를 반납한다. 플래그/refcnt는 다른 스레드와 공유되므로
+ * mutex로 보호한다.
+ * 실행 컨텍스트: for_each_channel을 시작한 스레드(보통 컨트롤러 소유 스레드).
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_for_each_channel(완료) → [bdev_nvme_clear_io_path_caches_done]
+ *     → nvme_ctrlr_put_ref
+ */
 static void
 bdev_nvme_clear_io_path_caches_done(struct nvme_ctrlr *nvme_ctrlr,
 				    void *ctx, int status)
 {
-	pthread_mutex_lock(&nvme_ctrlr->mutex);
-	assert(nvme_ctrlr->io_path_cache_clearing == true);
-	nvme_ctrlr->io_path_cache_clearing = false;
-	nvme_ctrlr_put_ref(nvme_ctrlr);
+	pthread_mutex_lock(&nvme_ctrlr->mutex);    /* [한국어] 플래그/refcnt 보호. */
+	assert(nvme_ctrlr->io_path_cache_clearing == true);    /* [한국어] 진행 중이었음을 검증. */
+	nvme_ctrlr->io_path_cache_clearing = false;    /* [한국어] 캐시 비우기 종료 표시. */
+	nvme_ctrlr_put_ref(nvme_ctrlr);    /* [한국어] 시작 시 잡은 참조 반납(파괴 진행 가능). */
 	pthread_mutex_unlock(&nvme_ctrlr->mutex);
 }
 
+/*
+ * [한국어]
+ * _bdev_nvme_clear_io_path_cache - 한 qpair에 매달린 모든 채널의 current_io_path 캐시를 비운다.
+ *
+ * @nvme_qpair: 캐시를 비울 대상 qpair.
+ *
+ * qpair의 io_path_list를 돌며, 살아 있는 채널(nbdev_ch != NULL)마다 캐시된 현재 경로를
+ * 무효화한다. qpair 상태가 변했을 때(연결/끊김) 그 qpair를 쓰는 채널들이 다음 IO에서
+ * 경로를 재선택하도록 강제하기 위함.
+ * 실행 컨텍스트: 해당 qpair를 소유한 채널 스레드(for_each_channel 콜백 내부).
+ *
+ * 호출 체인:
+ *   bdev_nvme_clear_io_path_cache / disconnected_qpair_cb → [_bdev_nvme_clear_io_path_cache]
+ *     → bdev_nvme_clear_current_io_path
+ */
 static void
 _bdev_nvme_clear_io_path_cache(struct nvme_qpair *nvme_qpair)
 {
-	struct nvme_io_path *io_path;
+	struct nvme_io_path *io_path;    /* [한국어] qpair에 연결된 경로 순회 커서. */
 
+	/* [한국어] 이 qpair를 쓰는 모든 경로를 순회. */
 	TAILQ_FOREACH(io_path, &nvme_qpair->io_path_list, tailq) {
+		/* [한국어] 이미 채널에서 분리된 경로(지연 free 대기)는 건너뜀. */
 		if (io_path->nbdev_ch == NULL) {
 			continue;
 		}
+		/* [한국어] 채널의 캐시된 현재 경로 무효화 → 다음 IO 때 재선택. */
 		bdev_nvme_clear_current_io_path(io_path->nbdev_ch);
 	}
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_clear_io_path_cache - for_each_channel이 채널마다 호출하는 캐시 비우기 콜백.
+ *
+ * @i: 채널 순회 iterator.
+ * @nvme_ctrlr: 대상 컨트롤러(미사용 — 시그니처용).
+ * @ctrlr_ch: 현재 순회 중인 컨트롤러 채널.
+ * @ctx: 미사용.
+ *
+ * 각 컨트롤러 채널의 qpair에 대해 경로 캐시를 비우고, 다음 채널로 순회를 이어간다.
+ * for_each_channel은 채널마다 그 채널 소유 스레드로 메시지를 보내 콜백을 실행하므로,
+ * 각 호출은 해당 채널의 lockless 자료구조를 안전하게 만진다(스레드 affinity).
+ * 실행 컨텍스트: 각 컨트롤러 채널 소유 스레드.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_for_each_channel → [bdev_nvme_clear_io_path_cache]
+ *     → _bdev_nvme_clear_io_path_cache → nvme_ctrlr_for_each_channel_continue
+ */
 static void
 bdev_nvme_clear_io_path_cache(struct nvme_ctrlr_channel_iter *i,
 			      struct nvme_ctrlr *nvme_ctrlr,
 			      struct nvme_ctrlr_channel *ctrlr_ch,
 			      void *ctx)
 {
-	assert(ctrlr_ch->qpair != NULL);
+	assert(ctrlr_ch->qpair != NULL);    /* [한국어] 채널엔 qpair가 있어야 함. */
 
-	_bdev_nvme_clear_io_path_cache(ctrlr_ch->qpair);
+	_bdev_nvme_clear_io_path_cache(ctrlr_ch->qpair);    /* [한국어] 이 채널 qpair의 경로 캐시 비우기. */
 
-	nvme_ctrlr_for_each_channel_continue(i, 0);
+	nvme_ctrlr_for_each_channel_continue(i, 0);    /* [한국어] 다음 채널로 순회 진행. */
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_clear_io_path_caches - 컨트롤러의 모든 채널에 걸쳐 경로 캐시 비우기를 시작한다.
+ *
+ * @nvme_ctrlr: 캐시를 비울 컨트롤러.
+ *
+ * ANA 변화/qpair 상태 변경 등으로 경로 선택을 재평가해야 할 때 호출한다. 컨트롤러가
+ * 사용 불가하거나 이미 캐시 비우기가 진행 중이면 아무 일도 안 한다(중복 방지). 그렇지
+ * 않으면 진행 플래그를 세우고 참조를 1 잡은 뒤 for_each_channel로 비동기 순회를 시작한다.
+ * 참조를 잡는 이유: 순회가 끝나기 전 컨트롤러가 파괴되지 않도록(done 콜백에서 put).
+ * 실행 컨텍스트: 컨트롤러 소유 스레드. 플래그/refcnt 공유 → mutex.
+ *
+ * 호출 체인:
+ *   ANA 처리/qpair 상태 변경 → [bdev_nvme_clear_io_path_caches]
+ *     → nvme_ctrlr_for_each_channel(...done)
+ */
 static void
 bdev_nvme_clear_io_path_caches(struct nvme_ctrlr *nvme_ctrlr)
 {
-	pthread_mutex_lock(&nvme_ctrlr->mutex);
+	pthread_mutex_lock(&nvme_ctrlr->mutex);    /* [한국어] 가용성/진행 플래그 검사 보호. */
+	/* [한국어] 사용 불가하거나 이미 진행 중이면 중복 시작 방지. */
 	if (!nvme_ctrlr_is_available(nvme_ctrlr) ||
 	    nvme_ctrlr->io_path_cache_clearing) {
 		pthread_mutex_unlock(&nvme_ctrlr->mutex);
 		return;
 	}
 
-	nvme_ctrlr->io_path_cache_clearing = true;
-	nvme_ctrlr_get_ref(nvme_ctrlr);
+	nvme_ctrlr->io_path_cache_clearing = true;    /* [한국어] 진행 중 표시. */
+	nvme_ctrlr_get_ref(nvme_ctrlr);    /* [한국어] 순회 동안 파괴 방지용 참조 획득. */
 	pthread_mutex_unlock(&nvme_ctrlr->mutex);
 
+	/* [한국어] 채널별 콜백으로 캐시 비우기, 완료 시 done 콜백에서 참조 반납. */
 	nvme_ctrlr_for_each_channel(nvme_ctrlr,
 				    bdev_nvme_clear_io_path_cache,
 				    NULL,
 				    bdev_nvme_clear_io_path_caches_done);
 }
 
+/*
+ * [한국어]
+ * nvme_poll_group_get_qpair - poll group 안에서 lib/nvme qpair에 대응하는 nvme_qpair 래퍼를 찾는다.
+ *
+ * @group: 검색할 nvme_poll_group.
+ * @qpair: lib/nvme의 실제 qpair 핸들(완료 콜백이 넘겨준 것).
+ * @return: 매칭되는 nvme_qpair 래퍼, 없으면 NULL.
+ *
+ * lib/nvme의 disconnected/완료 콜백은 raw spdk_nvme_qpair 포인터만 넘겨주므로, 모듈의
+ * 래퍼(nvme_qpair)를 역으로 찾아야 한다. poll group의 qpair_list를 선형 탐색한다.
+ * 실행 컨텍스트: poll group을 소유한 채널 스레드.
+ *
+ * 호출 체인:
+ *   bdev_nvme_disconnected_qpair_cb → [nvme_poll_group_get_qpair]
+ */
 static struct nvme_qpair *
 nvme_poll_group_get_qpair(struct nvme_poll_group *group, struct spdk_nvme_qpair *qpair)
 {
-	struct nvme_qpair *nvme_qpair;
+	struct nvme_qpair *nvme_qpair;    /* [한국어] 순회 커서/결과. */
 
+	/* [한국어] 그룹의 모든 래퍼를 돌며 raw qpair 포인터가 일치하는 것을 찾는다. */
 	TAILQ_FOREACH(nvme_qpair, &group->qpair_list, tailq) {
 		if (nvme_qpair->qpair == qpair) {
 			break;
 		}
 	}
 
-	return nvme_qpair;
+	return nvme_qpair;    /* [한국어] 일치 래퍼(또는 미발견 시 NULL). */
 }
 
+/* [한국어] nvme_qpair 래퍼를 파괴하는 함수의 전방 선언(아래에서 정의). */
 static void nvme_qpair_delete(struct nvme_qpair *nvme_qpair);
 
+/*
+ * [한국어]
+ * nvme_ctrlr_channel_reset_finish - 한 컨트롤러 채널의 reset 단계를 마무리하고 다음 채널로 진행.
+ *
+ * @ctrlr_ch: reset을 마친 컨트롤러 채널.
+ * @status: reset 결과(다음 단계로 전파).
+ *
+ * reset 시퀀스는 컨트롤러의 모든 채널을 순회하며 qpair를 재연결한다. 이 함수는 한
+ * 채널의 재연결 폴러(connect_poller)를 해제하고, 보관해 둔 reset iterator로 다음 채널
+ * 순회를 이어가게 한 뒤 iterator 참조를 비운다.
+ * 실행 컨텍스트: 해당 컨트롤러 채널 소유 스레드.
+ *
+ * 호출 체인:
+ *   reset connect 완료 경로 → [nvme_ctrlr_channel_reset_finish]
+ *     → nvme_ctrlr_for_each_channel_continue
+ */
 static void
 nvme_ctrlr_channel_reset_finish(struct nvme_ctrlr_channel *ctrlr_ch, int status)
 {
-	spdk_poller_unregister(&ctrlr_ch->connect_poller);
-	nvme_ctrlr_for_each_channel_continue(ctrlr_ch->reset_iter, status);
-	ctrlr_ch->reset_iter = NULL;
+	spdk_poller_unregister(&ctrlr_ch->connect_poller);    /* [한국어] 재연결 폴링 종료. */
+	nvme_ctrlr_for_each_channel_continue(ctrlr_ch->reset_iter, status);    /* [한국어] 다음 채널로 reset 진행. */
+	ctrlr_ch->reset_iter = NULL;    /* [한국어] iterator 참조 정리(이 채널의 reset 단계 종료). */
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_disconnected_qpair_cb - lib/nvme이 qpair 끊김을 통지할 때 호출되는 콜백.
+ *
+ * @qpair: 끊긴 lib/nvme qpair 핸들.
+ * @poll_group_ctx: 콜백 등록 시 넘긴 nvme_poll_group 포인터.
+ *
+ * spdk_nvme_poll_group_process_completions가 끊긴 qpair를 발견하면 이 콜백을 부른다.
+ * 처리 분기:
+ *   1) 래퍼를 못 찾으면(이미 정리됨) 무시.
+ *   2) lib/nvme qpair를 free하고 래퍼의 핸들을 NULL로(재연결은 reset 경로가 담당).
+ *   3) 이 qpair를 쓰던 채널들의 경로 캐시를 비운다.
+ *   4) 컨트롤러 채널이 이미 삭제됐으면(ctrlr_ch==NULL) 래퍼만 파괴하고 종료.
+ *   5) reset 중이 아니었으면(reset_iter==NULL) "예기치 못한 끊김" → failover로 복구.
+ *   6) reset 시퀀스 도중이면: connect_poller가 남아 있으면 재연결 실패(status=-1),
+ *      아니면 정상 끊김(status=0)으로 보고 reset 단계를 마무리한다.
+ * 실행 컨텍스트: poll group 소유 채널 스레드(완료 폴링 중).
+ *
+ * 호출 체인:
+ *   bdev_nvme_poll → spdk_nvme_poll_group_process_completions → [bdev_nvme_disconnected_qpair_cb]
+ *     → nvme_qpair_delete / bdev_nvme_failover_ctrlr / nvme_ctrlr_channel_reset_finish
+ */
 static void
 bdev_nvme_disconnected_qpair_cb(struct spdk_nvme_qpair *qpair, void *poll_group_ctx)
 {
-	struct nvme_poll_group *group = poll_group_ctx;
-	struct nvme_qpair *nvme_qpair;
-	struct nvme_ctrlr *nvme_ctrlr;
-	struct nvme_ctrlr_channel *ctrlr_ch;
-	uint16_t qid;
-	int status;
+	struct nvme_poll_group *group = poll_group_ctx;    /* [한국어] qpair가 속한 poll group. */
+	struct nvme_qpair *nvme_qpair;                    /* [한국어] raw qpair의 모듈 래퍼. */
+	struct nvme_ctrlr *nvme_ctrlr;                    /* [한국어] qpair의 컨트롤러. */
+	struct nvme_ctrlr_channel *ctrlr_ch;             /* [한국어] qpair의 컨트롤러 채널. */
+	uint16_t qid;                                    /* [한국어] qpair ID(로그용). */
+	int status;                                      /* [한국어] reset 단계로 전달할 결과. */
 
+	/* [한국어] raw qpair → 래퍼 역매핑. 없으면 이미 정리된 것 → 무시. */
 	nvme_qpair = nvme_poll_group_get_qpair(group, qpair);
 	if (nvme_qpair == NULL) {
 		return;
 	}
 
-	qid = spdk_nvme_qpair_get_id(qpair);
+	qid = spdk_nvme_qpair_get_id(qpair);    /* [한국어] 로그에 쓸 qpair ID 조회. */
+	/* [한국어] 아직 살아 있는 lib/nvme qpair면 자원 해제 후 래퍼 핸들 비움. */
 	if (nvme_qpair->qpair != NULL) {
 		spdk_nvme_ctrlr_free_io_qpair(nvme_qpair->qpair);
 		nvme_qpair->qpair = NULL;
 	}
 
+	/* [한국어] 이 qpair를 쓰던 채널들의 경로 캐시 무효화(끊긴 경로 재선택 방지). */
 	_bdev_nvme_clear_io_path_cache(nvme_qpair);
 
-	nvme_ctrlr = nvme_qpair->ctrlr;
-	ctrlr_ch = nvme_qpair->ctrlr_ch;
+	nvme_ctrlr = nvme_qpair->ctrlr;        /* [한국어] 컨트롤러 참조 복원. */
+	ctrlr_ch = nvme_qpair->ctrlr_ch;       /* [한국어] 컨트롤러 채널 참조 복원. */
 
 	/* In this case, ctrlr_channel is already deleted. */
+	/* [한국어] (위 영어 주석) 컨트롤러 채널이 이미 삭제된 경우 → 래퍼만 파괴하고 종료. */
 	if (ctrlr_ch == NULL) {
 		NVME_CTRLR_INFOLOG(nvme_ctrlr,
 				   NVME_QPAIR_LOG_FMT" was disconnected and freed. delete nvme_qpair.\n", qid, qpair);
@@ -2089,6 +3178,7 @@ bdev_nvme_disconnected_qpair_cb(struct spdk_nvme_qpair *qpair, void *poll_group_
 	}
 
 	/* qpair was disconnected unexpectedly. Reset controller for recovery. */
+	/* [한국어] (위 영어 주석) reset 중이 아닌데 끊김 = 예기치 못한 장애 → failover로 컨트롤러 복구. */
 	if (ctrlr_ch->reset_iter == NULL) {
 		NVME_CTRLR_INFOLOG(nvme_ctrlr,
 				   NVME_QPAIR_LOG_FMT" was disconnected and freed. reset controller.\n", qid, qpair);
@@ -2097,29 +3187,50 @@ bdev_nvme_disconnected_qpair_cb(struct spdk_nvme_qpair *qpair, void *poll_group_
 	}
 
 	/* We are in a full reset sequence. */
+	/* [한국어] (위 영어 주석) reset 시퀀스 도중의 끊김: 재연결 폴러 유무로 성공/실패 구분. */
 	if (ctrlr_ch->connect_poller != NULL) {
+		/* [한국어] 재연결을 시도 중이었는데 끊김 = 연결 실패 → 시퀀스 중단(status=-1). */
 		NVME_CTRLR_INFOLOG(nvme_ctrlr,
 				   NVME_QPAIR_LOG_FMT" failed to connect. abort the reset ctrlr sequence.\n", qid, qpair);
 		status = -1;
 	} else {
+		/* [한국어] 기존 qpair를 끊는 정상 단계였음 → 성공(status=0)으로 다음 단계 진행. */
 		NVME_CTRLR_INFOLOG(nvme_ctrlr,
 				   NVME_QPAIR_LOG_FMT" was disconnected and freed in a reset ctrlr sequence.\n", qid, qpair);
 		status = 0;
 	}
 
-	nvme_ctrlr_channel_reset_finish(ctrlr_ch, status);
+	nvme_ctrlr_channel_reset_finish(ctrlr_ch, status);    /* [한국어] 이 채널의 reset 단계 마무리. */
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_check_io_qpairs - poll group의 모든 qpair를 점검해 실패한 것의 경로 캐시를 비운다.
+ *
+ * @group: 점검할 poll group.
+ *
+ * process_completions가 음수(트랜스포트 레벨 오류)를 반환하면, 어느 qpair가 망가졌는지
+ * 알 수 없으므로 그룹 내 모든 qpair의 실패 사유를 확인해 실패한 것들의 경로 캐시를
+ * 비운다(그 경로로 더 IO가 가지 않도록). 끊김/복구는 disconnected 콜백이 별도로 처리.
+ * 실행 컨텍스트: poll group 소유 채널 스레드(폴링 직후).
+ *
+ * 호출 체인:
+ *   bdev_nvme_poll(완료 음수 시) → [bdev_nvme_check_io_qpairs]
+ *     → _bdev_nvme_clear_io_path_cache
+ */
 static void
 bdev_nvme_check_io_qpairs(struct nvme_poll_group *group)
 {
-	struct nvme_qpair *nvme_qpair;
+	struct nvme_qpair *nvme_qpair;    /* [한국어] qpair 순회 커서. */
 
+	/* [한국어] 그룹의 모든 qpair를 점검. */
 	TAILQ_FOREACH(nvme_qpair, &group->qpair_list, tailq) {
+		/* [한국어] 미연결이거나 컨트롤러 채널이 없는 qpair는 점검 대상 아님. */
 		if (nvme_qpair->qpair == NULL || nvme_qpair->ctrlr_ch == NULL) {
 			continue;
 		}
 
+		/* [한국어] 실패 사유가 잡힌 qpair면 그 경로 캐시를 비워 더 이상 선택되지 않게. */
 		if (spdk_nvme_qpair_get_failure_reason(nvme_qpair->qpair) !=
 		    SPDK_NVME_QPAIR_FAILURE_NONE) {
 			_bdev_nvme_clear_io_path_cache(nvme_qpair);
@@ -2127,111 +3238,217 @@ bdev_nvme_check_io_qpairs(struct nvme_poll_group *group)
 	}
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_poll - poll group의 IO 완료를 폴링하는 메인 poller(데이터 경로의 심장).
+ *
+ * @arg: nvme_poll_group 포인터.
+ * @return: 완료가 있었으면 SPDK_POLLER_BUSY, 없으면 SPDK_POLLER_IDLE.
+ *
+ * SPDK polled-mode의 핵심: 인터럽트 대신 reactor가 이 poller를 무한 반복 호출해 CQ를
+ * 폴링한다. spdk_nvme_poll_group_process_completions로 그룹 내 모든 qpair의 완료를
+ * 한 번에 수확하고, 각 IO의 완료 콜백을 동기적으로 실행한다. collect_spin_stat가 켜져
+ * 있으면 유효 완료가 없는 동안의 "헛도는 시간(spin)"을 측정해 효율 진단에 쓴다. 반환값이
+ * 음수면 트랜스포트 오류로 보고 qpair 점검을 수행한다. polled-mode는 CPU를 계속 쓰는
+ * 대신 인터럽트/문맥교환 지연을 없애 초저지연을 얻는 트레이드오프다.
+ * 실행 컨텍스트: poll group을 소유한 채널 스레드(reactor poller).
+ *
+ * 호출 체인:
+ *   SPDK reactor poller 루프 → [bdev_nvme_poll]
+ *     → spdk_nvme_poll_group_process_completions(bdev_nvme_disconnected_qpair_cb)
+ */
 static int
 bdev_nvme_poll(void *arg)
 {
-	struct nvme_poll_group *group = arg;
-	int64_t num_completions;
+	struct nvme_poll_group *group = arg;    /* [한국어] 폴링할 poll group. */
+	int64_t num_completions;                /* [한국어] 이번 폴링으로 수확한 완료 수(또는 음수 오류). */
 
+	/* [한국어] spin 통계: 폴링 시작 틱을 처음 한 번 기록(유효 완료 전까지의 idle 측정 시작). */
 	if (group->collect_spin_stat && group->start_ticks == 0) {
 		group->start_ticks = spdk_get_ticks();
 	}
 
+	/* [한국어] 그룹 내 모든 qpair의 CQ를 폴링해 완료 콜백 실행(제한 0 = 가능한 만큼). */
 	num_completions = spdk_nvme_poll_group_process_completions(group->group, 0,
 			  bdev_nvme_disconnected_qpair_cb);
 	if (group->collect_spin_stat) {
 		if (num_completions > 0) {
+			/* [한국어] 유효 완료 발생: 직전까지의 spin 구간을 누적하고 측정 리셋. */
 			if (group->end_ticks != 0) {
 				group->spin_ticks += (group->end_ticks - group->start_ticks);
 				group->end_ticks = 0;
 			}
 			group->start_ticks = 0;
 		} else {
+			/* [한국어] 완료 없음: 헛도는 시점의 틱을 기록(다음 유효 완료 때 누적). */
 			group->end_ticks = spdk_get_ticks();
 		}
 	}
 
+	/* [한국어] 음수 = 트랜스포트 레벨 오류 → 어느 qpair가 실패했는지 점검. */
 	if (spdk_unlikely(num_completions < 0)) {
 		bdev_nvme_check_io_qpairs(group);
 	}
 
+	/* [한국어] 완료가 있었으면 BUSY(일 함), 없으면 IDLE → reactor의 효율적 sleep 판단 근거. */
 	return num_completions > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
+/* [한국어] admin 큐 폴링 poller 함수의 전방 선언(아래에서 정의). */
 static int bdev_nvme_poll_adminq(void *arg);
 
+/*
+ * [한국어]
+ * bdev_nvme_change_adminq_poll_period - admin 큐 폴링 주기를 변경(타이머 poller 재등록).
+ *
+ * @nvme_ctrlr: 대상 컨트롤러.
+ * @new_period_us: 새 폴링 주기(마이크로초).
+ *
+ * admin 큐(AER, log page, reset 등)는 IO 큐만큼 자주 폴링할 필요가 없어 별도 타이머
+ * poller로 처리한다. reset 진행 중에는 더 자주, 평상시엔 더 드물게 주기를 바꾼다.
+ * interrupt mode에서는 폴링 대신 인터럽트가 admin 완료를 깨우므로 이 함수는 아무 일도
+ * 하지 않는다(타이머 poller 자체가 없음).
+ * 실행 컨텍스트: 컨트롤러 소유 스레드.
+ *
+ * 호출 체인:
+ *   reset/connect 경로 → [bdev_nvme_change_adminq_poll_period] → SPDK_POLLER_REGISTER
+ */
 static void
 bdev_nvme_change_adminq_poll_period(struct nvme_ctrlr *nvme_ctrlr, uint64_t new_period_us)
 {
+	/* [한국어] interrupt mode면 타이머 폴링이 없으므로 무시. */
 	if (spdk_interrupt_mode_is_enabled()) {
 		return;
 	}
 
+	/* [한국어] 기존 타이머 poller 해제 후 새 주기로 재등록(주기 변경 = 해제+재등록). */
 	spdk_poller_unregister(&nvme_ctrlr->adminq_timer_poller);
 
 	nvme_ctrlr->adminq_timer_poller = SPDK_POLLER_REGISTER(bdev_nvme_poll_adminq,
 					  nvme_ctrlr, new_period_us);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_poll_adminq - admin 큐 완료를 폴링하고 끊김/실패를 감지·처리하는 타이머 poller.
+ *
+ * @arg: nvme_ctrlr 포인터.
+ * @return: 완료가 없으면 IDLE, 있거나 오류면 BUSY.
+ *
+ * admin 큐의 완료(AER, log page, identify 등)를 처리한다. 결과 분기:
+ *   - rc < 0(admin 큐 끊김): disconnected_cb가 설정돼 있으면(의도된 disconnect, 예: reset
+ *     중) 폴링 주기를 평상시로 복원하고 그 콜백을 호출해 다음 단계로 진행. 콜백이 없으면
+ *     예기치 못한 끊김이므로 failover로 복구.
+ *   - rc >= 0이지만 admin qpair 실패 사유가 있으면: 경로 캐시를 비워 IO를 다른 경로로.
+ * 실행 컨텍스트: 컨트롤러 소유 스레드의 타이머 poller(non-interrupt mode).
+ *
+ * 호출 체인:
+ *   SPDK reactor 타이머 → [bdev_nvme_poll_adminq]
+ *     → spdk_nvme_ctrlr_process_admin_completions / disconnected_cb / bdev_nvme_failover_ctrlr
+ */
 static int
 bdev_nvme_poll_adminq(void *arg)
 {
-	int32_t rc;
-	struct nvme_ctrlr *nvme_ctrlr = arg;
-	nvme_ctrlr_disconnected_cb disconnected_cb;
+	int32_t rc;                                   /* [한국어] admin 완료 처리 결과(음수=끊김). */
+	struct nvme_ctrlr *nvme_ctrlr = arg;          /* [한국어] 폴링 대상 컨트롤러. */
+	nvme_ctrlr_disconnected_cb disconnected_cb;   /* [한국어] 의도된 disconnect 후속 콜백. */
 
 	assert(nvme_ctrlr != NULL);
 
+	/* [한국어] admin 큐의 완료를 처리(AER/log/identify 등 콜백 실행). */
 	rc = spdk_nvme_ctrlr_process_admin_completions(nvme_ctrlr->ctrlr);
 	if (rc < 0) {
+		/* [한국어] admin 큐 끊김: 등록된 disconnect 콜백을 꺼내 한 번만 호출하도록 비움. */
 		disconnected_cb = nvme_ctrlr->disconnected_cb;
 		nvme_ctrlr->disconnected_cb = NULL;
 
 		if (disconnected_cb != NULL) {
+			/* [한국어] 의도된 disconnect(reset 단계 등): 주기 복원 후 후속 콜백 진행. */
 			bdev_nvme_change_adminq_poll_period(nvme_ctrlr,
 							    g_opts.nvme_adminq_poll_period_us);
 			disconnected_cb(nvme_ctrlr);
 		} else {
+			/* [한국어] 예기치 못한 끊김: failover로 컨트롤러 복구 시도. */
 			bdev_nvme_failover_ctrlr(nvme_ctrlr);
 		}
 	} else if (spdk_nvme_ctrlr_get_admin_qp_failure_reason(nvme_ctrlr->ctrlr) !=
 		   SPDK_NVME_QPAIR_FAILURE_NONE) {
+		/* [한국어] 끊기진 않았지만 admin qpair 실패 사유가 잡힘 → 경로 캐시 비우기. */
 		bdev_nvme_clear_io_path_caches(nvme_ctrlr);
 	}
 
+	/* [한국어] 완료 없음(rc==0)이면 IDLE, 그 외(완료 있음/오류)면 BUSY. */
 	return rc == 0 ? SPDK_POLLER_IDLE : SPDK_POLLER_BUSY;
 }
 
+/*
+ * [한국어]
+ * nvme_bdev_free - nvme_bdev 객체와 부속 자원을 최종 해제하는 io_device unregister 콜백.
+ *
+ * @io_device: spdk_io_device_unregister에 등록됐던 nvme_bdev 포인터.
+ *
+ * 모든 IO 채널이 정리된 안전한 시점에 SPDK 프레임워크가 호출한다. mutex 파괴 + 이름
+ * 문자열 + 에러 통계 + 객체 본체를 차례로 해제한다.
+ * 실행 컨텍스트: app 스레드(io_device unregister 완료 콜백).
+ *
+ * 호출 체인:
+ *   bdev_nvme_destruct → spdk_io_device_unregister(채널 정리 후) → [nvme_bdev_free]
+ */
 static void
 nvme_bdev_free(void *io_device)
 {
-	struct nvme_bdev *nbdev = io_device;
+	struct nvme_bdev *nbdev = io_device;    /* [한국어] 해제할 논리 bdev. */
 
-	pthread_mutex_destroy(&nbdev->mutex);
-	free(nbdev->disk.name);
-	free(nbdev->err_stat);
-	free(nbdev);
+	pthread_mutex_destroy(&nbdev->mutex);    /* [한국어] 필드 보호용 mutex 파괴. */
+	free(nbdev->disk.name);                  /* [한국어] bdev 이름 문자열 해제. */
+	free(nbdev->err_stat);                   /* [한국어] NVMe 에러 통계 배열 해제(없으면 NULL). */
+	free(nbdev);                             /* [한국어] 객체 본체 해제. */
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_destruct - bdev fn_table::destruct 콜백. nvme_bdev를 해체하기 시작한다.
+ *
+ * @ctx: 해체할 nvme_bdev 포인터.
+ * @return: 항상 0(비동기 해제이므로 즉시 성공 보고; 실제 free는 채널 정리 후).
+ *
+ * spdk_bdev_unregister가 마지막 참조를 떨궜을 때 bdev 코어가 호출한다. 이 bdev에 묶인
+ * 모든 namespace의 역참조(nvme_ns->bdev)를 끊고, 각 ns가 여전히 이 bdev의 마지막 참조면
+ * 즉시 삭제한다. 단, reconnect 후 같은 NSID로 새 ns 객체가 생겼을 수 있는데, 그 경우
+ * 컨트롤러의 현재 ns가 다른 객체이므로 원본만 삭제하고 새 것은 건드리지 않는다(영어
+ * 주석 참조). 마지막에 nbdev_ctrlr의 bdevs 리스트에서 빼고, io_device를 unregister해
+ * 모든 채널이 정리된 뒤 nvme_bdev_free가 최종 해제하도록 한다.
+ * 실행 컨텍스트: app 스레드 전용(전역 리스트/컨트롤러 그룹을 만지므로 assert로 강제).
+ *
+ * 호출 체인:
+ *   spdk_bdev_unregister → bdev 코어 → [bdev_nvme_destruct]
+ *     → nvme_ns_delete / spdk_io_device_unregister(nvme_bdev_free)
+ */
 static int
 bdev_nvme_destruct(void *ctx)
 {
-	struct nvme_bdev *nbdev = ctx;
-	struct nvme_ns *nvme_ns, *tmp_nvme_ns;
+	struct nvme_bdev *nbdev = ctx;                  /* [한국어] 해체 대상 논리 bdev. */
+	struct nvme_ns *nvme_ns, *tmp_nvme_ns;          /* [한국어] ns 순회 커서 + 제거 안전용. */
 
+	/* [한국어] 전역/컨트롤러 그룹 상태를 변경하므로 반드시 app 스레드에서만 실행. */
 	assert(spdk_thread_is_app_thread(NULL));
 
 	NVME_BDEV_DEBUGLOG(nbdev, null_ctrlr, "destructing bdev\n");
+	/* [한국어] DTrace 프로브: 어떤 컨트롤러/NSID의 bdev가 해체되는지 추적. */
 	SPDK_DTRACE_PROBE2(bdev_nvme_destruct, nbdev->nbdev_ctrlr->name, nbdev->nsid);
 
+	/* [한국어] 이 bdev를 구성하던 모든 namespace(=path)를 순회 정리. */
 	TAILQ_FOREACH_SAFE(nvme_ns, &nbdev->nvme_ns_list, tailq, tmp_nvme_ns) {
-		nvme_ns->bdev = NULL;
+		nvme_ns->bdev = NULL;    /* [한국어] ns → bdev 역참조 끊기. */
 
-		assert(nvme_ns->id > 0);
+		assert(nvme_ns->id > 0);    /* [한국어] 유효 NSID 검증(0은 무효). */
 
 		/* A new namespace object with the same NSID may have been created after reconnect.
 		 * In that case, ignore the new one and continue destroying the original namespace.
 		 */
+		/* [한국어] (위 영어 주석) reconnect로 같은 NSID의 새 ns가 생겼을 수 있다.
+		 * 컨트롤러의 현재 ns가 이 객체와 같을 때만 "마지막 참조"이므로 즉시 삭제하고,
+		 * 다르면(새 객체로 교체됨) 원본은 depopulate 완료 시점까지 삭제를 미룬다. */
 		if (nvme_ctrlr_get_ns(nvme_ns->ctrlr, nvme_ns->id) != nvme_ns) {
 			NVME_NS_DEBUGLOG(nvme_ns, "ns free with the last reference to nbdev\n");
 			TAILQ_REMOVE(&nbdev->nvme_ns_list, nvme_ns, tailq);
@@ -2241,89 +3458,141 @@ bdev_nvme_destruct(void *ctx)
 		}
 	}
 
+	/* [한국어] 컨트롤러 그룹의 bdevs 리스트에서 이 bdev 제거. */
 	TAILQ_REMOVE(&nbdev->nbdev_ctrlr->bdevs, nbdev, tailq);
+	/* [한국어] io_device 해제 요청 — 모든 채널 정리 후 nvme_bdev_free가 최종 free. */
 	spdk_io_device_unregister(nbdev, nvme_bdev_free);
 
-	return 0;
+	return 0;    /* [한국어] 비동기 해제 시작 성공(실제 완료는 콜백에서). */
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_create_qpair - 한 I/O 채널이 사용할 NVMe I/O qpair(SQ+CQ 한 쌍)를 생성·연결한다.
+ *
+ * @nvme_qpair: 이 SPDK thread(=I/O 채널) 전용으로 만들어진 nvme_qpair 래퍼.
+ *              내부의 group(=poll group)은 이미 채널 생성 시점에 설정되어 있어야 한다.
+ * @return: 0=성공(연결 시작됨, 실제 연결 완료는 poll group 폴링에서 비동기 완료),
+ *          음수=qpair 할당/poll group 추가/connect 중 실패.
+ *
+ * 왜 필요한가: SPDK는 코어(=spdk_thread=reactor)마다 독립된 NVMe qpair를 둬서 lock 없이
+ * I/O를 발행한다. 채널이 처음 만들어지거나 reset 후 재연결될 때 이 함수로 qpair를 새로 띄운다.
+ * 동작: (1) 컨트롤러 기본 qpair opts를 복사하고 create_only=true로 "생성만, 연결은 분리" 모드 설정,
+ * (2) 인터럽트 모드가 아니면 async_mode/delay_cmd_submit 같은 폴링 최적화 활성화,
+ * (3) alloc_io_qpair로 qpair 객체 생성, (4) 이 채널의 poll group에 등록, (5) connect_io_qpair로
+ * Fabrics Connect(또는 PCIe SQ/CQ 활성)를 비동기 개시. create_only로 alloc과 connect를 분리해야
+ * poll group이 연결 진행 상태를 폴링으로 관찰할 수 있다.
+ * 실행 컨텍스트: 해당 채널을 소유한 I/O spdk_thread. qpair는 그 스레드에만 묶이므로 lockless.
+ *
+ * 호출 체인:
+ *   bdev_nvme_create_ctrlr_channel_cb / 재연결 경로 → [bdev_nvme_create_qpair]
+ *     → spdk_nvme_ctrlr_alloc_io_qpair → spdk_nvme_poll_group_add → spdk_nvme_ctrlr_connect_io_qpair
+ */
 static int
 bdev_nvme_create_qpair(struct nvme_qpair *nvme_qpair)
 {
-	struct nvme_ctrlr *nvme_ctrlr;
-	struct spdk_nvme_io_qpair_opts opts;
-	struct spdk_nvme_qpair *qpair;
-	int rc;
+	struct nvme_ctrlr *nvme_ctrlr;                  /* [한국어] qpair가 속한 NVMe 컨트롤러 래퍼. */
+	struct spdk_nvme_io_qpair_opts opts;            /* [한국어] qpair 생성 옵션(큐 깊이/모드 등). */
+	struct spdk_nvme_qpair *qpair;                  /* [한국어] 드라이버가 반환할 실제 qpair 핸들. */
+	int rc;                                         /* [한국어] 하위 호출 반환 코드 임시 저장. */
 
-	nvme_ctrlr = nvme_qpair->ctrlr;
+	nvme_ctrlr = nvme_qpair->ctrlr;                 /* [한국어] 래퍼에서 소속 컨트롤러 역참조. */
 
+	/* [한국어] 컨트롤러가 권장하는 기본 qpair 옵션을 opts에 채운다(큐 깊이/벡터 등). */
 	spdk_nvme_ctrlr_get_default_io_qpair_opts(nvme_ctrlr->ctrlr, &opts, sizeof(opts));
-	opts.create_only = true;
+	opts.create_only = true;                        /* [한국어] alloc 시점엔 연결하지 말고 핸들만 생성 — connect를 분리해 poll group이 진행을 폴링. */
 	/* In interrupt mode qpairs must be created in sync mode, else it will never be connected.
 	 * delay_cmd_submit must be false as in interrupt mode requests cannot be submitted in
 	 * completion context.
 	 */
+	/* [한국어] (위 영어 주석) 인터럽트 모드에서는 완료 컨텍스트에서 명령 제출이 불가하므로
+	 * async/delay 최적화를 끈다. 폴링 모드일 때만 아래 두 최적화를 켠다. */
 	if (!spdk_interrupt_mode_is_enabled()) {
-		opts.async_mode = true;
-		opts.delay_cmd_submit = g_opts.delay_cmd_submit;
+		opts.async_mode = true;                 /* [한국어] 비동기 SQE 제출 허용(폴링 컨텍스트에서 안전). */
+		opts.delay_cmd_submit = g_opts.delay_cmd_submit; /* [한국어] 여러 SQE를 모아 doorbell 1회로 batch(MMIO 절감). */
 	}
+	/* [한국어] 채널 큐 깊이는 사용자 설정과 드라이버 기본 중 큰 값을 채택(요청 큐 부족 방지). */
 	opts.io_queue_requests = spdk_max(g_opts.io_queue_requests, opts.io_queue_requests);
-	g_opts.io_queue_requests = opts.io_queue_requests;
+	g_opts.io_queue_requests = opts.io_queue_requests; /* [한국어] 합의된 값을 전역에 되돌려 이후 qpair들과 일관성 유지. */
 
+	/* [한국어] 실제 NVMe I/O qpair 생성 — SQ/CQ 메모리 할당(연결은 create_only로 미룸). */
 	qpair = spdk_nvme_ctrlr_alloc_io_qpair(nvme_ctrlr->ctrlr, &opts, sizeof(opts));
-	if (qpair == NULL) {
-		return -1;
+	if (qpair == NULL) {                            /* [한국어] 큐 자원 고갈/컨트롤러 불가 시 NULL. */
+		return -1;                              /* [한국어] 호출자(채널 생성)가 채널 구성 실패로 처리. */
 	}
 
+	/* [한국어] DTrace 프로브: 어떤 컨트롤러/큐ID/스레드에서 qpair가 생성되는지 추적. */
 	SPDK_DTRACE_PROBE3(bdev_nvme_create_qpair, nvme_ctrlr->nbdev_ctrlr->name,
 			   spdk_nvme_qpair_get_id(qpair), spdk_thread_get_id(spdk_get_thread()));
 
-	assert(nvme_qpair->group != NULL);
+	assert(nvme_qpair->group != NULL);              /* [한국어] poll group은 채널 생성 시 반드시 선설정. */
 
+	/* [한국어] qpair를 이 채널의 poll group에 추가 — 이후 group 폴링이 이 큐 완료를 수거. */
 	rc = spdk_nvme_poll_group_add(nvme_qpair->group->group, qpair);
-	if (rc != 0) {
+	if (rc != 0) {                                  /* [한국어] poll group 등록 실패. */
 		NVME_QPAIR_ERRLOG(nvme_qpair, "Unable to begin polling on NVMe Channel.\n");
-		goto err;
+		goto err;                               /* [한국어] 생성한 qpair를 해제하고 빠져나간다. */
 	}
 
+	/* [한국어] Fabrics Connect 캡슐 전송(또는 PCIe SQ/CQ 활성) 개시 — 완료는 비동기. */
 	rc = spdk_nvme_ctrlr_connect_io_qpair(nvme_ctrlr->ctrlr, qpair);
-	if (rc != 0) {
+	if (rc != 0) {                                  /* [한국어] connect 개시 실패(전송 오류/상태 불가). */
 		NVME_QPAIR_ERRLOG(nvme_qpair, "Unable to connect I/O qpair.\n");
-		goto err;
+		goto err;                               /* [한국어] qpair 해제 후 실패 반환. */
 	}
 
-	nvme_qpair->qpair = qpair;
+	nvme_qpair->qpair = qpair;                      /* [한국어] 성공 시 래퍼에 실제 핸들 연결(이후 I/O 발행에 사용). */
 
+	/* [한국어] 자동 failback이 켜져 있으면, 새 path가 살아났으니 채널들의 io_path 캐시를 무효화. */
 	if (!g_opts.disable_auto_failback) {
 		_bdev_nvme_clear_io_path_cache(nvme_qpair);
 	}
 
 	NVME_QPAIR_INFOLOG(nvme_qpair, "Connecting qpair started.\n");
-	return 0;
+	return 0;                                       /* [한국어] 연결 개시 성공(완료는 poll group 폴링에서). */
 
 err:
-	spdk_nvme_ctrlr_free_io_qpair(qpair);
+	spdk_nvme_ctrlr_free_io_qpair(qpair);           /* [한국어] 실패 정리: 할당된 qpair 메모리/큐 해제. */
 
-	return rc;
+	return rc;                                       /* [한국어] 실패 코드 전달. */
 }
 
+/* [한국어] 전방 선언: pending reset I/O 하나에 reset 결과를 통지하는 콜백(아래에서 정의). */
 static void bdev_nvme_reset_io_continue(void *cb_arg, int rc);
 
+/*
+ * [한국어]
+ * bdev_nvme_complete_pending_resets - reset 완료 시, 그동안 대기 큐에 쌓인 reset 요청들을 일괄 완료한다.
+ *
+ * @nvme_ctrlr: reset이 막 끝난 컨트롤러. pending_resets 리스트에 중복 reset 요청들이 들어 있다.
+ * @success: 방금 끝난 reset의 성공 여부. 대기 중이던 모든 요청에 동일 결과를 전파한다.
+ * @return: 없음.
+ *
+ * 왜 필요한가: 한 컨트롤러에 reset이 진행 중일 때 또 다른 bdev_reset 요청이 오면 즉시 실행하지 않고
+ * pending_resets에 큐잉한다(중복 reset 방지). 진행 중이던 reset이 끝나면 그 결과를 대기 요청들에
+ * 그대로 돌려준다. 동작: 리스트가 빌 때까지 head를 꺼내며 각 bio에 bdev_nvme_reset_io_continue를
+ * 호출해 성공이면 0, 실패면 -1을 통지한다.
+ * 실행 컨텍스트: app(메인) spdk_thread — reset 완료 경로(bdev_nvme_reset_ctrlr_complete)에서 호출.
+ *
+ * 호출 체인:
+ *   bdev_nvme_reset_ctrlr_complete → [bdev_nvme_complete_pending_resets] → bdev_nvme_reset_io_continue
+ */
 static void
 bdev_nvme_complete_pending_resets(struct nvme_ctrlr *nvme_ctrlr, bool success)
 {
-	int rc = 0;
-	struct nvme_bdev_io *bio;
+	int rc = 0;                                     /* [한국어] 대기 요청들에 통지할 결과 코드(기본 성공). */
+	struct nvme_bdev_io *bio;                       /* [한국어] 큐에서 꺼낸 reset 요청 I/O. */
 
-	if (!success) {
+	if (!success) {                                 /* [한국어] reset이 실패했으면 모든 대기 요청도 실패 처리. */
 		rc = -1;
 	}
 
+	/* [한국어] pending_resets가 빌 때까지 head부터 하나씩 꺼내 결과 통지. */
 	while (!TAILQ_EMPTY(&nvme_ctrlr->pending_resets)) {
-		bio = TAILQ_FIRST(&nvme_ctrlr->pending_resets);
-		TAILQ_REMOVE(&nvme_ctrlr->pending_resets, bio, retry_link);
+		bio = TAILQ_FIRST(&nvme_ctrlr->pending_resets); /* [한국어] 가장 오래 기다린 요청부터. */
+		TAILQ_REMOVE(&nvme_ctrlr->pending_resets, bio, retry_link); /* [한국어] 큐에서 제거(중복 완료 방지). */
 
-		bdev_nvme_reset_io_continue(bio, rc);
+		bdev_nvme_reset_io_continue(bio, rc);   /* [한국어] 해당 reset I/O에 결과 전달 → bdev_io 완료로 이어짐. */
 	}
 }
 
@@ -2333,121 +3602,204 @@ bdev_nvme_complete_pending_resets(struct nvme_ctrlr *nvme_ctrlr, bool success)
  * The purpose of the boolean return value is to request the caller to disconnect
  * the current trid now to try connecting the next trid.
  */
+/*
+ * [한국어]
+ * bdev_nvme_failover_trid - 현재 활성 경로(trid)를 실패로 표시하고 다음 대체 경로로 전환한다.
+ *
+ * @nvme_ctrlr: 다중 경로(trid 리스트)를 가진 컨트롤러. 첫 trid가 현재 활성 경로여야 한다.
+ * @remove: true면 실패한 trid를 리스트에서 제거(영구 삭제), false면 라운드로빈용으로 리스트 끝으로 이동.
+ * @start: failover 시퀀스의 첫 진입인지 여부. true면 backoff 무시하고 다음 trid를 즉시 시도.
+ * @return: true=호출자가 지금 즉시 현재 trid를 disconnect하고 다음 trid 연결을 시도해야 함,
+ *          false=대체 경로가 없거나 아직 backoff 대기 중이라 지금 전환하지 않음.
+ *
+ * 왜 필요한가: NVMe-oF 다중 경로(multipath) 환경에서 한 네트워크 경로가 죽으면 다른 traddr/trsvcid로
+ * 자동 전환(failover)해야 한다. (영어 주석 참고) 반환 bool은 "지금 끊고 다음 경로로 붙어라"는 신호다.
+ * 동작: (1) 현재 trid의 last_failed_tsc에 현재 tsc 기록(=실패 표시), (2) 다음 trid가 없으면 false,
+ * (3) reset 시퀀스 중 재시도 비활성(reconnect_delay=0, start 아님)이면 false, (4) 컨트롤러를 fail로
+ * 강제하고 active_path_id를 다음 trid로 교체 후 드라이버에 set_trid, (5) 이전 trid를 remove하거나
+ * 리스트 끝으로 회전(라운드로빈), (6) start이거나 다음 trid가 한 번도 실패하지 않았으면 즉시 시도(true),
+ * (7) backoff(reconnect_delay_sec)가 충분히 지났으면 true, 아니면 false.
+ * 실행 컨텍스트: app spdk_thread, nvme_ctrlr->mutex 보유 상태에서 호출됨.
+ *
+ * 호출 체인:
+ *   bdev_nvme_reset_ctrlr_complete / bdev_nvme_failover_ctrlr → [bdev_nvme_failover_trid]
+ */
 static bool
 bdev_nvme_failover_trid(struct nvme_ctrlr *nvme_ctrlr, bool remove, bool start)
 {
-	struct spdk_nvme_path_id *path_id, *next_path;
-	int rc __attribute__((unused));
+	struct spdk_nvme_path_id *path_id, *next_path; /* [한국어] 현재 경로와 다음 후보 경로. */
+	int rc __attribute__((unused));                 /* [한국어] set_trid 반환(릴리스 빌드에선 assert만 사용). */
 
-	path_id = TAILQ_FIRST(&nvme_ctrlr->trids);
-	assert(path_id);
-	assert(path_id == nvme_ctrlr->active_path_id);
-	next_path = TAILQ_NEXT(path_id, link);
+	path_id = TAILQ_FIRST(&nvme_ctrlr->trids);      /* [한국어] 리스트 head = 현재 활성 trid. */
+	assert(path_id);                                /* [한국어] 최소 1개 경로는 존재해야 함. */
+	assert(path_id == nvme_ctrlr->active_path_id);  /* [한국어] head가 곧 활성 경로라는 불변식 확인. */
+	next_path = TAILQ_NEXT(path_id, link);          /* [한국어] 전환 후보(다음 경로) — 없을 수 있음. */
 
 	/* Update the last failed time. It means the trid is failed if its last
 	 * failed time is non-zero.
 	 */
+	/* [한국어] (위 영어) last_failed_tsc != 0 이면 그 경로는 "실패"로 간주. 현재 시각 기록. */
 	path_id->last_failed_tsc = spdk_get_ticks();
 
-	if (next_path == NULL) {
+	if (next_path == NULL) {                        /* [한국어] 대체 경로가 없으면 전환 불가. */
 		/* There is no alternate trid within a controller. */
-		return false;
+		return false;                           /* [한국어] 호출자는 같은 경로 재시도 또는 reconnect 대기. */
 	}
 
 	if (!start && nvme_ctrlr->opts.reconnect_delay_sec == 0) {
 		/* Connect is not retried in a controller reset sequence. Connecting
 		 * the next trid will be done by the next bdev_nvme_failover_ctrlr() call.
 		 */
+		/* [한국어] reconnect 지연이 0이면 reset 시퀀스 안에서 재연결을 시도하지 않는다.
+		 * 다음 trid 연결은 다음 failover 호출이 담당하므로 지금은 false. */
 		return false;
 	}
 
-	assert(path_id->trid.trtype != SPDK_NVME_TRANSPORT_PCIE);
+	assert(path_id->trid.trtype != SPDK_NVME_TRANSPORT_PCIE); /* [한국어] PCIe는 단일 경로 — failover는 Fabrics만. */
 
 	NVME_CTRLR_NOTICELOG(nvme_ctrlr, "Start failover to %s:%s\n", next_path->trid.traddr,
-			     next_path->trid.trsvcid);
-	spdk_nvme_ctrlr_fail(nvme_ctrlr->ctrlr);
-	nvme_ctrlr->active_path_id = next_path;
-	rc = spdk_nvme_ctrlr_set_trid(nvme_ctrlr->ctrlr, &next_path->trid);
-	assert(rc == 0);
-	TAILQ_REMOVE(&nvme_ctrlr->trids, path_id, link);
+			     next_path->trid.trsvcid); /* [한국어] 어느 주소:포트로 전환하는지 로그. */
+	spdk_nvme_ctrlr_fail(nvme_ctrlr->ctrlr);        /* [한국어] 현재 경로의 컨트롤러를 강제 fail — 진행 중 I/O 정리. */
+	nvme_ctrlr->active_path_id = next_path;         /* [한국어] 활성 경로 포인터를 다음 trid로 갱신. */
+	rc = spdk_nvme_ctrlr_set_trid(nvme_ctrlr->ctrlr, &next_path->trid); /* [한국어] 드라이버에 새 전송 주소 알림. */
+	assert(rc == 0);                                /* [한국어] fail 상태에서 set_trid는 항상 성공해야 함. */
+	TAILQ_REMOVE(&nvme_ctrlr->trids, path_id, link); /* [한국어] 이전 경로를 리스트에서 분리(아래에서 재배치/삭제). */
 	if (!remove) {
 		/** Shuffle the old trid to the end of the list and use the new one.
 		 * Allows for round robin through multiple connections.
 		 */
+		/* [한국어] (위 영어) 이전 trid를 리스트 끝으로 회전 — 여러 경로 라운드로빈 순환 유지. */
 		TAILQ_INSERT_TAIL(&nvme_ctrlr->trids, path_id, link);
 	} else {
-		free(path_id);
+		free(path_id);                          /* [한국어] remove면 이전 경로를 영구 삭제. */
 	}
 
 	if (start || next_path->last_failed_tsc == 0) {
 		/* bdev_nvme_failover_ctrlr() is just called or the next trid is not failed
 		 * or used yet. Try the next trid now.
 		 */
+		/* [한국어] 첫 진입이거나 다음 경로가 한 번도 실패한 적 없으면 backoff 없이 즉시 시도. */
 		return true;
 	}
 
 	if (spdk_get_ticks() > next_path->last_failed_tsc + spdk_get_ticks_hz() *
 	    nvme_ctrlr->opts.reconnect_delay_sec) {
 		/* Enough backoff passed since the next trid failed. Try the next trid now. */
+		/* [한국어] 다음 경로가 마지막으로 실패한 뒤 reconnect_delay_sec만큼 충분히 지났으면 재시도. */
 		return true;
 	}
 
 	/* The next trid will be tried after reconnect_delay_sec seconds. */
-	return false;
+	return false;                                   /* [한국어] 아직 backoff 중 — 나중에 재시도. */
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_check_ctrlr_loss_timeout - 컨트롤러 손실 타임아웃(ctrlr_loss_timeout_sec) 경과 여부 판정.
+ *
+ * @nvme_ctrlr: reset/reconnect 재시도 중인 컨트롤러. reset_start_tsc 기준으로 경과를 측정.
+ * @return: true=손실 타임아웃 초과(이제 컨트롤러를 영구 삭제해야 함), false=아직 유예 내(또는 무제한).
+ *
+ * 왜 필요한가: NVMe-oF 연결이 끊긴 뒤 무한정 재연결을 시도하지 않고, 사용자가 지정한 시간이 지나면
+ * 컨트롤러를 포기(삭제)해야 한다. 동작: timeout이 0이거나 -1(무제한)이면 항상 false, 그 외에는
+ * reset 시작 이후 경과 초(elapsed)를 손실 타임아웃과 비교.
+ * 실행 컨텍스트: app spdk_thread(reset 완료/재연결 폴러 경로). spdk_get_ticks_hz()로 tsc→초 변환.
+ *
+ * 호출 체인:
+ *   bdev_nvme_check_op_after_reset / 재연결 폴러 → [bdev_nvme_check_ctrlr_loss_timeout]
+ */
 static bool
 bdev_nvme_check_ctrlr_loss_timeout(struct nvme_ctrlr *nvme_ctrlr)
 {
-	uint32_t elapsed;
+	uint32_t elapsed;                               /* [한국어] reset 시작 이후 경과 시간(초). */
 
+	/* [한국어] 0(즉시 포기 안 함) 또는 -1(무제한 재시도)이면 손실 타임아웃 미적용. */
 	if (nvme_ctrlr->opts.ctrlr_loss_timeout_sec == 0 ||
 	    nvme_ctrlr->opts.ctrlr_loss_timeout_sec == -1) {
 		return false;
 	}
 
-	assert(nvme_ctrlr->opts.ctrlr_loss_timeout_sec >= 0);
+	assert(nvme_ctrlr->opts.ctrlr_loss_timeout_sec >= 0); /* [한국어] 위 분기 이후엔 양수만 남음. */
+	/* [한국어] (현재 tsc - reset 시작 tsc)를 tsc 주파수로 나눠 경과 초 계산. */
 	elapsed = (spdk_get_ticks() - nvme_ctrlr->reset_start_tsc) / spdk_get_ticks_hz();
 	if (elapsed >= (uint32_t)nvme_ctrlr->opts.ctrlr_loss_timeout_sec) {
-		return true;
+		return true;                            /* [한국어] 유예 초과 → 컨트롤러 포기/삭제. */
 	} else {
-		return false;
+		return false;                           /* [한국어] 아직 유예 내 → 계속 재시도. */
 	}
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_check_fast_io_fail_timeout - fast I/O fail 타임아웃 경과 여부 판정.
+ *
+ * @nvme_ctrlr: reset 중인 컨트롤러. reset_start_tsc 기준 경과를 측정.
+ * @return: true=fast_io_fail 타임아웃 초과(대기 중 I/O를 빨리 실패시켜야 함), false=아직 유예 내(또는 비활성).
+ *
+ * 왜 필요한가: 컨트롤러 복구를 끝까지 기다리지 않고, 더 짧은 fast_io_fail_timeout_sec이 지나면
+ * 큐에 묶인 I/O를 즉시 실패로 돌려 상위 애플리케이션의 지연을 제한한다(ctrlr_loss_timeout보다 짧게 설정).
+ * 동작: timeout이 0이면 비활성(false), 그 외 reset 이후 경과 초를 비교.
+ * 실행 컨텍스트: app spdk_thread(reset 완료 경로).
+ *
+ * 호출 체인:
+ *   bdev_nvme_reset_ctrlr_complete → [bdev_nvme_check_fast_io_fail_timeout]
+ */
 static bool
 bdev_nvme_check_fast_io_fail_timeout(struct nvme_ctrlr *nvme_ctrlr)
 {
-	uint32_t elapsed;
+	uint32_t elapsed;                               /* [한국어] reset 시작 이후 경과 초. */
 
-	if (nvme_ctrlr->opts.fast_io_fail_timeout_sec == 0) {
+	if (nvme_ctrlr->opts.fast_io_fail_timeout_sec == 0) { /* [한국어] 0이면 fast-fail 비활성. */
 		return false;
 	}
 
+	/* [한국어] reset 시작 이후 경과 초 계산. */
 	elapsed = (spdk_get_ticks() - nvme_ctrlr->reset_start_tsc) / spdk_get_ticks_hz();
 	if (elapsed >= nvme_ctrlr->opts.fast_io_fail_timeout_sec) {
-		return true;
+		return true;                            /* [한국어] 임계 초과 → 대기 I/O를 빠르게 실패. */
 	} else {
-		return false;
+		return false;                           /* [한국어] 아직 유예 내. */
 	}
 }
 
+/* [한국어] 전방 선언: reset 시퀀스 종료 시 상태 정리/후속 동작을 수행하는 함수(아래 정의). */
 static void bdev_nvme_reset_ctrlr_complete(struct nvme_ctrlr *nvme_ctrlr, bool success);
 
+/*
+ * [한국어]
+ * nvme_ctrlr_disconnect - 컨트롤러 연결을 끊고, 끊김 완료 시 실행할 콜백을 등록한다.
+ *
+ * @nvme_ctrlr: 끊을 컨트롤러. reset/failover/재연결 시퀀스의 한 단계로 호출됨.
+ * @cb_fn: 실제로 disconnect가 완료된 뒤(adminq 폴링으로 비동기 확인) 호출할 콜백
+ *         (예: bdev_nvme_reconnect_ctrlr, bdev_nvme_start_reconnect_delay_timer).
+ * @return: 없음(실패 시 즉시 reset 실패로 마감).
+ *
+ * 왜 필요한가: NVMe 컨트롤러 disconnect는 즉시 끝나지 않고 adminq를 폴링하며 비동기로 완료된다.
+ * 그래서 "끊긴 다음 무엇을 할지"를 콜백으로 예약해 두고, 완료 시점에 그 콜백이 호출되도록 한다.
+ * 동작: (1) spdk_nvme_ctrlr_disconnect 시도, (2) 실패(이미 resetting/removed)면 reset을 즉시 실패
+ * 처리, (3) 성공 시 disconnected_cb에 콜백 저장, (4) 더 빠른 완료 감지를 위해 adminq 폴링 주기를
+ * 0(가능한 한 자주)으로 단축.
+ * 실행 컨텍스트: app spdk_thread.
+ *
+ * 호출 체인:
+ *   bdev_nvme_reset_ctrlr_complete / failover 경로 → [nvme_ctrlr_disconnect]
+ *     → spdk_nvme_ctrlr_disconnect → (완료 후) disconnected_cb
+ */
 static void
 nvme_ctrlr_disconnect(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_disconnected_cb cb_fn)
 {
-	int rc;
+	int rc;                                         /* [한국어] disconnect 개시 반환 코드. */
 
 	NVME_CTRLR_INFOLOG(nvme_ctrlr, "Start disconnecting ctrlr.\n");
 
-	rc = spdk_nvme_ctrlr_disconnect(nvme_ctrlr->ctrlr);
-	if (rc != 0) {
+	rc = spdk_nvme_ctrlr_disconnect(nvme_ctrlr->ctrlr); /* [한국어] 드라이버에 연결 해제 요청(비동기 시작). */
+	if (rc != 0) {                                  /* [한국어] 이미 resetting/removed면 실패. */
 		NVME_CTRLR_WARNLOG(nvme_ctrlr, "disconnecting ctrlr failed.\n");
 
 		/* Disconnect fails if ctrlr is already resetting or removed. In this case,
 		 * fail the reset sequence immediately.
 		 */
+		/* [한국어] (위 영어) 더 진행할 수 없으므로 reset 시퀀스를 즉시 실패로 마감. */
 		bdev_nvme_reset_ctrlr_complete(nvme_ctrlr, false);
 		return;
 	}
@@ -2455,31 +3807,53 @@ nvme_ctrlr_disconnect(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_disconnected_cb 
 	/* spdk_nvme_ctrlr_disconnect() may complete asynchronously later by polling adminq.
 	 * Set callback here to execute the specified operation after ctrlr is really disconnected.
 	 */
-	assert(nvme_ctrlr->disconnected_cb == NULL);
-	nvme_ctrlr->disconnected_cb = cb_fn;
+	/* [한국어] (위 영어) disconnect는 adminq 폴링으로 나중에 완료된다. 완료 시 수행할 콜백을 지금 등록. */
+	assert(nvme_ctrlr->disconnected_cb == NULL);    /* [한국어] 이전 콜백이 남아있지 않아야 함(단일 진행). */
+	nvme_ctrlr->disconnected_cb = cb_fn;            /* [한국어] adminq 폴러가 끊김을 감지하면 이 콜백 호출. */
 
 	/* During disconnection, reduce the period to poll adminq more often. */
+	/* [한국어] 끊김을 더 빨리 감지하기 위해 adminq 폴링 주기를 0으로(가능한 한 자주) 줄임. */
 	bdev_nvme_change_adminq_poll_period(nvme_ctrlr, 0);
 }
 
+/* [한국어] reset 완료 후 컨트롤러에 대해 수행할 후속 동작 종류. */
 enum bdev_nvme_op_after_reset {
-	OP_NONE,
-	OP_COMPLETE_PENDING_DESTRUCT,
-	OP_DESTRUCT,
-	OP_DELAYED_RECONNECT,
-	OP_FAILOVER,
+	OP_NONE,                                        /* [한국어] 추가 동작 없음(정상 종료). */
+	OP_COMPLETE_PENDING_DESTRUCT,                   /* [한국어] 대기 중이던 해제(destruct)를 이제 마무리. */
+	OP_DESTRUCT,                                    /* [한국어] 손실 타임아웃 초과 → 컨트롤러 영구 삭제. */
+	OP_DELAYED_RECONNECT,                           /* [한국어] reconnect_delay_sec 후 재연결 예약. */
+	OP_FAILOVER,                                    /* [한국어] 대기 중이던 failover를 즉시 수행. */
 };
 
+/* [한국어] enum을 함수 반환 타입으로 쓰기 위한 typedef 별칭. */
 typedef enum bdev_nvme_op_after_reset _bdev_nvme_op_after_reset;
 
+/*
+ * [한국어]
+ * bdev_nvme_check_op_after_reset - reset 결과/상태를 보고 다음에 취할 동작을 결정한다.
+ *
+ * @nvme_ctrlr: reset이 막 끝난 컨트롤러.
+ * @success: reset 성공 여부.
+ * @pending_failover: reset 진행 중에 failover 요청이 쌓였는지(경쟁 조건 보정용).
+ * @return: OP_* 열거값 — 호출자(reset 완료 핸들러)가 이 값에 따라 분기한다.
+ *
+ * 왜 필요한가: reset 완료 시점의 상태(삭제 대기/성공/타임아웃/실패)에 따라 후속 동작이 갈린다.
+ * 이 함수가 정책 결정을 한곳에 모아 호출자의 switch를 단순화한다. 동작: (1) 컨트롤러가 등록 해제
+ * 가능 상태면 OP_COMPLETE_PENDING_DESTRUCT, (2) 성공이거나 reconnect_delay=0이면 pending_failover
+ * 유무에 따라 OP_FAILOVER/OP_NONE, (3) 손실 타임아웃 초과면 OP_DESTRUCT, (4) 그 외엔 OP_DELAYED_RECONNECT.
+ * 실행 컨텍스트: app spdk_thread, mutex 보유 상태.
+ *
+ * 호출 체인:
+ *   bdev_nvme_reset_ctrlr_complete → [bdev_nvme_check_op_after_reset]
+ */
 static _bdev_nvme_op_after_reset
 bdev_nvme_check_op_after_reset(struct nvme_ctrlr *nvme_ctrlr, bool success,
 			       bool pending_failover)
 {
-	if (nvme_ctrlr_can_be_unregistered(nvme_ctrlr)) {
+	if (nvme_ctrlr_can_be_unregistered(nvme_ctrlr)) { /* [한국어] 삭제 대기 + 참조 0이면. */
 		/* Complete pending destruct after reset completes. */
-		return OP_COMPLETE_PENDING_DESTRUCT;
-	} else if (success || nvme_ctrlr->opts.reconnect_delay_sec == 0) {
+		return OP_COMPLETE_PENDING_DESTRUCT;    /* [한국어] reset 끝났으니 미뤄둔 해제를 마무리. */
+	} else if (success || nvme_ctrlr->opts.reconnect_delay_sec == 0) { /* [한국어] 성공 또는 즉시 재시도 정책. */
 		if (pending_failover) {
 			/* This is a fix for a race condition that failover was lost
 			 * if fabric connect command got timeout while ctrlr was being
@@ -2490,69 +3864,125 @@ bdev_nvme_check_op_after_reset(struct nvme_ctrlr *nvme_ctrlr, bool success,
 			 * On the other hand, if reset failed, delayed reconnect will be
 			 * executed. In this case, we do not have to failover immediately.
 			 */
+			/* [한국어] (위 영어) reset 중 failover 요청이 유실되는 경쟁 조건 보정.
+			 * reset이 성공했는데 failover가 대기 중이면 지금 즉시 failover 수행. */
 			return OP_FAILOVER;
 		} else {
-			return OP_NONE;
+			return OP_NONE;                 /* [한국어] 대기 failover 없으면 추가 동작 없음. */
 		}
-	} else if (bdev_nvme_check_ctrlr_loss_timeout(nvme_ctrlr)) {
-		return OP_DESTRUCT;
+	} else if (bdev_nvme_check_ctrlr_loss_timeout(nvme_ctrlr)) { /* [한국어] 실패 + 손실 타임아웃 초과. */
+		return OP_DESTRUCT;                     /* [한국어] 포기하고 컨트롤러 영구 삭제. */
 	} else {
-		return OP_DELAYED_RECONNECT;
+		return OP_DELAYED_RECONNECT;            /* [한국어] 실패 but 유예 내 → 지연 후 재연결. */
 	}
 }
 
+/* [한국어] 전방 선언: 컨트롤러를 삭제(hotplug 여부 인자)하는 함수. */
 static int bdev_nvme_delete_ctrlr(struct nvme_ctrlr *nvme_ctrlr, bool hotplug);
+/* [한국어] 전방 선언: 컨트롤러 재연결 시퀀스를 시작하는 함수. */
 static void bdev_nvme_reconnect_ctrlr(struct nvme_ctrlr *nvme_ctrlr);
 
+/*
+ * [한국어]
+ * bdev_nvme_reconnect_delay_timer_expired - reconnect 지연 타이머 만료 시 재연결을 개시하는 폴러 콜백.
+ *
+ * @ctx: nvme_ctrlr 포인터(타이머 등록 시 전달).
+ * @return: SPDK_POLLER_BUSY (이 호출에서 작업을 했음을 알림 — 일회성 타이머라 곧 해제됨).
+ *
+ * 왜 필요한가: 연결 실패 후 reconnect_delay_sec 만큼 backoff한 뒤 자동으로 재연결을 시도하기 위한
+ * 일회성 타이머 폴러. 동작: (1) 타이머 자신을 unregister, (2) reconnect_is_delayed 플래그가 꺼졌으면
+ * (취소됨) 그냥 종료, (3) destruct 중이면 종료, (4) resetting=true로 표시 후 adminq 폴러를 재개하고
+ * bdev_nvme_reconnect_ctrlr로 실제 재연결 시작.
+ * 실행 컨텍스트: 컨트롤러가 속한 app spdk_thread의 타이머 폴러. mutex로 상태 플래그 보호.
+ *
+ * 호출 체인:
+ *   SPDK 타이머 폴러 런타임 → [bdev_nvme_reconnect_delay_timer_expired] → bdev_nvme_reconnect_ctrlr
+ */
 static int
 bdev_nvme_reconnect_delay_timer_expired(void *ctx)
 {
-	struct nvme_ctrlr *nvme_ctrlr = ctx;
+	struct nvme_ctrlr *nvme_ctrlr = ctx;            /* [한국어] 타이머가 묶인 컨트롤러. */
 
-	SPDK_DTRACE_PROBE1(bdev_nvme_ctrlr_reconnect_delay, nvme_ctrlr->nbdev_ctrlr->name);
-	pthread_mutex_lock(&nvme_ctrlr->mutex);
+	SPDK_DTRACE_PROBE1(bdev_nvme_ctrlr_reconnect_delay, nvme_ctrlr->nbdev_ctrlr->name); /* [한국어] 재연결 지연 만료 추적. */
+	pthread_mutex_lock(&nvme_ctrlr->mutex);         /* [한국어] reconnect/destruct 플래그를 원자적으로 검사·변경. */
 
-	spdk_poller_unregister(&nvme_ctrlr->reconnect_delay_timer);
+	spdk_poller_unregister(&nvme_ctrlr->reconnect_delay_timer); /* [한국어] 일회성 타이머이므로 즉시 해제. */
 
-	if (!nvme_ctrlr->reconnect_is_delayed) {
+	if (!nvme_ctrlr->reconnect_is_delayed) {        /* [한국어] 그사이 재연결 예약이 취소됐으면. */
+		pthread_mutex_unlock(&nvme_ctrlr->mutex);
+		return SPDK_POLLER_BUSY;                /* [한국어] 아무 동작 없이 종료. */
+	}
+
+	nvme_ctrlr->reconnect_is_delayed = false;       /* [한국어] 지연 상태 해제(이제 실제 재연결로 진행). */
+
+	if (nvme_ctrlr->destruct) {                     /* [한국어] 삭제 진행 중이면 재연결하지 않음. */
 		pthread_mutex_unlock(&nvme_ctrlr->mutex);
 		return SPDK_POLLER_BUSY;
 	}
 
-	nvme_ctrlr->reconnect_is_delayed = false;
-
-	if (nvme_ctrlr->destruct) {
-		pthread_mutex_unlock(&nvme_ctrlr->mutex);
-		return SPDK_POLLER_BUSY;
-	}
-
-	assert(nvme_ctrlr->resetting == false);
-	nvme_ctrlr->resetting = true;
+	assert(nvme_ctrlr->resetting == false);         /* [한국어] 재연결 직전엔 reset 진행 중이 아니어야 함. */
+	nvme_ctrlr->resetting = true;                   /* [한국어] reset/reconnect 진행 표시(중복 진입 차단). */
 
 	pthread_mutex_unlock(&nvme_ctrlr->mutex);
 
-	spdk_poller_resume(nvme_ctrlr->adminq_timer_poller);
+	spdk_poller_resume(nvme_ctrlr->adminq_timer_poller); /* [한국어] 일시정지했던 adminq 폴러 재개(연결 진행 폴링). */
 
-	bdev_nvme_reconnect_ctrlr(nvme_ctrlr);
-	return SPDK_POLLER_BUSY;
+	bdev_nvme_reconnect_ctrlr(nvme_ctrlr);          /* [한국어] 실제 재연결 시퀀스 개시. */
+	return SPDK_POLLER_BUSY;                        /* [한국어] 작업 수행했음을 폴러 런타임에 보고. */
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_start_reconnect_delay_timer - reconnect_delay_sec 후 재연결하도록 지연 타이머를 건다.
+ *
+ * @nvme_ctrlr: 재연결을 미룰 컨트롤러.
+ * @return: 없음.
+ *
+ * 왜 필요한가: 연결이 끊긴 직후 곧바로 재시도하면 죽은 타깃에 폭주가 발생하므로, 일정 시간(backoff)
+ * 뒤에 한 번 재연결하도록 일회성 타이머를 등록한다. 동작: (1) adminq 폴러를 일시정지(끊긴 상태에서
+ * 불필요한 폴링 방지), (2) reconnect_is_delayed=true 표시, (3) reconnect_delay_sec(초)를 마이크로초로
+ * 환산해 타이머 폴러 등록.
+ * 실행 컨텍스트: app spdk_thread. nvme_ctrlr_disconnect의 disconnected_cb로 호출되는 경우가 많다.
+ *
+ * 호출 체인:
+ *   bdev_nvme_reset_ctrlr_complete(OP_DELAYED_RECONNECT) → nvme_ctrlr_disconnect(cb=이 함수)
+ *     → [bdev_nvme_start_reconnect_delay_timer]
+ */
 static void
 bdev_nvme_start_reconnect_delay_timer(struct nvme_ctrlr *nvme_ctrlr)
 {
-	spdk_poller_pause(nvme_ctrlr->adminq_timer_poller);
+	spdk_poller_pause(nvme_ctrlr->adminq_timer_poller); /* [한국어] 끊긴 동안 adminq 폴링 일시정지(자원 절약). */
 
-	assert(nvme_ctrlr->reconnect_is_delayed == false);
-	nvme_ctrlr->reconnect_is_delayed = true;
+	assert(nvme_ctrlr->reconnect_is_delayed == false); /* [한국어] 중복 지연 등록 방지. */
+	nvme_ctrlr->reconnect_is_delayed = true;        /* [한국어] 재연결이 지연 예약됨을 표시. */
 
-	assert(nvme_ctrlr->reconnect_delay_timer == NULL);
+	assert(nvme_ctrlr->reconnect_delay_timer == NULL); /* [한국어] 기존 타이머가 없어야 함. */
+	/* [한국어] reconnect_delay_sec(초) → 마이크로초 환산 후 일회성 타이머 등록. */
 	nvme_ctrlr->reconnect_delay_timer = SPDK_POLLER_REGISTER(bdev_nvme_reconnect_delay_timer_expired,
 					    nvme_ctrlr,
 					    nvme_ctrlr->opts.reconnect_delay_sec * SPDK_SEC_TO_USEC);
 }
 
+/* [한국어] 전방 선언: discovery 서비스 항목에서 이 컨트롤러를 제거하는 함수. */
 static void remove_discovery_entry(struct nvme_ctrlr *nvme_ctrlr);
 
+/*
+ * [한국어]
+ * bdev_nvme_reset_ctrlr_complete - 컨트롤러 리셋/페일오버 완료 후 상태를 정리하는 내부 함수.
+ *
+ * @nvme_ctrlr: 완료된 리셋 대상 컨트롤러
+ * @success: 리셋/재연결 성공 여부
+ * @return: void
+ *
+ * 리셋 완료 시 호출되며, 다음 작업을 결정한다:
+ *   1) 리셋 실패 시 다음 alternate trid로 즉시 페일오버 또는 reconnect_delay_sec 후 재시도.
+ *   2) pending_resets 완료, resetting/in_failover 플래그 클리어.
+ *   3) op_after_reset 상태에 따라 남은 destruct/failover/reconnect 시퀀스 실행.
+ * 컨텍스트: app 스레드 강제. mutex를 획득 후 상태를 조작한다.
+ *
+ * 호출 체인:
+ *   bdev_nvme_reset_create_qpairs_done() → [이 함수] → nvme_ctrlr_disconnect / remove_discovery_entry 등
+ */
 static void
 bdev_nvme_reset_ctrlr_complete(struct nvme_ctrlr *nvme_ctrlr, bool success)
 {
@@ -2643,12 +4073,46 @@ bdev_nvme_reset_ctrlr_complete(struct nvme_ctrlr *nvme_ctrlr, bool success)
 	}
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_reset_create_qpairs_failed - qpair 생성 실패 시 리셋 시퀀스를 실패로 완료.
+ *
+ * @nvme_ctrlr: 대상 컨트롤러
+ * @ctx: 사용하지 않음
+ * @status: 에러 코드
+ * @return: void
+ *
+ * nvme_ctrlr_for_each_channel 완료 콜백. qpair 생성에 실패한 경우
+ * bdev_nvme_reset_ctrlr_complete(success=false)를 호출해 리셋 실패로 처리한다.
+ *
+ * 호출 체인:
+ *   bdev_nvme_reset_create_qpairs_done() → nvme_ctrlr_for_each_channel → [이 함수]
+ *   → bdev_nvme_reset_ctrlr_complete(false)
+ */
 static void
 bdev_nvme_reset_create_qpairs_failed(struct nvme_ctrlr *nvme_ctrlr, void *ctx, int status)
 {
 	bdev_nvme_reset_ctrlr_complete(nvme_ctrlr, false);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_reset_destroy_qpair - 리셋 시퀀스에서 각 채널의 qpair를 비동기 연결 해제.
+ *
+ * @i: 채널 이터레이터
+ * @nvme_ctrlr: 대상 컨트롤러
+ * @ctrlr_ch: 현재 처리 중인 컨트롤러 채널
+ * @ctx: 사용하지 않음
+ * @return: void
+ *
+ * nvme_ctrlr_for_each_channel의 채널별 콜백. 각 채널의 io_path 캐시를 클리어하고
+ * qpair를 disconnect한다. qpair가 실제로 disconnected될 때까지는 reset_iter를 보관하고
+ * bdev_nvme_disconnected_qpair_cb에서 nvme_ctrlr_for_each_channel_continue를 호출한다.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_for_each_channel() → [이 함수] → spdk_nvme_ctrlr_disconnect_io_qpair()
+ *   → (비동기) bdev_nvme_disconnected_qpair_cb → nvme_ctrlr_channel_reset_finish
+ */
 static void
 bdev_nvme_reset_destroy_qpair(struct nvme_ctrlr_channel_iter *i,
 			      struct nvme_ctrlr *nvme_ctrlr,
@@ -2681,6 +4145,25 @@ bdev_nvme_reset_destroy_qpair(struct nvme_ctrlr_channel_iter *i,
 	}
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_reset_create_qpairs_done - 리셋 후 모든 qpair 생성 완료 콜백.
+ *
+ * @nvme_ctrlr: 대상 컨트롤러
+ * @ctx: 사용하지 않음
+ * @status: 0이면 전체 qpair 생성 성공, 비0이면 하나 이상 실패
+ * @return: void
+ *
+ * nvme_ctrlr_for_each_channel의 완료 콜백.
+ * 성공 시 bdev_nvme_reset_ctrlr_complete(true)로 리셋 완료를 알린다.
+ * 실패 시 생성된 qpair들을 정리(bdev_nvme_reset_destroy_qpair)하고
+ * bdev_nvme_reset_create_qpairs_failed에서 리셋 실패로 처리한다.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_for_each_channel(bdev_nvme_reset_create_qpair) → [이 함수]
+ *   → bdev_nvme_reset_ctrlr_complete(true) 또는
+ *   → nvme_ctrlr_for_each_channel(bdev_nvme_reset_destroy_qpair)
+ */
 static void
 bdev_nvme_reset_create_qpairs_done(struct nvme_ctrlr *nvme_ctrlr, void *ctx, int status)
 {
@@ -2699,6 +4182,22 @@ bdev_nvme_reset_create_qpairs_done(struct nvme_ctrlr *nvme_ctrlr, void *ctx, int
 	}
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_reset_check_qpair_connected - 리셋 중 qpair 연결 완료 여부를 폴링하는 poller.
+ *
+ * @ctx: nvme_ctrlr_channel 포인터 (connect_poller에 등록된 인자)
+ * @return: SPDK_POLLER_BUSY (연결 중) 또는 SPDK_POLLER_BUSY (완료 후도 마찬가지)
+ *
+ * bdev_nvme_reset_create_qpair()에서 SPDK_POLLER_REGISTER로 등록.
+ * spdk_nvme_qpair_is_connected()가 true가 되면 nvme_ctrlr_channel_reset_finish()로
+ * 채널별 리셋 단계를 완료하고, 자동 페일백이 활성이면 io_path 캐시를 클리어한다.
+ * reset_iter가 NULL이면 qpair 연결이 이미 실패한 상태이므로 abort 중이다.
+ *
+ * 호출 체인:
+ *   SPDK_POLLER_REGISTER → [이 함수] → nvme_ctrlr_channel_reset_finish()
+ *   → nvme_ctrlr_for_each_channel_continue()
+ */
 static int
 bdev_nvme_reset_check_qpair_connected(void *ctx)
 {
@@ -2733,6 +4232,25 @@ bdev_nvme_reset_check_qpair_connected(void *ctx)
 	return SPDK_POLLER_BUSY;
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_reset_create_qpair - 리셋 후 각 채널의 qpair를 새로 생성하고 연결 폴링 시작.
+ *
+ * @i: 채널 이터레이터 (for_each_channel 프레임워크)
+ * @nvme_ctrlr: 대상 컨트롤러
+ * @ctrlr_ch: 현재 처리 중인 컨트롤러 채널
+ * @ctx: 사용하지 않음
+ * @return: void
+ *
+ * 리셋 완료 후 nvme_ctrlr_for_each_channel 루프에서 각 채널마다 호출됨.
+ * bdev_nvme_create_qpair()로 새 qpair를 생성하고, 성공 시
+ * bdev_nvme_reset_check_qpair_connected poller를 등록해 연결 완료를 기다린다.
+ * 실패 시 reset_iter를 클리어하고 채널 루프를 에러로 계속 진행한다.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_for_each_channel(bdev_nvme_reconnect_ctrlr_poll) → [이 함수]
+ *   → bdev_nvme_create_qpair() → SPDK_POLLER_REGISTER(bdev_nvme_reset_check_qpair_connected)
+ */
 static void
 bdev_nvme_reset_create_qpair(struct nvme_ctrlr_channel_iter *i,
 			     struct nvme_ctrlr *nvme_ctrlr,
@@ -2761,6 +4279,22 @@ bdev_nvme_reset_create_qpair(struct nvme_ctrlr_channel_iter *i,
 	}
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_check_namespaces - 리셋 후 제거된 namespace를 감지하여 ns 포인터를 NULL로 설정.
+ *
+ * @nvme_ctrlr: 대상 컨트롤러
+ * @return: void
+ *
+ * 컨트롤러 재연결 성공 후(bdev_nvme_reconnect_ctrlr_poll에서) 호출.
+ * 리셋 중에 remove된 namespace는 spdk_nvme_ctrlr_is_active_ns()가 false를 반환하므로
+ * nvme_ns->ns를 NULL로 설정한다. 이후 nvme_ctrlr_populate_namespaces()에서
+ * 실제 detach/depopulate 처리가 이루어진다.
+ * 컨텍스트: app 스레드 강제.
+ *
+ * 호출 체인:
+ *   bdev_nvme_reconnect_ctrlr_poll() → [이 함수] → nvme_ctrlr_for_each_channel(bdev_nvme_reset_create_qpair)
+ */
 static void
 nvme_ctrlr_check_namespaces(struct nvme_ctrlr *nvme_ctrlr)
 {
@@ -2779,6 +4313,23 @@ nvme_ctrlr_check_namespaces(struct nvme_ctrlr *nvme_ctrlr)
 }
 
 
+/*
+ * [한국어]
+ * bdev_nvme_reconnect_ctrlr_poll - 컨트롤러 재연결 완료 여부를 폴링하는 poller.
+ *
+ * @arg: nvme_ctrlr 포인터 (reset_detach_poller에 등록된 인자)
+ * @return: SPDK_POLLER_BUSY (재연결 중) 또는 SPDK_POLLER_BUSY (완료 후 처리)
+ *
+ * bdev_nvme_reconnect_ctrlr()에서 reset_detach_poller로 등록됨.
+ * spdk_nvme_ctrlr_reconnect_poll_async()를 반복 호출해 연결 완료를 감지.
+ * ctrlr_loss_timeout 초과 시 스스로 fail 처리.
+ * 연결 성공 시 namespace 확인 후 qpair 재생성 시퀀스 시작.
+ * 연결 실패 시 bdev_nvme_reset_ctrlr_complete(false)로 리셋 실패 처리.
+ *
+ * 호출 체인:
+ *   SPDK_POLLER_REGISTER → [이 함수] → 성공: nvme_ctrlr_for_each_channel(bdev_nvme_reset_create_qpair)
+ *                                   → 실패: bdev_nvme_reset_ctrlr_complete(false)
+ */
 static int
 bdev_nvme_reconnect_ctrlr_poll(void *arg)
 {
@@ -2816,6 +4367,23 @@ bdev_nvme_reconnect_ctrlr_poll(void *arg)
 	return SPDK_POLLER_BUSY;
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_reconnect_ctrlr - 컨트롤러 비동기 재연결을 시작하고 poll poller를 등록.
+ *
+ * @nvme_ctrlr: 재연결할 컨트롤러
+ * @return: void
+ *
+ * spdk_nvme_ctrlr_reconnect_async()로 lib/nvme 수준의 비동기 재연결을 개시하고
+ * reset_detach_poller에 bdev_nvme_reconnect_ctrlr_poll을 등록해 완료를 대기한다.
+ * dtrace probe: bdev_nvme_ctrlr_reconnect.
+ * 컨텍스트: app 스레드(spdk_thread_send_msg 또는 reconnect_delay_timer 콜백).
+ *
+ * 호출 체인:
+ *   bdev_nvme_reset_destroy_qpair_done() → [이 함수]
+ *   또는 nvme_ctrlr_disconnect(callback=bdev_nvme_reconnect_ctrlr) → [이 함수]
+ *   → SPDK_POLLER_REGISTER(bdev_nvme_reconnect_ctrlr_poll)
+ */
 static void
 bdev_nvme_reconnect_ctrlr(struct nvme_ctrlr *nvme_ctrlr)
 {
@@ -2829,6 +4397,24 @@ bdev_nvme_reconnect_ctrlr(struct nvme_ctrlr *nvme_ctrlr)
 					  nvme_ctrlr, 0);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_reset_destroy_qpair_done - qpair 전부 해제 완료 후 재연결 단계로 진입.
+ *
+ * @nvme_ctrlr: 대상 컨트롤러
+ * @ctx: 사용하지 않음
+ * @status: 0 고정 (assert로 검증)
+ * @return: void
+ *
+ * nvme_ctrlr_for_each_channel(bdev_nvme_reset_destroy_qpair)의 완료 콜백.
+ * Fabrics transport인 경우 nvme_ctrlr_disconnect 후 bdev_nvme_reconnect_ctrlr를 호출.
+ * PCIe인 경우 disconnect 없이 bdev_nvme_reconnect_ctrlr를 직접 호출.
+ * dtrace probe: bdev_nvme_ctrlr_reset.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_for_each_channel(bdev_nvme_reset_destroy_qpair) → [이 함수]
+ *   → nvme_ctrlr_disconnect() 또는 bdev_nvme_reconnect_ctrlr()
+ */
 static void
 bdev_nvme_reset_destroy_qpair_done(struct nvme_ctrlr *nvme_ctrlr, void *ctx, int status)
 {
@@ -2844,6 +4430,22 @@ bdev_nvme_reset_destroy_qpair_done(struct nvme_ctrlr *nvme_ctrlr, void *ctx, int
 	}
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_reset_destroy_qpairs - 리셋 시퀀스 시작: 모든 채널의 qpair 해제 루프 시작.
+ *
+ * @nvme_ctrlr: 대상 컨트롤러
+ * @return: void
+ *
+ * _bdev_nvme_reset_ctrlr에서 호출. nvme_ctrlr_for_each_channel을 통해
+ * 모든 스레드의 ctrlr_channel에 bdev_nvme_reset_destroy_qpair를 적용한다.
+ * 완료 콜백은 bdev_nvme_reset_destroy_qpair_done.
+ *
+ * 호출 체인:
+ *   _bdev_nvme_reset_ctrlr() → [이 함수]
+ *   → nvme_ctrlr_for_each_channel(bdev_nvme_reset_destroy_qpair)
+ *   → bdev_nvme_reset_destroy_qpair_done()
+ */
 static void
 bdev_nvme_reset_destroy_qpairs(struct nvme_ctrlr *nvme_ctrlr)
 {
@@ -2855,6 +4457,22 @@ bdev_nvme_reset_destroy_qpairs(struct nvme_ctrlr *nvme_ctrlr)
 				    bdev_nvme_reset_destroy_qpair_done);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_reconnect_ctrlr_now - reconnect_delay_timer 만료 후 즉시 재연결 시작.
+ *
+ * @ctx: nvme_ctrlr 포인터 (타이머 콜백 인자)
+ * @return: void
+ *
+ * reconnect_delay_sec 후 reconnect_delay_timer 만료 시 호출.
+ * 타이머를 해제하고 adminq_timer_poller를 재개(resume)한 뒤
+ * bdev_nvme_reconnect_ctrlr()를 호출해 실제 재연결을 시작한다.
+ * 컨텍스트: app 스레드.
+ *
+ * 호출 체인:
+ *   SPDK_POLLER_REGISTER(reconnect_delay_timer) → [이 함수]
+ *   → bdev_nvme_reconnect_ctrlr()
+ */
 static void
 bdev_nvme_reconnect_ctrlr_now(void *ctx)
 {
@@ -2870,6 +4488,25 @@ bdev_nvme_reconnect_ctrlr_now(void *ctx)
 	bdev_nvme_reconnect_ctrlr(nvme_ctrlr);
 }
 
+/*
+ * [한국어]
+ * _bdev_nvme_reset_ctrlr - app 스레드에서 실제 리셋 시퀀스를 시작하는 내부 함수.
+ *
+ * @ctx: nvme_ctrlr 포인터 (spdk_thread_send_msg의 메시지 인자)
+ * @return: void
+ *
+ * bdev_nvme_reset_ctrlr_unsafe() 또는 bdev_nvme_failover_ctrlr()에서
+ * spdk_thread_send_msg(app_thread, _bdev_nvme_reset_ctrlr)로 디스패치된다.
+ * adminq_timer_poller를 일시 중지(pause)하고 bdev_nvme_reset_destroy_qpairs()로
+ * 전체 리셋 시퀀스(qpair 해제 → 재연결 → qpair 재생성)를 시작한다.
+ * reconnect_delay_timer가 이미 등록된 경우(재연결 지연 중)에는 시퀀스를 즉시 시작하지 않고
+ * 타이머가 만료되면 bdev_nvme_reconnect_ctrlr_now가 호출된다.
+ * 컨텍스트: app 스레드 강제.
+ *
+ * 호출 체인:
+ *   bdev_nvme_reset_ctrlr_unsafe() / bdev_nvme_failover_ctrlr_unsafe()
+ *   → spdk_thread_send_msg(app_thread) → [이 함수] → bdev_nvme_reset_destroy_qpairs()
+ */
 static void
 _bdev_nvme_reset_ctrlr(void *ctx)
 {
@@ -2885,6 +4522,23 @@ _bdev_nvme_reset_ctrlr(void *ctx)
 	}
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_reset_ctrlr_unsafe - mutex 보유 상태에서 리셋 플래그를 설정하고 실행 함수를 결정.
+ *
+ * @nvme_ctrlr: 대상 컨트롤러
+ * @msg_fn: 실행할 리셋 함수를 반환하는 출력 포인터
+ *          - reconnect 지연 중: bdev_nvme_reconnect_ctrlr_now
+ *          - 그 외: _bdev_nvme_reset_ctrlr
+ * @return: 0(성공), -ENXIO(destruct 중), -EBUSY(already resetting), -EALREADY(disabled)
+ *
+ * bdev_nvme_reset_ctrlr()에서 mutex 보호 하에 호출됨.
+ * resetting=true, dont_retry=true 플래그를 설정하고,
+ * reconnect_delay 중이면 delay를 취소하고 즉시 재연결 함수를 선택한다.
+ *
+ * 호출 체인:
+ *   bdev_nvme_reset_ctrlr() → [이 함수] → (mutex 해제) → spdk_thread_send_msg(msg_fn)
+ */
 static int
 bdev_nvme_reset_ctrlr_unsafe(struct nvme_ctrlr *nvme_ctrlr, spdk_msg_fn *msg_fn)
 {
@@ -2920,6 +4574,22 @@ bdev_nvme_reset_ctrlr_unsafe(struct nvme_ctrlr *nvme_ctrlr, spdk_msg_fn *msg_fn)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_reset_ctrlr - 컨트롤러 리셋을 시작하는 외부 진입점(thread-safe).
+ *
+ * @nvme_ctrlr: 리셋할 컨트롤러
+ * @return: 0(성공 시작), -ENXIO/-EBUSY/-EALREADY(에러)
+ *
+ * mutex를 획득해 bdev_nvme_reset_ctrlr_unsafe()로 상태 플래그를 설정한 후,
+ * spdk_thread_send_msg(app_thread)로 리셋 시퀀스를 app 스레드에서 비동기 실행한다.
+ * timeout_cb, failover, RPC 등에서 호출됨.
+ * 컨텍스트: 어느 스레드에서도 호출 가능.
+ *
+ * 호출 체인:
+ *   timeout_cb() / nvme_abort_cpl() / bdev_nvme_check_fast_io_fail_timeout() →
+ *   [이 함수] → spdk_thread_send_msg → _bdev_nvme_reset_ctrlr / bdev_nvme_reconnect_ctrlr_now
+ */
 static int
 bdev_nvme_reset_ctrlr(struct nvme_ctrlr *nvme_ctrlr)
 {
@@ -2937,6 +4607,21 @@ bdev_nvme_reset_ctrlr(struct nvme_ctrlr *nvme_ctrlr)
 	return rc;
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_enable_ctrlr - disabled 상태의 컨트롤러를 다시 활성화(재연결 시작).
+ *
+ * @nvme_ctrlr: 활성화할 컨트롤러
+ * @return: 0(성공), -ENXIO(destruct 중), -EBUSY(resetting 중), -EALREADY(이미 enabled)
+ *
+ * nvme_ctrlr_op(NVME_CTRLR_OP_ENABLE) RPC에서 호출.
+ * disabled=false, resetting=true로 설정 후 bdev_nvme_reconnect_ctrlr_now()를 직접 호출해
+ * 즉각 재연결 시퀀스를 시작한다.
+ * 컨텍스트: app 스레드 강제.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_op() → [이 함수] → bdev_nvme_reconnect_ctrlr_now() → bdev_nvme_reconnect_ctrlr()
+ */
 static int
 bdev_nvme_enable_ctrlr(struct nvme_ctrlr *nvme_ctrlr)
 {
@@ -2968,6 +4653,23 @@ bdev_nvme_enable_ctrlr(struct nvme_ctrlr *nvme_ctrlr)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_disable_ctrlr_complete - qpair 전부 해제 및 disconnect 완료 후 컨트롤러를 disabled 상태로 전환.
+ *
+ * @nvme_ctrlr: 비활성화 완료할 컨트롤러
+ * @return: void
+ *
+ * bdev_nvme_disable_destroy_qpairs_done()에서 직접 호출되거나
+ * nvme_ctrlr_disconnect(callback=bdev_nvme_disable_ctrlr_complete)를 통해 호출됨.
+ * disabled=true, resetting=false로 설정하고 adminq_timer_poller를 일시 중지.
+ * pending_resets를 성공(true)으로 완료하고 ctrlr_op_cb를 호출.
+ * nvme_ctrlr 레퍼런스 카운트 감소.
+ *
+ * 호출 체인:
+ *   bdev_nvme_disable_destroy_qpairs_done() → [이 함수] 또는
+ *   nvme_ctrlr_disconnect(bdev_nvme_disable_ctrlr_complete) → [이 함수]
+ */
 static void
 bdev_nvme_disable_ctrlr_complete(struct nvme_ctrlr *nvme_ctrlr)
 {
@@ -3000,6 +4702,23 @@ bdev_nvme_disable_ctrlr_complete(struct nvme_ctrlr *nvme_ctrlr)
 	nvme_ctrlr_put_ref(nvme_ctrlr);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_disable_destroy_qpairs_done - disable 시 qpair 전부 해제 완료 콜백.
+ *
+ * @nvme_ctrlr: 대상 컨트롤러
+ * @ctx: 사용하지 않음
+ * @status: 0 고정 (assert로 검증)
+ * @return: void
+ *
+ * nvme_ctrlr_for_each_channel(bdev_nvme_reset_destroy_qpair)의 완료 콜백.
+ * Fabrics transport: nvme_ctrlr_disconnect 후 bdev_nvme_disable_ctrlr_complete 호출.
+ * PCIe: bdev_nvme_disable_ctrlr_complete를 직접 호출.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_for_each_channel(bdev_nvme_reset_destroy_qpair) → [이 함수]
+ *   → bdev_nvme_disable_ctrlr_complete() 또는 nvme_ctrlr_disconnect()
+ */
 static void
 bdev_nvme_disable_destroy_qpairs_done(struct nvme_ctrlr *nvme_ctrlr, void *ctx, int status)
 {
@@ -3012,6 +4731,22 @@ bdev_nvme_disable_destroy_qpairs_done(struct nvme_ctrlr *nvme_ctrlr, void *ctx, 
 	}
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_disable_destroy_qpairs - disable 시퀀스: 모든 채널의 qpair 해제 루프 시작.
+ *
+ * @nvme_ctrlr: 대상 컨트롤러
+ * @return: void
+ *
+ * _bdev_nvme_disconnect_and_disable_ctrlr에서 호출.
+ * nvme_ctrlr_for_each_channel로 각 채널에 bdev_nvme_reset_destroy_qpair 적용.
+ * 완료 콜백은 bdev_nvme_disable_destroy_qpairs_done.
+ *
+ * 호출 체인:
+ *   _bdev_nvme_disconnect_and_disable_ctrlr() → [이 함수]
+ *   → nvme_ctrlr_for_each_channel(bdev_nvme_reset_destroy_qpair)
+ *   → bdev_nvme_disable_destroy_qpairs_done()
+ */
 static void
 bdev_nvme_disable_destroy_qpairs(struct nvme_ctrlr *nvme_ctrlr)
 {
@@ -3021,6 +4756,22 @@ bdev_nvme_disable_destroy_qpairs(struct nvme_ctrlr *nvme_ctrlr)
 				    bdev_nvme_disable_destroy_qpairs_done);
 }
 
+/*
+ * [한국어]
+ * _bdev_nvme_cancel_reconnect_and_disable_ctrlr - reconnect 지연 타이머를 취소하고 즉시 disable 완료.
+ *
+ * @ctx: nvme_ctrlr 포인터 (spdk_thread_send_msg 메시지 인자)
+ * @return: void
+ *
+ * bdev_nvme_disable_ctrlr()에서 reconnect_is_delayed=true인 경우에
+ * 이 함수가 msg_fn으로 선택됨. reconnect_delay_timer를 해제하고
+ * bdev_nvme_disable_ctrlr_complete()를 직접 호출해 qpair 해제 없이 disable 완료.
+ * 컨텍스트: app 스레드 강제.
+ *
+ * 호출 체인:
+ *   bdev_nvme_disable_ctrlr() → spdk_thread_send_msg → [이 함수]
+ *   → bdev_nvme_disable_ctrlr_complete()
+ */
 static void
 _bdev_nvme_cancel_reconnect_and_disable_ctrlr(void *ctx)
 {
@@ -3034,6 +4785,23 @@ _bdev_nvme_cancel_reconnect_and_disable_ctrlr(void *ctx)
 	bdev_nvme_disable_ctrlr_complete(nvme_ctrlr);
 }
 
+/*
+ * [한국어]
+ * _bdev_nvme_disconnect_and_disable_ctrlr - app 스레드에서 disable 시퀀스(qpair 해제 → disconnect)를 시작.
+ *
+ * @ctx: nvme_ctrlr 포인터 (spdk_thread_send_msg 메시지 인자)
+ * @return: void
+ *
+ * bdev_nvme_disable_ctrlr()에서 reconnect_is_delayed=false인 경우에
+ * 이 함수가 msg_fn으로 선택됨.
+ * PCIe: 먼저 nvme_ctrlr_disconnect 후 bdev_nvme_disable_destroy_qpairs 실행.
+ * Fabrics: bdev_nvme_disable_destroy_qpairs를 직접 실행.
+ * 컨텍스트: app 스레드 강제.
+ *
+ * 호출 체인:
+ *   bdev_nvme_disable_ctrlr() → spdk_thread_send_msg → [이 함수]
+ *   → nvme_ctrlr_disconnect() / bdev_nvme_disable_destroy_qpairs()
+ */
 static void
 _bdev_nvme_disconnect_and_disable_ctrlr(void *ctx)
 {
@@ -3049,6 +4817,23 @@ _bdev_nvme_disconnect_and_disable_ctrlr(void *ctx)
 	}
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_disable_ctrlr - 컨트롤러를 비활성화하여 I/O를 차단하고 qpair를 해제.
+ *
+ * @nvme_ctrlr: 비활성화할 컨트롤러
+ * @return: 0(성공 시작), -ENXIO(destruct 중), -EBUSY(resetting 중), -EALREADY(이미 disabled)
+ *
+ * nvme_ctrlr_op(NVME_CTRLR_OP_DISABLE) RPC에서 호출.
+ * resetting=true, dont_retry=true로 설정 후 적절한 disable 함수를 msg_fn으로 선택:
+ *   - reconnect 지연 중: _bdev_nvme_cancel_reconnect_and_disable_ctrlr
+ *   - 그 외: _bdev_nvme_disconnect_and_disable_ctrlr
+ * nvme_ctrlr 레퍼런스를 획득하고 spdk_thread_send_msg(app_thread)로 비동기 실행.
+ * 컨텍스트: 어느 스레드에서도 호출 가능.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_op() → [이 함수] → spdk_thread_send_msg → 선택된 msg_fn
+ */
 static int
 bdev_nvme_disable_ctrlr(struct nvme_ctrlr *nvme_ctrlr)
 {
@@ -3089,6 +4874,24 @@ bdev_nvme_disable_ctrlr(struct nvme_ctrlr *nvme_ctrlr)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_op - 단일 컨트롤러에 reset/enable/disable 중 하나를 적용하는 디스패처.
+ *
+ * @nvme_ctrlr: 대상 컨트롤러
+ * @op: NVME_CTRLR_OP_RESET / _ENABLE / _DISABLE
+ * @cb_fn: 완료 콜백 (성공 시 rc=0, 실패 시 rc<0)
+ * @cb_arg: 콜백 인자
+ * @return: 0(성공 시작), 에러코드
+ *
+ * op 값에 따라 bdev_nvme_reset_ctrlr / enable / disable_ctrlr를 호출하고
+ * 성공 시 ctrlr_op_cb_fn/arg를 설정해 완료 시 콜백이 호출되게 한다.
+ * -EALREADY는 호출자(nvme_ctrlr_op_rpc)에서 0으로 매핑된다.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_op_rpc() / nvme_bdev_ctrlr_op_rpc() → [이 함수]
+ *   → bdev_nvme_reset/enable/disable_ctrlr()
+ */
 static int
 nvme_ctrlr_op(struct nvme_ctrlr *nvme_ctrlr, enum nvme_ctrlr_op op,
 	      bdev_nvme_ctrlr_op_cb cb_fn, void *cb_arg)
@@ -3119,14 +4922,64 @@ nvme_ctrlr_op(struct nvme_ctrlr *nvme_ctrlr, enum nvme_ctrlr_op op,
 	return rc;
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_op_rpc_ctx - nvme_ctrlr_op_rpc() 및 nvme_bdev_ctrlr_op_rpc()의 실행 컨텍스트.
+ *
+ * reset/enable/disable 등의 컨트롤러 연산을 비동기 시퀀스로 수행할 때
+ * 단일 nvme_ctrlr 또는 nvme_bdev_ctrlr 내 전체 컨트롤러를 순회하며 사용한다.
+ */
 struct nvme_ctrlr_op_rpc_ctx {
 	struct nvme_ctrlr *nvme_ctrlr;
+	/* [한국어] 현재 처리 중인 nvme_ctrlr 포인터.
+	 * 설정자: nvme_bdev_ctrlr_op_rpc()의 초기화 및 _nvme_bdev_ctrlr_op_rpc_continue()의 순회.
+	 * 읽는 자: nvme_ctrlr_op(), _nvme_bdev_ctrlr_op_rpc_continue()에서 다음 컨트롤러 탐색.
+	 * 값 범위: 유효한 nvme_ctrlr 포인터 또는 NULL(완료 후).
+	 * 동기화: app 스레드에서만 접근하므로 락 불필요. */
+
 	enum nvme_ctrlr_op op;
+	/* [한국어] 수행할 연산 종류 (RESET/ENABLE/DISABLE).
+	 * 설정자: nvme_ctrlr_op_rpc() / nvme_bdev_ctrlr_op_rpc() 초기화 시.
+	 * 읽는 자: _nvme_bdev_ctrlr_op_rpc_continue()에서 다음 컨트롤러에 같은 연산 적용.
+	 * 값 범위: enum nvme_ctrlr_op 열거값 중 하나.
+	 * 동기화: 단일 app 스레드에서만 접근. */
+
 	int rc;
+	/* [한국어] 현재까지의 누적 에러 코드.
+	 * 설정자: nvme_bdev_ctrlr_op_rpc_continue()에서 각 컨트롤러 완료 시 갱신.
+	 * 읽는 자: _nvme_bdev_ctrlr_op_rpc_continue()에서 에러 발생 여부 판단.
+	 * 값 범위: 0(성공) 또는 음수 에러코드.
+	 * 동기화: app 스레드에서만 접근. */
+
 	bdev_nvme_ctrlr_op_cb cb_fn;
+	/* [한국어] 모든 컨트롤러 연산 완료 후 호출할 최종 콜백 함수 포인터.
+	 * 설정자: nvme_ctrlr_op_rpc() / nvme_bdev_ctrlr_op_rpc() 초기화 시.
+	 * 읽는 자: nvme_ctrlr_op_rpc_complete(), _nvme_bdev_ctrlr_op_rpc_continue() 완료 시.
+	 * 값 범위: NULL이 아닌 유효한 함수 포인터.
+	 * 동기화: app 스레드에서만 접근. */
+
 	void *cb_arg;
+	/* [한국어] cb_fn에 전달할 불투명 콜백 인자 (일반적으로 RPC ctx 포인터).
+	 * 설정자: nvme_ctrlr_op_rpc() / nvme_bdev_ctrlr_op_rpc() 초기화 시.
+	 * 읽는 자: cb_fn 호출 시.
+	 * 값 범위: NULL 또는 유효한 포인터.
+	 * 동기화: app 스레드에서만 접근. */
 };
 
+/*
+ * [한국어]
+ * nvme_ctrlr_op_rpc_complete - 단일 컨트롤러 연산 완료 시 최종 콜백을 호출하고 ctx를 해제.
+ *
+ * @cb_arg: nvme_ctrlr_op_rpc_ctx 포인터
+ * @rc: 연산 결과 코드
+ * @return: void
+ *
+ * nvme_ctrlr_op()에 cb_fn으로 등록됨.
+ * 연산 완료 후 ctx->cb_fn(ctx->cb_arg, rc)를 호출하고 ctx를 free한다.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_op() 완료 → [이 함수] → ctx->cb_fn(cb_arg, rc)
+ */
 static void
 nvme_ctrlr_op_rpc_complete(void *cb_arg, int rc)
 {
@@ -3174,6 +5027,23 @@ nvme_ctrlr_op_rpc(struct nvme_ctrlr *nvme_ctrlr, enum nvme_ctrlr_op op,
 
 static void nvme_bdev_ctrlr_op_rpc_continue(void *cb_arg, int rc);
 
+/*
+ * [한국어]
+ * _nvme_bdev_ctrlr_op_rpc_continue - app 스레드에서 다음 컨트롤러로 연산을 진행하는 내부 함수.
+ *
+ * @_ctx: nvme_ctrlr_op_rpc_ctx 포인터 (spdk_thread_send_msg 인자)
+ * @return: void
+ *
+ * nvme_bdev_ctrlr_op_rpc_continue()에서 spdk_thread_send_msg(app_thread)로 디스패치됨.
+ * ctx->rc가 에러면 즉시 cb_fn 호출로 완료.
+ * 그렇지 않으면 TAILQ_NEXT로 다음 nvme_ctrlr를 찾아 같은 op를 실행.
+ * 더 이상 컨트롤러가 없으면 cb_fn 호출로 완료.
+ * 컨텍스트: app 스레드 강제.
+ *
+ * 호출 체인:
+ *   nvme_bdev_ctrlr_op_rpc_continue() → spdk_thread_send_msg → [이 함수]
+ *   → nvme_ctrlr_op(next_nvme_ctrlr) 또는 ctx->cb_fn()
+ */
 static void
 _nvme_bdev_ctrlr_op_rpc_continue(void *_ctx)
 {
@@ -3209,6 +5079,21 @@ complete:
 	free(ctx);
 }
 
+/*
+ * [한국어]
+ * nvme_bdev_ctrlr_op_rpc_continue - 각 컨트롤러 연산 완료 시 app 스레드로 다음 진행을 dispatch.
+ *
+ * @cb_arg: nvme_ctrlr_op_rpc_ctx 포인터
+ * @rc: 방금 완료된 컨트롤러 연산의 결과 코드
+ * @return: void
+ *
+ * nvme_ctrlr_op()에 cb_fn으로 등록됨 (nvme_bdev_ctrlr_op_rpc에서 순회 시 사용).
+ * rc를 ctx->rc에 저장하고 _nvme_bdev_ctrlr_op_rpc_continue를 app 스레드로 dispatch.
+ * app 스레드 보장이 필요한 이유: TAILQ_NEXT 접근이 g_nvme_bdev_ctrlrs 리스트를 참조하기 때문.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_op() 완료 → [이 함수] → spdk_thread_send_msg → _nvme_bdev_ctrlr_op_rpc_continue
+ */
 static void
 nvme_bdev_ctrlr_op_rpc_continue(void *cb_arg, int rc)
 {
@@ -3268,6 +5153,23 @@ nvme_bdev_ctrlr_op_rpc(struct nvme_bdev_ctrlr *nbdev_ctrlr, enum nvme_ctrlr_op o
 
 static int _bdev_nvme_reset_io(struct nvme_io_path *io_path, struct nvme_bdev_io *bio);
 
+/*
+ * [한국어]
+ * bdev_nvme_unfreeze_bdev_channel_done - 모든 채널의 unfreeze 완료 후 reset_io를 최종 완료.
+ *
+ * @nbdev: 대상 NVMe bdev
+ * @ctx: nvme_bdev_io (reset I/O) 포인터
+ * @status: 0이면 전체 채널 unfreeze 성공
+ * @return: void
+ *
+ * nvme_bdev_for_each_channel(bdev_nvme_unfreeze_bdev_channel)의 완료 콜백.
+ * bio->cpl.cdw0 값으로 최종 성공/실패 상태를 결정하고 __bdev_nvme_io_complete를 호출한다.
+ * cdw0==0이면 SUCCESS, 비0이면 FAILED.
+ *
+ * 호출 체인:
+ *   nvme_bdev_for_each_channel(bdev_nvme_unfreeze_bdev_channel) → [이 함수]
+ *   → __bdev_nvme_io_complete(bdev_io, io_status)
+ */
 static void
 bdev_nvme_unfreeze_bdev_channel_done(struct nvme_bdev *nbdev, void *ctx, int status)
 {
@@ -3284,6 +5186,24 @@ bdev_nvme_unfreeze_bdev_channel_done(struct nvme_bdev *nbdev, void *ctx, int sta
 	__bdev_nvme_io_complete(spdk_bdev_io_from_ctx(bio), io_status, NULL);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_unfreeze_bdev_channel - reset_io 완료 후 각 채널의 freeze를 해제.
+ *
+ * @i: 채널 이터레이터
+ * @nbdev: 대상 NVMe bdev
+ * @nbdev_ch: 현재 처리 중인 bdev 채널
+ * @ctx: 사용하지 않음
+ * @return: void
+ *
+ * nvme_bdev_for_each_channel의 채널별 콜백.
+ * retry 대기 중인 I/O를 모두 abort하고 resetting=false로 채널을 unfreeze한다.
+ * 채널이 unfreeze되면 새로운 I/O가 다시 처리될 수 있게 된다.
+ *
+ * 호출 체인:
+ *   bdev_nvme_reset_io_complete() → nvme_bdev_for_each_channel → [이 함수]
+ *   → bdev_nvme_unfreeze_bdev_channel_done()
+ */
 static void
 bdev_nvme_unfreeze_bdev_channel(struct nvme_bdev_channel_iter *i,
 				struct nvme_bdev *nbdev,
@@ -3295,6 +5215,22 @@ bdev_nvme_unfreeze_bdev_channel(struct nvme_bdev_channel_iter *i,
 	nvme_bdev_for_each_channel_continue(i, 0);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_reset_io_complete - 모든 nvme_ctrlr 리셋 시도 완료 후 채널 unfreeze 단계로 진입.
+ *
+ * @bio: reset I/O 포인터 (nvme_bdev_io)
+ * @return: void
+ *
+ * _bdev_nvme_reset_io_continue()에서 더 이상 처리할 io_path가 없을 때 호출.
+ * nvme_bdev_for_each_channel(bdev_nvme_unfreeze_bdev_channel)을 통해 모든 채널을
+ * unfreeze하고 retry 대기 I/O를 abort한다.
+ *
+ * 호출 체인:
+ *   _bdev_nvme_reset_io_continue() → [이 함수]
+ *   → nvme_bdev_for_each_channel(bdev_nvme_unfreeze_bdev_channel)
+ *   → bdev_nvme_unfreeze_bdev_channel_done()
+ */
 static void
 bdev_nvme_reset_io_complete(struct nvme_bdev_io *bio)
 {
@@ -3308,6 +5244,21 @@ bdev_nvme_reset_io_complete(struct nvme_bdev_io *bio)
 				   bdev_nvme_unfreeze_bdev_channel_done);
 }
 
+/*
+ * [한국어]
+ * _bdev_nvme_reset_io_continue - I/O 요청 스레드에서 다음 io_path의 리셋을 계속 진행.
+ *
+ * @ctx: nvme_bdev_io 포인터 (spdk_thread_send_msg 인자)
+ * @return: void
+ *
+ * bdev_nvme_reset_io_continue()에서 spdk_thread_send_msg로 I/O 스레드에서 실행됨.
+ * 이전 io_path를 완료하고 STAILQ_NEXT로 다음 io_path를 찾아 _bdev_nvme_reset_io를 호출.
+ * 더 이상 io_path가 없으면 bdev_nvme_reset_io_complete로 전체 리셋 완료.
+ *
+ * 호출 체인:
+ *   bdev_nvme_reset_io_continue() → spdk_thread_send_msg → [이 함수]
+ *   → _bdev_nvme_reset_io(next) 또는 bdev_nvme_reset_io_complete()
+ */
 static void
 _bdev_nvme_reset_io_continue(void *ctx)
 {
@@ -3332,6 +5283,23 @@ complete:
 	bdev_nvme_reset_io_complete(bio);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_reset_io_continue - 각 nvme_ctrlr 리셋 완료 후 I/O 스레드로 다음 단계를 dispatch.
+ *
+ * @cb_arg: nvme_bdev_io 포인터 (reset I/O)
+ * @rc: 방금 완료된 컨트롤러 리셋 결과 코드 (0=성공)
+ * @return: void
+ *
+ * _bdev_nvme_reset_io()에서 ctrlr_op_cb_fn으로 등록됨.
+ * rc==0이면 bio->cpl.cdw0=0(성공으로 표시)하고
+ * I/O 스레드에 _bdev_nvme_reset_io_continue를 dispatch한다.
+ * I/O 스레드에서 dispatch하는 이유: STAILQ_NEXT 접근이 bdev_channel 데이터이기 때문.
+ *
+ * 호출 체인:
+ *   bdev_nvme_reset_ctrlr_complete() 또는 bdev_nvme_complete_pending_resets() → ctrlr_op_cb_fn
+ *   → [이 함수] → spdk_thread_send_msg(I/O thread) → _bdev_nvme_reset_io_continue
+ */
 static void
 bdev_nvme_reset_io_continue(void *cb_arg, int rc)
 {
@@ -3351,6 +5319,25 @@ bdev_nvme_reset_io_continue(void *cb_arg, int rc)
 	spdk_thread_send_msg(spdk_bdev_io_get_thread(bdev_io), _bdev_nvme_reset_io_continue, bio);
 }
 
+/*
+ * [한국어]
+ * _bdev_nvme_reset_io - 특정 io_path의 nvme_ctrlr에 대해 리셋을 시작하거나 대기열에 추가.
+ *
+ * @io_path: 리셋할 대상 nvme_ctrlr를 가리키는 io_path
+ * @bio: reset I/O 요청 (nvme_bdev_io)
+ * @return: 0(리셋 시작 또는 pending 큐 추가), 음수 에러코드(-EALREADY=disabled)
+ *
+ * bdev_nvme_freeze_bdev_channel_done()과 _bdev_nvme_reset_io_continue()에서 호출.
+ * bdev_nvme_reset_ctrlr_unsafe()로 리셋 플래그를 설정하고:
+ *   - 성공: ctrlr_op_cb_fn=bdev_nvme_reset_io_continue로 설정하고 msg_fn dispatch.
+ *   - -EBUSY: pending_resets 큐에 추가하고 0 반환.
+ *   - -EALREADY: disabled 상태 → 호출자가 건너뜀.
+ *
+ * 호출 체인:
+ *   bdev_nvme_freeze_bdev_channel_done() → [이 함수]
+ *   또는 _bdev_nvme_reset_io_continue() → [이 함수]
+ *   → spdk_thread_send_msg(app_thread, msg_fn)
+ */
 static int
 _bdev_nvme_reset_io(struct nvme_io_path *io_path, struct nvme_bdev_io *bio)
 {
@@ -3394,6 +5381,24 @@ _bdev_nvme_reset_io(struct nvme_io_path *io_path, struct nvme_bdev_io *bio)
 	return rc;
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_freeze_bdev_channel_done - 모든 채널 freeze 완료 후 컨트롤러 리셋 시퀀스 시작.
+ *
+ * @nbdev: 대상 NVMe bdev
+ * @ctx: nvme_bdev_io (reset I/O) 포인터
+ * @status: 0이면 전체 채널 freeze 성공
+ * @return: void
+ *
+ * nvme_bdev_for_each_channel(bdev_nvme_freeze_bdev_channel)의 완료 콜백.
+ * bio->cpl.cdw0=1(초기 실패 상태)로 설정하고 첫 번째 io_path부터
+ * _bdev_nvme_reset_io()를 통해 각 nvme_ctrlr 리셋을 순차적으로 시작한다.
+ * 첫 io_path가 disabled(-EALREADY)이면 bdev_nvme_reset_io_continue로 건너뛴다.
+ *
+ * 호출 체인:
+ *   nvme_bdev_for_each_channel(bdev_nvme_freeze_bdev_channel) → [이 함수]
+ *   → _bdev_nvme_reset_io(first io_path)
+ */
 static void
 bdev_nvme_freeze_bdev_channel_done(struct nvme_bdev *nbdev, void *ctx, int status)
 {
@@ -3423,6 +5428,24 @@ bdev_nvme_freeze_bdev_channel_done(struct nvme_bdev *nbdev, void *ctx, int statu
 	}
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_freeze_bdev_channel - reset_io 시작 시 각 채널을 freeze(새 I/O 차단).
+ *
+ * @i: 채널 이터레이터
+ * @nbdev: 대상 NVMe bdev
+ * @nbdev_ch: 현재 처리 중인 bdev 채널
+ * @ctx: 사용하지 않음
+ * @return: void
+ *
+ * nvme_bdev_for_each_channel의 채널별 콜백.
+ * resetting=true로 설정해 bdev_nvme_find_io_path()가 이 채널에서 새 I/O 경로를 찾지 못하게 한다.
+ * 이미 진행 중인 I/O는 계속 처리되지만 새 I/O는 retry 대기열로 들어간다.
+ *
+ * 호출 체인:
+ *   bdev_nvme_reset_io() → nvme_bdev_for_each_channel → [이 함수]
+ *   → bdev_nvme_freeze_bdev_channel_done()
+ */
 static void
 bdev_nvme_freeze_bdev_channel(struct nvme_bdev_channel_iter *i,
 			      struct nvme_bdev *nbdev,
@@ -3433,6 +5456,24 @@ bdev_nvme_freeze_bdev_channel(struct nvme_bdev_channel_iter *i,
 	nvme_bdev_for_each_channel_continue(i, 0);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_reset_io - bdev RESET I/O 요청의 진입점. 모든 채널을 freeze하고 리셋 시퀀스 시작.
+ *
+ * @nbdev: 리셋할 NVMe bdev
+ * @bio: RESET I/O 요청 (nvme_bdev_io), bdev_io->type == SPDK_BDEV_IO_TYPE_RESET
+ * @return: void
+ *
+ * _bdev_nvme_submit_request()에서 SPDK_BDEV_IO_TYPE_RESET 케이스로 호출.
+ * nvme_bdev_for_each_channel(bdev_nvme_freeze_bdev_channel)을 통해 모든 채널의
+ * resetting=true로 설정하고 bdev_nvme_freeze_bdev_channel_done에서 실제 리셋 시작.
+ * 멀티패스 환경에서는 io_path_list의 모든 nvme_ctrlr를 순차적으로 리셋한다.
+ *
+ * 호출 체인:
+ *   _bdev_nvme_submit_request(RESET) → [이 함수]
+ *   → nvme_bdev_for_each_channel(bdev_nvme_freeze_bdev_channel)
+ *   → bdev_nvme_freeze_bdev_channel_done() → _bdev_nvme_reset_io()
+ */
 static void
 bdev_nvme_reset_io(struct nvme_bdev *nbdev, struct nvme_bdev_io *bio)
 {
@@ -3443,6 +5484,24 @@ bdev_nvme_reset_io(struct nvme_bdev *nbdev, struct nvme_bdev_io *bio)
 				   bdev_nvme_freeze_bdev_channel_done);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_failover_ctrlr_unsafe - mutex 보유 상태에서 페일오버 플래그를 설정하는 내부 함수.
+ *
+ * @nvme_ctrlr: 페일오버할 컨트롤러
+ * @remove: true이면 현재 trid를 제거(삭제 케이스), false이면 실패 표시만
+ * @return: 0(페일오버 시작), -ENXIO(destruct 중), -EINPROGRESS(reset 중),
+ *          -EBUSY(페일오버 이미 진행 중), -EALREADY(지연 재연결 또는 disabled)
+ *
+ * bdev_nvme_failover_ctrlr()와 _bdev_nvme_delete()에서 mutex 보유 상태로 호출됨.
+ * bdev_nvme_failover_trid()로 다음 trid를 활성으로 설정하고
+ * resetting=true, in_failover=true 플래그를 설정한다.
+ * 이미 reconnect 지연 중이거나 disabled면 현재 타이머/활성화에 의존해 -EALREADY 반환.
+ *
+ * 호출 체인:
+ *   bdev_nvme_failover_ctrlr() → [이 함수]
+ *   또는 _bdev_nvme_delete() → [이 함수] → (0이면) _bdev_nvme_reset_ctrlr dispatch
+ */
 static int
 bdev_nvme_failover_ctrlr_unsafe(struct nvme_ctrlr *nvme_ctrlr, bool remove)
 {
@@ -3491,6 +5550,23 @@ bdev_nvme_failover_ctrlr_unsafe(struct nvme_ctrlr *nvme_ctrlr, bool remove)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_failover_ctrlr - thread-safe 페일오버 진입점: mutex 획득 후 페일오버 시작.
+ *
+ * @nvme_ctrlr: 페일오버할 컨트롤러
+ * @return: 0(성공 또는 -EALREADY가 무시됨), 에러코드
+ *
+ * bdev_nvme_disconnected_qpair_cb()와 bdev_nvme_check_ctrlr_loss_timeout() 등에서 호출.
+ * mutex를 획득해 bdev_nvme_failover_ctrlr_unsafe(remove=false)를 호출하고
+ * 성공 시 spdk_thread_send_msg(app_thread, _bdev_nvme_reset_ctrlr)로 리셋 시작.
+ * -EALREADY는 0으로 처리(이미 재연결 예약됨).
+ * 컨텍스트: 어느 스레드에서도 호출 가능.
+ *
+ * 호출 체인:
+ *   bdev_nvme_disconnected_qpair_cb() → [이 함수]
+ *   → spdk_thread_send_msg(app_thread) → _bdev_nvme_reset_ctrlr
+ */
 static int
 bdev_nvme_failover_ctrlr(struct nvme_ctrlr *nvme_ctrlr)
 {
@@ -3521,6 +5597,24 @@ static int bdev_nvme_copy(struct nvme_bdev_io *bio, uint64_t dst_offset_blocks,
 			  uint64_t src_offset_blocks,
 			  uint64_t num_blocks);
 
+/*
+ * [한국어]
+ * bdev_nvme_get_buf_cb - spdk_bdev_io_get_buf() 완료 콜백: 버퍼 획득 후 readv 실행.
+ *
+ * @ch: I/O 채널
+ * @bdev_io: 버퍼를 기다리던 bdev I/O 요청
+ * @success: 버퍼 획득 성공 여부
+ * @return: void
+ *
+ * READ I/O에서 iov_base가 NULL인 경우(버퍼 미할당) spdk_bdev_io_get_buf()를 호출하고
+ * 이 함수가 버퍼 할당 완료 후 콜백으로 호출된다.
+ * 버퍼 획득 실패 시 -EINVAL로 실패 완료.
+ * io_path가 사용 불가이면 -ENXIO로 실패.
+ * 성공 시 bdev_nvme_readv()를 호출해 실제 NVMe READ 명령을 제출.
+ *
+ * 호출 체인:
+ *   spdk_bdev_io_get_buf() → (버퍼 할당) → [이 함수] → bdev_nvme_readv()
+ */
 static void
 bdev_nvme_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io,
 		     bool success)
@@ -3555,6 +5649,30 @@ exit:
 	}
 }
 
+/*
+ * [한국어]
+ * _bdev_nvme_submit_request - I/O 타입에 따라 실제 NVMe 명령을 제출하는 내부 디스패처.
+ *
+ * @nbdev_ch: bdev 채널 (I/O 경로 정보 포함)
+ * @bdev_io: 제출할 bdev I/O 요청
+ * @return: void
+ *
+ * bdev_nvme_submit_request()에서 호출. bdev_io->type에 따라 다음 중 하나를 실행:
+ *   READ: iov_base가 있으면 bdev_nvme_readv(), 없으면 spdk_bdev_io_get_buf() (콜백으로 재진입).
+ *   WRITE: bdev_nvme_writev()
+ *   COMPARE, COMPARE_AND_WRITE, UNMAP, WRITE_ZEROES, ZONE_APPEND, GET_ZONE_INFO,
+ *   ZONE_MANAGEMENT, COPY, WRITE_UNCORRECTABLE: 각 해당 함수 호출.
+ *   RESET: io_path=NULL로 설정 후 bdev_nvme_reset_io(). return(완료 처리 다름).
+ *   NVME_NSSR: 서브시스템 리셋 후 즉시 완료.
+ *   FLUSH: VWC 비활성 또는 g_opts.enable_flush=false이면 즉시 성공.
+ *   NVME_ADMIN: io_path=NULL로 bdev_nvme_admin_passthru(). return.
+ *   NVME_IO, NVME_IO_MD, NVME_IOV_MD: passthru 함수 호출.
+ *   ABORT: bio_to_abort를 통해 bdev_nvme_abort(). return.
+ * rc!=0이면 bdev_nvme_io_complete(bio, rc)로 실패 처리.
+ *
+ * 호출 체인:
+ *   bdev_nvme_submit_request() → [이 함수] → 각 I/O 타입별 함수
+ */
 static inline void
 _bdev_nvme_submit_request(struct nvme_bdev_channel *nbdev_ch, struct spdk_bdev_io *bdev_io)
 {
@@ -3728,6 +5846,26 @@ _bdev_nvme_submit_request(struct nvme_bdev_channel *nbdev_ch, struct spdk_bdev_i
 	}
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_submit_request - bdev 레이어에서 호출하는 I/O 제출 함수 (retry 경로).
+ *
+ * @ch: spdk_io_channel (spdk_io_channel_get_ctx로 nvme_bdev_channel 획득)
+ * @bdev_io: 제출할 bdev I/O 요청
+ * @return: void
+ *
+ * bdev_nvme_submit_request_initial()에서 submit_tsc/retry_count 초기화 후 호출되거나
+ * retry 경로에서 직접 호출됨.
+ * submit_tsc: 최초 제출이면 bdev_io의 타임스탬프 사용, retry이면 현재 tsc.
+ * spdk_trace_record로 TRACE_BDEV_NVME_IO_START 기록.
+ * bdev_nvme_find_io_path()로 최적 io_path 탐색 후 _bdev_nvme_submit_request() 호출.
+ * admin 명령은 io_path가 없어도 허용(fallthrough).
+ * 일반 I/O에서 io_path 없으면 -ENXIO로 실패.
+ *
+ * 호출 체인:
+ *   bdev_nvme_submit_request_initial() → [이 함수] → _bdev_nvme_submit_request()
+ *   또는 bdev_nvme_retry_io() → [이 함수] → _bdev_nvme_submit_request()
+ */
 static void
 bdev_nvme_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
@@ -3759,6 +5897,22 @@ bdev_nvme_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 	_bdev_nvme_submit_request(nbdev_ch, bdev_io);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_submit_request_initial - 새 I/O의 실제 최초 제출 진입점 (nvmelib_fn_table.submit_request).
+ *
+ * @ch: spdk_io_channel
+ * @bdev_io: 최초 제출되는 bdev I/O
+ * @return: void
+ *
+ * nvmelib_fn_table.submit_request로 등록된 함수.
+ * bdev 레이어가 새 I/O를 제출할 때 이 함수가 호출된다.
+ * submit_tsc=0, retry_count=0으로 초기화한 후 bdev_nvme_submit_request()를 호출.
+ * retry 경로(bdev_nvme_retry_io)에서는 이 함수가 아닌 bdev_nvme_submit_request()를 직접 호출.
+ *
+ * 호출 체인:
+ *   bdev 레이어(nvmelib_fn_table.submit_request) → [이 함수] → bdev_nvme_submit_request()
+ */
 static void
 bdev_nvme_submit_request_initial(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
@@ -3773,6 +5927,19 @@ bdev_nvme_submit_request_initial(struct spdk_io_channel *ch, struct spdk_bdev_io
 	bdev_nvme_submit_request(ch, bdev_io);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_is_supported_csi - 주어진 NVMe CSI(Command Set Identifier)가 지원되는지 확인.
+ *
+ * @csi: NVMe Command Set Identifier (SPDK_NVME_CSI_NVM, SPDK_NVME_CSI_ZNS 등)
+ * @return: true이면 지원, false이면 미지원
+ *
+ * bdev_nvme_io_type_supported()에서 호출해 ZNS/NVM 외의 CSI를 처리하는 논리 분기에 사용.
+ * NVM(일반 블록)과 ZNS(Zoned Namespace) CSI만 지원한다.
+ *
+ * 호출 체인:
+ *   bdev_nvme_io_type_supported() → [이 함수]
+ */
 static bool
 bdev_nvme_is_supported_csi(enum spdk_nvme_csi csi)
 {
@@ -3786,6 +5953,24 @@ bdev_nvme_is_supported_csi(enum spdk_nvme_csi csi)
 	}
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_io_type_supported - 이 bdev이 특정 I/O 타입을 지원하는지 여부를 반환.
+ *
+ * @ctx: nvme_bdev 포인터 (bdev->ctxt)
+ * @io_type: 확인할 I/O 타입 (SPDK_BDEV_IO_TYPE_*)
+ * @return: true이면 지원, false이면 미지원
+ *
+ * nvmelib_fn_table.io_type_supported로 등록. bdev 레이어가 특정 I/O 타입 가용성을 확인 시 호출.
+ * 지원되지 않는 CSI면 NVME_ADMIN/NVME_IO/NVME_IO_MD만 허용.
+ * NVM/ZNS CSI인 경우 컨트롤러 기능(cdata->oncs, ctrlr_flags 등)에 따라 지원 여부 결정:
+ *   UNMAP: oncs.nvmdsmsv, WRITE_ZEROES: oncs.nvmwzsv, COMPARE_AND_WRITE: CAW flag,
+ *   ZONE_APPEND: ZNS+ZONE_APPEND flag, COPY: oncs.nvmcpys 등.
+ * 컨텍스트: app 스레드 강제.
+ *
+ * 호출 체인:
+ *   bdev 레이어(nvmelib_fn_table.io_type_supported) → [이 함수]
+ */
 static bool
 bdev_nvme_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 {
@@ -3874,6 +6059,25 @@ bdev_nvme_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 	}
 }
 
+/*
+ * [한국어]
+ * nvme_qpair_create - 컨트롤러 채널을 위한 nvme_qpair를 생성하고 poll group에 등록.
+ *
+ * @nvme_ctrlr: qpair를 생성할 컨트롤러
+ * @ctrlr_ch: qpair를 연결할 컨트롤러 채널
+ * @return: 0(성공), -ENOMEM(할당 실패), 기타 에러코드
+ *
+ * bdev_nvme_create_ctrlr_channel_cb()에서 io_device 채널 생성 시 호출됨.
+ * nvme_qpair를 할당하고 spdk_get_io_channel(&g_nvme_bdev_ctrlrs)로 poll group 채널 획득.
+ * VTUNE 빌드 시 collect_spin_stat=true 설정.
+ * 컨트롤러가 disabled 상태가 아니면 bdev_nvme_create_qpair()로 실제 HW qpair 생성.
+ * reconnect_delay_sec>0 AND bdev_retry_count>0이면 qpair 생성 실패를 무시(재시도 가능).
+ * nvme_ctrlr 레퍼런스 카운트 증가.
+ *
+ * 호출 체인:
+ *   bdev_nvme_create_ctrlr_channel_cb() → [이 함수]
+ *   → bdev_nvme_create_qpair() → spdk_nvme_ctrlr_alloc_io_qpair()
+ */
 static int
 nvme_qpair_create(struct nvme_ctrlr *nvme_ctrlr, struct nvme_ctrlr_channel *ctrlr_ch)
 {
@@ -3936,6 +6140,21 @@ nvme_qpair_create(struct nvme_ctrlr *nvme_ctrlr, struct nvme_ctrlr_channel *ctrl
 	return 0;
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_create_ctrlr_channel_cb - nvme_ctrlr io_device의 채널 생성 콜백.
+ *
+ * @io_device: nvme_ctrlr 포인터 (spdk_io_device_register 시 등록한 io_device)
+ * @ctx_buf: 새로 할당된 nvme_ctrlr_channel 버퍼
+ * @return: 0(성공), 에러코드(실패)
+ *
+ * spdk_get_io_channel(nvme_ctrlr) 호출 시 SPDK io_device 프레임워크가 이 콜백을 호출.
+ * 실제 작업은 nvme_qpair_create()에 위임하여 nvme_qpair 할당 및 poll group 연결.
+ * 컨텍스트: 해당 spdk_thread에서 실행.
+ *
+ * 호출 체인:
+ *   spdk_get_io_channel(nvme_ctrlr) → SPDK io_device 프레임워크 → [이 함수] → nvme_qpair_create()
+ */
 static int
 bdev_nvme_create_ctrlr_channel_cb(void *io_device, void *ctx_buf)
 {
@@ -3945,6 +6164,25 @@ bdev_nvme_create_ctrlr_channel_cb(void *io_device, void *ctx_buf)
 	return nvme_qpair_create(nvme_ctrlr, ctrlr_ch);
 }
 
+/*
+ * [한국어]
+ * nvme_qpair_delete - nvme_qpair를 정리하고 메모리를 해제하는 내부 함수.
+ *
+ * @nvme_qpair: 삭제할 nvme_qpair 포인터
+ * @return: void
+ *
+ * bdev_nvme_destroy_ctrlr_channel_cb()에서 qpair가 HW 연결 없이 삭제될 때 호출.
+ * 1) io_path_list의 모든 io_path를 TAILQ_REMOVE 후 nvme_io_path_free()로 해제.
+ * 2) qpair를 poll group의 qpair_list에서 제거.
+ * 3) spdk_put_io_channel()로 poll group 채널 레퍼런스 반환.
+ * 4) nvme_ctrlr_put_ref()로 컨트롤러 레퍼런스 감소.
+ * 5) free(nvme_qpair)로 메모리 해제.
+ * 컨텍스트: 해당 spdk_thread에서 실행.
+ *
+ * 호출 체인:
+ *   bdev_nvme_destroy_ctrlr_channel_cb() → [이 함수]
+ *   → nvme_io_path_free() / spdk_put_io_channel() / nvme_ctrlr_put_ref()
+ */
 static void
 nvme_qpair_delete(struct nvme_qpair *nvme_qpair)
 {
@@ -3966,6 +6204,25 @@ nvme_qpair_delete(struct nvme_qpair *nvme_qpair)
 	free(nvme_qpair);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_destroy_ctrlr_channel_cb - nvme_ctrlr io_device의 채널 삭제 콜백.
+ *
+ * @io_device: nvme_ctrlr 포인터
+ * @ctx_buf: 삭제할 nvme_ctrlr_channel 버퍼
+ * @return: void
+ *
+ * spdk_put_io_channel(ctrlr_ch) 시 SPDK io_device 프레임워크가 이 콜백을 호출.
+ * I/O path 캐시를 클리어한 후 qpair 상태에 따라:
+ *   - qpair가 HW 연결됨: disconnect 요청 후 비동기 해제를 위해 ctrlr_ch를 NULL로 분리.
+ *   - qpair가 없음: nvme_qpair_delete()로 즉시 해제.
+ * reset_iter가 활성이면 nvme_ctrlr_channel_reset_finish()로 리셋 완료 처리.
+ * 컨텍스트: 해당 spdk_thread에서 실행.
+ *
+ * 호출 체인:
+ *   spdk_put_io_channel(ctrlr_ch) → SPDK 프레임워크 → [이 함수]
+ *   → spdk_nvme_ctrlr_disconnect_io_qpair() or nvme_qpair_delete()
+ */
 static void
 bdev_nvme_destroy_ctrlr_channel_cb(void *io_device, void *ctx_buf)
 {
@@ -4001,6 +6258,22 @@ bdev_nvme_destroy_ctrlr_channel_cb(void *io_device, void *ctx_buf)
 	}
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_get_accel_channel - poll group의 accel I/O 채널을 지연 초기화하여 반환.
+ *
+ * @group: nvme_poll_group 포인터
+ * @return: accel I/O 채널 포인터, 실패 시 NULL
+ *
+ * bdev_nvme_append_crc32c()와 bdev_nvme_append_copy()에서 호출.
+ * accel_channel이 아직 없으면 spdk_accel_get_io_channel()로 획득 후 group에 캐시.
+ * 이미 있으면 즉시 반환(빠른 경로). 지연 초기화 패턴으로 필요 시에만 채널 생성.
+ * 컨텍스트: poll group 소속 spdk_thread.
+ *
+ * 호출 체인:
+ *   bdev_nvme_append_crc32c() → [이 함수] → spdk_accel_get_io_channel()
+ *   bdev_nvme_append_copy() → [이 함수] → spdk_accel_get_io_channel()
+ */
 static inline struct spdk_io_channel *
 bdev_nvme_get_accel_channel(struct nvme_poll_group *group)
 {
@@ -4016,24 +6289,92 @@ bdev_nvme_get_accel_channel(struct nvme_poll_group *group)
 	return group->accel_channel;
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_finish_sequence - accel 시퀀스를 완료 처리하는 래퍼 함수.
+ *
+ * @seq: 완료할 accel 시퀀스 핸들
+ * @cb_fn: 완료 콜백 (spdk_nvme_accel_completion_cb 타입)
+ * @cb_arg: 콜백 인수
+ * @return: void
+ *
+ * g_bdev_nvme_accel_fn_table.finish_sequence로 등록된 함수.
+ * NVMe 드라이버가 accel 시퀀스 완료를 요청할 때 이 함수를 통해 spdk_accel_sequence_finish()를 호출.
+ * 인터페이스 분리를 위한 래퍼 패턴.
+ *
+ * 호출 체인:
+ *   spdk_nvme 드라이버(accel_fn_table.finish_sequence) → [이 함수] → spdk_accel_sequence_finish()
+ */
 static void
 bdev_nvme_finish_sequence(void *seq, spdk_nvme_accel_completion_cb cb_fn, void *cb_arg)
 {
 	spdk_accel_sequence_finish(seq, cb_fn, cb_arg);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_abort_sequence - accel 시퀀스를 중단하는 래퍼 함수.
+ *
+ * @seq: 중단할 accel 시퀀스 핸들
+ * @return: void
+ *
+ * g_bdev_nvme_accel_fn_table.abort_sequence로 등록된 함수.
+ * NVMe 드라이버가 오류 발생 시 accel 시퀀스를 취소할 때 호출.
+ * spdk_accel_sequence_abort()로 즉시 중단 처리.
+ *
+ * 호출 체인:
+ *   spdk_nvme 드라이버(accel_fn_table.abort_sequence) → [이 함수] → spdk_accel_sequence_abort()
+ */
 static void
 bdev_nvme_abort_sequence(void *seq)
 {
 	spdk_accel_sequence_abort(seq);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_reverse_sequence - accel 시퀀스 순서를 역전시키는 래퍼 함수.
+ *
+ * @seq: 역전할 accel 시퀀스 핸들
+ * @return: void
+ *
+ * g_bdev_nvme_accel_fn_table.reverse_sequence로 등록된 함수.
+ * 읽기 I/O에서 PI(Protection Information) 검증을 역순으로 처리할 때 호출.
+ * spdk_accel_sequence_reverse()로 시퀀스 단계 순서를 반전.
+ *
+ * 호출 체인:
+ *   spdk_nvme 드라이버(accel_fn_table.reverse_sequence) → [이 함수] → spdk_accel_sequence_reverse()
+ */
 static void
 bdev_nvme_reverse_sequence(void *seq)
 {
 	spdk_accel_sequence_reverse(seq);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_append_crc32c - accel 시퀀스에 CRC32C 계산 단계를 추가하는 래퍼.
+ *
+ * @ctx: nvme_poll_group 포인터 (accel 채널 획득에 사용)
+ * @seq: accel 시퀀스 핸들 포인터 (spdk_accel_sequence**)
+ * @dst: CRC32C 결과를 저장할 uint32_t 포인터
+ * @iovs: 입력 데이터 iovec 배열
+ * @iovcnt: iovec 개수
+ * @domain: 메모리 도메인 (DMA 가능 영역)
+ * @domain_ctx: 메모리 도메인 컨텍스트
+ * @seed: CRC32C 초기값
+ * @cb_fn: 단계 완료 콜백
+ * @cb_arg: 콜백 인수
+ * @return: 0(성공), -ENOMEM(accel 채널 획득 실패), 기타 에러코드
+ *
+ * g_bdev_nvme_accel_fn_table.append_crc32c로 등록된 함수.
+ * NVMe 드라이버가 PI(Protection Information) T10 DIF CRC 계산을 accel에 오프로드할 때 호출.
+ * accel 채널을 지연 초기화 후 spdk_accel_append_crc32c()로 시퀀스에 단계 추가.
+ *
+ * 호출 체인:
+ *   spdk_nvme 드라이버(accel_fn_table.append_crc32c) → [이 함수]
+ *   → bdev_nvme_get_accel_channel() → spdk_accel_append_crc32c()
+ */
 static int
 bdev_nvme_append_crc32c(void *ctx, void **seq, uint32_t *dst, struct iovec *iovs, uint32_t iovcnt,
 			struct spdk_memory_domain *domain, void *domain_ctx, uint32_t seed,
@@ -4051,6 +6392,32 @@ bdev_nvme_append_crc32c(void *ctx, void **seq, uint32_t *dst, struct iovec *iovs
 					domain, domain_ctx, seed, cb_fn, cb_arg);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_append_copy - accel 시퀀스에 메모리 복사 단계를 추가하는 래퍼.
+ *
+ * @ctx: nvme_poll_group 포인터
+ * @seq: accel 시퀀스 핸들 포인터
+ * @dst_iovs: 대상 iovec 배열
+ * @dst_iovcnt: 대상 iovec 개수
+ * @dst_domain: 대상 메모리 도메인
+ * @dst_domain_ctx: 대상 메모리 도메인 컨텍스트
+ * @src_iovs: 소스 iovec 배열
+ * @src_iovcnt: 소스 iovec 개수
+ * @src_domain: 소스 메모리 도메인
+ * @src_domain_ctx: 소스 메모리 도메인 컨텍스트
+ * @cb_fn: 단계 완료 콜백
+ * @cb_arg: 콜백 인수
+ * @return: 0(성공), -ENOMEM(accel 채널 획득 실패), 기타 에러코드
+ *
+ * g_bdev_nvme_accel_fn_table.append_copy로 등록된 함수.
+ * NVMe 드라이버가 메모리 도메인 간 데이터 복사(예: DMA 전송)를 accel에 오프로드할 때 호출.
+ * accel 채널을 지연 초기화 후 spdk_accel_append_copy()로 시퀀스에 단계 추가.
+ *
+ * 호출 체인:
+ *   spdk_nvme 드라이버(accel_fn_table.append_copy) → [이 함수]
+ *   → bdev_nvme_get_accel_channel() → spdk_accel_append_copy()
+ */
 static int
 bdev_nvme_append_copy(void *ctx, void **seq, struct iovec *dst_iovs, uint32_t dst_iovcnt,
 		      struct spdk_memory_domain *dst_domain, void *dst_domain_ctx,
@@ -4081,12 +6448,45 @@ static struct spdk_nvme_accel_fn_table g_bdev_nvme_accel_fn_table = {
 	.abort_sequence		= bdev_nvme_abort_sequence,
 };
 
+/*
+ * [한국어]
+ * bdev_nvme_poll_group_interrupt_cb - interrupt 모드에서 poll group 인터럽트 발생 시 콜백.
+ *
+ * @group: NVMe poll group 핸들 (사용하지 않음 — ctx에서 group을 가져옴)
+ * @ctx: nvme_poll_group 포인터
+ * @return: void
+ *
+ * spdk_interrupt_mode_is_enabled()가 true일 때 인터럽트 기반 I/O 완료 알림이 도착하면 호출.
+ * 실제 완료 처리는 bdev_nvme_poll()에 위임.
+ * 인터럽트 모드에서 poller 대신 fd_group 인터럽트를 사용하는 설계를 지원.
+ *
+ * 호출 체인:
+ *   spdk_nvme poll group 인터럽트 → [이 함수] → bdev_nvme_poll()
+ */
 static void
 bdev_nvme_poll_group_interrupt_cb(struct spdk_nvme_poll_group *group, void *ctx)
 {
 	bdev_nvme_poll(ctx);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_create_poll_group_cb - g_nvme_bdev_ctrlrs io_device의 poll group 채널 생성 콜백.
+ *
+ * @io_device: g_nvme_bdev_ctrlrs 포인터 (전역 컨트롤러 목록)
+ * @ctx_buf: 새로 할당된 nvme_poll_group 버퍼
+ * @return: 0(성공), -1(실패)
+ *
+ * spdk_get_io_channel(&g_nvme_bdev_ctrlrs) 호출 시 SPDK io_device 프레임워크가 이 콜백을 호출.
+ * 1) spdk_nvme_poll_group_create()로 NVMe poll group 생성 (accel fn_table 연결).
+ * 2) interrupt 모드이면 period=0, polling 모드이면 g_opts.nvme_ioq_poll_period_us로 poller 등록.
+ * 3) interrupt 모드이면 fd_group 기반 인터럽트 핸들러를 별도 등록.
+ * 모든 qpair는 이 poll group을 통해 CQ 폴링/완료 처리됨.
+ *
+ * 호출 체인:
+ *   nvme_qpair_create() → spdk_get_io_channel(&g_nvme_bdev_ctrlrs)
+ *   → SPDK 프레임워크 → [이 함수] → spdk_nvme_poll_group_create()
+ */
 static int
 bdev_nvme_create_poll_group_cb(void *io_device, void *ctx_buf)
 {
@@ -4136,6 +6536,25 @@ bdev_nvme_create_poll_group_cb(void *io_device, void *ctx_buf)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_destroy_poll_group_cb - g_nvme_bdev_ctrlrs io_device의 poll group 채널 삭제 콜백.
+ *
+ * @io_device: g_nvme_bdev_ctrlrs 포인터
+ * @ctx_buf: 삭제할 nvme_poll_group 버퍼
+ * @return: void
+ *
+ * spdk_put_io_channel(pg_ch) 시 SPDK io_device 프레임워크가 이 콜백을 호출.
+ * qpair_list가 비어 있어야 함(assert).
+ * accel_channel이 있으면 spdk_put_io_channel()로 반환.
+ * interrupt 모드이면 spdk_interrupt_unregister()로 인터럽트 핸들러 해제.
+ * poller 해제 후 spdk_nvme_poll_group_destroy()로 poll group 삭제.
+ * 컨텍스트: 해당 spdk_thread.
+ *
+ * 호출 체인:
+ *   nvme_qpair_delete() → spdk_put_io_channel(pg_ch)
+ *   → SPDK 프레임워크 → [이 함수] → spdk_nvme_poll_group_destroy()
+ */
 static void
 bdev_nvme_destroy_poll_group_cb(void *io_device, void *ctx_buf)
 {
@@ -4158,6 +6577,22 @@ bdev_nvme_destroy_poll_group_cb(void *io_device, void *ctx_buf)
 	}
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_get_io_channel - nvme_bdev의 I/O 채널(nvme_bdev_channel)을 획득하는 fn_table 콜백.
+ *
+ * @ctx: nvme_bdev 포인터 (bdev->ctxt)
+ * @return: spdk_io_channel 포인터 (nvme_bdev_channel 포함)
+ *
+ * nvmelib_fn_table.get_io_channel로 등록된 함수.
+ * bdev 레이어가 I/O 제출을 위해 채널을 요청할 때 호출.
+ * nvme_bdev를 io_device로 spdk_get_io_channel()을 호출하여
+ * bdev_nvme_create_bdev_channel_cb()가 실행되고 nvme_bdev_channel이 초기화됨.
+ *
+ * 호출 체인:
+ *   bdev 레이어(fn_table.get_io_channel) → [이 함수]
+ *   → spdk_get_io_channel(nbdev) → bdev_nvme_create_bdev_channel_cb()
+ */
 static struct spdk_io_channel *
 bdev_nvme_get_io_channel(void *ctx)
 {
@@ -4166,6 +6601,21 @@ bdev_nvme_get_io_channel(void *ctx)
 	return spdk_get_io_channel(nbdev);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_get_module_ctx - nvme_bdev의 모듈 컨텍스트(spdk_nvme_ns)를 반환.
+ *
+ * @ctx: nvme_bdev 포인터 (bdev->ctxt)
+ * @return: spdk_nvme_ns 포인터(성공), NULL(bdev가 nvme_if 모듈이 아니거나 ns가 없음)
+ *
+ * nvmelib_fn_table.get_module_ctx로 등록된 함수.
+ * bdev 레이어가 모듈 전용 데이터를 가져올 때 호출 (예: RPC 조회, PI 정보 조회).
+ * nvme_ns_list의 첫 번째 ns의 spdk_nvme_ns를 반환.
+ * 컨텍스트: app 스레드(assert 포함).
+ *
+ * 호출 체인:
+ *   bdev 레이어(fn_table.get_module_ctx) → [이 함수]
+ */
 static void *
 bdev_nvme_get_module_ctx(void *ctx)
 {
@@ -4186,6 +6636,21 @@ bdev_nvme_get_module_ctx(void *ctx)
 	return nvme_ns->ns;
 }
 
+/*
+ * [한국어]
+ * _nvme_ana_state_str - ANA 상태 enum 값을 사람이 읽을 수 있는 문자열로 변환.
+ *
+ * @ana_state: spdk_nvme_ana_state enum 값
+ * @return: ANA 상태 문자열 (예: "optimized", "non_optimized", "inaccessible" 등)
+ *
+ * bdev_nvme_dump_info_json() 및 nvme_namespace_info_json()에서 JSON 출력 시 호출.
+ * NVMe-oF ANA(Asymmetric Namespace Access) 상태를 문자열로 변환.
+ * 알 수 없는 상태는 "unknown"을 반환.
+ *
+ * 호출 체인:
+ *   bdev_nvme_dump_info_json() → [이 함수]
+ *   nvme_namespace_info_json() → [이 함수]
+ */
 static const char *
 _nvme_ana_state_str(enum spdk_nvme_ana_state ana_state)
 {
@@ -4205,6 +6670,24 @@ _nvme_ana_state_str(enum spdk_nvme_ana_state ana_state)
 	}
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_get_memory_domains - 이 bdev가 지원하는 메모리 도메인 목록을 반환.
+ *
+ * @ctx: nvme_bdev 포인터 (bdev->ctxt)
+ * @domains: 도메인을 저장할 배열 (NULL이면 카운트만 반환)
+ * @array_size: 배열 크기
+ * @return: 지원하는 메모리 도메인 수 (>0), 에러(< 0)
+ *
+ * nvmelib_fn_table.get_memory_domains로 등록된 함수.
+ * bdev 레이어가 DMA 지원 메모리 도메인 목록을 쿼리할 때 호출.
+ * nvme_ns_list의 모든 컨트롤러에 대해 spdk_nvme_ctrlr_get_memory_domains()를 호출하여 합산.
+ * 컨텍스트: app 스레드(assert 포함).
+ *
+ * 호출 체인:
+ *   bdev 레이어(fn_table.get_memory_domains) → [이 함수]
+ *   → spdk_nvme_ctrlr_get_memory_domains()
+ */
 static int
 bdev_nvme_get_memory_domains(void *ctx, struct spdk_memory_domain **domains, int array_size)
 {
@@ -4238,6 +6721,21 @@ bdev_nvme_get_memory_domains(void *ctx, struct spdk_memory_domain **domains, int
 	return i;
 }
 
+/*
+ * [한국어]
+ * nvme_ctrlr_get_state_str - nvme_ctrlr의 현재 상태를 사람이 읽을 수 있는 문자열로 반환.
+ *
+ * @nvme_ctrlr: 상태를 조회할 nvme_ctrlr 포인터
+ * @return: 상태 문자열 (예: "deleting", "failed", "resetting", "reconnect_is_delayed",
+ *          "disabled", "enabled")
+ *
+ * nvme_ctrlr_info_json()에서 JSON 출력 시 호출.
+ * 우선순위: destruct > failed > resetting > reconnect_is_delayed > disabled > enabled.
+ * 컨텍스트: app 스레드 (ctrlr 상태 필드 접근 시 mutex 보호 불필요 — app 스레드에서만).
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_info_json() → [이 함수]
+ */
 static const char *
 nvme_ctrlr_get_state_str(struct nvme_ctrlr *nvme_ctrlr)
 {
@@ -4322,6 +6820,24 @@ nvme_ctrlr_info_json(struct spdk_json_write_ctx *w, struct nvme_ctrlr *nvme_ctrl
 	spdk_json_write_object_end(w);
 }
 
+/*
+ * [한국어]
+ * nvme_namespace_info_json - 단일 nvme_ns의 상세 정보를 JSON 객체로 직렬화.
+ *
+ * @w: JSON 쓰기 컨텍스트
+ * @nvme_ns: 정보를 직렬화할 nvme_ns 포인터
+ * @return: void
+ *
+ * bdev_nvme_dump_info_json()에서 nvme_ns_list를 순회하며 호출.
+ * ns가 NULL(아직 매핑 안 됨)이면 아무것도 쓰지 않고 반환.
+ * 출력 필드:
+ *   pci_address (PCIe인 경우), trid, ctrlr_data(cntlid, vendor_id, model_number,
+ *   serial_number, firmware_revision), vs(NVMe 버전), ns_data(id, sector_size,
+ *   md_size, pi_type, extended_lba_size, sectors), ana_state.
+ *
+ * 호출 체인:
+ *   bdev_nvme_dump_info_json() → [이 함수]
+ */
 static void
 nvme_namespace_info_json(struct spdk_json_write_ctx *w,
 			 struct nvme_ns *nvme_ns)
@@ -4441,6 +6957,20 @@ nvme_namespace_info_json(struct spdk_json_write_ctx *w,
 	spdk_json_write_object_end(w);
 }
 
+/*
+ * [한국어]
+ * nvme_bdev_get_mp_policy_str - 멀티패스 정책 enum을 문자열로 변환.
+ *
+ * @nbdev: nvme_bdev 포인터
+ * @return: "active_passive" 또는 "active_active"
+ *
+ * bdev_nvme_dump_info_json()에서 JSON 출력 시 호출.
+ * BDEV_NVME_MP_POLICY_ACTIVE_PASSIVE: 하나의 경로만 활성화.
+ * BDEV_NVME_MP_POLICY_ACTIVE_ACTIVE: 모든 경로를 동시 사용.
+ *
+ * 호출 체인:
+ *   bdev_nvme_dump_info_json() → [이 함수]
+ */
 static const char *
 nvme_bdev_get_mp_policy_str(struct nvme_bdev *nbdev)
 {
@@ -4455,6 +6985,20 @@ nvme_bdev_get_mp_policy_str(struct nvme_bdev *nbdev)
 	}
 }
 
+/*
+ * [한국어]
+ * nvme_bdev_get_mp_selector_str - 멀티패스 선택기 enum을 문자열로 변환.
+ *
+ * @nbdev: nvme_bdev 포인터
+ * @return: "round_robin" 또는 "queue_depth"
+ *
+ * bdev_nvme_dump_info_json()에서 mp_policy가 ACTIVE_ACTIVE일 때만 호출.
+ * BDEV_NVME_MP_SELECTOR_ROUND_ROBIN: 경로를 순환하며 사용.
+ * BDEV_NVME_MP_SELECTOR_QUEUE_DEPTH: 가장 큐가 짧은 경로 우선.
+ *
+ * 호출 체인:
+ *   bdev_nvme_dump_info_json() → [이 함수]
+ */
 static const char *
 nvme_bdev_get_mp_selector_str(struct nvme_bdev *nbdev)
 {
@@ -4469,6 +7013,23 @@ nvme_bdev_get_mp_selector_str(struct nvme_bdev *nbdev)
 	}
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_dump_info_json - 이 bdev의 상세 정보를 JSON으로 직렬화 (fn_table.dump_info_json).
+ *
+ * @ctx: nvme_bdev 포인터 (bdev->ctxt)
+ * @w: JSON 쓰기 컨텍스트
+ * @return: 항상 0
+ *
+ * nvmelib_fn_table.dump_info_json으로 등록된 함수.
+ * bdev 레이어가 "nvme" 배열(nvme_ns_list 순회)과 mp_policy/selector/rr_min_io를 출력.
+ * 각 ns에 대해 nvme_namespace_info_json()을 호출.
+ * 컨텍스트: app 스레드(assert 포함).
+ *
+ * 호출 체인:
+ *   bdev 레이어(fn_table.dump_info_json) → [이 함수]
+ *   → nvme_namespace_info_json()
+ */
 static int
 bdev_nvme_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 {
@@ -4493,12 +7054,42 @@ bdev_nvme_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_write_config_json - bdev 별 설정을 JSON으로 직렬화 (fn_table.write_config_json).
+ *
+ * @bdev: spdk_bdev 포인터
+ * @w: JSON 쓰기 컨텍스트
+ * @return: void
+ *
+ * nvmelib_fn_table.write_config_json으로 등록된 함수.
+ * nvme bdev는 개별 bdev 단위의 설정이 없으므로 아무것도 출력하지 않는다.
+ * 전체 컨트롤러/bdev 설정은 bdev_nvme_config_json()에서 처리.
+ *
+ * 호출 체인:
+ *   bdev 레이어(fn_table.write_config_json) → [이 함수] (no-op)
+ */
 static void
 bdev_nvme_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
 {
 	/* No config per bdev needed */
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_get_spin_time - 이 채널의 I/O 폴링 spin 시간(마이크로초)을 반환.
+ *
+ * @ch: spdk_io_channel (nvme_bdev_channel 포함)
+ * @return: 마이크로초 단위 spin 시간 (VTUNE 통계 수집 시에만 유효)
+ *
+ * nvmelib_fn_table.get_spin_time으로 등록된 함수.
+ * collect_spin_stat=true인 poll group에 대해 start_ticks~end_ticks 구간을 spin_ticks에 누적.
+ * 누적값을 spdk_get_ticks_hz()로 마이크로초 단위로 변환 후 반환.
+ * SPDK_CONFIG_VTUNE 빌드 옵션 시에만 collect_spin_stat=true가 설정됨.
+ *
+ * 호출 체인:
+ *   bdev 레이어(fn_table.get_spin_time) → [이 함수]
+ */
 static uint64_t
 bdev_nvme_get_spin_time(struct spdk_io_channel *ch)
 {
@@ -4527,6 +7118,21 @@ bdev_nvme_get_spin_time(struct spdk_io_channel *ch)
 	return (spin_time * 1000000ULL) / spdk_get_ticks_hz();
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_reset_device_stat - nvme_bdev의 에러 통계를 초기화.
+ *
+ * @ctx: nvme_bdev 포인터 (bdev->ctxt)
+ * @return: void
+ *
+ * nvmelib_fn_table.reset_device_stat으로 등록된 함수.
+ * err_stat이 NULL이면 (통계 수집 안 함) 아무것도 하지 않음.
+ * mutex를 획득하고 memset으로 err_stat을 0으로 초기화한 뒤 mutex 해제.
+ * 컨텍스트: 어느 스레드에서든 호출 가능(mutex로 보호).
+ *
+ * 호출 체인:
+ *   bdev 레이어(fn_table.reset_device_stat) → [이 함수]
+ */
 static void
 bdev_nvme_reset_device_stat(void *ctx)
 {
@@ -4541,6 +7147,22 @@ bdev_nvme_reset_device_stat(void *ctx)
 	pthread_mutex_unlock(&nbdev->mutex);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_format_nvme_status - NVMe 상태 문자열을 JSON 키 형식(소문자_밑줄)으로 변환.
+ *
+ * @dst: 변환 결과를 저장할 버퍼 (256바이트 이상 필요)
+ * @src: 원본 NVMe 상태 문자열 (spdk_nvme_cpl_get_status_string 반환값)
+ * @return: void
+ *
+ * bdev_nvme_dump_device_stat_json()에서 JSON 키를 생성할 때 호출.
+ * " - " → "_", "-" → "_", " " → "_" 순서로 치환 후 소문자로 변환.
+ * 예: "Invalid Field in Command" → "invalid_field_in_command"
+ * JSON string should be lowercases and underscore delimited string.
+ *
+ * 호출 체인:
+ *   bdev_nvme_dump_device_stat_json() → [이 함수]
+ */
 /* JSON string should be lowercases and underscore delimited string. */
 static void
 bdev_nvme_format_nvme_status(char *dst, const char *src)
@@ -4553,6 +7175,24 @@ bdev_nvme_format_nvme_status(char *dst, const char *src)
 	spdk_strlwr(dst);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_dump_device_stat_json - nvme_bdev의 에러 통계를 JSON으로 직렬화.
+ *
+ * @ctx: nvme_bdev 포인터 (bdev->ctxt)
+ * @w: JSON 쓰기 컨텍스트
+ * @return: void
+ *
+ * nvmelib_fn_table.dump_device_stat_json으로 등록된 함수.
+ * err_stat이 NULL이면 (통계 수집 안 함) 아무것도 출력하지 않음.
+ * status_type[8]과 status[4][256] 배열을 순회하여 0이 아닌 항목만 JSON에 출력.
+ * 각 상태 코드를 bdev_nvme_format_nvme_status()로 소문자_밑줄 형식으로 변환 후 키로 사용.
+ * 출력 구조: nvme_error → { status_type: {...}, status_code: {...} }
+ *
+ * 호출 체인:
+ *   bdev 레이어(fn_table.dump_device_stat_json) → [이 함수]
+ *   → bdev_nvme_format_nvme_status()
+ */
 static void
 bdev_nvme_dump_device_stat_json(void *ctx, struct spdk_json_write_ctx *w)
 {
@@ -4604,6 +7244,23 @@ bdev_nvme_dump_device_stat_json(void *ctx, struct spdk_json_write_ctx *w)
 	spdk_json_write_object_end(w);
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_accel_sequence_supported - 이 bdev가 특정 I/O 타입에 accel 시퀀스를 지원하는지 확인.
+ *
+ * @ctx: nvme_bdev 포인터 (bdev->ctxt)
+ * @type: 확인할 I/O 타입
+ * @return: true이면 지원, false이면 미지원
+ *
+ * nvmelib_fn_table.accel_sequence_supported로 등록된 함수.
+ * g_opts.allow_accel_sequence가 false이면 무조건 false.
+ * READ/WRITE 타입만 지원 가능 (나머지는 false).
+ * SPDK_NVME_CTRLR_ACCEL_SEQUENCE_SUPPORTED 플래그로 컨트롤러 기능 확인.
+ * 컨텍스트: app 스레드(assert 포함).
+ *
+ * 호출 체인:
+ *   bdev 레이어(fn_table.accel_sequence_supported) → [이 함수]
+ */
 static bool
 bdev_nvme_accel_sequence_supported(void *ctx, enum spdk_bdev_io_type type)
 {
@@ -4652,6 +7309,25 @@ static const struct spdk_bdev_fn_table nvmelib_fn_table = {
 typedef int (*bdev_nvme_parse_ana_log_page_cb)(
 	const struct spdk_nvme_ana_group_descriptor *desc, void *cb_arg);
 
+/*
+ * [한국어]
+ * bdev_nvme_parse_ana_log_page - ANA 로그 페이지를 파싱하여 각 group descriptor에 콜백 호출.
+ *
+ * @nvme_ctrlr: ANA 로그 페이지를 보유한 nvme_ctrlr
+ * @cb_fn: 각 ANA 그룹 descriptor를 처리할 콜백 함수
+ * @cb_arg: 콜백 인수
+ * @return: 0(정상 완료), -EINVAL(ana_log_page가 NULL), 콜백에서 반환한 양수(조기 종료)
+ *
+ * nvme_ctrlr_set_ana_states(), nvme_ns_set_ana_state() 콜백 체인에서 사용.
+ * ANA 로그 페이지 버퍼를 순회하면서 각 spdk_nvme_ana_group_descriptor를 복사본에 memcpy 후
+ * cb_fn을 호출한다 (복사본 사용: 원본 DMA 버퍼 직접 접근 회피).
+ * cb_fn이 양수를 반환하면 조기 종료 (1 = 해당 ns 발견, -1 = 에러).
+ * 컨텍스트: app 스레드.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_set_ana_states() → [이 함수] → nvme_ns_set_ana_state()
+ *   nvme_ns_set_ana_state() 내부 → _nvme_ns_set_ana_state()
+ */
 static int
 bdev_nvme_parse_ana_log_page(struct nvme_ctrlr *nvme_ctrlr,
 			     bdev_nvme_parse_ana_log_page_cb cb_fn, void *cb_arg)
@@ -4687,6 +7363,23 @@ bdev_nvme_parse_ana_log_page(struct nvme_ctrlr *nvme_ctrlr,
 	return rc;
 }
 
+/*
+ * [한국어]
+ * nvme_ns_ana_transition_timedout - ANA 상태 전환 타임아웃 poller 콜백.
+ *
+ * @ctx: nvme_ns 포인터
+ * @return: SPDK_POLLER_BUSY
+ *
+ * _nvme_ns_set_ana_state()에서 INACCESSIBLE/CHANGE 상태 진입 시 ANATT(Ana Transition Time) 타이머로 등록.
+ * ANATT(cdata->anatt 초) 이후에도 OPTIMIZED/NON_OPTIMIZED로 전환되지 않으면 이 poller가 호출.
+ * anatt_timer를 해제하고 ana_transition_timedout=true 설정.
+ * ana_transition_timedout=true이면 해당 경로는 사용 불가로 간주됨.
+ * 컨텍스트: app 스레드.
+ *
+ * 호출 체인:
+ *   SPDK_POLLER_REGISTER(ANATT 타이머) → [이 함수]
+ *   _nvme_ns_set_ana_state() → SPDK_POLLER_REGISTER → [이 함수 등록]
+ */
 static int
 nvme_ns_ana_transition_timedout(void *ctx)
 {
@@ -4698,6 +7391,24 @@ nvme_ns_ana_transition_timedout(void *ctx)
 	return SPDK_POLLER_BUSY;
 }
 
+/*
+ * [한국어]
+ * _nvme_ns_set_ana_state - nvme_ns의 ANA 상태를 descriptor에서 읽어 실제로 업데이트.
+ *
+ * @nvme_ns: ANA 상태를 업데이트할 nvme_ns
+ * @desc: 읽어온 spdk_nvme_ana_group_descriptor
+ * @return: void
+ *
+ * nvme_ns_set_ana_state()가 해당 ns의 descriptor를 찾으면 이 함수를 호출.
+ * ana_group_id와 ana_state를 업데이트하고 ana_state_updating=false로 설정.
+ * OPTIMIZED/NON_OPTIMIZED: anatt_timer 해제 및 ana_transition_timedout=false.
+ * INACCESSIBLE/CHANGE: anatt_timer가 없으면 ANATT 타이머 등록.
+ * 컨텍스트: app 스레드.
+ *
+ * 호출 체인:
+ *   nvme_ns_set_ana_state() → [이 함수]
+ *   → SPDK_POLLER_REGISTER(nvme_ns_ana_transition_timedout) [ANATT 타이머 등록]
+ */
 static void
 _nvme_ns_set_ana_state(struct nvme_ns *nvme_ns,
 		       const struct spdk_nvme_ana_group_descriptor *desc)
@@ -4731,6 +7442,22 @@ _nvme_ns_set_ana_state(struct nvme_ns *nvme_ns,
 	}
 }
 
+/*
+ * [한국어]
+ * nvme_ns_set_ana_state - 단일 nvme_ns에 대한 ANA 그룹 descriptor를 매칭하고 상태 적용.
+ *
+ * @desc: 파싱된 ANA 그룹 descriptor
+ * @cb_arg: nvme_ns 포인터
+ * @return: 1(이 ns를 발견하여 처리 완료), 0(이 descriptor는 해당 ns와 무관)
+ *
+ * bdev_nvme_parse_ana_log_page()의 콜백으로 등록되어 각 ANA group descriptor에 대해 호출.
+ * descriptor의 nsid 배열을 순회하여 nvme_ns의 ns id와 일치하는지 확인.
+ * 일치하면 _nvme_ns_set_ana_state()로 실제 상태 업데이트 후 1을 반환(파싱 조기 종료).
+ * 컨텍스트: app 스레드.
+ *
+ * 호출 체인:
+ *   bdev_nvme_parse_ana_log_page() → [이 함수] → _nvme_ns_set_ana_state()
+ */
 static int
 nvme_ns_set_ana_state(const struct spdk_nvme_ana_group_descriptor *desc, void *cb_arg)
 {
@@ -4751,6 +7478,24 @@ nvme_ns_set_ana_state(const struct spdk_nvme_ana_group_descriptor *desc, void *c
 	return 0;
 }
 
+/*
+ * [한국어]
+ * nvme_generate_uuid - SN(Serial Number)과 NSID로 결정론적(deterministic) UUID 생성.
+ *
+ * @sn: 컨트롤러 시리얼 넘버 문자열 (최대 SPDK_NVME_CTRLR_SN_LEN)
+ * @nsid: Namespace ID (uint32_t)
+ * @uuid: 생성된 UUID를 저장할 spdk_uuid 포인터
+ * @return: 0(성공), -EINVAL(문자열 포맷 실패), spdk_uuid_generate_sha1 에러코드
+ *
+ * nbdev_create()에서 NGUID와 UUID가 없고 g_opts.generate_uuids=true일 때 호출.
+ * "SN + NSID" 문자열에 대해 SHA1 기반 UUID v5를 생성.
+ * namespace_uuid = "edaed2de-24bc-4b07-b559-f47ecbe730fd" (고정 namespace UUID).
+ * 동일 SN과 NSID에 대해 항상 동일한 UUID를 생성하므로 재시작 후에도 bdev 이름 연속성 유지.
+ * 컨텍스트: app 스레드.
+ *
+ * 호출 체인:
+ *   nbdev_create() → [이 함수] → spdk_uuid_generate_sha1()
+ */
 static int
 nvme_generate_uuid(const char *sn, uint32_t nsid, struct spdk_uuid *uuid)
 {
@@ -4781,6 +7526,28 @@ nvme_generate_uuid(const char *sn, uint32_t nsid, struct spdk_uuid *uuid)
 	return rc;
 }
 
+/*
+ * [한국어]
+ * nbdev_create - spdk_bdev 구조체를 NVMe namespace 정보로 초기화 (bdev 등록 준비).
+ *
+ * @disk: 초기화할 spdk_bdev 구조체 포인터
+ * @base_name: 컨트롤러 이름 (bdev 이름: "<base_name>n<nsid>" 형식)
+ * @ctrlr: 컨트롤러 핸들
+ * @ns: namespace 핸들
+ * @bdev_opts: bdev 생성 옵션 (allow_unrecognized_csi 등)
+ * @ctx: 미사용 (NULL)
+ * @return: 0(성공), -ENOTSUP(지원하지 않는 CSI), -ENOMEM(이름 할당 실패), 기타 에러
+ *
+ * nvme_bdev_alloc()에서 호출. CSI(NVM/ZNS/기타)에 따라 bdev 속성 설정:
+ *   UUID: NGUID > UUID > (generate_uuids=true이면 nvme_generate_uuid) 순서로 결정.
+ *   blocklen, blockcnt, max_segment_size, max_num_segments, optimal_io_boundary 설정.
+ *   atomic_write_unit(NAWUPF/NAWUN)과 phys_bs(NPWG) 설정.
+ *   fn_table: nvmelib_fn_table, module: nvme_if.
+ * 컨텍스트: app 스레드.
+ *
+ * 호출 체인:
+ *   nvme_bdev_alloc() → [이 함수] → nvme_generate_uuid() (조건부)
+ */
 static int
 nbdev_create(struct spdk_bdev *disk, const char *base_name,
 	     struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns,
@@ -4940,6 +7707,23 @@ nbdev_create(struct spdk_bdev *disk, const char *base_name,
 	return 0;
 }
 
+/*
+ * [한국어]
+ * nvme_bdev_alloc - nvme_bdev 구조체를 할당하고 기본값으로 초기화.
+ *
+ * @return: 초기화된 nvme_bdev 포인터(성공), NULL(실패)
+ *
+ * nvme_bdev_create()에서 호출. calloc으로 nvme_bdev를 할당하고:
+ *   g_opts.nvme_error_stat=true이면 err_stat도 calloc으로 할당.
+ *   pthread_mutex_init()으로 mutex 초기화.
+ *   ref=1, mp_policy=ACTIVE_PASSIVE, mp_selector=ROUND_ROBIN, rr_min_io=UINT32_MAX 설정.
+ *   nvme_ns_list TAILQ 초기화.
+ * 실패 시 부분 할당을 해제하고 NULL 반환.
+ * 컨텍스트: app 스레드.
+ *
+ * 호출 체인:
+ *   nvme_bdev_create() → [이 함수]
+ */
 static struct nvme_bdev *
 nvme_bdev_alloc(void)
 {
@@ -4977,6 +7761,27 @@ nvme_bdev_alloc(void)
 	return nbdev;
 }
 
+/*
+ * [한국어]
+ * nvme_bdev_create - 새 nvme_bdev를 생성하고 bdev 프레임워크에 등록.
+ *
+ * @nvme_ctrlr: bdev를 생성할 컨트롤러
+ * @nvme_ns: bdev로 노출할 namespace
+ * @return: 0(성공), -ENOMEM(할당 실패), nbdev_create 에러코드, spdk_bdev_register 에러코드
+ *
+ * nvme_ctrlr_populate_namespace()에서 호출.
+ * 1) nvme_bdev_alloc()으로 nvme_bdev 할당.
+ * 2) nbdev_create()으로 spdk_bdev 필드 초기화.
+ * 3) spdk_io_device_register()로 nvme_bdev를 io_device로 등록 (채널 관리용).
+ * 4) nvme_ns->bdev 연결 및 nbdev_ctrlr->bdevs에 추가.
+ * 5) spdk_bdev_register()로 bdev 레이어에 등록 (상위 모듈에서 사용 가능해짐).
+ * 실패 시 단계별 정리 후 에러 반환.
+ * 컨텍스트: app 스레드.
+ *
+ * 호출 체인:
+ *   nvme_ctrlr_populate_namespace() → [이 함수]
+ *   → nvme_bdev_alloc() → nbdev_create() → spdk_bdev_register()
+ */
 static int
 nvme_bdev_create(struct nvme_ctrlr *nvme_ctrlr, struct nvme_ns *nvme_ns)
 {
@@ -5030,6 +7835,21 @@ nvme_bdev_create(struct nvme_ctrlr *nvme_ctrlr, struct nvme_ns *nvme_ns)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * bdev_nvme_compare_ns - 두 namespace가 동일한 물리 namespace를 나타내는지 비교.
+ *
+ * @ns1: 첫 번째 namespace 핸들
+ * @ns2: 두 번째 namespace 핸들
+ * @return: true이면 동일 namespace, false이면 다른 namespace
+ *
+ * nvme_bdev_add_ns()에서 multipath 경로 추가 시 동일 namespace 여부를 확인하기 위해 호출.
+ * 비교 항목: NGUID, EUI64, UUID(양쪽 다 NULL이거나 값이 같아야 함), CSI.
+ * 컨텍스트: app 스레드.
+ *
+ * 호출 체인:
+ *   nvme_bdev_add_ns() → [이 함수]
+ */
 static bool
 bdev_nvme_compare_ns(struct spdk_nvme_ns *ns1, struct spdk_nvme_ns *ns2)
 {
@@ -5048,6 +7868,23 @@ bdev_nvme_compare_ns(struct spdk_nvme_ns *ns1, struct spdk_nvme_ns *ns2)
 	       spdk_nvme_ns_get_csi(ns1) == spdk_nvme_ns_get_csi(ns2);
 }
 
+/*
+ * [한국어]
+ * hotplug_probe_cb - hotplug 감지된 NVMe 장치를 attach할지 결정하는 콜백.
+ *
+ * @cb_ctx: 미사용 (NULL)
+ * @trid: 감지된 장치의 transport ID
+ * @opts: 연결 옵션 (이 함수에서 일부 필드를 설정함)
+ * @return: true이면 attach, false이면 스킵
+ *
+ * bdev_nvme_hotplug()의 spdk_nvme_probe_poll_async() 콜백으로 등록.
+ * g_skipped_nvme_ctrlrs 목록에 있는 장치는 스킵.
+ * arbitration/priority 가중치와 disable_read_ana_log_page 옵션 설정.
+ * 컨텍스트: app 스레드 (bdev_nvme_hotplug poller에서 호출).
+ *
+ * 호출 체인:
+ *   spdk_nvme_probe_poll_async() → [이 함수]
+ */
 static bool
 hotplug_probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 		 struct spdk_nvme_ctrlr_opts *opts)
